@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Data & Secrets
+.env
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+data/
+secrets/
+*.pem
+*.key
+.master_key
+
+# Node / Frontend
+frontend/node_modules/
+frontend/dist/
+backend/static/
+*.tsbuildinfo
+
+# Logs & Temp
+*.log
+*.tmp
+.DS_Store

@@ -1,0 +1,16 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.9.0
+pydantic-settings>=2.6.0
+sqlalchemy>=2.0.35
+aiosqlite>=0.20.0
+greenlet>=3.0.0
+httpx[socks]>=0.27.2
+websockets>=13.1
+cryptography>=43.0.1
+argon2-cffi>=23.1.0
+PyJWT>=2.9.0
+python-multipart>=0.0.12
+pytest>=8.3.3
+pytest-asyncio>=0.24.0
+respx>=0.21.1

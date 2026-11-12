@@ -1,0 +1,252 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Optional
+
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.core.database import Base
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    username: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
+    password_hash: Mapped[str] = mapped_column(String(256), nullable=False)
+    role: Mapped[str] = mapped_column(String(32), default="admin", nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    last_login_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ProxyNode(Base):
+    __tablename__ = "proxy_nodes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    url: Mapped[str] = mapped_column(String(255), nullable=False)  # e.g. http://127.0.0.1:7890
+    region: Mapped[str] = mapped_column(String(32), default="AUTO", nullable=False)
+    priority: Mapped[int] = mapped_column(Integer, default=10, nullable=False)
+    is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    is_healthy: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    latency_ms: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    last_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class LeadSource(Base):
+    __tablename__ = "lead_sources"
+    __table_args__ = (UniqueConstraint("platform", "portfolio_id", name="uq_lead_platform_portfolio"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    platform: Mapped[str] = mapped_column(String(32), default="binance_bapi", nullable=False)
+    portfolio_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    avatar_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    poll_interval_sec: Mapped[int] = mapped_column(Integer, default=15, nullable=False)
+    proxy_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("proxy_nodes.id", ondelete="SET NULL"), nullable=True
+    )
+    is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    is_public_dashboard: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    position_show: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    margin_balance: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    aum_amount: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    last_trade_time: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    last_sync_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="idle", nullable=False)
+
+    snapshot_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    orders_store_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    closed_cache_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    seen_order_keys_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    seen_closed_ids_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    bindings: Mapped[list["CopyBinding"]] = relationship(
+        back_populates="lead", cascade="all, delete-orphan"
+    )
+
+
+class TradingAccount(Base):
+    __tablename__ = "trading_accounts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    exchange: Mapped[str] = mapped_column(String(32), nullable=False)  # okx | binance
+    environment: Mapped[str] = mapped_column(String(16), default="demo", nullable=False)  # demo | live
+    encrypted_credentials: Mapped[str] = mapped_column(Text, nullable=False)
+    api_key_masked: Mapped[str] = mapped_column(String(64), nullable=False)
+    proxy_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("proxy_nodes.id", ondelete="SET NULL"), nullable=True
+    )
+    is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    margin_mode: Mapped[str] = mapped_column(String(16), default="cross", nullable=False)
+    position_mode: Mapped[str] = mapped_column(String(16), default="hedge", nullable=False)
+
+    usdt_equity: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    avail_equity: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    hwm_equity: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    total_notional: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    unrealized_pnl: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    positions_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    last_sync_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="idle", nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    bindings: Mapped[list["CopyBinding"]] = relationship(
+        back_populates="account", cascade="all, delete-orphan"
+    )
+
+
+class CopyBinding(Base):
+    __tablename__ = "copy_bindings"
+    __table_args__ = (UniqueConstraint("lead_id", "account_id", name="uq_binding_lead_account"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    lead_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("lead_sources.id", ondelete="CASCADE"), nullable=False
+    )
+    account_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("trading_accounts.id", ondelete="CASCADE"), nullable=False
+    )
+    is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    risk_scale: Mapped[float] = mapped_column(Float, default=1.0, nullable=False)
+    max_total_leverage: Mapped[float] = mapped_column(Float, default=8.0, nullable=False)
+    max_single_leverage: Mapped[float] = mapped_column(Float, default=4.0, nullable=False)
+    max_instrument_leverage: Mapped[int] = mapped_column(Integer, default=20, nullable=False)
+    max_drawdown_pct: Mapped[float] = mapped_column(Float, default=30.0, nullable=False)
+    max_slippage_pct: Mapped[float] = mapped_column(Float, default=1.0, nullable=False)
+    ioc_offset_pct: Mapped[float] = mapped_column(Float, default=0.5, nullable=False)
+    order_mode: Mapped[str] = mapped_column(String(32), default="ioc_then_market", nullable=False)
+
+    symbol_whitelist_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    symbol_blacklist_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    symbol_map_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+
+    circuit_breaker_tripped: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    circuit_breaker_reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    baseline_seeded: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    lead: Mapped["LeadSource"] = relationship(back_populates="bindings")
+    account: Mapped["TradingAccount"] = relationship(back_populates="bindings")
+    debts: Mapped[list["BindingDebt"]] = relationship(
+        back_populates="binding", cascade="all, delete-orphan"
+    )
+
+
+class BindingDebt(Base):
+    __tablename__ = "binding_debts"
+    __table_args__ = (
+        UniqueConstraint("binding_id", "symbol", "position_side", name="uq_debt_binding_sym_side"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    binding_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("copy_bindings.id", ondelete="CASCADE"), nullable=False
+    )
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    position_side: Mapped[str] = mapped_column(String(16), nullable=False)  # LONG | SHORT
+    pending_usd: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    binding: Mapped["CopyBinding"] = relationship(back_populates="debts")
+
+
+class ExecutionRecord(Base):
+    __tablename__ = "execution_records"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    binding_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("copy_bindings.id", ondelete="SET NULL"), nullable=True
+    )
+    lead_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    account_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    lead_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    account_name: Mapped[str] = mapped_column(String(120), nullable=False)
+
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    inst_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    side: Mapped[str] = mapped_column(String(16), nullable=False)
+    position_side: Mapped[str] = mapped_column(String(16), nullable=False)
+    action: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+
+    lead_qty: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    lead_price: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    lead_notional: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+
+    my_qty: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    my_price: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    my_notional: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    slippage_pct: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    order_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    details: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False, index=True
+    )
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    username: Mapped[str] = mapped_column(String(64), default="system", nullable=False)
+    action: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    resource_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    resource_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    details: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    ip_address: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False, index=True
+    )
+
+
+class SystemConfig(Base):
+    __tablename__ = "system_configs"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value_json: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )

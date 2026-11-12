@@ -1,0 +1,80 @@
+from __future__ import annotations
+
+import logging
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+
+from app.api import accounts, auth, bindings, dashboard, leads, proxies, settings as settings_api, ws
+from app.core.config import get_settings
+from app.core.database import init_db
+from app.services.engine.orchestrator import orchestrator
+
+settings = get_settings()
+logging.basicConfig(
+    level=getattr(logging, settings.log_level.upper(), logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    await init_db()
+    if settings.enable_background_engine:
+        await orchestrator.start()
+    try:
+        yield
+    finally:
+        await orchestrator.stop()
+
+
+def create_app() -> FastAPI:
+    app = FastAPI(
+        title="MirrorQuant",
+        version="1.0.0",
+        description="Open-source multi-lead copy-trading & quantitative monitoring platform",
+        lifespan=lifespan,
+    )
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    app.include_router(auth.router)
+    app.include_router(dashboard.router)
+    app.include_router(leads.router)
+    app.include_router(accounts.router)
+    app.include_router(bindings.router)
+    app.include_router(proxies.router)
+    app.include_router(settings_api.router)
+    app.include_router(ws.router)
+
+    @app.get("/api/health")
+    async def health():
+        return {"status": "ok", "app": settings.app_name, "version": "1.0.0"}
+
+    static_dir = Path(__file__).resolve().parent.parent / "static"
+    if static_dir.exists() and (static_dir / "index.html").exists():
+        assets_dir = static_dir / "assets"
+        if assets_dir.exists():
+            app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
+
+        @app.get("/{full_path:path}")
+        async def spa_fallback(full_path: str):
+            candidate = static_dir / full_path
+            if full_path and candidate.exists() and candidate.is_file():
+                return FileResponse(str(candidate))
+            return FileResponse(str(static_dir / "index.html"))
+
+    return app
+
+
+app = create_app()
