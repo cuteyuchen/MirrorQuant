@@ -384,6 +384,8 @@ class BinanceBapiCollector(BaseLeadCollector):
         self._brackets_map: Dict[str, Any] = {}
         self._brackets_ts: float = 0.0
         self._marks_cache: Dict[str, Dict[str, Any]] = {}
+        self._perf_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self._holdings_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
 
     @staticmethod
     def _headers(portfolio_id: str, time_range: str = "7D") -> Dict[str, str]:
@@ -705,14 +707,29 @@ class BinanceBapiCollector(BaseLeadCollector):
         except Exception:
             pass
 
-        # Performance & direct holdings
-        perf: Dict[str, Any] = {}
-        for tr in ("7D", "30D", "90D"):
-            try:
-                perf[tr] = await self.fetch_performance(portfolio_id, time_range=tr, proxy_url=proxy_url)
-            except Exception:
-                pass
-        holdings = await self.fetch_holdings(portfolio_id, proxy_url=proxy_url)
+        # Performance & direct holdings (cached to keep 5s live price ticks fast)
+        now_s = time.time()
+        cached_perf = self._perf_cache.get(portfolio_id)
+        if cached_perf and (now_s - cached_perf[0]) < 180.0 and cached_perf[1]:
+            perf = dict(cached_perf[1])
+        else:
+            async def _get_perf(tr: str):
+                try:
+                    return tr, await self.fetch_performance(portfolio_id, time_range=tr, proxy_url=proxy_url)
+                except Exception:
+                    return tr, None
+
+            perf_items = await asyncio.gather(*(_get_perf(tr) for tr in ("7D", "30D", "90D")))
+            perf = {tr: val for tr, val in perf_items if val is not None}
+            if perf:
+                self._perf_cache[portfolio_id] = (now_s, perf)
+
+        cached_holdings = self._holdings_cache.get(portfolio_id)
+        if cached_holdings and (now_s - cached_holdings[0]) < 60.0:
+            holdings = list(cached_holdings[1])
+        else:
+            holdings = await self.fetch_holdings(portfolio_id, proxy_url=proxy_url)
+            self._holdings_cache[portfolio_id] = (now_s, holdings)
 
         margin_balance = fnum(detail.get("marginBalance"))
         open_positions = reconstruct_open_positions(orders_store, closed_rows=closed_rows)

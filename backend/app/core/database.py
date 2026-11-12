@@ -92,6 +92,8 @@ DEFAULT_SYSTEM_CONFIG = {
         "telegram_chat_id": "",
         "wecom_enabled": False,
         "wecom_webhook_url": "",
+        "outbox_enabled": False,
+        "outbox_path": "",
         "notify_on_execution": True,
         "notify_on_lead_order": True,
         "notify_on_risk_block": True,

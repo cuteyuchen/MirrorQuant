@@ -98,7 +98,7 @@ async function openDetail(lead: any) {
 }
 
 function downloadCsv(leadId: number, type: "orders" | "cycles") {
-  window.open(`/api/leads/${leadId}/export-csv?export_type=${type}`, "_blank");
+  window.open(api.resolveUrl(`/api/leads/${leadId}/export-csv?export_type=${type}`), "_blank");
 }
 
 function formatUsd(val: number) {
@@ -349,7 +349,7 @@ onMounted(loadData);
                   <span class="text-xs font-mono text-slate-400">Qty: {{ pos.qty }} · Entry: {{ pos.avgEntry }} · Mark: {{ pos.currentPrice }}</span>
                 </div>
                 <div class="font-mono text-sm font-bold" :class="pos.uPnL >= 0 ? 'text-emerald-400' : 'text-rose-400'">
-                  {{ pos.uPnL >= 0 ? "+" : "" }}{{ formatUsd(pos.uPnL) }} ({{ pos.roePct }}%)
+                  {{ pos.uPnL >= 0 ? "+" : "" }}{{ formatUsd(pos.uPnL) }} ({{ (pos.uPnLRoePct ?? pos.uPnLPct ?? 0).toFixed(2) }}%)
                 </div>
               </div>
 
@@ -357,18 +357,18 @@ onMounted(loadData);
               <div v-if="pos.analysis?.ok" class="grid grid-cols-1 md:grid-cols-3 gap-3 pt-2 border-t border-slate-800/80 text-xs">
                 <div class="p-2.5 rounded-lg bg-surface/80 border border-slate-800">
                   <span class="text-[10px] text-slate-500 uppercase font-mono block">1H / 4H Trend & RSI</span>
-                  <span class="text-accent font-mono">{{ pos.analysis.tf1h?.trend }} · RSI14: {{ pos.analysis.tf1h?.rsi14 }}</span>
+                  <span class="text-accent font-mono">{{ pos.analysis.trend1h }} / {{ pos.analysis.trend4h }} · RSI {{ pos.analysis.rsi1h }}/{{ pos.analysis.rsi4h }}</span>
                 </div>
                 <div class="p-2.5 rounded-lg bg-surface/80 border border-slate-800">
-                  <span class="text-[10px] text-slate-500 uppercase font-mono block">72H Swing Zone</span>
+                  <span class="text-[10px] text-slate-500 uppercase font-mono block">72H Entry Zone & Verdict</span>
                   <span class="text-slate-200 font-mono">
-                    {{ pos.analysis.tf1h?.swingZone }} ({{ pos.analysis.tf1h?.swingPosPct }}%)
+                    {{ pos.analysis.entryZone }} ({{ pos.analysis.entryRangePct }}%) · {{ pos.analysis.verdict }}
                   </span>
                 </div>
                 <div class="p-2.5 rounded-lg bg-surface/80 border border-slate-800">
                   <span class="text-[10px] text-slate-500 uppercase font-mono block">Invalidation & Targets</span>
                   <span class="text-slate-200 font-mono">
-                    SL Ref: {{ pos.analysis.levels?.invalidation }} · T1: {{ pos.analysis.levels?.t1 }}
+                    SL: {{ pos.analysis.invalidationLevel }} · T1: {{ pos.analysis.target1 }} (R:R {{ pos.analysis.rrFromEntry }}x)
                   </span>
                 </div>
               </div>

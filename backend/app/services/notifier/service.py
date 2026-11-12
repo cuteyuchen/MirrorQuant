@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import fcntl
+import json
 import logging
+import time
+from pathlib import Path
 from typing import Any, Dict
 
 import httpx
@@ -9,12 +13,33 @@ logger = logging.getLogger("mirrorquant.notifier")
 
 
 class NotificationService:
-    """Async multi-channel dispatcher (Webhook, Telegram Bot, WeCom/DingTalk)."""
+    """Async multi-channel dispatcher (Webhook, Telegram Bot, WeCom/DingTalk, JSONL Outbox)."""
 
     @staticmethod
     async def dispatch(config: Dict[str, Any], title: str, message: str, event_type: str = "info") -> Dict[str, Any]:
         results: Dict[str, Any] = {}
         full_text = f"[{title}]\n{message}"
+
+        if config.get("outbox_enabled") and config.get("outbox_path"):
+            outbox_file = Path(str(config["outbox_path"]).strip()).expanduser()
+            try:
+                outbox_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(outbox_file, "a+", encoding="utf-8") as f:
+                    fcntl.flock(f, fcntl.LOCK_EX)
+                    try:
+                        record = {
+                            "text": full_text,
+                            "title": title,
+                            "eventType": event_type,
+                            "ts": int(time.time() * 1000),
+                        }
+                        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                        f.flush()
+                    finally:
+                        fcntl.flock(f, fcntl.LOCK_UN)
+                results["outbox"] = {"ok": True, "path": str(outbox_file)}
+            except Exception as exc:
+                results["outbox"] = {"ok": False, "error": str(exc)}
 
         async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
             if config.get("webhook_enabled") and config.get("webhook_url"):

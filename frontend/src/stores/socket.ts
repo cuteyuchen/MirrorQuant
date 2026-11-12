@@ -1,5 +1,6 @@
 import { defineStore } from "pinia";
 import { ref } from "vue";
+import { BASE_PREFIX } from "@/api/client";
 
 export const useSocketStore = defineStore("socket", () => {
   const connected = ref(false);
@@ -15,7 +16,7 @@ export const useSocketStore = defineStore("socket", () => {
 
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const host = window.location.host;
-    const wsUrl = `${protocol}//${host}/ws/stream`;
+    const wsUrl = `${protocol}//${host}${BASE_PREFIX}/ws/stream`;
 
     try {
       ws = new WebSocket(wsUrl);

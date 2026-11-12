@@ -135,6 +135,20 @@ onMounted(loadData);
               class="w-full px-3 py-2 rounded-lg bg-surface border border-slate-700 text-white font-mono"
             />
           </div>
+
+          <!-- Local JSONL Outbox -->
+          <div class="p-3.5 rounded-xl bg-background/60 border border-slate-800 space-y-2.5">
+            <label class="flex items-center gap-2 font-semibold text-slate-200 cursor-pointer">
+              <input v-model="settingsData.notifications.outbox_enabled" type="checkbox" class="rounded bg-background border-slate-600 text-accent" />
+              <span>Local JSONL Outbox (File Queue)</span>
+            </label>
+            <input
+              v-if="settingsData.notifications.outbox_enabled"
+              v-model="settingsData.notifications.outbox_path"
+              placeholder="/path/to/outbox.jsonl"
+              class="w-full px-3 py-2 rounded-lg bg-surface border border-slate-700 text-white font-mono"
+            />
+          </div>
         </div>
       </div>
 

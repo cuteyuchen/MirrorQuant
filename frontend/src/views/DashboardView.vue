@@ -269,11 +269,11 @@ function statusBadge(status: string) {
                     :class="pos.uPnL >= 0 ? 'text-emerald-400' : 'text-rose-400'"
                   >
                     {{ pos.uPnL >= 0 ? "+" : "" }}{{ formatUsd(pos.uPnL) }}
-                    <div class="text-[10px] font-normal opacity-80">{{ pos.roePct }}%</div>
+                    <div class="text-[10px] font-normal opacity-80">{{ (pos.uPnLRoePct ?? pos.uPnLPct ?? 0).toFixed(2) }}%</div>
                   </td>
                   <td class="py-3 px-4">
                     <span v-if="pos.analysis?.ok" class="text-[11px] font-mono text-accent">
-                      {{ pos.analysis.summary?.trendLabel || pos.analysis.tf1h?.trend }}
+                      {{ pos.analysis.verdict }} · {{ pos.analysis.trend1h }}
                     </span>
                     <span v-else class="text-[11px] text-slate-500">N/A</span>
                   </td>

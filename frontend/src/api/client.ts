@@ -1,13 +1,19 @@
+export const BASE_PREFIX = (import.meta.env.BASE_URL || "/").replace(/\/$/, "");
+
 export interface ApiResponse<T = any> {
   data?: T;
   error?: string;
 }
 
 class ApiClient {
-  private baseUrl = "";
+  private baseUrl = BASE_PREFIX;
+
+  resolveUrl(endpoint: string): string {
+    return `${this.baseUrl}${endpoint}`;
+  }
 
   async request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
-    const url = `${this.baseUrl}${endpoint}`;
+    const url = this.resolveUrl(endpoint);
     const headers = new Headers(options.headers || {});
     if (!headers.has("Content-Type") && !(options.body instanceof FormData)) {
       headers.set("Content-Type", "application/json");

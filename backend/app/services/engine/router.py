@@ -157,7 +157,7 @@ class CopyRouter:
         if notify_cfg:
             should_notify = (
                 (status == "EXECUTED" and notify_cfg.get("notify_on_execution", True))
-                or (status.startswith("BLOCKED") and notify_cfg.get("notify_on_risk_block", True))
+                or ((status.startswith("BLOCKED") or status == "FAILED") and notify_cfg.get("notify_on_risk_block", True))
             )
             if should_notify:
                 title = f"MirrorQuant [{status}] {symbol}"
