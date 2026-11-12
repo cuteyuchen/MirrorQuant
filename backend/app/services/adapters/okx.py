@@ -60,7 +60,7 @@ class OKXAdapter(BaseExchangeAdapter):
         method: str,
         path: str,
         params: Optional[Dict[str, Any]] = None,
-        body: Optional[Dict[str, Any]] = None,
+        body: Optional[Any] = None,
         auth: bool = True,
         retries: int = 3,
     ) -> Any:
@@ -85,7 +85,9 @@ class OKXAdapter(BaseExchangeAdapter):
                 if self.is_simulated:
                     headers["x-simulated-trading"] = "1"
                 if auth:
-                    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+                    now_ms = int(time.time() * 1000) + self._time_offset_ms
+                    ts_dt = datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc)
+                    ts = ts_dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{ts_dt.microsecond // 1000:03d}Z"
                     headers["OK-ACCESS-KEY"] = self.api_key
                     headers["OK-ACCESS-SIGN"] = self._sign(ts, method, request_path, body_str)
                     headers["OK-ACCESS-TIMESTAMP"] = ts
@@ -333,3 +335,70 @@ class OKXAdapter(BaseExchangeAdapter):
             "state": row.get("state"),
             "raw": row,
         }
+
+    async def sync_time(self) -> int:
+        data = await self._request("GET", "/api/v5/public/time", auth=False)
+        if data and isinstance(data, list) and data[0].get("ts"):
+            srv_ms = int(data[0]["ts"])
+            self._time_offset_ms = srv_ms - int(time.time() * 1000)
+        return self._time_offset_ms
+
+    async def place_tp_sl(
+        self,
+        inst_id: str,
+        pos_side: str,
+        sz: str,
+        tp_px: Optional[str] = None,
+        sl_px: Optional[str] = None,
+        td_mode: str = "cross",
+    ) -> Dict[str, Any]:
+        if not tp_px and not sl_px:
+            return {"ok": False, "details": "No TP/SL trigger price specified"}
+        close_side = "sell" if pos_side.lower() == "long" else "buy"
+        ord_type = "oco" if (tp_px and sl_px) else "conditional"
+        body: Dict[str, Any] = {
+            "instId": inst_id,
+            "tdMode": td_mode,
+            "side": close_side,
+            "ordType": ord_type,
+            "sz": str(sz),
+            "reduceOnly": True,
+        }
+        body["posSide"] = pos_side.lower() if self.position_mode == "hedge" else "net"
+        if tp_px:
+            body["tpTriggerPx"] = str(tp_px)
+            body["tpOrdPx"] = "-1"
+            body["tpTriggerPxType"] = "mark"
+        if sl_px:
+            body["slTriggerPx"] = str(sl_px)
+            body["slOrdPx"] = "-1"
+            body["slTriggerPxType"] = "mark"
+
+        data = await self._request("POST", "/api/v5/trade/order-algo", body=body)
+        item = data[0] if data else {}
+        s_code = str(item.get("sCode", "0"))
+        if s_code != "0":
+            raise ExchangeAPIError("okx", s_code, item.get("sMsg", "TP/SL algo order rejected"), item)
+        algo_id = str(item.get("algoId") or "")
+        return {"ok": True, "algoId": algo_id, "tpOrderId": algo_id if tp_px else None, "slOrderId": algo_id if sl_px else None}
+
+    async def cancel_tp_sl(self, inst_id: str, pos_side: Optional[str] = None) -> bool:
+        cancelled = False
+        for ot in ("conditional", "oco"):
+            try:
+                pending = await self._request(
+                    "GET",
+                    "/api/v5/trade/orders-algo-pending",
+                    params={"instId": inst_id, "ordType": ot},
+                )
+                req_list = [
+                    {"algoId": p["algoId"], "instId": inst_id}
+                    for p in (pending or [])
+                    if p.get("algoId") and (not pos_side or str(p.get("posSide") or "").lower() == pos_side.lower())
+                ]
+                if req_list:
+                    await self._request("POST", "/api/v5/trade/cancel-algos", body=req_list[:10])
+                    cancelled = True
+            except Exception:
+                continue
+        return cancelled

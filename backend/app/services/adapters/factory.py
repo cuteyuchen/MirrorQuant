@@ -4,6 +4,8 @@ from typing import Dict, Optional
 
 from app.services.adapters.base import BaseExchangeAdapter
 from app.services.adapters.binance import BinanceAdapter
+from app.services.adapters.bitget import BitgetAdapter
+from app.services.adapters.bybit import BybitAdapter
 from app.services.adapters.okx import OKXAdapter
 
 
@@ -26,6 +28,22 @@ def create_exchange_adapter(
         )
     if ex == "binance":
         return BinanceAdapter(
+            credentials=credentials,
+            environment=environment,
+            proxy_url=proxy_url,
+            margin_mode=margin_mode,
+            position_mode=position_mode,
+        )
+    if ex == "bybit":
+        return BybitAdapter(
+            credentials=credentials,
+            environment=environment,
+            proxy_url=proxy_url,
+            margin_mode=margin_mode,
+            position_mode=position_mode,
+        )
+    if ex == "bitget":
+        return BitgetAdapter(
             credentials=credentials,
             environment=environment,
             proxy_url=proxy_url,

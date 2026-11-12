@@ -38,6 +38,8 @@ def _account_out(a: TradingAccount) -> dict:
         "usdtEquity": round(a.usdt_equity, 2),
         "availEquity": round(a.avail_equity, 2),
         "hwmEquity": round(a.hwm_equity, 2),
+        "dayStartEquity": round(getattr(a, "day_start_equity", 0.0) or 0.0, 2),
+        "clockOffsetMs": int(getattr(a, "clock_offset_ms", 0) or 0),
         "totalNotional": round(a.total_notional, 2),
         "unrealizedPnl": round(a.unrealized_pnl, 2),
         "positions": positions,
@@ -60,8 +62,11 @@ async def create_account(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    if payload.exchange == "okx" and not (payload.passphrase or "").strip():
-        raise HTTPException(status_code=400, detail="OKX accounts require an API passphrase")
+    if payload.exchange in ("okx", "bitget") and not (payload.passphrase or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail=f"{payload.exchange.upper()} accounts require an API passphrase",
+        )
 
     vault = CredentialVault()
     creds = {

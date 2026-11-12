@@ -169,6 +169,7 @@ onActivated(() => {
                 <p class="text-xs font-mono text-slate-400 mt-0.5 flex items-center gap-1.5">
                   <Shield class="w-3 h-3 text-emerald-400" />
                   <span>{{ acct.apiKeyMasked }}</span>
+                  <span v-if="acct.clockOffsetMs" class="text-[10px] text-slate-500">({{ acct.clockOffsetMs }}ms)</span>
                 </p>
               </div>
             </div>
@@ -266,6 +267,8 @@ onActivated(() => {
               <select v-model="form.exchange" class="w-full px-3.5 py-2 rounded-xl bg-background border border-slate-700 text-sm text-white">
                 <option value="okx">OKX V5</option>
                 <option value="binance">Binance USDT-M</option>
+                <option value="bybit">Bybit V5</option>
+                <option value="bitget">Bitget V2</option>
               </select>
             </div>
             <div>
@@ -288,7 +291,7 @@ onActivated(() => {
             <label class="block text-xs text-slate-400 mb-1">{{ t("accts.secretKey") }}</label>
             <input v-model="form.secretKey" type="password" required class="w-full px-3.5 py-2 rounded-xl bg-background border border-slate-700 text-sm font-mono text-white" />
           </div>
-          <div v-if="form.exchange === 'okx'">
+          <div v-if="form.exchange === 'okx' || form.exchange === 'bitget'">
             <label class="block text-xs text-slate-400 mb-1">{{ t("accts.passphrase") }}</label>
             <input v-model="form.passphrase" type="password" required class="w-full px-3.5 py-2 rounded-xl bg-background border border-slate-700 text-sm font-mono text-white" />
           </div>

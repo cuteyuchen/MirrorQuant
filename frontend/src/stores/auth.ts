@@ -1,6 +1,6 @@
 import { defineStore } from "pinia";
 import { ref } from "vue";
-import { api } from "@/api/client";
+import { api, ApiError } from "@/api/client";
 import { useDataCacheStore } from "./dataCache";
 
 export interface User {
@@ -8,8 +8,15 @@ export interface User {
   username: string;
   role: string;
   is_active: boolean;
+  totp_enabled?: boolean;
   created_at: string;
   last_login_at?: string;
+}
+
+export interface CaptchaChallenge {
+  captchaToken: string;
+  svg: string;
+  expiresInSec: number;
 }
 
 export const useAuthStore = defineStore("auth", () => {
@@ -18,6 +25,10 @@ export const useAuthStore = defineStore("auth", () => {
   const user = ref<User | null>(null);
   const loading = ref<boolean>(false);
   const error = ref<string | null>(null);
+  const captchaRequired = ref<boolean>(false);
+  const totpRequired = ref<boolean>(false);
+  const lockRemainingSec = ref<number>(0);
+  const captchaData = ref<CaptchaChallenge | null>(null);
 
   async function checkStatus() {
     loading.value = true;
@@ -36,16 +47,55 @@ export const useAuthStore = defineStore("auth", () => {
     }
   }
 
-  async function login(username: string, password: string) {
+  async function fetchCaptcha() {
+    try {
+      captchaData.value = await api.get<CaptchaChallenge>("/api/auth/captcha");
+    } catch {
+      captchaData.value = null;
+    }
+  }
+
+  async function login(
+    username: string,
+    password: string,
+    captchaToken?: string,
+    captchaAnswer?: string,
+    totpCode?: string
+  ) {
     loading.value = true;
     error.value = null;
     try {
-      const res = await api.post<{ user: User }>("/api/auth/login", { username, password });
+      const res = await api.post<{ user: User }>("/api/auth/login", {
+        username,
+        password,
+        captchaToken: captchaToken || undefined,
+        captchaAnswer: captchaAnswer || undefined,
+        totpCode: totpCode || undefined,
+      });
       authenticated.value = true;
       user.value = res.user;
+      captchaRequired.value = false;
+      totpRequired.value = false;
+      lockRemainingSec.value = 0;
+      captchaData.value = null;
       return true;
     } catch (err: any) {
-      error.value = err.message;
+      if (err instanceof ApiError && err.data) {
+        const detail = typeof err.data.detail === "object" ? err.data.detail : err.data;
+        if (detail?.captchaRequired) {
+          captchaRequired.value = true;
+          await fetchCaptcha();
+        }
+        if (detail?.totpRequired) {
+          totpRequired.value = true;
+        }
+        if (typeof detail?.lockRemainingSec === "number" && detail.lockRemainingSec > 0) {
+          lockRemainingSec.value = detail.lockRemainingSec;
+        }
+        error.value = detail?.message || err.detail;
+      } else {
+        error.value = err.message;
+      }
       return false;
     } finally {
       loading.value = false;
@@ -89,7 +139,12 @@ export const useAuthStore = defineStore("auth", () => {
     user,
     loading,
     error,
+    captchaRequired,
+    totpRequired,
+    lockRemainingSec,
+    captchaData,
     checkStatus,
+    fetchCaptcha,
     login,
     setup,
     logout,

@@ -74,4 +74,14 @@ class NotificationService:
                 except Exception as exc:
                     results["wecom"] = {"ok": False, "error": str(exc)}
 
+            if config.get("dingtalk_enabled") and config.get("dingtalk_webhook_url"):
+                try:
+                    resp = await client.post(
+                        config["dingtalk_webhook_url"],
+                        json={"msgtype": "text", "text": {"content": full_text}},
+                    )
+                    results["dingtalk"] = {"ok": resp.status_code < 400, "status": resp.status_code}
+                except Exception as exc:
+                    results["dingtalk"] = {"ok": False, "error": str(exc)}
+
         return results

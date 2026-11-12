@@ -31,8 +31,29 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String(256), nullable=False)
     role: Mapped[str] = mapped_column(String(32), default="admin", nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    totp_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    totp_secret_enc: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    totp_pending_secret_enc: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     last_login_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class LoginAttemptGuard(Base):
+    __tablename__ = "login_attempt_guards"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    guard_key: Mapped[str] = mapped_column(String(160), unique=True, nullable=False, index=True)
+    key_type: Mapped[str] = mapped_column(String(16), nullable=False)  # ip | user
+    key_value: Mapped[str] = mapped_column(String(128), nullable=False)
+    fail_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_fail_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    locked_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_ip: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    last_username: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    alert_sent_level: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
 
 
 class ProxyNode(Base):
@@ -97,7 +118,7 @@ class TradingAccount(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(120), nullable=False)
-    exchange: Mapped[str] = mapped_column(String(32), nullable=False)  # okx | binance
+    exchange: Mapped[str] = mapped_column(String(32), nullable=False)  # okx | binance | bybit | bitget
     environment: Mapped[str] = mapped_column(String(16), default="demo", nullable=False)  # demo | live
     encrypted_credentials: Mapped[str] = mapped_column(Text, nullable=False)
     api_key_masked: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -111,6 +132,9 @@ class TradingAccount(Base):
     usdt_equity: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     avail_equity: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     hwm_equity: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    day_start_equity: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    day_start_date: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    clock_offset_ms: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     total_notional: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     unrealized_pnl: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     positions_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -148,9 +172,20 @@ class CopyBinding(Base):
     max_single_leverage: Mapped[float] = mapped_column(Float, default=4.0, nullable=False)
     max_instrument_leverage: Mapped[int] = mapped_column(Integer, default=20, nullable=False)
     max_drawdown_pct: Mapped[float] = mapped_column(Float, default=30.0, nullable=False)
+    daily_max_loss_pct: Mapped[float] = mapped_column(Float, default=10.0, nullable=False)
     max_slippage_pct: Mapped[float] = mapped_column(Float, default=1.0, nullable=False)
+    max_spread_pct: Mapped[float] = mapped_column(Float, default=0.3, nullable=False)
     ioc_offset_pct: Mapped[float] = mapped_column(Float, default=0.5, nullable=False)
     order_mode: Mapped[str] = mapped_column(String(32), default="ioc_then_market", nullable=False)
+
+    tp_sl_mode: Mapped[str] = mapped_column(String(32), default="follow_lead", nullable=False)  # follow_lead | independent | hybrid_guard
+    enable_stop_loss: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    stop_loss_pct: Mapped[float] = mapped_column(Float, default=5.0, nullable=False)
+    enable_take_profit: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    take_profit_pct: Mapped[float] = mapped_column(Float, default=10.0, nullable=False)
+    enable_trailing_stop: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    trailing_callback_pct: Mapped[float] = mapped_column(Float, default=2.0, nullable=False)
+    hard_stop_loss_pct: Mapped[float] = mapped_column(Float, default=15.0, nullable=False)
 
     symbol_whitelist_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
     symbol_blacklist_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
@@ -158,6 +193,7 @@ class CopyBinding(Base):
 
     circuit_breaker_tripped: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     circuit_breaker_reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    consecutive_failures: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     baseline_seeded: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
@@ -170,6 +206,31 @@ class CopyBinding(Base):
     debts: Mapped[list["BindingDebt"]] = relationship(
         back_populates="binding", cascade="all, delete-orphan"
     )
+    guards: Mapped[list["PositionGuardState"]] = relationship(
+        back_populates="binding", cascade="all, delete-orphan"
+    )
+
+
+class PositionGuardState(Base):
+    __tablename__ = "position_guard_states"
+    __table_args__ = (
+        UniqueConstraint("binding_id", "inst_id", "pos_side", name="uq_pos_guard_binding_inst_side"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    binding_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("copy_bindings.id", ondelete="CASCADE"), nullable=False
+    )
+    inst_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    pos_side: Mapped[str] = mapped_column(String(16), nullable=False)  # long | short
+    entry_px: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    peak_px: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    trough_px: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    binding: Mapped["CopyBinding"] = relationship(back_populates="guards")
 
 
 class BindingDebt(Base):

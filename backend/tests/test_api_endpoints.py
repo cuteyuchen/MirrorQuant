@@ -169,3 +169,61 @@ async def test_api_full_workflow(async_client: AsyncClient):
             ws.send_text("ping")
             pong = ws.receive_json()
             assert pong["type"] == "pong"
+
+
+@pytest.mark.asyncio
+async def test_login_brute_force_lockout_and_captcha(async_client: AsyncClient):
+    # Ensure setup or use an account
+    client_ip = "192.168.10.99"
+    headers = {"X-Forwarded-For": client_ip}
+
+    # 1. First 2 failures: regular 401
+    for _ in range(2):
+        res = await async_client.post(
+            "/api/auth/login",
+            headers=headers,
+            json={"username": "superadmin", "password": "WrongPassword"},
+        )
+        assert res.status_code == 401
+
+    # 2. 3rd failure: requires captcha
+    res = await async_client.post(
+        "/api/auth/login",
+        headers=headers,
+        json={"username": "superadmin", "password": "WrongPassword"},
+    )
+    assert res.status_code == 401
+    assert res.json().get("captchaRequired") is True
+    assert "captchaSvg" in res.json()
+    assert "captchaToken" in res.json()
+
+    # 4th failure: send invalid captcha answer -> recorded as failure 4
+    res = await async_client.post(
+        "/api/auth/login",
+        headers=headers,
+        json={
+            "username": "superadmin",
+            "password": "WrongPassword",
+            "captcha_token": "fake_token",
+            "captcha_answer": "wrong",
+        },
+    )
+    assert res.status_code == 400
+    assert res.json().get("code") == "INVALID_CAPTCHA"
+
+    # 5th failure: send another invalid captcha answer -> reaches 5 failures -> 429 lockout!
+    res = await async_client.post(
+        "/api/auth/login",
+        headers=headers,
+        json={
+            "username": "superadmin",
+            "password": "WrongPassword",
+            "captcha_token": "fake_token_2",
+            "captcha_answer": "wrong",
+        },
+    )
+    assert res.status_code == 429
+    assert "Retry-After" in res.headers
+    assert res.json().get("code") == "ACCOUNT_LOCKED"
+    assert res.json().get("lockRemainingSec", 0) > 0
+

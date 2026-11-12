@@ -19,6 +19,9 @@ class SetupRequest(CamelModel):
 class LoginRequest(CamelModel):
     username: str
     password: str
+    captcha_token: Optional[str] = None
+    captcha_answer: Optional[str] = None
+    totp_code: Optional[str] = None
 
 
 class ChangePasswordRequest(CamelModel):
@@ -26,11 +29,21 @@ class ChangePasswordRequest(CamelModel):
     new_password: str = Field(min_length=8, max_length=128)
 
 
+class TotpVerifyRequest(CamelModel):
+    code: str = Field(min_length=6, max_length=12)
+
+
+class TotpDisableRequest(CamelModel):
+    current_password: str
+    code: Optional[str] = None
+
+
 class UserOut(CamelModel):
     id: int
     username: str
     role: str
     is_active: bool
+    totp_enabled: bool = False
     created_at: datetime
     last_login_at: Optional[datetime] = None
 
@@ -73,7 +86,7 @@ class LeadUpdate(CamelModel):
 
 class AccountCreate(CamelModel):
     name: str = Field(min_length=1, max_length=120)
-    exchange: str = Field(pattern="^(okx|binance)$")
+    exchange: str = Field(pattern="^(okx|binance|bybit|bitget)$")
     environment: str = Field(default="demo", pattern="^(demo|live)$")
     api_key: str = Field(min_length=4, max_length=256)
     secret_key: str = Field(min_length=4, max_length=256)
@@ -106,9 +119,19 @@ class BindingCreate(CamelModel):
     max_single_leverage: float = Field(default=4.0, gt=0.0, le=100.0)
     max_instrument_leverage: int = Field(default=20, ge=1, le=125)
     max_drawdown_pct: float = Field(default=30.0, gt=0.0, le=100.0)
+    daily_max_loss_pct: float = Field(default=10.0, gt=0.0, le=100.0)
     max_slippage_pct: float = Field(default=1.0, gt=0.0, le=50.0)
+    max_spread_pct: float = Field(default=0.3, ge=0.0, le=20.0)
     ioc_offset_pct: float = Field(default=0.5, ge=0.0, le=10.0)
     order_mode: str = Field(default="ioc_then_market", pattern="^(ioc_then_market|ioc_only|market_only)$")
+    tp_sl_mode: str = Field(default="follow_lead", pattern="^(follow_lead|independent|hybrid_guard)$")
+    enable_stop_loss: bool = False
+    stop_loss_pct: float = Field(default=5.0, gt=0.0, le=95.0)
+    enable_take_profit: bool = False
+    take_profit_pct: float = Field(default=10.0, gt=0.0, le=500.0)
+    enable_trailing_stop: bool = False
+    trailing_callback_pct: float = Field(default=2.0, gt=0.0, le=50.0)
+    hard_stop_loss_pct: float = Field(default=15.0, gt=0.0, le=95.0)
     symbol_whitelist: List[str] = Field(default_factory=list)
     symbol_blacklist: List[str] = Field(default_factory=list)
     symbol_map: Dict[str, str] = Field(default_factory=dict)
@@ -122,9 +145,19 @@ class BindingUpdate(CamelModel):
     max_single_leverage: Optional[float] = Field(default=None, gt=0.0, le=100.0)
     max_instrument_leverage: Optional[int] = Field(default=None, ge=1, le=125)
     max_drawdown_pct: Optional[float] = Field(default=None, gt=0.0, le=100.0)
+    daily_max_loss_pct: Optional[float] = Field(default=None, gt=0.0, le=100.0)
     max_slippage_pct: Optional[float] = Field(default=None, gt=0.0, le=50.0)
+    max_spread_pct: Optional[float] = Field(default=None, ge=0.0, le=20.0)
     ioc_offset_pct: Optional[float] = Field(default=None, ge=0.0, le=10.0)
     order_mode: Optional[str] = Field(default=None, pattern="^(ioc_then_market|ioc_only|market_only)$")
+    tp_sl_mode: Optional[str] = Field(default=None, pattern="^(follow_lead|independent|hybrid_guard)$")
+    enable_stop_loss: Optional[bool] = None
+    stop_loss_pct: Optional[float] = Field(default=None, gt=0.0, le=95.0)
+    enable_take_profit: Optional[bool] = None
+    take_profit_pct: Optional[float] = Field(default=None, gt=0.0, le=500.0)
+    enable_trailing_stop: Optional[bool] = None
+    trailing_callback_pct: Optional[float] = Field(default=None, gt=0.0, le=50.0)
+    hard_stop_loss_pct: Optional[float] = Field(default=None, gt=0.0, le=95.0)
     symbol_whitelist: Optional[List[str]] = None
     symbol_blacklist: Optional[List[str]] = None
     symbol_map: Optional[Dict[str, str]] = None
@@ -139,3 +172,4 @@ class SettingsUpdate(CamelModel):
     public_monitoring_enabled: Optional[bool] = None
     notifications: Optional[Dict[str, Any]] = None
     risk_defaults: Optional[Dict[str, Any]] = None
+    resilience: Optional[Dict[str, Any]] = None

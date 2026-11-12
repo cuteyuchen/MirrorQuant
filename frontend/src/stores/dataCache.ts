@@ -16,6 +16,7 @@ export const useDataCacheStore = defineStore("dataCache", () => {
   const proxies = ref<CacheEntry<any[]> | null>(null);
   const settings = ref<CacheEntry<any> | null>(null);
   const auditLogs = ref<CacheEntry<any[]> | null>(null);
+  const securityGuards = ref<CacheEntry<any[]> | null>(null);
 
   const inflight: Record<string, Promise<any> | undefined> = {};
 
@@ -106,6 +107,15 @@ export const useDataCacheStore = defineStore("dataCache", () => {
     });
   }
 
+  async function fetchSecurityGuards(force = false, ttlMs = 15000) {
+    if (!force && isFresh(securityGuards.value, ttlMs)) return securityGuards.value!.data;
+    return dedup("securityGuards", force, async () => {
+      const res = await api.get<{ items: any[] }>("/api/settings/security-guards");
+      securityGuards.value = { data: res.items || [], fetchedAt: Date.now() };
+      return securityGuards.value.data;
+    });
+  }
+
   function clearAll() {
     overview.value = null;
     leads.value = null;
@@ -115,6 +125,7 @@ export const useDataCacheStore = defineStore("dataCache", () => {
     proxies.value = null;
     settings.value = null;
     auditLogs.value = null;
+    securityGuards.value = null;
   }
 
   return {
@@ -126,6 +137,7 @@ export const useDataCacheStore = defineStore("dataCache", () => {
     proxies,
     settings,
     auditLogs,
+    securityGuards,
     isFresh,
     fetchOverview,
     fetchLeads,
@@ -135,6 +147,7 @@ export const useDataCacheStore = defineStore("dataCache", () => {
     fetchProxies,
     fetchSettings,
     fetchAuditLogs,
+    fetchSecurityGuards,
     clearAll,
   };
 });

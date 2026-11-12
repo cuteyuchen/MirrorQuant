@@ -11,9 +11,9 @@ from fastapi import WebSocket
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import get_session_factory
+from app.core.database import DEFAULT_SYSTEM_CONFIG, get_session_factory
 from app.core.security import CredentialVault
-from app.models.domain import LeadSource, ProxyNode, TradingAccount
+from app.models.domain import CopyBinding, LeadSource, ProxyNode, TradingAccount
 from app.services.adapters.factory import create_exchange_adapter
 from app.services.analysis.pa_analyzer import PAAnalyzer
 from app.services.engine.router import CopyRouter
@@ -55,7 +55,7 @@ class WebSocketHub:
 
 
 class EngineOrchestrator:
-    """Coordinates periodic lead collection, account sync, copy routing, and WS streaming."""
+    """Coordinates periodic lead collection, account sync, clock sync, reconciliation & WS streaming."""
 
     def __init__(self):
         self.ws_hub = WebSocketHub()
@@ -68,6 +68,8 @@ class EngineOrchestrator:
         self._last_lead_poll: Dict[int, float] = {}
         self._last_full_sweep: Dict[int, float] = {}
         self._last_account_poll: Dict[int, float] = {}
+        self._last_clock_sync: Dict[int, float] = {}
+        self._last_reconcile: Dict[int, float] = {}
 
     async def start(self) -> None:
         if self._running:
@@ -107,6 +109,10 @@ class EngineOrchestrator:
             accounts = list(
                 (await db.scalars(select(TradingAccount).where(TradingAccount.is_enabled == True))).all()  # noqa: E712
             )
+            resilience_cfg = await self.router._get_config(
+                db, "resilience", DEFAULT_SYSTEM_CONFIG["resilience"]
+            )
+            reconcile_sec = max(15, int(resilience_cfg.get("reconcile_interval_sec", 60)))
 
             now = time.time()
             for lead in leads:
@@ -119,7 +125,67 @@ class EngineOrchestrator:
                 last = self._last_account_poll.get(account.id, 0.0)
                 if now - last >= 15.0:
                     self._last_account_poll[account.id] = now
-                    await self.sync_account(db, account, proxies)
+                    await self.sync_account(db, account, proxies, resilience_cfg=resilience_cfg)
+
+            # Periodic position reconciliation & software TP/SL guard checks
+            bindings = list(
+                (await db.scalars(select(CopyBinding).where(CopyBinding.is_enabled == True))).all()  # noqa: E712
+            )
+            for b in bindings:
+                if not b.baseline_seeded:
+                    continue
+                last_rec = self._last_reconcile.get(b.id, 0.0)
+                if now - last_rec < reconcile_sec:
+                    continue
+                self._last_reconcile[b.id] = now
+                lead = next((l for l in leads if l.id == b.lead_id), None)
+                acct = next((a for a in accounts if a.id == b.account_id), None)
+                if not lead or not acct or not lead.snapshot_json:
+                    continue
+                try:
+                    snap = json.loads(lead.snapshot_json)
+                    lead_open = snap.get("openPositions") or []
+                    creds = self.vault.decrypt_dict(acct.encrypted_credentials)
+                    proxy_url = (
+                        ProxyManager.select_proxy_url(proxies, acct.proxy_id)
+                        if acct.proxy_id is not None
+                        else None
+                    )
+                    adapter = create_exchange_adapter(
+                        exchange=acct.exchange,
+                        credentials=creds,
+                        environment=acct.environment,
+                        proxy_url=proxy_url,
+                        margin_mode=acct.margin_mode,
+                        position_mode=acct.position_mode,
+                    )
+                    adapter._time_offset_ms = int(getattr(acct, "clock_offset_ms", 0) or 0)
+                    live_pos = await adapter.get_positions()
+                    instruments = await adapter.get_instruments()
+                    await self.router.check_position_guards(
+                        db=db,
+                        lead=lead,
+                        account=acct,
+                        binding=b,
+                        adapter=adapter,
+                        local_positions=live_pos,
+                        instruments=instruments,
+                    )
+                    if lead.position_show is not False:
+                        await self.router.reconcile_orphan_positions(
+                            db=db,
+                            lead=lead,
+                            account=acct,
+                            binding=b,
+                            adapter=adapter,
+                            lead_open_positions=lead_open,
+                            local_positions=live_pos,
+                            instruments=instruments,
+                            resilience_cfg=resilience_cfg,
+                        )
+                    await db.commit()
+                except Exception as exc:
+                    logger.debug("Reconcile/guard tick skipped for binding %s: %s", b.id, exc)
 
     async def sync_lead(
         self,
@@ -204,6 +270,7 @@ class EngineOrchestrator:
         db: AsyncSession,
         account: TradingAccount,
         proxies: Optional[List[ProxyNode]] = None,
+        resilience_cfg: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         if proxies is None:
             proxies = list((await db.scalars(select(ProxyNode).order_by(ProxyNode.priority))).all())
@@ -222,10 +289,23 @@ class EngineOrchestrator:
                 margin_mode=account.margin_mode,
                 position_mode=account.position_mode,
             )
+            clock_sec = int((resilience_cfg or {}).get("clock_sync_interval_sec", 300))
+            now = time.time()
+            if clock_sec > 0 and (now - self._last_clock_sync.get(account.id, 0.0)) >= clock_sec:
+                try:
+                    offset_ms = await adapter.sync_time()
+                    account.clock_offset_ms = int(offset_ms)
+                    self._last_clock_sync[account.id] = now
+                except Exception:
+                    pass
+            else:
+                adapter._time_offset_ms = int(getattr(account, "clock_offset_ms", 0) or 0)
+
             bal = await adapter.get_usdt_balance()
             positions = await adapter.get_positions()
             if bal.eq > account.hwm_equity:
                 account.hwm_equity = bal.eq
+            CopyRouter._refresh_day_start(account, bal.eq)
             account.usdt_equity = bal.eq
             account.avail_equity = bal.avail_eq
             account.total_notional = sum(p.notional_usd for p in positions)

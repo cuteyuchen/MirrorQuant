@@ -12,6 +12,26 @@ from app.core.security import decode_access_token
 from app.models.domain import AuditLog, User
 
 
+def extract_client_ip(request: Optional[Request]) -> str:
+    """Extract real client IP safely behind Nginx/Cloudflare reverse proxy."""
+    if not request:
+        return "unknown"
+    cf_ip = (request.headers.get("CF-Connecting-IP") or "").strip()
+    if cf_ip:
+        return cf_ip[:64]
+    real_ip = (request.headers.get("X-Real-IP") or "").strip()
+    if real_ip:
+        return real_ip[:64]
+    fwd = (request.headers.get("X-Forwarded-For") or "").strip()
+    if fwd:
+        first_hop = fwd.split(",")[0].strip()
+        if first_hop:
+            return first_hop[:64]
+    if request.client and request.client.host:
+        return request.client.host[:64]
+    return "unknown"
+
+
 def extract_token_from_request(request: Request) -> Optional[str]:
     settings = get_settings()
     token = request.cookies.get(settings.cookie_name)
@@ -61,7 +81,7 @@ async def record_audit(
     user: Optional[User] = None,
     request: Optional[Request] = None,
 ) -> None:
-    ip = request.client.host if (request and request.client) else None
+    ip = extract_client_ip(request) if request else None
     db.add(
         AuditLog(
             user_id=user.id if user else None,

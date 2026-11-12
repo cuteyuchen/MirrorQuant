@@ -105,6 +105,27 @@ class BaseExchangeAdapter(ABC):
         self.margin_mode = margin_mode
         self.position_mode = position_mode
         self.timeout = timeout
+        self._time_offset_ms: int = 0
+
+    async def sync_time(self) -> int:
+        """Synchronize clock offset (server_ms - local_ms) to prevent timestamp drift rejections."""
+        return self._time_offset_ms
+
+    async def place_tp_sl(
+        self,
+        inst_id: str,
+        pos_side: str,
+        sz: str,
+        tp_px: Optional[str] = None,
+        sl_px: Optional[str] = None,
+        td_mode: str = "cross",
+    ) -> Dict[str, Any]:
+        """Place conditional TP/SL guard order(s) for an open position."""
+        return {"ok": False, "unsupported": True, "details": f"TP/SL orders not supported on {self.exchange}"}
+
+    async def cancel_tp_sl(self, inst_id: str, pos_side: Optional[str] = None) -> bool:
+        """Cancel pending conditional TP/SL orders for an instrument."""
+        return False
 
     @abstractmethod
     def resolve_symbol(

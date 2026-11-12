@@ -1,5 +1,18 @@
 export const BASE_PREFIX = (import.meta.env.BASE_URL || "/").replace(/\/$/, "");
 
+export class ApiError extends Error {
+  status: number;
+  detail: string;
+  data: any;
+
+  constructor(status: number, detail: string, data: any = null) {
+    super(detail);
+    this.status = status;
+    this.detail = detail;
+    this.data = data;
+  }
+}
+
 export interface ApiResponse<T = any> {
   data?: T;
   error?: string;
@@ -22,18 +35,25 @@ class ApiClient {
     const res = await fetch(url, {
       ...options,
       headers,
-      credentials: "include", // Send HttpOnly cookie
+      credentials: "include",
     });
 
     if (!res.ok) {
       let errDetail = `HTTP ${res.status}`;
+      let body: any = null;
       try {
-        const body = await res.json();
-        errDetail = body.detail || body.error || errDetail;
+        body = await res.json();
+        if (typeof body.detail === "string") {
+          errDetail = body.detail;
+        } else if (body.detail && typeof body.detail === "object") {
+          errDetail = body.detail.message || JSON.stringify(body.detail);
+        } else if (body.error) {
+          errDetail = body.error;
+        }
       } catch {
         // use default
       }
-      throw new Error(errDetail);
+      throw new ApiError(res.status, errDetail, body);
     }
 
     if (res.status === 204) {

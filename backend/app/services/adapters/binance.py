@@ -71,7 +71,7 @@ class BinanceAdapter(BaseExchangeAdapter):
                 req_params = dict(base_params)
                 headers: Dict[str, str] = {"User-Agent": "MirrorQuant/1.0"}
                 if auth:
-                    req_params["timestamp"] = int(time.time() * 1000)
+                    req_params["timestamp"] = int(time.time() * 1000) + self._time_offset_ms
                     req_params["recvWindow"] = 5000
                     qs = self._sign_query(req_params)
                     headers["X-MBX-APIKEY"] = self.api_key
@@ -325,3 +325,65 @@ class BinanceAdapter(BaseExchangeAdapter):
             "state": row.get("status"),
             "raw": row,
         }
+
+    async def sync_time(self) -> int:
+        data = await self._request("GET", "/fapi/v1/time", auth=False)
+        if isinstance(data, dict) and data.get("serverTime"):
+            self._time_offset_ms = int(data["serverTime"]) - int(time.time() * 1000)
+        return self._time_offset_ms
+
+    async def place_tp_sl(
+        self,
+        inst_id: str,
+        pos_side: str,
+        sz: str,
+        tp_px: Optional[str] = None,
+        sl_px: Optional[str] = None,
+        td_mode: str = "cross",
+    ) -> Dict[str, Any]:
+        if not tp_px and not sl_px:
+            return {"ok": False, "details": "No TP/SL trigger price specified"}
+        close_side = "SELL" if pos_side.lower() == "long" else "BUY"
+        out: Dict[str, Any] = {"ok": True, "tpOrderId": None, "slOrderId": None}
+
+        async def _submit_cond(ord_type: str, stop_px: str) -> str:
+            params: Dict[str, Any] = {
+                "symbol": inst_id,
+                "side": close_side,
+                "type": ord_type,
+                "stopPrice": str(stop_px),
+                "quantity": str(sz),
+                "workingType": "MARK_PRICE",
+                "priceProtect": "TRUE",
+            }
+            if self.position_mode == "hedge":
+                params["positionSide"] = pos_side.upper()
+            else:
+                params["positionSide"] = "BOTH"
+                params["reduceOnly"] = "true"
+            res = await self._request("POST", "/fapi/v1/order", params=params)
+            return str(res.get("orderId") or "")
+
+        if tp_px:
+            out["tpOrderId"] = await _submit_cond("TAKE_PROFIT_MARKET", tp_px)
+        if sl_px:
+            out["slOrderId"] = await _submit_cond("STOP_MARKET", sl_px)
+        return out
+
+    async def cancel_tp_sl(self, inst_id: str, pos_side: Optional[str] = None) -> bool:
+        try:
+            open_orders = await self._request("GET", "/fapi/v1/openOrders", params={"symbol": inst_id})
+            cancelled = False
+            for o in open_orders or []:
+                if o.get("type") in ("STOP_MARKET", "TAKE_PROFIT_MARKET", "STOP", "TAKE_PROFIT"):
+                    if pos_side and str(o.get("positionSide") or "").lower() not in (pos_side.lower(), "both"):
+                        continue
+                    await self._request(
+                        "DELETE",
+                        "/fapi/v1/order",
+                        params={"symbol": inst_id, "orderId": o["orderId"]},
+                    )
+                    cancelled = True
+            return cancelled
+        except Exception:
+            return False

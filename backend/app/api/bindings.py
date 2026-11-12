@@ -41,14 +41,25 @@ async def _binding_out(db: AsyncSession, b: CopyBinding) -> dict:
         "maxSingleLeverage": b.max_single_leverage,
         "maxInstrumentLeverage": b.max_instrument_leverage,
         "maxDrawdownPct": b.max_drawdown_pct,
+        "dailyMaxLossPct": getattr(b, "daily_max_loss_pct", 10.0),
         "maxSlippagePct": b.max_slippage_pct,
+        "maxSpreadPct": getattr(b, "max_spread_pct", 0.3),
         "iocOffsetPct": b.ioc_offset_pct,
         "orderMode": b.order_mode,
+        "tpSlMode": getattr(b, "tp_sl_mode", "follow_lead"),
+        "enableStopLoss": bool(getattr(b, "enable_stop_loss", False)),
+        "stopLossPct": getattr(b, "stop_loss_pct", 5.0),
+        "enableTakeProfit": bool(getattr(b, "enable_take_profit", False)),
+        "takeProfitPct": getattr(b, "take_profit_pct", 10.0),
+        "enableTrailingStop": bool(getattr(b, "enable_trailing_stop", False)),
+        "trailingCallbackPct": getattr(b, "trailing_callback_pct", 2.0),
+        "hardStopLossPct": getattr(b, "hard_stop_loss_pct", 15.0),
         "symbolWhitelist": json.loads(b.symbol_whitelist_json or "[]"),
         "symbolBlacklist": json.loads(b.symbol_blacklist_json or "[]"),
         "symbolMap": json.loads(b.symbol_map_json or "{}"),
         "circuitBreakerTripped": b.circuit_breaker_tripped,
         "circuitBreakerReason": b.circuit_breaker_reason,
+        "consecutiveFailures": getattr(b, "consecutive_failures", 0),
         "baselineSeeded": b.baseline_seeded,
         "pendingDebtUsd": round(total_debt, 2),
         "debts": [
@@ -101,9 +112,19 @@ async def create_binding(
         max_single_leverage=payload.max_single_leverage,
         max_instrument_leverage=payload.max_instrument_leverage,
         max_drawdown_pct=payload.max_drawdown_pct,
+        daily_max_loss_pct=payload.daily_max_loss_pct,
         max_slippage_pct=payload.max_slippage_pct,
+        max_spread_pct=payload.max_spread_pct,
         ioc_offset_pct=payload.ioc_offset_pct,
         order_mode=payload.order_mode,
+        tp_sl_mode=payload.tp_sl_mode,
+        enable_stop_loss=payload.enable_stop_loss,
+        stop_loss_pct=payload.stop_loss_pct,
+        enable_take_profit=payload.enable_take_profit,
+        take_profit_pct=payload.take_profit_pct,
+        enable_trailing_stop=payload.enable_trailing_stop,
+        trailing_callback_pct=payload.trailing_callback_pct,
+        hard_stop_loss_pct=payload.hard_stop_loss_pct,
         symbol_whitelist_json=json.dumps([s.upper() for s in payload.symbol_whitelist]),
         symbol_blacklist_json=json.dumps([s.upper() for s in payload.symbol_blacklist]),
         symbol_map_json=json.dumps(payload.symbol_map),
@@ -193,6 +214,7 @@ async def reset_circuit_breaker(
         raise HTTPException(status_code=404, detail="Binding not found")
     binding.circuit_breaker_tripped = False
     binding.circuit_breaker_reason = None
+    binding.consecutive_failures = 0
     await record_audit(db, "RESET_BREAKER", "binding", str(binding.id), "Circuit breaker reset", current_user, request)
     await db.commit()
     return {"item": await _binding_out(db, binding)}
