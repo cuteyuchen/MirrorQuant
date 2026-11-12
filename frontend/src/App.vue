@@ -12,31 +12,42 @@ import {
   Menu,
   Network,
   Settings,
-  ShieldAlert,
   Users,
   X,
 } from "lucide-vue-next";
 import { useAuthStore } from "@/stores/auth";
 import { useSocketStore } from "@/stores/socket";
+import { useI18n } from "@/i18n";
+import LangToggle from "@/components/LangToggle.vue";
 
 const route = useRoute();
 const router = useRouter();
 const authStore = useAuthStore();
 const socketStore = useSocketStore();
+const { t } = useI18n();
 const mobileMenuOpen = ref(false);
+
+const cachedViews = [
+  "DashboardView",
+  "LeadsView",
+  "AccountsView",
+  "BindingsView",
+  "ProxiesView",
+  "SettingsView",
+];
 
 const isPublicOrAuthLayout = computed(() => {
   return ["/login", "/setup", "/public"].includes(route.path);
 });
 
-const navItems = [
-  { name: "Dashboard", path: "/dashboard", icon: BarChart3 },
-  { name: "Leads & PA", path: "/leads", icon: Users },
-  { name: "Accounts", path: "/accounts", icon: KeyRound },
-  { name: "Copy Matrix", path: "/bindings", icon: Layers },
-  { name: "Proxy Nodes", path: "/proxies", icon: Network },
-  { name: "Settings & Audit", path: "/settings", icon: Settings },
-];
+const navItems = computed(() => [
+  { name: t("nav.dashboard"), path: "/dashboard", icon: BarChart3 },
+  { name: t("nav.leads"), path: "/leads", icon: Users },
+  { name: t("nav.accounts"), path: "/accounts", icon: KeyRound },
+  { name: t("nav.bindings"), path: "/bindings", icon: Layers },
+  { name: t("nav.proxies"), path: "/proxies", icon: Network },
+  { name: t("nav.settings"), path: "/settings", icon: Settings },
+]);
 
 watch(
   () => authStore.authenticated,
@@ -82,7 +93,8 @@ async function handleLogout() {
         </div>
         <span class="font-bold tracking-tight text-slate-100">MirrorQuant</span>
       </div>
-      <div class="flex items-center gap-3">
+      <div class="flex items-center gap-2">
+        <LangToggle />
         <span
           class="inline-flex items-center gap-1.5 text-xs px-2 py-0.5 rounded-full border"
           :class="
@@ -95,7 +107,7 @@ async function handleLogout() {
             class="w-1.5 h-1.5 rounded-full"
             :class="socketStore.connected ? 'bg-emerald-400 animate-pulse' : 'bg-rose-400'"
           ></span>
-          {{ socketStore.connected ? "LIVE" : "OFF" }}
+          {{ socketStore.connected ? t("nav.live") : t("nav.off") }}
         </span>
         <button
           @click="mobileMenuOpen = !mobileMenuOpen"
@@ -122,18 +134,19 @@ async function handleLogout() {
     >
       <div>
         <!-- Brand Header -->
-        <div class="hidden md:flex items-center justify-between px-5 py-5 border-b border-slate-800/80">
-          <div class="flex items-center gap-3">
+        <div class="hidden md:flex items-center justify-between px-4 py-5 border-b border-slate-800/80 gap-2">
+          <div class="flex items-center gap-2.5 min-w-0">
             <div
-              class="w-9 h-9 rounded-xl bg-gradient-to-br from-accent/20 to-brand/20 border border-accent/30 flex items-center justify-center shadow-lg shadow-accent/10"
+              class="w-9 h-9 rounded-xl bg-gradient-to-br from-accent/20 to-brand/20 border border-accent/30 flex items-center justify-center shadow-lg shadow-accent/10 shrink-0"
             >
               <Cpu class="w-5 h-5 text-accent" />
             </div>
-            <div>
+            <div class="min-w-0">
               <h1 class="font-bold text-base tracking-tight text-white">MirrorQuant</h1>
-              <p class="text-[11px] text-slate-400 font-mono">v1.0 · QUANT TERMINAL</p>
+              <p class="text-[10px] text-slate-400 font-mono truncate">{{ t("app.brandSub") }}</p>
             </div>
           </div>
+          <LangToggle />
         </div>
 
         <!-- Navigation -->
@@ -161,7 +174,7 @@ async function handleLogout() {
               class="flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium text-slate-400 hover:text-cyan-300 hover:bg-slate-800/50 transition-all"
             >
               <Globe class="w-4 h-4" />
-              <span>Public Feed</span>
+              <span>{{ t("nav.publicFeed") }}</span>
             </router-link>
           </div>
         </nav>
@@ -172,7 +185,7 @@ async function handleLogout() {
         <div class="flex items-center justify-between px-2 py-1.5 rounded-lg bg-background/60 border border-slate-800">
           <div class="flex items-center gap-2 text-xs text-slate-400">
             <Activity class="w-3.5 h-3.5 text-accent" />
-            <span>Stream WS</span>
+            <span>{{ t("nav.streamWs") }}</span>
           </div>
           <span
             class="inline-flex items-center gap-1.5 text-[11px] font-mono"
@@ -182,7 +195,7 @@ async function handleLogout() {
               class="w-1.5 h-1.5 rounded-full"
               :class="socketStore.connected ? 'bg-emerald-400 animate-pulse' : 'bg-rose-400'"
             ></span>
-            {{ socketStore.connected ? "CONNECTED" : "RECONNECTING" }}
+            {{ socketStore.connected ? t("nav.connected") : t("nav.reconnecting") }}
           </span>
         </div>
 
@@ -201,7 +214,7 @@ async function handleLogout() {
           <button
             @click="handleLogout"
             class="p-2 rounded-lg text-slate-400 hover:text-rose-400 hover:bg-rose-500/10 transition-colors"
-            title="Sign out"
+            :title="t('nav.signOut')"
           >
             <LogOut class="w-4 h-4" />
           </button>
@@ -209,9 +222,13 @@ async function handleLogout() {
       </div>
     </aside>
 
-    <!-- Main Content -->
+    <!-- Main Content with Keep-Alive Cache -->
     <main class="flex-1 min-w-0 p-4 md:p-6 lg:p-8 max-w-[1600px] mx-auto w-full">
-      <router-view />
+      <router-view v-slot="{ Component }">
+        <keep-alive :include="cachedViews">
+          <component :is="Component" />
+        </keep-alive>
+      </router-view>
     </main>
   </div>
 </template>

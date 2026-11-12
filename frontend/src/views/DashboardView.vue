@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref, watch } from "vue";
+import { onActivated, onDeactivated, onMounted, onUnmounted, ref, watch } from "vue";
 import {
   Activity,
   AlertOctagon,
@@ -13,35 +13,44 @@ import {
 } from "lucide-vue-next";
 import { api } from "@/api/client";
 import { useSocketStore } from "@/stores/socket";
+import { useDataCacheStore } from "@/stores/dataCache";
+import { useI18n } from "@/i18n";
+
+defineOptions({ name: "DashboardView" });
 
 const socketStore = useSocketStore();
-const loading = ref(true);
-const data = ref<any>({
-  kpis: {
-    totalEquity: 0,
-    availEquity: 0,
-    totalNotional: 0,
-    totalUnrealizedPnl: 0,
-    actualLeverage: 0,
-    drawdownPct: 0,
-    activeLeads: 0,
-    totalLeads: 0,
-    activeAccounts: 0,
-    totalAccounts: 0,
-    activeBindings: 0,
-    globalKillSwitch: false,
-  },
-  leadPositions: [],
-  followerPositions: [],
-  recentExecutions: [],
-});
+const cache = useDataCacheStore();
+const { t, isZh } = useI18n();
+
+const loading = ref(!cache.overview);
+const data = ref<any>(
+  cache.overview?.data || {
+    kpis: {
+      totalEquity: 0,
+      availEquity: 0,
+      totalNotional: 0,
+      totalUnrealizedPnl: 0,
+      actualLeverage: 0,
+      drawdownPct: 0,
+      activeLeads: 0,
+      totalLeads: 0,
+      activeAccounts: 0,
+      totalAccounts: 0,
+      activeBindings: 0,
+      globalKillSwitch: false,
+    },
+    leadPositions: [],
+    followerPositions: [],
+    recentExecutions: [],
+  }
+);
 
 let pollTimer: any = null;
 
-async function fetchOverview() {
+async function fetchOverview(force = false) {
+  if (!cache.overview) loading.value = true;
   try {
-    const res = await api.get<any>("/api/dashboard/overview");
-    data.value = res;
+    data.value = await cache.fetchOverview(force, 6000);
   } catch (e) {
     console.error("Failed to load overview", e);
   } finally {
@@ -56,6 +65,7 @@ async function toggleKillSwitch() {
       enabled: nextState,
     });
     data.value.kpis.globalKillSwitch = res.globalKillSwitch;
+    await fetchOverview(true);
   } catch (e) {
     console.error("Kill switch toggle failed", e);
   }
@@ -64,18 +74,35 @@ async function toggleKillSwitch() {
 watch(
   () => socketStore.recentEvents.length,
   () => {
-    fetchOverview();
+    fetchOverview(true);
   }
 );
 
+function startPolling() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(() => fetchOverview(true), 6000);
+}
+
+function stopPolling() {
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+}
+
 onMounted(() => {
-  fetchOverview();
-  pollTimer = setInterval(fetchOverview, 6000);
+  fetchOverview(false);
+  startPolling();
 });
 
-onUnmounted(() => {
-  if (pollTimer) clearInterval(pollTimer);
+onActivated(() => {
+  if (cache.overview) data.value = cache.overview.data;
+  fetchOverview(false);
+  startPolling();
 });
+
+onDeactivated(stopPolling);
+onUnmounted(stopPolling);
 
 function formatUsd(val: number) {
   return new Intl.NumberFormat("en-US", {
@@ -100,18 +127,18 @@ function statusBadge(status: string) {
     <!-- Header & Kill Switch -->
     <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
       <div>
-        <h2 class="text-xl sm:text-2xl font-bold text-white tracking-tight">Terminal Overview</h2>
+        <h2 class="text-xl sm:text-2xl font-bold text-white tracking-tight">{{ t("dash.title") }}</h2>
         <p class="text-xs sm:text-sm text-slate-400 mt-0.5">
-          Real-time portfolio telemetry, PA signals, and copy execution matrix
+          {{ t("dash.subtitle") }}
         </p>
       </div>
       <div class="flex items-center gap-2.5">
         <button
-          @click="fetchOverview"
+          @click="fetchOverview(true)"
           class="px-3 py-2 rounded-xl bg-surface border border-slate-700 hover:border-slate-500 text-xs font-medium text-slate-300 flex items-center gap-1.5 transition-colors"
         >
           <RefreshCw class="w-3.5 h-3.5" :class="{ 'animate-spin': loading }" />
-          <span>Refresh</span>
+          <span>{{ t("dash.refresh") }}</span>
         </button>
 
         <button
@@ -124,7 +151,7 @@ function statusBadge(status: string) {
           "
         >
           <AlertOctagon class="w-4 h-4" />
-          <span>{{ data.kpis.globalKillSwitch ? "KILL SWITCH ACTIVE (HALTED)" : "Emergency Kill Switch" }}</span>
+          <span>{{ data.kpis.globalKillSwitch ? t("dash.killActive") : t("dash.killBtn") }}</span>
         </button>
       </div>
     </div>
@@ -137,50 +164,45 @@ function statusBadge(status: string) {
       <div class="flex items-center gap-3">
         <ShieldAlert class="w-5 h-5 text-rose-400 shrink-0" />
         <div>
-          <p class="text-sm font-semibold text-rose-200">Global Kill Switch Engaged</p>
-          <p class="text-xs text-rose-300/80">
-            All new copy-trade open orders are blocked. Reduce-only and full close sync orders remain active for safety.
-          </p>
+          <p class="text-sm font-semibold text-rose-200">{{ t("dash.killBannerTitle") }}</p>
+          <p class="text-xs text-rose-300/80">{{ t("dash.killBannerDesc") }}</p>
         </div>
       </div>
       <button
         @click="toggleKillSwitch"
         class="px-3 py-1.5 rounded-lg bg-rose-500 text-white text-xs font-semibold hover:bg-rose-600 shrink-0"
       >
-        Resume Trading
+        {{ t("dash.resumeTrading") }}
       </button>
     </div>
 
     <!-- KPI Cards -->
     <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
-      <!-- Total Equity -->
       <div class="p-5 rounded-2xl bg-surface border border-slate-800/80 shadow-lg">
         <div class="flex items-center justify-between text-slate-400 text-xs font-medium mb-2">
-          <span>FOLLOWER EQUITY</span>
+          <span>{{ t("dash.followerEquity") }}</span>
           <Wallet class="w-4 h-4 text-accent" />
         </div>
         <div class="text-2xl font-bold font-mono text-white">{{ formatUsd(data.kpis.totalEquity) }}</div>
         <div class="text-xs text-slate-400 mt-1.5 font-mono">
-          Avail: <span class="text-slate-200">{{ formatUsd(data.kpis.availEquity) }}</span>
+          {{ t("dash.avail") }}: <span class="text-slate-200">{{ formatUsd(data.kpis.availEquity) }}</span>
         </div>
       </div>
 
-      <!-- Notional & Leverage -->
       <div class="p-5 rounded-2xl bg-surface border border-slate-800/80 shadow-lg">
         <div class="flex items-center justify-between text-slate-400 text-xs font-medium mb-2">
-          <span>PORTFOLIO EXPOSURE</span>
+          <span>{{ t("dash.exposure") }}</span>
           <TrendingUp class="w-4 h-4 text-brand" />
         </div>
         <div class="text-2xl font-bold font-mono text-white">{{ formatUsd(data.kpis.totalNotional) }}</div>
         <div class="text-xs text-slate-400 mt-1.5 font-mono">
-          Effective Lev: <span class="text-accent">{{ data.kpis.actualLeverage }}x</span>
+          {{ t("dash.effectiveLev") }}: <span class="text-accent">{{ data.kpis.actualLeverage }}x</span>
         </div>
       </div>
 
-      <!-- uPnL & Drawdown -->
       <div class="p-5 rounded-2xl bg-surface border border-slate-800/80 shadow-lg">
         <div class="flex items-center justify-between text-slate-400 text-xs font-medium mb-2">
-          <span>UNREALIZED PNL</span>
+          <span>{{ t("dash.unrealizedPnl") }}</span>
           <Activity class="w-4 h-4 text-emerald-400" />
         </div>
         <div
@@ -190,51 +212,48 @@ function statusBadge(status: string) {
           {{ data.kpis.totalUnrealizedPnl >= 0 ? "+" : "" }}{{ formatUsd(data.kpis.totalUnrealizedPnl) }}
         </div>
         <div class="text-xs text-slate-400 mt-1.5 font-mono">
-          HWM Drawdown:
+          {{ t("dash.hwmDrawdown") }}:
           <span :class="data.kpis.drawdownPct > 15 ? 'text-rose-400' : 'text-slate-200'">
             {{ data.kpis.drawdownPct }}%
           </span>
         </div>
       </div>
 
-      <!-- Active Nodes -->
       <div class="p-5 rounded-2xl bg-surface border border-slate-800/80 shadow-lg">
         <div class="flex items-center justify-between text-slate-400 text-xs font-medium mb-2">
-          <span>TOPOLOGY STATUS</span>
+          <span>{{ t("dash.topology") }}</span>
           <Zap class="w-4 h-4 text-amber-400" />
         </div>
         <div class="text-2xl font-bold font-mono text-white">
-          {{ data.kpis.activeBindings }} <span class="text-sm font-normal text-slate-400">Bindings</span>
+          {{ data.kpis.activeBindings }} <span class="text-sm font-normal text-slate-400">{{ t("dash.bindingsUnit") }}</span>
         </div>
         <div class="text-xs text-slate-400 mt-1.5 font-mono">
-          Leads: {{ data.kpis.activeLeads }}/{{ data.kpis.totalLeads }} · Accts: {{ data.kpis.activeAccounts }}/{{ data.kpis.totalAccounts }}
+          {{ t("dash.leadsLabel") }}: {{ data.kpis.activeLeads }}/{{ data.kpis.totalLeads }} · {{ t("dash.acctsLabel") }}: {{ data.kpis.activeAccounts }}/{{ data.kpis.totalAccounts }}
         </div>
       </div>
     </div>
 
     <!-- Main Grid: Positions + Executions -->
     <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
-      <!-- Left: Lead & Follower Positions -->
       <div class="lg:col-span-7 space-y-6">
-        <!-- Lead Open Positions -->
         <div class="rounded-2xl bg-surface border border-slate-800/80 overflow-hidden">
           <div class="px-5 py-4 border-b border-slate-800/80 flex items-center justify-between">
-            <h3 class="text-sm font-semibold text-white">Monitored Lead Positions (Reconstructed & PA)</h3>
-            <span class="text-xs font-mono text-slate-400">{{ data.leadPositions.length }} Active</span>
+            <h3 class="text-sm font-semibold text-white">{{ t("dash.monitoredLeadPos") }}</h3>
+            <span class="text-xs font-mono text-slate-400">{{ t("dash.activeCount", { n: data.leadPositions.length }) }}</span>
           </div>
           <div v-if="data.leadPositions.length === 0" class="p-8 text-center text-xs text-slate-500">
-            No open lead positions detected yet. Add and sync a Lead source in the Leads view.
+            {{ t("dash.noLeadPos") }}
           </div>
           <div v-else class="overflow-x-auto">
             <table class="w-full text-left border-collapse text-xs">
               <thead>
                 <tr class="border-b border-slate-800 text-slate-400 uppercase font-mono">
-                  <th class="py-3 px-4">Lead / Symbol</th>
-                  <th class="py-3 px-4">Side</th>
-                  <th class="py-3 px-4 text-right">Entry / Mark</th>
-                  <th class="py-3 px-4 text-right">Notional</th>
-                  <th class="py-3 px-4 text-right">Est. uPnL</th>
-                  <th class="py-3 px-4">PA Bias</th>
+                  <th class="py-3 px-4">{{ t("dash.colLeadSymbol") }}</th>
+                  <th class="py-3 px-4">{{ t("dash.colSide") }}</th>
+                  <th class="py-3 px-4 text-right">{{ t("dash.colEntryMark") }}</th>
+                  <th class="py-3 px-4 text-right">{{ t("dash.colNotional") }}</th>
+                  <th class="py-3 px-4 text-right">{{ t("dash.colEstUpnl") }}</th>
+                  <th class="py-3 px-4">{{ t("dash.colPaBias") }}</th>
                 </tr>
               </thead>
               <tbody class="divide-y divide-slate-800/60">
@@ -246,11 +265,7 @@ function statusBadge(status: string) {
                   <td class="py-3 px-4">
                     <span
                       class="inline-flex items-center gap-1 px-2 py-0.5 rounded-md font-mono font-semibold text-[11px]"
-                      :class="
-                        pos.positionSide === 'LONG'
-                          ? 'bg-emerald-500/15 text-emerald-400'
-                          : 'bg-rose-500/15 text-rose-400'
-                      "
+                      :class="pos.positionSide === 'LONG' ? 'bg-emerald-500/15 text-emerald-400' : 'bg-rose-500/15 text-rose-400'"
                     >
                       <ArrowUpRight v-if="pos.positionSide === 'LONG'" class="w-3 h-3" />
                       <ArrowDownRight v-else class="w-3 h-3" />
@@ -273,9 +288,10 @@ function statusBadge(status: string) {
                   </td>
                   <td class="py-3 px-4">
                     <span v-if="pos.analysis?.ok" class="text-[11px] font-mono text-accent">
-                      {{ pos.analysis.verdict }} · {{ pos.analysis.trend1h }}
+                      {{ isZh && pos.analysis.verdictZh ? pos.analysis.verdictZh : pos.analysis.verdict }} ·
+                      {{ isZh && pos.analysis.trend1hZh ? pos.analysis.trend1hZh : pos.analysis.trend1h }}
                     </span>
-                    <span v-else class="text-[11px] text-slate-500">N/A</span>
+                    <span v-else class="text-[11px] text-slate-500">—</span>
                   </td>
                 </tr>
               </tbody>
@@ -283,24 +299,23 @@ function statusBadge(status: string) {
           </div>
         </div>
 
-        <!-- Follower Open Positions -->
         <div class="rounded-2xl bg-surface border border-slate-800/80 overflow-hidden">
           <div class="px-5 py-4 border-b border-slate-800/80 flex items-center justify-between">
-            <h3 class="text-sm font-semibold text-white">Follower Exchange Positions</h3>
-            <span class="text-xs font-mono text-slate-400">{{ data.followerPositions.length }} Open</span>
+            <h3 class="text-sm font-semibold text-white">{{ t("dash.followerPosTitle") }}</h3>
+            <span class="text-xs font-mono text-slate-400">{{ t("dash.openCount", { n: data.followerPositions.length }) }}</span>
           </div>
           <div v-if="data.followerPositions.length === 0" class="p-8 text-center text-xs text-slate-500">
-            No active follower positions across connected exchange accounts.
+            {{ t("dash.noFollowerPos") }}
           </div>
           <div v-else class="overflow-x-auto">
             <table class="w-full text-left border-collapse text-xs">
               <thead>
                 <tr class="border-b border-slate-800 text-slate-400 uppercase font-mono">
-                  <th class="py-3 px-4">Account / Contract</th>
-                  <th class="py-3 px-4">Side</th>
-                  <th class="py-3 px-4 text-right">Size / AvgPx</th>
-                  <th class="py-3 px-4 text-right">Notional</th>
-                  <th class="py-3 px-4 text-right">uPnL</th>
+                  <th class="py-3 px-4">{{ t("dash.colAcctContract") }}</th>
+                  <th class="py-3 px-4">{{ t("dash.colSide") }}</th>
+                  <th class="py-3 px-4 text-right">{{ t("dash.colSizeAvgPx") }}</th>
+                  <th class="py-3 px-4 text-right">{{ t("dash.colNotional") }}</th>
+                  <th class="py-3 px-4 text-right">{{ t("dash.colUpnl") }}</th>
                 </tr>
               </thead>
               <tbody class="divide-y divide-slate-800/60">
@@ -314,11 +329,7 @@ function statusBadge(status: string) {
                   <td class="py-3 px-4">
                     <span
                       class="px-2 py-0.5 rounded-md font-mono font-semibold text-[11px] uppercase"
-                      :class="
-                        pos.posSide === 'long'
-                          ? 'bg-emerald-500/15 text-emerald-400'
-                          : 'bg-rose-500/15 text-rose-400'
-                      "
+                      :class="pos.posSide === 'long' ? 'bg-emerald-500/15 text-emerald-400' : 'bg-rose-500/15 text-rose-400'"
                     >
                       {{ pos.posSide }} {{ pos.lever }}x
                     </span>
@@ -341,15 +352,14 @@ function statusBadge(status: string) {
         </div>
       </div>
 
-      <!-- Right: Live Execution Feed -->
       <div class="lg:col-span-5">
         <div class="rounded-2xl bg-surface border border-slate-800/80 overflow-hidden h-full flex flex-col">
           <div class="px-5 py-4 border-b border-slate-800/80 flex items-center justify-between">
-            <h3 class="text-sm font-semibold text-white">Copy Execution & Risk Feed</h3>
-            <span class="text-xs font-mono text-accent">LIVE STREAM</span>
+            <h3 class="text-sm font-semibold text-white">{{ t("dash.execFeedTitle") }}</h3>
+            <span class="text-xs font-mono text-accent">{{ t("dash.liveStream") }}</span>
           </div>
           <div v-if="data.recentExecutions.length === 0" class="p-8 text-center text-xs text-slate-500 flex-1">
-            Waiting for lead trade events...
+            {{ t("dash.waitingEvents") }}
           </div>
           <div v-else class="divide-y divide-slate-800/60 max-h-[640px] overflow-y-auto">
             <div v-for="ex in data.recentExecutions" :key="ex.id" class="p-4 hover:bg-slate-800/30 transition-colors">
@@ -358,10 +368,7 @@ function statusBadge(status: string) {
                   <span class="font-bold text-xs text-white truncate">{{ ex.symbol }}</span>
                   <span class="text-[11px] font-mono text-slate-400">{{ ex.action }}</span>
                 </div>
-                <span
-                  class="px-2 py-0.5 rounded-full text-[10px] font-mono border shrink-0"
-                  :class="statusBadge(ex.status)"
-                >
+                <span class="px-2 py-0.5 rounded-full text-[10px] font-mono border shrink-0" :class="statusBadge(ex.status)">
                   {{ ex.status }}
                 </span>
               </div>

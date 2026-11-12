@@ -1,6 +1,7 @@
 import { defineStore } from "pinia";
 import { ref } from "vue";
 import { api } from "@/api/client";
+import { useDataCacheStore } from "./dataCache";
 
 export interface User {
   id: number;
@@ -74,6 +75,11 @@ export const useAuthStore = defineStore("auth", () => {
     } finally {
       authenticated.value = false;
       user.value = null;
+      try {
+        useDataCacheStore().clearAll();
+      } catch {
+        // ignore
+      }
     }
   }
 

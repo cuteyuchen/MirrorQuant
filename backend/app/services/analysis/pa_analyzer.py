@@ -112,47 +112,77 @@ def find_unmitigated_fvgs(
     return nb, na
 
 
-def _trend_label(px: float, ema21: float, ema55: float) -> Tuple[str, str]:
+def _trend_label(px: float, ema21: float, ema55: float) -> Tuple[str, str, str]:
     if px > ema21 and ema21 > ema55:
-        return "BULL", "Bullish Stack"
+        return "BULL", "Bullish Stack", "多头排列"
     if px < ema21 and ema21 < ema55:
-        return "BEAR", "Bearish Stack"
+        return "BEAR", "Bearish Stack", "空头排列"
     if px > ema21 and px > ema55:
-        return "BULL_BIAS", "Bullish Bias"
+        return "BULL_BIAS", "Bullish Bias", "偏多结构"
     if px < ema21 and px < ema55:
-        return "BEAR_BIAS", "Bearish Bias"
-    return "RANGE", "Range / Choppy"
+        return "BEAR_BIAS", "Bearish Bias", "偏空结构"
+    return "RANGE", "Range / Choppy", "震荡整理"
 
 
 def analyze_scaling(
     entry_orders: Optional[Sequence[Dict[str, Any]]],
     position_side: str,
     avg_entry: float,
-) -> Tuple[str, Optional[str]]:
+) -> Tuple[str, Optional[str], str, Optional[str]]:
     if not entry_orders or len(entry_orders) <= 1:
-        return "Single Entry", None
+        return "Single Entry", None, "单笔建仓", None
     ordered = sorted(entry_orders, key=lambda x: x.get("t", 0))
     prices = [float(x["p"]) for x in ordered if x.get("p")]
     if len(prices) <= 1:
-        return "Single Entry", None
+        return "Single Entry", None, "单笔建仓", None
     p_first, p_last = prices[0], prices[-1]
     p_min, p_max = min(prices), max(prices)
     span_ms = (ordered[-1].get("t", 0) or 0) - (ordered[0].get("t", 0) or 0)
     spread_pct = (p_max - p_min) / p_min * 100.0 if p_min > 0 else 0.0
 
     if spread_pct < 0.25 and span_ms <= 30 * 60 * 1000:
-        return "TWAP / Split Cluster", f"{len(prices)} fills between {smart_px(p_min)}~{smart_px(p_max)} ({spread_pct:.2f}%)"
+        return (
+            "TWAP / Split Cluster",
+            f"{len(prices)} fills between {smart_px(p_min)}~{smart_px(p_max)} ({spread_pct:.2f}%)",
+            "TWAP / 密集拆单",
+            f"{len(prices)} 笔集中成交于 {smart_px(p_min)}~{smart_px(p_max)}（价差 {spread_pct:.2f}%）",
+        )
     if position_side == "SHORT":
         if p_last > p_first * 1.008:
-            return "Scale-In Higher (Averaging Up Short)", f"{smart_px(p_first)} -> {smart_px(p_last)}, avg {smart_px(avg_entry)}"
+            return (
+                "Scale-In Higher (Averaging Up Short)",
+                f"{smart_px(p_first)} -> {smart_px(p_last)}, avg {smart_px(avg_entry)}",
+                "逢高分批加空（拉高均价）",
+                f"{smart_px(p_first)} → {smart_px(p_last)}，均价 {smart_px(avg_entry)}",
+            )
         if p_last < p_first * 0.992:
-            return "Momentum Pyramid Short", f"{smart_px(p_first)} -> {smart_px(p_last)}, avg {smart_px(avg_entry)}"
+            return (
+                "Momentum Pyramid Short",
+                f"{smart_px(p_first)} -> {smart_px(p_last)}, avg {smart_px(avg_entry)}",
+                "顺势滚仓追空",
+                f"{smart_px(p_first)} → {smart_px(p_last)}，均价 {smart_px(avg_entry)}",
+            )
     else:
         if p_last < p_first * 0.992:
-            return "Scale-In Lower (Averaging Down Long)", f"{smart_px(p_first)} -> {smart_px(p_last)}, avg {smart_px(avg_entry)}"
+            return (
+                "Scale-In Lower (Averaging Down Long)",
+                f"{smart_px(p_first)} -> {smart_px(p_last)}, avg {smart_px(avg_entry)}",
+                "逢低分批加多（摊低均价）",
+                f"{smart_px(p_first)} → {smart_px(p_last)}，均价 {smart_px(avg_entry)}",
+            )
         if p_last > p_first * 1.008:
-            return "Momentum Pyramid Long", f"{smart_px(p_first)} -> {smart_px(p_last)}, avg {smart_px(avg_entry)}"
-    return "Range Scaling", f"{len(prices)} orders across {smart_px(p_min)}~{smart_px(p_max)}"
+            return (
+                "Momentum Pyramid Long",
+                f"{smart_px(p_first)} -> {smart_px(p_last)}, avg {smart_px(avg_entry)}",
+                "顺势滚仓追多",
+                f"{smart_px(p_first)} → {smart_px(p_last)}，均价 {smart_px(avg_entry)}",
+            )
+    return (
+        "Range Scaling",
+        f"{len(prices)} orders across {smart_px(p_min)}~{smart_px(p_max)}",
+        "区间分批建仓",
+        f"{len(prices)} 笔分散于 {smart_px(p_min)}~{smart_px(p_max)}（均价 {smart_px(avg_entry)}）",
+    )
 
 
 class PAAnalyzer:
@@ -243,8 +273,8 @@ class PAAnalyzer:
         eq72 = (high72 + low72) / 2.0
 
         bull_fvg, bear_fvg = find_unmitigated_fvgs(c1h, atr_1h)
-        t1_code, t1_label = _trend_label(px, ema21_1h, ema55_1h)
-        t4_code, t4_label = _trend_label(px, ema21_4h, ema55_4h)
+        t1_code, t1_label, t1_zh = _trend_label(px, ema21_1h, ema55_1h)
+        t4_code, t4_label, t4_zh = _trend_label(px, ema21_4h, ema55_4h)
 
         span72 = max(high72 - low72, 1e-9)
         entry_pct = max(0.0, min(100.0, (avg_entry - low72) / span72 * 100.0))
@@ -257,21 +287,21 @@ class PAAnalyzer:
         aligned_4h = (t4_code in ("BEAR", "BEAR_BIAS")) if ps == "SHORT" else (t4_code in ("BULL", "BULL_BIAS"))
 
         if aligned_1h and aligned_4h:
-            trend_align, trend_score = "1H+4H Aligned", 2
+            trend_align, trend_align_zh, trend_score = "1H+4H Aligned", "双周期强共振", 2
         elif aligned_1h:
-            trend_align, trend_score = "1H Aligned / 4H Counter", 1
+            trend_align, trend_align_zh, trend_score = "1H Aligned / 4H Counter", "1H 顺势 / 4H 逆势", 1
         elif aligned_4h:
-            trend_align, trend_score = "4H Aligned / 1H Pullback", 0
+            trend_align, trend_align_zh, trend_score = "4H Aligned / 1H Pullback", "4H 顺势 / 1H 回调", 0
         else:
-            trend_align, trend_score = "Counter-Trend Both TF", -2
+            trend_align, trend_align_zh, trend_score = "Counter-Trend Both TF", "双周期逆势", -2
 
         if ps == "SHORT":
             if entry_pct >= 68:
-                entry_zone, loc_score = "Premium Zone Short", 2
+                entry_zone, entry_zone_zh, loc_score = "Premium Zone Short", "溢价区做空", 2
             elif entry_pct >= 42:
-                entry_zone, loc_score = "Equilibrium Short", 1
+                entry_zone, entry_zone_zh, loc_score = "Equilibrium Short", "均衡区做空", 1
             else:
-                entry_zone, loc_score = "Discount Chase Short", -1
+                entry_zone, entry_zone_zh, loc_score = "Discount Chase Short", "折价区追空", -1
 
             res_cands = [high24, ema21_1h, ema55_1h] + ([bear_fvg["high"]] if bear_fvg else [])
             above_res = [x for x in res_cands if x > px * 0.999]
@@ -291,11 +321,11 @@ class PAAnalyzer:
             rr_cur = (px - target1) / max(invalidation - px, 1e-9) if invalidation > px else 0.0
         else:
             if entry_pct <= 32:
-                entry_zone, loc_score = "Discount Zone Long", 2
+                entry_zone, entry_zone_zh, loc_score = "Discount Zone Long", "折价区做多", 2
             elif entry_pct <= 58:
-                entry_zone, loc_score = "Equilibrium Long", 1
+                entry_zone, entry_zone_zh, loc_score = "Equilibrium Long", "均衡区做多", 1
             else:
-                entry_zone, loc_score = "Premium Chase Long", -1
+                entry_zone, entry_zone_zh, loc_score = "Premium Chase Long", "溢价区追多", -1
 
             sup_cands = [low24, ema21_1h, ema55_1h] + ([bull_fvg["low"]] if bull_fvg else [])
             below_sup = [x for x in sup_cands if x < px * 1.001]
@@ -316,15 +346,15 @@ class PAAnalyzer:
 
         total_score = trend_score + loc_score + (1 if edge_pct >= 0.8 else (-1 if edge_pct <= -1.5 else 0))
         if total_score >= 3:
-            verdict, v_level = "Strong Alignment", "good"
+            verdict, verdict_zh, v_level = "Strong Alignment", "顺势占优", "good"
         elif total_score >= 1:
-            verdict, v_level = "Favorable Structure", "mid"
+            verdict, verdict_zh, v_level = "Favorable Structure", "结构良好", "mid"
         elif total_score >= -1:
-            verdict, v_level = "Neutral / Tactical", "warn"
+            verdict, verdict_zh, v_level = "Neutral / Tactical", "中性博弈", "warn"
         else:
-            verdict, v_level = "Counter-Trend Risk", "bad"
+            verdict, verdict_zh, v_level = "Counter-Trend Risk", "逆势高险", "bad"
 
-        scaling_style, scaling_desc = analyze_scaling(entry_orders, ps, avg_entry)
+        scaling_style, scaling_desc, scaling_style_zh, scaling_desc_zh = analyze_scaling(entry_orders, ps, avg_entry)
 
         summary = (
             f"Entry {smart_px(avg_entry)} at {entry_pct:.0f}% of 72H range ({entry_zone}, "
@@ -332,17 +362,36 @@ class PAAnalyzer:
             f"(1H {t1_label} / 4H {t4_label}, RSI {rsi_1h or 50:.0f}/{rsi_4h or 50:.0f}). "
             f"Invalidation {smart_px(invalidation)}, T1 {smart_px(target1)}, T2 {smart_px(target2)}."
         )
+        edge_txt_zh = f"当前浮盈 {edge_pct:.2f}%" if edge_pct >= 0 else f"当前浮亏 {abs(edge_pct):.2f}%"
+        fvg_zh_parts = []
+        if bear_fvg:
+            fvg_zh_parts.append(f"上方 1H 空头 FVG 阻力带 {smart_px(bear_fvg['low'])}~{smart_px(bear_fvg['high'])}")
+        if bull_fvg:
+            fvg_zh_parts.append(f"下方 1H 多头 FVG 支撑带 {smart_px(bull_fvg['low'])}~{smart_px(bull_fvg['high'])}")
+        fvg_zh = ("；" + "，".join(fvg_zh_parts)) if fvg_zh_parts else ""
+        scale_note_zh = f"；{scaling_desc_zh}" if scaling_desc_zh else ""
+        summary_zh = (
+            f"均价 {smart_px(avg_entry)} 处于近 72H 区间 {entry_pct:.0f}% 分位（{entry_zone_zh}，"
+            f"相对 1H EMA21 偏离 {entry_vs_ema21_atr:+.1f} ATR）{scale_note_zh}；{edge_txt_zh}。"
+            f"{trend_align_zh}（1H {t1_zh} / 4H {t4_zh}，RSI {rsi_1h or 50:.0f}/{rsi_4h or 50:.0f}）{fvg_zh}；"
+            f"客观防守失效参考 {smart_px(invalidation)}，第一目标 {smart_px(target1)} / 次级 {smart_px(target2)}（仅作 K 线结构参考，不构成投资建议）。"
+        )
 
         return {
             "ok": True,
             "symbol": symbol,
             "positionSide": ps,
             "verdict": verdict,
+            "verdictZh": verdict_zh,
             "verdictLevel": v_level,
             "trend1h": t1_label,
+            "trend1hZh": t1_zh,
             "trend4h": t4_label,
+            "trend4hZh": t4_zh,
             "trendAlignment": trend_align,
+            "trendAlignmentZh": trend_align_zh,
             "entryZone": entry_zone,
+            "entryZoneZh": entry_zone_zh,
             "entryRangePct": round(entry_pct, 1),
             "curRangePct": round(cur_pct, 1),
             "entryVsEma21Atr": round(entry_vs_ema21_atr, 2),
@@ -375,8 +424,11 @@ class PAAnalyzer:
                 [round_px(bull_fvg["low"]), round_px(bull_fvg["high"])] if bull_fvg else None
             ),
             "scalingStyle": scaling_style,
+            "scalingStyleZh": scaling_style_zh,
             "scalingDesc": scaling_desc,
+            "scalingDescZh": scaling_desc_zh,
             "summary": summary,
+            "summaryZh": summary_zh,
             "analyzedAt": int(time.time() * 1000),
         }
 

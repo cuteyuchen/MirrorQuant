@@ -386,6 +386,8 @@ class BinanceBapiCollector(BaseLeadCollector):
         self._marks_cache: Dict[str, Dict[str, Any]] = {}
         self._perf_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
         self._holdings_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
+        self._chart_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
+        self._alloc_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 
     @staticmethod
     def _headers(portfolio_id: str, time_range: str = "7D") -> Dict[str, str]:
@@ -517,6 +519,48 @@ class BinanceBapiCollector(BaseLeadCollector):
             return data if isinstance(data, list) else []
         except Exception:
             return []
+
+    async def fetch_roi_chart(
+        self, portfolio_id: str, time_range: str = "365D", proxy_url: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        try:
+            data = await self._http_json(
+                f"{PUBLIC_COPY}/lead-portfolio/chart-data?portfolioId={quote(portfolio_id)}&dataType=ROI&timeRange={time_range}",
+                portfolio_id=portfolio_id,
+                proxy_url=proxy_url,
+                time_range=time_range,
+                retries=2,
+            )
+            if isinstance(data, list):
+                return [
+                    {"t": x.get("dateTime"), "v": fnum(x.get("value")) or 0.0}
+                    for x in data
+                    if x.get("dateTime") is not None
+                ]
+            return []
+        except Exception:
+            return []
+
+    async def fetch_allocation(
+        self, portfolio_id: str, time_range: str = "90D", proxy_url: Optional[str] = None
+    ) -> Dict[str, Any]:
+        try:
+            data = await self._http_json(
+                f"{PUBLIC_COPY}/lead-portfolio/performance/coin?portfolioId={quote(portfolio_id)}&timeRange={time_range}",
+                portfolio_id=portfolio_id,
+                proxy_url=proxy_url,
+                time_range=time_range,
+                retries=2,
+            )
+            if isinstance(data, dict):
+                return {
+                    "timeRange": data.get("timeRange") or time_range,
+                    "updateTime": data.get("updateTime"),
+                    "items": data.get("data") or [],
+                }
+            return {"timeRange": time_range, "updateTime": None, "items": []}
+        except Exception:
+            return {"timeRange": time_range, "updateTime": None, "items": []}
 
     async def fetch_marks(
         self, symbols: Sequence[str], proxy_url: Optional[str] = None
@@ -719,7 +763,7 @@ class BinanceBapiCollector(BaseLeadCollector):
                 except Exception:
                     return tr, None
 
-            perf_items = await asyncio.gather(*(_get_perf(tr) for tr in ("7D", "30D", "90D")))
+            perf_items = await asyncio.gather(*(_get_perf(tr) for tr in ("7D", "30D", "90D", "180D", "365D")))
             perf = {tr: val for tr, val in perf_items if val is not None}
             if perf:
                 self._perf_cache[portfolio_id] = (now_s, perf)
@@ -730,6 +774,22 @@ class BinanceBapiCollector(BaseLeadCollector):
         else:
             holdings = await self.fetch_holdings(portfolio_id, proxy_url=proxy_url)
             self._holdings_cache[portfolio_id] = (now_s, holdings)
+
+        cached_chart = self._chart_cache.get(portfolio_id)
+        if cached_chart and (now_s - cached_chart[0]) < 300.0 and cached_chart[1]:
+            roi_chart = list(cached_chart[1])
+        else:
+            roi_chart = await self.fetch_roi_chart(portfolio_id, time_range="365D", proxy_url=proxy_url)
+            if roi_chart:
+                self._chart_cache[portfolio_id] = (now_s, roi_chart)
+
+        cached_alloc = self._alloc_cache.get(portfolio_id)
+        if cached_alloc and (now_s - cached_alloc[0]) < 300.0 and cached_alloc[1].get("items"):
+            allocation = dict(cached_alloc[1])
+        else:
+            allocation = await self.fetch_allocation(portfolio_id, time_range="90D", proxy_url=proxy_url)
+            if allocation.get("items"):
+                self._alloc_cache[portfolio_id] = (now_s, allocation)
 
         margin_balance = fnum(detail.get("marginBalance"))
         open_positions = reconstruct_open_positions(orders_store, closed_rows=closed_rows)
@@ -745,8 +805,11 @@ class BinanceBapiCollector(BaseLeadCollector):
             p["lastPrice"] = last_px
             p["markPrice"] = mark
             p["currentPrice"] = cur_px
+            p["indexPrice"] = m.get("indexPrice")
             p["fundingRate"] = m.get("fundingRate")
+            p["nextFundingTime"] = m.get("nextFundingTime")
             p["priceTime"] = m.get("priceTime")
+            p["priceSource"] = m.get("source")
 
             qty = p.get("qty") or 0.0
             entry = p.get("avgEntry")
@@ -765,6 +828,12 @@ class BinanceBapiCollector(BaseLeadCollector):
                 if (p.get("markValue") and margin_balance)
                 else None
             )
+            entry_val = p.get("entryValue")
+            p["entryLeverage"] = (
+                round(entry_val / margin_balance, 4)
+                if (entry_val is not None and margin_balance)
+                else None
+            )
             if mark is not None and entry:
                 upnl = (entry - mark) * qty if p["positionSide"] == "SHORT" else (mark - entry) * qty
                 p["uPnL"] = round(upnl, 2)
@@ -775,14 +844,33 @@ class BinanceBapiCollector(BaseLeadCollector):
 
             t = self.mmr_tier(brackets, p["symbol"], p.get("markValue"))
             p["mmr"] = t
-            p["maintMargin"] = (t or {}).get("maintMargin")
+            maint_m = (t or {}).get("maintMargin")
+            p["maintMargin"] = maint_m
+            p["maintMarginPct"] = (t or {}).get("mmrPct")
+            p["maintMarginRoePct"] = (
+                round(maint_m / margin_balance * 100, 4)
+                if (maint_m is not None and margin_balance)
+                else None
+            )
             p["heldMs"] = (now_ms - p["openTime"]) if p.get("openTime") else None
+            entry_orders = p.get("entryOrders") or []
+            p["entryOrdersCount"] = len(entry_orders)
+            last_add = max((e.get("t") or 0) for e in entry_orders) if entry_orders else p.get("openTime")
+            p["lastAddTime"] = last_add
+            p["sinceLastAddMs"] = (now_ms - last_add) if last_add else None
 
         tot_mark = sum(p["markValue"] for p in open_positions if p.get("markValue"))
         tot_entry = sum(p["entryValue"] for p in open_positions if p.get("entryValue"))
         tot_upnl = sum(p["uPnL"] for p in open_positions if p.get("uPnL") is not None)
         tot_mm = sum((p.get("mmr") or {}).get("maintMargin") or 0 for p in open_positions)
         tot_lev = round(tot_mark / margin_balance, 4) if (margin_balance and tot_mark) else 0.0
+        entry_lev = round(tot_entry / margin_balance, 4) if (margin_balance and tot_entry) else 0.0
+        short_cnt = sum(1 for p in open_positions if p.get("positionSide") == "SHORT")
+        long_cnt = sum(1 for p in open_positions if p.get("positionSide") == "LONG")
+        exact_mmr = all(((p.get("mmr") or {}).get("exact", True)) for p in open_positions) if open_positions else True
+        max_pos_lev = max((p.get("notionalLeverage") or 0.0 for p in open_positions), default=0.0)
+        for p in open_positions:
+            p["sharePct"] = round((p["markValue"] / tot_mark * 100.0), 2) if (tot_mark and p.get("markValue")) else None
 
         if with_analysis and self.pa_analyzer is not None and open_positions:
             analyzer = self.pa_analyzer
@@ -824,9 +912,17 @@ class BinanceBapiCollector(BaseLeadCollector):
             for o in recent_raw
         ]
 
+        tags_raw = detail.get("tagItemVos") or []
+        tags = [t.get("tagDesc") or t.get("tagName") for t in tags_raw if (t.get("tagDesc") or t.get("tagName"))]
+        if not tags:
+            tags = detail.get("tag") or []
+        if detail.get("signTradFi") and "TradFi" not in tags:
+            tags = ["TradFi", *tags]
+
         return {
             "meta": {
                 "generatedAt": now_ms,
+                "priceUpdatedAt": max((p.get("priceTime") or 0 for p in open_positions), default=now_ms) or now_ms,
                 "fetchMs": int((time.perf_counter() - t0) * 1000),
                 "portfolioId": portfolio_id,
                 "nickname": detail.get("nickname") or portfolio_id,
@@ -842,6 +938,9 @@ class BinanceBapiCollector(BaseLeadCollector):
                 "isPaused": detail.get("isPaused"),
                 "positionShow": detail.get("positionShow"),
                 "description": detail.get("description"),
+                "tags": tags,
+                "signTradFi": detail.get("signTradFi"),
+                "startTime": detail.get("startTime"),
                 "lastTradeTime": detail.get("lastTradeTime"),
                 "aumAmount": fnum(detail.get("aumAmount")),
                 "copyAum": fnum(detail.get("copyAum")),
@@ -849,22 +948,47 @@ class BinanceBapiCollector(BaseLeadCollector):
                 "copierPnl": fnum(detail.get("copierPnl")),
                 "currentCopyCount": detail.get("currentCopyCount"),
                 "maxCopyCount": detail.get("maxCopyCount"),
+                "totalCopyCount": detail.get("totalCopyCount"),
+                "favoriteCount": detail.get("favoriteCount"),
+                "mockCopyCount": detail.get("mockCopyCount"),
                 "profitSharingRate": detail.get("profitSharingRate"),
+                "sharpRatio": fnum(detail.get("sharpRatio")),
+                "aiSummary": detail.get("aiSummary"),
             },
             "performance": perf,
+            "roiChart365D": roi_chart,
+            "allocation": allocation,
             "holdings": holdings,
             "openPositions": open_positions,
+            "openPositionsMeta": {
+                "source": "api" if (detail.get("positionShow") and holdings) else "derived-from-order-history",
+                "positionShow": detail.get("positionShow"),
+                "asOf": now_ms,
+            },
             "openPositionsSummary": {
                 "positionCount": len(open_positions),
+                "shortCount": short_cnt,
+                "longCount": long_cnt,
+                "symbols": [p["symbol"] for p in open_positions],
                 "totalEntryNotional": round(tot_entry, 2),
                 "totalMarkNotional": round(tot_mark, 2),
                 "totalNotionalLeverage": tot_lev,
+                "entryLeverage": entry_lev,
+                "maxPositionLeverage": round(max_pos_lev, 4) if open_positions else 0.0,
+                "marginCoveragePct": round(margin_balance / tot_mark * 100, 2) if (margin_balance and tot_mark) else (100.0 if margin_balance else None),
                 "estMaintenanceMargin": round(tot_mm, 2),
+                "estMaintenanceMarginRatioPct": round(tot_mm / margin_balance * 100, 2) if (margin_balance and open_positions) else 0.0,
+                "avgMmrPct": round(tot_mm / tot_mark * 100, 2) if (tot_mark and open_positions) else 0.0,
+                "mmrSource": ("binance-official-brackets" if exact_mmr else "estimated-fallback-5pct") if open_positions else None,
                 "totalUnrealizedPnl": round(tot_upnl, 2),
+                "totalUnrealizedPnlPctOfEntry": round(tot_upnl / tot_entry * 100, 2) if (tot_entry and open_positions) else 0.0,
                 "totalMarginRoePct": (
                     round(tot_upnl / margin_balance * 100, 4) if (margin_balance and open_positions) else 0.0
                 ),
+                "adverseMoveBufferPct": round((margin_balance - tot_mm) / tot_mark * 100, 2) if (margin_balance and tot_mark) else (100.0 if margin_balance else None),
+                "availableMargin": round(margin_balance - tot_mm, 2) if margin_balance is not None else None,
                 "marginBalance": margin_balance,
+                "priceAsOf": now_ms,
             },
             "orderBatches": batches,
             "tradeCycles": trade_cycles,
