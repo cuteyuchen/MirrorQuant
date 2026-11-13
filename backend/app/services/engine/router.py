@@ -281,18 +281,39 @@ class CopyRouter:
             should_notify = (
                 (status == "EXECUTED" and notify_cfg.get("notify_on_execution", True))
                 or (
-                    (status.startswith("BLOCKED") or status == "FAILED" or status.startswith("SKIPPED_STALE"))
+                    (status.startswith("BLOCKED") or status == "FAILED" or status.startswith("SKIPPED_STALE") or status == "SKIPPED_UNSUPPORTED")
                     and notify_cfg.get("notify_on_risk_block", True)
                 )
             )
             if should_notify:
                 title = f"MirrorQuant [{status}] {symbol}"
-                msg = (
-                    f"Binding: {binding.name} ({lead.name} -> {account.name})\n"
-                    f"Action: {action} ({inst_id})\n"
-                    f"Qty: {my_qty} @ {my_price} (~${my_notional:,.2f})\n"
-                    f"Detail: {details}"
-                )
+                exch_label = "欧易" if "okx" in str(account.exchange).lower() else account.exchange
+                is_demo = str(account.environment).lower() in ("demo", "simulated")
+                tag = f"{exch_label}{'模拟盘' if is_demo else ''}跟单"
+
+                action_map = {
+                    "OPEN_LONG": "开多", "ADD_LONG": "加多", "OPEN_SHORT": "开空", "ADD_SHORT": "加空",
+                    "FULL_CLOSE": "全额平仓", "PARTIAL_REDUCE": "减仓",
+                    "CLOSE_LONG": "平多", "REDUCE_LONG": "减多", "CLOSE_SHORT": "平空", "REDUCE_SHORT": "减空",
+                }
+                act_str = action_map.get(action, action)
+                if status == "EXECUTED":
+                    px_str = f"{my_price:g}" if isinstance(my_price, (int, float)) else str(my_price)
+                    notional_val = f" (~${my_notional:,.0f})" if my_notional else ""
+                    msg = f"{tag}: 已同步{act_str} {my_qty}张 均价 {px_str}{notional_val}"
+                elif status == "SKIPPED_UNSUPPORTED":
+                    msg = f"{tag}: 模拟盘未上线该合约 ({symbol})，已跳过"
+                elif status == "SKIPPED_NO_LOCAL_POS":
+                    msg = f"{tag}: 本地无 {symbol} 持仓，跳过平仓"
+                elif status.startswith("BLOCKED_SLIPPAGE"):
+                    msg = f"{tag}: 滑点拦截 {symbol} ({details})"
+                elif status.startswith("BLOCKED"):
+                    msg = f"{tag}: 风控拦截 {symbol} ({status})"
+                elif status == "FAILED":
+                    msg = f"{tag}: 下单失败 {symbol} ({details})"
+                else:
+                    msg = f"{tag}: {status} {symbol} ({details})"
+
                 try:
                     asyncio.create_task(NotificationService.dispatch(notify_cfg, title, msg, event_type=status))
                 except RuntimeError:

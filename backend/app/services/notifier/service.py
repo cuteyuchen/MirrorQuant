@@ -18,7 +18,8 @@ class NotificationService:
     @staticmethod
     async def dispatch(config: Dict[str, Any], title: str, message: str, event_type: str = "info") -> Dict[str, Any]:
         results: Dict[str, Any] = {}
-        full_text = f"[{title}]\n{message}"
+        clean_msg = message.strip()
+        full_text = f"[{title}]\n{clean_msg}" if title else clean_msg
 
         if config.get("outbox_enabled") and config.get("outbox_path"):
             outbox_file = Path(str(config["outbox_path"]).strip()).expanduser()
@@ -28,7 +29,7 @@ class NotificationService:
                     fcntl.flock(f, fcntl.LOCK_EX)
                     try:
                         record = {
-                            "text": full_text,
+                            "text": clean_msg,
                             "title": title,
                             "eventType": event_type,
                             "ts": int(time.time() * 1000),

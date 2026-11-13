@@ -9,6 +9,10 @@
   }
 }
 
+.pb-safe {
+  padding-bottom: max(0.5rem, env(safe-area-inset-bottom, 0px));
+}
+
 /* Custom scrollbars */
 ::-webkit-scrollbar {
   width: 6px;

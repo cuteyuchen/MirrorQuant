@@ -1,19 +1,17 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import {
   Activity,
-  BarChart3,
   Cpu,
+  GitFork,
   Globe,
-  KeyRound,
-  Layers,
+  LayoutDashboard,
   LogOut,
-  Menu,
   Network,
   Settings,
   Users,
-  X,
+  Wallet,
 } from "lucide-vue-next";
 import { useAuthStore } from "@/stores/auth";
 import { useSocketStore } from "@/stores/socket";
@@ -25,7 +23,6 @@ const router = useRouter();
 const authStore = useAuthStore();
 const socketStore = useSocketStore();
 const { t } = useI18n();
-const mobileMenuOpen = ref(false);
 
 const cachedViews = [
   "DashboardView",
@@ -40,13 +37,23 @@ const isPublicOrAuthLayout = computed(() => {
   return ["/login", "/setup", "/public"].includes(route.path);
 });
 
+// Desktop Navigation Items
 const navItems = computed(() => [
-  { name: t("nav.dashboard"), path: "/dashboard", icon: BarChart3 },
+  { name: t("nav.dashboard"), path: "/dashboard", icon: LayoutDashboard },
   { name: t("nav.leads"), path: "/leads", icon: Users },
-  { name: t("nav.accounts"), path: "/accounts", icon: KeyRound },
-  { name: t("nav.bindings"), path: "/bindings", icon: Layers },
+  { name: t("nav.accounts"), path: "/accounts", icon: Wallet },
+  { name: t("nav.bindings"), path: "/bindings", icon: GitFork },
   { name: t("nav.proxies"), path: "/proxies", icon: Network },
   { name: t("nav.settings"), path: "/settings", icon: Settings },
+]);
+
+// Mobile Bottom Navigation Bar (5 core tabs)
+const mobileNavItems = computed(() => [
+  { name: t("nav.mobile.dashboard"), path: "/dashboard", icon: LayoutDashboard },
+  { name: t("nav.mobile.leads"), path: "/leads", icon: Users },
+  { name: t("nav.mobile.accounts"), path: "/accounts", icon: Wallet },
+  { name: t("nav.mobile.bindings"), path: "/bindings", icon: GitFork },
+  { name: t("nav.mobile.settings"), path: "/settings", icon: Settings },
 ]);
 
 watch(
@@ -83,58 +90,51 @@ async function handleLogout() {
   </div>
 
   <div v-else class="min-h-screen bg-background text-slate-100 flex flex-col md:flex-row">
-    <!-- Mobile Topbar -->
+    <!-- Mobile Topbar: Minimal header, clean & simple, NO hamburger menu toggle -->
     <header
-      class="md:hidden flex items-center justify-between px-4 py-3 bg-surface border-b border-slate-800 sticky top-0 z-40"
+      class="md:hidden flex items-center justify-between px-4 py-3 bg-[#0d121c]/95 backdrop-blur border-b border-[#1e293b] sticky top-0 z-40"
     >
       <div class="flex items-center gap-2.5">
         <div class="w-8 h-8 rounded-lg bg-accent/10 border border-accent/30 flex items-center justify-center">
           <Cpu class="w-4 h-4 text-accent" />
         </div>
-        <span class="font-bold tracking-tight text-slate-100">MirrorQuant</span>
+        <div class="flex items-center gap-2">
+          <span class="font-bold tracking-tight text-slate-100 text-sm">MirrorQuant</span>
+          <span
+            class="inline-flex items-center gap-1 text-[10px] font-mono px-2 py-0.5 rounded-full border"
+            :class="
+              socketStore.connected
+                ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
+                : 'bg-rose-500/10 text-rose-400 border-rose-500/30'
+            "
+          >
+            <span
+              class="w-1.5 h-1.5 rounded-full"
+              :class="socketStore.connected ? 'bg-emerald-400 animate-pulse' : 'bg-rose-400'"
+            ></span>
+            {{ socketStore.connected ? t("nav.live") : t("nav.off") }}
+          </span>
+        </div>
       </div>
       <div class="flex items-center gap-2">
         <LangToggle />
-        <span
-          class="inline-flex items-center gap-1.5 text-xs px-2 py-0.5 rounded-full border"
-          :class="
-            socketStore.connected
-              ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
-              : 'bg-rose-500/10 text-rose-400 border-rose-500/30'
-          "
-        >
-          <span
-            class="w-1.5 h-1.5 rounded-full"
-            :class="socketStore.connected ? 'bg-emerald-400 animate-pulse' : 'bg-rose-400'"
-          ></span>
-          {{ socketStore.connected ? t("nav.live") : t("nav.off") }}
-        </span>
         <button
-          @click="mobileMenuOpen = !mobileMenuOpen"
-          class="p-2 rounded-lg bg-surface2 text-slate-300 hover:text-white"
-          aria-label="Toggle Menu"
+          @click="handleLogout"
+          class="p-2 rounded-lg text-slate-400 hover:text-rose-400 hover:bg-rose-500/10 transition-colors"
+          :title="t('nav.signOut')"
         >
-          <X v-if="mobileMenuOpen" class="w-5 h-5" />
-          <Menu v-else class="w-5 h-5" />
+          <LogOut class="w-4 h-4" />
         </button>
       </div>
     </header>
 
-    <!-- Mobile Drawer Overlay -->
-    <div
-      v-if="mobileMenuOpen"
-      @click="mobileMenuOpen = false"
-      class="fixed inset-0 bg-black/60 backdrop-blur-sm z-40 md:hidden"
-    ></div>
-
-    <!-- Sidebar -->
+    <!-- Desktop Sidebar (Hidden on mobile) -->
     <aside
-      class="fixed md:sticky top-0 left-0 z-50 h-screen w-64 bg-surface border-r border-slate-800/80 flex flex-col justify-between transition-transform duration-200 ease-in-out"
-      :class="mobileMenuOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'"
+      class="hidden md:flex sticky top-0 left-0 z-30 h-screen w-64 bg-surface border-r border-slate-800/80 flex-col justify-between shrink-0"
     >
       <div>
         <!-- Brand Header -->
-        <div class="hidden md:flex items-center justify-between px-4 py-5 border-b border-slate-800/80 gap-2">
+        <div class="flex items-center justify-between px-4 py-5 border-b border-slate-800/80 gap-2">
           <div class="flex items-center gap-2.5 min-w-0">
             <div
               class="w-9 h-9 rounded-xl bg-gradient-to-br from-accent/20 to-brand/20 border border-accent/30 flex items-center justify-center shadow-lg shadow-accent/10 shrink-0"
@@ -155,7 +155,6 @@ async function handleLogout() {
             v-for="item in navItems"
             :key="item.path"
             :to="item.path"
-            @click="mobileMenuOpen = false"
             class="flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium transition-all duration-150"
             :class="
               route.path === item.path
@@ -170,7 +169,6 @@ async function handleLogout() {
           <div class="pt-4 mt-4 border-t border-slate-800/80">
             <router-link
               to="/public"
-              @click="mobileMenuOpen = false"
               class="flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium text-slate-400 hover:text-cyan-300 hover:bg-slate-800/50 transition-all"
             >
               <Globe class="w-4 h-4" />
@@ -222,13 +220,47 @@ async function handleLogout() {
       </div>
     </aside>
 
-    <!-- Main Content with Keep-Alive Cache -->
-    <main class="flex-1 min-w-0 p-4 md:p-6 lg:p-8 max-w-[1600px] mx-auto w-full">
+    <!-- Main Content with Keep-Alive Cache (Extra pb-24 on mobile prevents bottom tab overlap) -->
+    <main class="flex-1 min-w-0 p-4 pb-24 md:pb-6 md:p-6 lg:p-8 max-w-[1600px] mx-auto w-full">
       <router-view v-slot="{ Component }">
         <keep-alive :include="cachedViews">
           <component :is="Component" />
         </keep-alive>
       </router-view>
     </main>
+
+    <!-- Mobile Native-Style Bottom Navigation Bar (Sticky fixed bottom, sleek glassmorphism) -->
+    <nav
+      class="md:hidden fixed bottom-0 left-0 right-0 z-40 bg-[#0d121c]/95 backdrop-blur border-t border-[#1e293b] pb-safe shadow-[0_-8px_24px_rgba(0,0,0,0.5)]"
+    >
+      <div class="grid grid-cols-5 items-center justify-around h-14 max-w-md mx-auto px-1">
+        <router-link
+          v-for="item in mobileNavItems"
+          :key="item.path"
+          :to="item.path"
+          class="flex flex-col items-center justify-center h-full relative group transition-colors duration-150"
+          :class="
+            route.path === item.path
+              ? 'text-[#00f090] font-semibold'
+              : 'text-slate-400 hover:text-slate-200'
+          "
+        >
+          <!-- Active Indicator Pill/Bar -->
+          <span
+            v-if="route.path === item.path"
+            class="absolute top-0 left-1/2 -translate-x-1/2 w-8 h-0.5 bg-[#00f090] rounded-full shadow-[0_0_8px_#00f090]"
+          ></span>
+
+          <component
+            :is="item.icon"
+            class="w-5 h-5 transition-transform duration-150 group-active:scale-90"
+            :class="route.path === item.path ? 'text-[#00f090]' : 'text-slate-400'"
+          />
+          <span class="text-[10px] mt-1 tracking-tight leading-none truncate max-w-full px-0.5">
+            {{ item.name }}
+          </span>
+        </router-link>
+      </div>
+    </nav>
   </div>
 </template>
