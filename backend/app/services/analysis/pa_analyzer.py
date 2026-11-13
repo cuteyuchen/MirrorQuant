@@ -5,11 +5,13 @@ import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
+from app.core.config import get_settings
 from app.services.proxy.manager import ProxyManager
 
 FAPI_PRIMARY = "https://www.binance.com"
 FAPI_FALLBACK = "https://fapi.binance.com"
 KLINE_TTL = {"1h": 60.0, "4h": 180.0}
+KLINE_TIMEFRAME_SECONDS = {"1h": 3600.0, "4h": 14400.0}
 
 
 def smart_px(v: Optional[float]) -> str:
@@ -79,7 +81,7 @@ def calc_rsi(closes: Sequence[float], period: int = 14) -> Optional[float]:
         avg_g = (avg_g * (period - 1) + gains[i]) / period
         avg_l = (avg_l * (period - 1) + losses[i]) / period
     if avg_l == 0:
-        return 100.0
+        return 50.0 if avg_g == 0 else 100.0
     rs = avg_g / avg_l
     return 100.0 - (100.0 / (1.0 + rs))
 
@@ -191,6 +193,22 @@ class PAAnalyzer:
     def __init__(self):
         self._kline_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
+    @staticmethod
+    def _data_as_of(candles: Sequence[Dict[str, float]]) -> Optional[int]:
+        # Binance's close time can be in the future for an open candle. Its open
+        # time is a conservative, source-provided timestamp for the observation.
+        if not candles or not candles[-1].get("ot"):
+            return None
+        return int(candles[-1]["ot"])
+
+    @classmethod
+    def _is_stale(cls, candles: Sequence[Dict[str, float]], interval: str, now: float) -> bool:
+        as_of = cls._data_as_of(candles)
+        if as_of is None or as_of > now * 1000:
+            return True
+        max_age = KLINE_TIMEFRAME_SECONDS[interval] * get_settings().pa_kline_max_staleness_multiplier
+        return now - as_of / 1000 > max_age
+
     async def fetch_klines(
         self,
         symbol: str,
@@ -202,7 +220,8 @@ class PAAnalyzer:
         ttl = KLINE_TTL.get(interval, 60.0)
         now = time.time()
         cached = self._kline_cache.get(key)
-        if cached and (now - cached["at"]) < ttl and len(cached["rows"]) >= 30:
+        if (cached and (now - cached["at"]) < ttl and len(cached["rows"]) >= 30
+                and not self._is_stale(cached["rows"], interval, now)):
             return cached["rows"]
 
         path = f"/fapi/v1/klines?symbol={quote(symbol)}&interval={interval}&limit={limit}"
@@ -233,6 +252,8 @@ class PAAnalyzer:
                 except Exception:
                     await asyncio.sleep(0.25 * (attempt + 1))
 
+        # Analysis below exposes the source timestamp and staleness when the
+        # upstream is unavailable; a cache hit never advances that timestamp.
         return cached["rows"] if cached else []
 
     def analyze_from_candles(
@@ -251,7 +272,11 @@ class PAAnalyzer:
         if len(c1h) < 60 or len(c4h) < 56:
             return {"ok": False, "reason": "kline_unavailable"}
 
-        px = float(current_price) if current_price else c1h[-1]["c"]
+        now = time.time()
+        stale = self._is_stale(c1h, "1h", now) or self._is_stale(c4h, "4h", now)
+        timestamps = [self._data_as_of(c1h), self._data_as_of(c4h)]
+        as_of = min(timestamps) if all(t is not None for t in timestamps) else None
+        px = float(current_price) if current_price and not stale else c1h[-1]["c"]
         closes_1h_live = [c["c"] for c in c1h[:-1]] + [px]
         closes_4h_live = [c["c"] for c in c4h[:-1]] + [px]
 
@@ -263,6 +288,8 @@ class PAAnalyzer:
         atr_1h = calc_atr(c1h[:-1], 14) or (px * 0.01)
         rsi_1h = calc_rsi(closes_1h_live, 14)
         rsi_4h = calc_rsi(closes_4h_live, 14)
+        display_rsi_1h = rsi_1h if rsi_1h is not None else 50
+        display_rsi_4h = rsi_4h if rsi_4h is not None else 50
 
         win24 = c1h[-24:]
         win72 = c1h[-72:]
@@ -359,7 +386,7 @@ class PAAnalyzer:
         summary = (
             f"Entry {smart_px(avg_entry)} at {entry_pct:.0f}% of 72H range ({entry_zone}, "
             f"{entry_vs_ema21_atr:+.1f} ATR vs 1H EMA21); {trend_align} "
-            f"(1H {t1_label} / 4H {t4_label}, RSI {rsi_1h or 50:.0f}/{rsi_4h or 50:.0f}). "
+            f"(1H {t1_label} / 4H {t4_label}, RSI {display_rsi_1h:.0f}/{display_rsi_4h:.0f}). "
             f"Invalidation {smart_px(invalidation)}, T1 {smart_px(target1)}, T2 {smart_px(target2)}."
         )
         edge_txt_zh = f"当前浮盈 {edge_pct:.2f}%" if edge_pct >= 0 else f"当前浮亏 {abs(edge_pct):.2f}%"
@@ -373,7 +400,7 @@ class PAAnalyzer:
         summary_zh = (
             f"均价 {smart_px(avg_entry)} 处于近 72H 区间 {entry_pct:.0f}% 分位（{entry_zone_zh}，"
             f"相对 1H EMA21 偏离 {entry_vs_ema21_atr:+.1f} ATR）{scale_note_zh}；{edge_txt_zh}。"
-            f"{trend_align_zh}（1H {t1_zh} / 4H {t4_zh}，RSI {rsi_1h or 50:.0f}/{rsi_4h or 50:.0f}）{fvg_zh}；"
+            f"{trend_align_zh}（1H {t1_zh} / 4H {t4_zh}，RSI {display_rsi_1h:.0f}/{display_rsi_4h:.0f}）{fvg_zh}；"
             f"客观防守失效参考 {smart_px(invalidation)}，第一目标 {smart_px(target1)} / 次级 {smart_px(target2)}（仅作 K 线结构参考，不构成投资建议）。"
         )
 
@@ -429,7 +456,9 @@ class PAAnalyzer:
             "scalingDescZh": scaling_desc_zh,
             "summary": summary,
             "summaryZh": summary_zh,
-            "analyzedAt": int(time.time() * 1000),
+            "stale": stale,
+            "asOf": as_of,
+            "analyzedAt": as_of,
         }
 
     async def analyze_position(

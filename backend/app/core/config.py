@@ -10,7 +10,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Callable, List, Optional
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -87,6 +87,7 @@ class Settings(BaseSettings):
     enable_background_engine: bool = True
     default_lead_poll_sec: int = 15
     price_tick_sec: int = 5
+    pa_kline_max_staleness_multiplier: float = Field(default=3.0, gt=0, allow_inf_nan=False)
 
     @field_validator("cors_origins", mode="before")
     @classmethod
