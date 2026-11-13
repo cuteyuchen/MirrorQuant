@@ -16,7 +16,7 @@ from app.schemas.api import AccountCreate, AccountUpdate
 from app.services.adapters.factory import create_exchange_adapter
 from app.services.engine.orchestrator import orchestrator
 from app.services.engine.serialization import serialized_execution
-from app.services.proxy.manager import ProxyManager
+from app.services.proxy.manager import ProxyEgressError, ProxyManager
 
 router = APIRouter(prefix="/api/accounts", tags=["accounts"])
 
@@ -181,7 +181,10 @@ async def test_account_connectivity(
     vault = CredentialVault()
     creds = vault.decrypt_dict(acct.encrypted_credentials)
     proxies = list((await db.scalars(select(ProxyNode).order_by(ProxyNode.priority))).all())
-    proxy_url = ProxyManager.select_proxy_url(proxies, acct.proxy_id) if acct.proxy_id is not None else None
+    try:
+        proxy_url = ProxyManager.select_proxy_url(proxies, acct.proxy_id)
+    except ProxyEgressError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     adapter = create_exchange_adapter(
         exchange=acct.exchange,
         credentials=creds,

@@ -11,10 +11,11 @@ from app.api.deps import get_current_user, record_audit
 from app.api.exposure import require_binding_flat
 from app.core.database import get_db
 from app.core.secret_mask import redact_proxy_userinfo
-from app.models.domain import CopyBinding, LeadSource, User
+from app.models.domain import CopyBinding, LeadSource, ProxyNode, User
 from app.schemas.api import LeadCreate, LeadUpdate
 from app.services.engine.orchestrator import orchestrator
 from app.services.engine.serialization import serialized_execution
+from app.services.proxy.manager import ProxyEgressError, ProxyManager
 
 router = APIRouter(prefix="/api/leads", tags=["leads"])
 
@@ -184,25 +185,31 @@ async def analyze_lead_symbol(
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
 
+    proxies = list((await db.scalars(select(ProxyNode).order_by(ProxyNode.priority))).all())
+    try:
+        proxy_url = ProxyManager.select_proxy_url(proxies, lead.proxy_id)
+    except ProxyEgressError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
     if symbol and avg_entry:
-        res = await orchestrator.pa_analyzer.analyze_position(symbol.upper(), position_side.upper(), avg_entry)
+        res = await orchestrator.pa_analyzer.analyze_position(
+            symbol.upper(), position_side.upper(), avg_entry, proxy_url=proxy_url,
+        )
         return {"items": [res]}
 
     snap = json.loads(lead.snapshot_json) if lead.snapshot_json else {}
     items = []
     for p in snap.get("openPositions") or []:
-        if p.get("analysis"):
-            items.append(p["analysis"])
-        else:
-            items.append(
-                await orchestrator.pa_analyzer.analyze_position(
-                    p["symbol"],
-                    p["positionSide"],
-                    p.get("avgEntry"),
-                    current_price=p.get("currentPrice"),
-                    entry_orders=p.get("entryOrders"),
-                )
+        items.append(
+            await orchestrator.pa_analyzer.analyze_position(
+                p["symbol"],
+                p["positionSide"],
+                p.get("avgEntry"),
+                current_price=p.get("currentPrice"),
+                entry_orders=p.get("entryOrders"),
+                proxy_url=proxy_url,
             )
+        )
     return {"items": items}
 
 

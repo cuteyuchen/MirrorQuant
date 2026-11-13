@@ -6,7 +6,12 @@ from typing import Optional, Sequence
 
 import httpx
 
+from app.core.config import get_settings
 from app.models.domain import ProxyNode
+
+
+class ProxyEgressError(RuntimeError):
+    """No permitted healthy egress route is available."""
 
 
 @dataclass
@@ -33,6 +38,8 @@ class ProxyManager:
         timeout: float = 15.0,
         headers: Optional[dict] = None,
     ) -> httpx.AsyncClient:
+        if not proxy_url and not get_settings().allow_direct_egress:
+            raise ProxyEgressError("Direct egress is disabled; configure a healthy proxy or enable MQ_ALLOW_DIRECT_EGRESS")
         merged_headers = dict(ProxyManager.DEFAULT_HEADERS)
         if headers:
             merged_headers.update(headers)
@@ -50,33 +57,18 @@ class ProxyManager:
         nodes: Sequence[ProxyNode],
         preferred_proxy_id: Optional[int] = None,
     ) -> Optional[str]:
-        enabled = [n for n in nodes if n.is_enabled]
-        if preferred_proxy_id is not None:
-            for n in enabled:
-                if n.id == preferred_proxy_id:
-                    return n.url
-        healthy = sorted(
-            [n for n in enabled if n.is_healthy],
-            key=lambda n: (n.priority, n.latency_ms if n.latency_ms is not None else 99999.0),
-        )
-        if healthy:
-            return healthy[0].url
-        if enabled:
-            fallback = sorted(enabled, key=lambda n: n.priority)
-            return fallback[0].url
-        return None
+        return ProxyManager.ordered_proxy_urls(nodes, preferred_proxy_id)[0]
 
     @staticmethod
     def ordered_proxy_urls(
         nodes: Sequence[ProxyNode],
         preferred_proxy_id: Optional[int] = None,
-        include_direct_fallback: bool = True,
     ) -> list[Optional[str]]:
         enabled = [n for n in nodes if n.is_enabled]
         ordered: list[Optional[str]] = []
         if preferred_proxy_id is not None:
             for n in enabled:
-                if n.id == preferred_proxy_id and n.url not in ordered:
+                if n.id == preferred_proxy_id and n.is_healthy and n.url not in ordered:
                     ordered.append(n.url)
         healthy = sorted(
             [n for n in enabled if n.is_healthy],
@@ -85,11 +77,10 @@ class ProxyManager:
         for n in healthy:
             if n.url not in ordered:
                 ordered.append(n.url)
-        for n in sorted(enabled, key=lambda x: x.priority):
-            if n.url not in ordered:
-                ordered.append(n.url)
-        if include_direct_fallback or not ordered:
+        if get_settings().allow_direct_egress:
             ordered.append(None)
+        if not ordered:
+            raise ProxyEgressError("No healthy enabled proxy is available and direct egress is disabled")
         return ordered
 
     @classmethod
