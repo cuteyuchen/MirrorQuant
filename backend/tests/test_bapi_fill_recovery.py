@@ -301,17 +301,21 @@ async def test_consecutive_failures_have_error_log_outbox_and_degraded_readiness
 
 
 @pytest.mark.asyncio
-async def test_recovery_resets_failure_incident_and_rearms_notification():
+async def test_recovery_resets_failure_incident_and_rearms_notification(monkeypatch):
     async with get_session_factory()() as db:
         lead = await make_lead(db, status="running")
         monitor = EngineOrchestrator()
         now = int(datetime.now(timezone.utc).timestamp() * 1000)
         assert await monitor._record_lead_sync_failure(db, lead, now, "test failure")
+        first_notice = await db.scalar(select(NotificationOutbox))
+        # Recovery starts after the failure notification has been persisted.
+        now = int(first_notice.created_at.replace(tzinfo=timezone.utc).timestamp() * 1000)
         snap = {"meta": {"generatedAt": now + 1}, "openPositions": [], "openPositionsMeta": {
             "asOf": now + 1, "authoritative": True, "complete": True, "positionShow": True, "source": "api"}}
         assert await monitor._publish_lead_snapshot(db, lead, snap, {}, now + 1)
         assert not (json.loads(lead.snapshot_json)["openPositionsMeta"]).get("consecutiveSyncFailures")
-        next_started = int(datetime.now(timezone.utc).timestamp() * 1000) + 1
+        next_started = now + 2
+        monkeypatch.setattr("app.services.engine.orchestrator.time.time", lambda: next_started / 1000)
         assert await monitor._record_lead_sync_failure(db, lead, next_started, "test next incident")
         assert len(list((await db.scalars(select(NotificationOutbox))).all())) == 1
         assert json.loads(lead.snapshot_json)["openPositionsMeta"]["consecutiveSyncFailures"] == 1

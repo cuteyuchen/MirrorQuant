@@ -338,6 +338,44 @@ async def test_event_key_survives_lost_snapshot_flags_and_orchestrator_restart(m
 
 
 @pytest.mark.asyncio
+async def test_frozen_clock_success_then_failure_is_recorded(monitor, clock, monkeypatch):
+    clock.now = 1_700_000_000.125
+    started_ms = int(clock.now * 1000)
+
+    class AheadDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls.fromtimestamp(clock.now + 0.008, tz=tz)
+
+    # Reproduce the independent datetime clock being ahead without real time.
+    monkeypatch.setattr("app.services.engine.orchestrator.datetime", AheadDatetime)
+    async with get_session_factory()() as db:
+        lead = await make_lead(
+            db, clock, last_sync_at=datetime.fromtimestamp(clock.now - 60, tz=timezone.utc),
+        )
+        success = await monitor.sync_lead(db, lead, proxies=[])
+        assert success["ok"] is True and not success.get("superseded")
+
+        monitor.collector.fetch_order_history.side_effect = RuntimeError("history unavailable")
+        failure = await monitor.sync_lead(db, lead, proxies=[])
+        assert failure["ok"] is False and not failure.get("superseded")
+        snapshot = json.loads(lead.snapshot_json)
+        assert snapshot["openPositionsMeta"]["consecutiveSyncFailures"] == 1
+        assert lead.status == "error" and "history unavailable" in lead.last_error
+        assert lead.last_sync_at.replace(tzinfo=timezone.utc) == datetime.fromtimestamp(
+            started_ms / 1000, tz=timezone.utc,
+        )
+
+        # Legacy snapshots without generatedAt retain the successful attempt time.
+        snapshot["meta"].pop("generatedAt")
+        freshness = lead_freshness(lead, snapshot)
+        assert freshness["generatedAt"] == started_ms
+        assert freshness["snapshotAgeSec"] == 0
+        assert freshness["stale"] is True
+        assert freshness["consecutiveSyncFailures"] == 1
+
+
+@pytest.mark.asyncio
 async def test_full_detail_recovery_clears_failure_state_and_rearms_alert(monitor, clock):
     async with get_session_factory()() as db:
         lead = await make_lead(db, clock)

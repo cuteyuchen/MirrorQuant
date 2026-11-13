@@ -447,7 +447,8 @@ class EngineOrchestrator:
         else:
             # last_sync_at records full recovery, so a partial publication cannot
             # rearm an already delivered (or failed) outbox incident.
-            lead.last_sync_at = datetime.now(timezone.utc)
+            # Use the attempt clock so subsequent failures are not falsely superseded.
+            lead.last_sync_at = datetime.fromtimestamp(started_ms / 1000, tz=timezone.utc)
             lead.last_error = None
         lead.status = "running"
 
