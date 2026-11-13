@@ -32,3 +32,13 @@ backend/static/
 *.log
 *.tmp
 .DS_Store
+*.orig
+*.rej
+
+# Internal audit artifacts (never publish: contain infra details and secrets)
+CODEX_AUDIT_REPORT.md
+CODEX_AUDIT_PROMPT.md
+codex_audit_output.txt
+*_AUDIT_REPORT.md
+*_AUDIT_PROMPT.md
+codex_audit_*.txt
