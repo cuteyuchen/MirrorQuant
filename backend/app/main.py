@@ -4,14 +4,17 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import select
 
 from app.api import accounts, auth, bindings, dashboard, leads, proxies, settings as settings_api, ws
 from app.core.config import get_settings
-from app.core.database import init_db
+from app.core.database import get_session_factory, init_db
+from app.core.security import CredentialVault
+from app.models.domain import TradingAccount, User
 from app.services.engine.orchestrator import orchestrator
 
 settings = get_settings()
@@ -23,7 +26,22 @@ logging.basicConfig(
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    # Provision local keys only before a new database is created. An existing
+    # database with a missing key requires restoring its original key.
+    settings.resolved_master_key()
+    settings.resolved_jwt_secret()
     await init_db()
+    vault = CredentialVault()
+    async with get_session_factory()() as db:
+        try:
+            for encrypted in await db.scalars(select(TradingAccount.encrypted_credentials)):
+                vault.decrypt_dict(encrypted)
+            for user in await db.scalars(select(User)):
+                for encrypted in (user.totp_secret_enc, user.totp_pending_secret_enc):
+                    if encrypted:
+                        vault.decrypt_string(encrypted)
+        except Exception as exc:
+            raise RuntimeError("Stored credentials cannot be decrypted; restore the correct master key") from exc
     if settings.enable_background_engine:
         await orchestrator.start()
     try:
@@ -48,6 +66,12 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    @app.middleware("http")
+    async def strip_mq_prefix(request, call_next):
+        if request.url.path.startswith("/mq/api/"):
+            request.scope["path"] = request.url.path[3:]  # strip /mq
+        return await call_next(request)
+
     app.include_router(auth.router)
     app.include_router(dashboard.router)
     app.include_router(leads.router)
@@ -69,10 +93,13 @@ def create_app() -> FastAPI:
 
         @app.get("/{full_path:path}")
         async def spa_fallback(full_path: str):
-            candidate = static_dir / full_path
-            if full_path and candidate.exists() and candidate.is_file():
+            root = static_dir.resolve()
+            candidate = (root / full_path).resolve()
+            if not candidate.is_relative_to(root):
+                raise HTTPException(status_code=404, detail="Not found")
+            if full_path and candidate.is_file():
                 return FileResponse(str(candidate))
-            return FileResponse(str(static_dir / "index.html"))
+            return FileResponse(str(root / "index.html"))
 
     return app
 

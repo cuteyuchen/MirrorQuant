@@ -5,6 +5,7 @@ import {
   AlertOctagon,
   ArrowDownRight,
   ArrowUpRight,
+  Calculator,
   RefreshCw,
   ShieldAlert,
   TrendingUp,
@@ -15,12 +16,15 @@ import { api } from "@/api/client";
 import { useSocketStore } from "@/stores/socket";
 import { useDataCacheStore } from "@/stores/dataCache";
 import { useI18n } from "@/i18n";
+import PositionCalculatorCard from "@/components/PositionCalculatorCard.vue";
 
 defineOptions({ name: "DashboardView" });
 
 const socketStore = useSocketStore();
 const cache = useDataCacheStore();
 const { t, isZh } = useI18n();
+
+const showLeadCalculator = ref(false);
 
 const loading = ref(!cache.overview);
 const data = ref<any>(
@@ -239,7 +243,29 @@ function statusBadge(status: string) {
         <div class="rounded-2xl bg-surface border border-slate-800/80 overflow-hidden">
           <div class="px-5 py-4 border-b border-slate-800/80 flex items-center justify-between">
             <h3 class="text-sm font-semibold text-white">{{ t("dash.monitoredLeadPos") }}</h3>
-            <span class="text-xs font-mono text-slate-400">{{ t("dash.activeCount", { n: data.leadPositions.length }) }}</span>
+            <div class="flex items-center gap-2">
+              <span class="text-xs font-mono text-slate-400">{{ t("dash.activeCount", { n: data.leadPositions.length }) }}</span>
+              <button
+                v-if="data.leadPositions.length > 0"
+                type="button"
+                @click="showLeadCalculator = !showLeadCalculator"
+                class="px-2.5 py-1 rounded-lg text-xs font-mono font-medium flex items-center gap-1.5 border transition-all cursor-pointer"
+                :class="
+                  showLeadCalculator
+                    ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/50'
+                    : 'bg-surface2/80 hover:bg-slate-700 text-slate-300 border-slate-700'
+                "
+              >
+                <Calculator class="w-3.5 h-3.5 text-cyan-400" />
+                <span>{{ showLeadCalculator ? (isZh ? '收起测算' : 'Hide Calc') : (isZh ? '开仓测算' : 'Calculator') }}</span>
+              </button>
+            </div>
+          </div>
+          <div v-if="showLeadCalculator" class="p-4 border-b border-slate-800/80 bg-slate-900/60">
+            <PositionCalculatorCard
+              :open-positions="data.leadPositions"
+              :compact="true"
+            />
           </div>
           <div v-if="data.leadPositions.length === 0" class="p-8 text-center text-xs text-slate-500">
             {{ t("dash.noLeadPos") }}

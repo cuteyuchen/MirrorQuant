@@ -8,10 +8,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, record_audit
+from app.api.exposure import require_binding_flat
 from app.core.database import get_db
-from app.models.domain import LeadSource, User
+from app.models.domain import CopyBinding, LeadSource, User
 from app.schemas.api import LeadCreate, LeadUpdate
 from app.services.engine.orchestrator import orchestrator
+from app.services.engine.serialization import serialized_execution
 
 router = APIRouter(prefix="/api/leads", tags=["leads"])
 
@@ -94,6 +96,7 @@ async def create_lead(
 
 
 @router.put("/{lead_id}")
+@serialized_execution
 async def update_lead(
     lead_id: int,
     payload: LeadUpdate,
@@ -115,6 +118,7 @@ async def update_lead(
 
 
 @router.delete("/{lead_id}")
+@serialized_execution
 async def delete_lead(
     lead_id: int,
     request: Request,
@@ -124,6 +128,11 @@ async def delete_lead(
     lead = await db.get(LeadSource, lead_id)
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
+    if lead.is_enabled:
+        raise HTTPException(status_code=409, detail="Disable the lead and drain exposure before deletion")
+    bindings = list((await db.scalars(select(CopyBinding).where(CopyBinding.lead_id == lead_id))).all())
+    for binding in bindings:
+        await require_binding_flat(db, binding, deleting=True)
     name = lead.name
     await db.delete(lead)
     await record_audit(db, "DELETE_LEAD", "lead", str(lead_id), f"Deleted lead {name}", current_user, request)

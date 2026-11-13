@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
@@ -17,7 +18,10 @@ from app.models.domain import CopyBinding, LeadSource, ProxyNode, TradingAccount
 from app.services.adapters.factory import create_exchange_adapter
 from app.services.analysis.pa_analyzer import PAAnalyzer
 from app.services.engine.router import CopyRouter
-from app.services.lead_collector.binance_bapi import BinanceBapiCollector
+from app.services.engine.risk import RiskEngine
+from app.services.engine.serialization import serialized_execution
+from app.services.engine.sizer import exact
+from app.services.lead_collector.binance_bapi import BinanceBapiCollector, STORE_MAX, is_authoritative_snapshot
 from app.services.proxy.manager import ProxyManager
 
 logger = logging.getLogger("mirrorquant.orchestrator")
@@ -26,32 +30,37 @@ logger = logging.getLogger("mirrorquant.orchestrator")
 class WebSocketHub:
     def __init__(self):
         self._clients: Set[WebSocket] = set()
+        self._validators = {}
         self._lock = asyncio.Lock()
 
-    async def connect(self, ws: WebSocket) -> None:
+    async def connect(self, ws: WebSocket, validator=None) -> None:
         await ws.accept()
         async with self._lock:
             self._clients.add(ws)
+            self._validators[ws] = validator
 
     async def disconnect(self, ws: WebSocket) -> None:
         async with self._lock:
             self._clients.discard(ws)
+            self._validators.pop(ws, None)
 
     async def broadcast(self, message: Dict[str, Any]) -> None:
         async with self._lock:
             clients = list(self._clients)
         if not clients:
             return
-        dead: List[WebSocket] = []
-        for ws in clients:
+        async def send(ws: WebSocket) -> None:
             try:
-                await ws.send_json(message)
+                validator = self._validators.get(ws)
+                if validator is None or not await asyncio.wait_for(validator(), timeout=1.0):
+                    await asyncio.wait_for(ws.close(code=1008), timeout=1.0)
+                    await self.disconnect(ws)
+                    return
+                await asyncio.wait_for(ws.send_json(message), timeout=1.0)
             except Exception:
-                dead.append(ws)
-        if dead:
-            async with self._lock:
-                for ws in dead:
-                    self._clients.discard(ws)
+                await self.disconnect(ws)
+
+        await asyncio.gather(*(send(ws) for ws in clients))
 
 
 class EngineOrchestrator:
@@ -65,6 +74,7 @@ class EngineOrchestrator:
         self.router = CopyRouter(vault=self.vault, broadcast_fn=self.ws_hub.broadcast)
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        self._risk_task: Optional[asyncio.Task] = None
         self._last_lead_poll: Dict[int, float] = {}
         self._last_full_sweep: Dict[int, float] = {}
         self._last_account_poll: Dict[int, float] = {}
@@ -76,18 +86,27 @@ class EngineOrchestrator:
             return
         self._running = True
         self._task = asyncio.create_task(self._loop(), name="mirrorquant-orchestrator")
+        self._risk_task = asyncio.create_task(self._risk_loop(), name="mirrorquant-risk-monitor")
         logger.info("EngineOrchestrator background loop started")
 
     async def stop(self) -> None:
         self._running = False
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-            self._task = None
+        tasks = [task for task in (self._task, self._risk_task) if task is not None]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._task = self._risk_task = None
         logger.info("EngineOrchestrator stopped")
+
+    async def _risk_loop(self) -> None:
+        while self._running:
+            try:
+                await self.risk_tick()
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Independent risk monitor failed")
+            await asyncio.sleep(2.0)
 
     async def _loop(self) -> None:
         while self._running:
@@ -115,77 +134,99 @@ class EngineOrchestrator:
             reconcile_sec = max(15, int(resilience_cfg.get("reconcile_interval_sec", 60)))
 
             now = time.time()
-            for lead in leads:
-                last = self._last_lead_poll.get(lead.id, 0.0)
-                if now - last >= max(5, lead.poll_interval_sec):
-                    self._last_lead_poll[lead.id] = now
-                    await self.sync_lead(db, lead, proxies)
-
+            # Refresh account health and calibrate clocks before admitting lead work.
             for account in accounts:
                 last = self._last_account_poll.get(account.id, 0.0)
                 if now - last >= 15.0:
                     self._last_account_poll[account.id] = now
                     await self.sync_account(db, account, proxies, resilience_cfg=resilience_cfg)
 
-            # Periodic position reconciliation & software TP/SL guard checks
-            bindings = list(
-                (await db.scalars(select(CopyBinding).where(CopyBinding.is_enabled == True))).all()  # noqa: E712
-            )
-            for b in bindings:
-                if not b.baseline_seeded:
-                    continue
-                last_rec = self._last_reconcile.get(b.id, 0.0)
-                if now - last_rec < reconcile_sec:
-                    continue
-                self._last_reconcile[b.id] = now
-                lead = next((l for l in leads if l.id == b.lead_id), None)
-                acct = next((a for a in accounts if a.id == b.account_id), None)
-                if not lead or not acct or not lead.snapshot_json:
-                    continue
+            for lead in leads:
+                last = self._last_lead_poll.get(lead.id, 0.0)
+                if now - last >= max(5, lead.poll_interval_sec):
+                    self._last_lead_poll[lead.id] = now
+                    await self.sync_lead(db, lead, proxies)
+
+    async def risk_tick(self) -> None:
+        """Protect owned exposure even while ingestion fails or entry controls are disabled."""
+        factory = get_session_factory()
+        async with factory() as db:
+            binding_ids = list((await db.scalars(select(CopyBinding.id))).all())
+        semaphore = asyncio.Semaphore(4)
+
+        async def check_binding(binding_id: int) -> None:
+            async with semaphore, factory() as db:
                 try:
-                    snap = json.loads(lead.snapshot_json)
-                    lead_open = snap.get("openPositions") or []
-                    creds = self.vault.decrypt_dict(acct.encrypted_credentials)
-                    proxy_url = (
-                        ProxyManager.select_proxy_url(proxies, acct.proxy_id)
-                        if acct.proxy_id is not None
-                        else None
-                    )
+                    binding = await db.get(CopyBinding, binding_id)
+                    if binding is None:
+                        return
+                    lead = await db.get(LeadSource, binding.lead_id)
+                    account = await db.get(TradingAccount, binding.account_id)
+                    if lead is None or account is None:
+                        return
+                    proxies = list((await db.scalars(select(ProxyNode).order_by(ProxyNode.priority))).all())
+                    resilience_cfg = await self.router._get_config(db, "resilience", DEFAULT_SYSTEM_CONFIG["resilience"])
+                    credentials = self.vault.decrypt_dict(account.encrypted_credentials)
+                    proxy_url = ProxyManager.select_proxy_url(proxies, account.proxy_id) if account.proxy_id is not None else None
                     adapter = create_exchange_adapter(
-                        exchange=acct.exchange,
-                        credentials=creds,
-                        environment=acct.environment,
-                        proxy_url=proxy_url,
-                        margin_mode=acct.margin_mode,
-                        position_mode=acct.position_mode,
+                        exchange=account.exchange, credentials=credentials,
+                        environment=account.environment, proxy_url=proxy_url,
+                        margin_mode=account.margin_mode, position_mode=account.position_mode,
                     )
-                    adapter._time_offset_ms = int(getattr(acct, "clock_offset_ms", 0) or 0)
-                    live_pos = await adapter.get_positions()
-                    instruments = await adapter.get_instruments()
+                    adapter._time_offset_ms = int(getattr(account, "clock_offset_ms", 0) or 0)
+                    await db.commit()
+                    live_positions, instruments = await asyncio.wait_for(
+                        asyncio.gather(adapter.get_positions(), adapter.get_instruments()), timeout=20.0
+                    )
+                    await self._check_account_equity(db, binding, account, adapter)
                     await self.router.check_position_guards(
-                        db=db,
-                        lead=lead,
-                        account=acct,
-                        binding=b,
-                        adapter=adapter,
-                        local_positions=live_pos,
-                        instruments=instruments,
+                        db=db, lead=lead, account=account, binding=binding, adapter=adapter,
+                        local_positions=live_positions, instruments=instruments,
                     )
-                    if lead.position_show is not False:
+                    now = time.time()
+                    interval = max(15, int(resilience_cfg.get("reconcile_interval_sec", 60)))
+                    snapshot = json.loads(lead.snapshot_json or "{}")
+                    if lead.status == "running" and now - self._last_reconcile.get(binding.id, 0.0) >= interval and is_authoritative_snapshot(snapshot):
+                        self._last_reconcile[binding.id] = now
+                        # Guard orders may have changed physical exposure.
+                        live_positions = await adapter.get_positions()
                         await self.router.reconcile_orphan_positions(
-                            db=db,
-                            lead=lead,
-                            account=acct,
-                            binding=b,
-                            adapter=adapter,
-                            lead_open_positions=lead_open,
-                            local_positions=live_pos,
-                            instruments=instruments,
-                            resilience_cfg=resilience_cfg,
+                            db=db, lead=lead, account=account, binding=binding, adapter=adapter,
+                            lead_open_positions=snapshot["openPositions"], local_positions=live_positions,
+                            instruments=instruments, resilience_cfg=resilience_cfg,
                         )
                     await db.commit()
-                except Exception as exc:
-                    logger.debug("Reconcile/guard tick skipped for binding %s: %s", b.id, exc)
+                except Exception:
+                    await db.rollback()
+                    logger.exception("Risk monitor failed for binding %s", binding_id)
+
+        await asyncio.gather(*(check_binding(binding_id) for binding_id in binding_ids))
+
+    @serialized_execution
+    async def _check_account_equity(self, db: AsyncSession, binding: CopyBinding, account: TradingAccount, adapter: Any) -> None:
+        """Continuously latch configured loss breakers; protection remains active."""
+        balance = await asyncio.wait_for(adapter.get_usdt_balance(), timeout=15.0)
+        await db.refresh(binding)
+        await db.refresh(account)
+        if not math.isfinite(balance.eq) or not math.isfinite(balance.avail_eq):
+            binding.circuit_breaker_tripped = True
+            binding.circuit_breaker_reason = "Invalid exchange account equity; entries suspended"
+            await db.commit()
+            return
+        account.hwm_equity = max(account.hwm_equity, balance.eq)
+        CopyRouter._refresh_day_start(account, balance.eq)
+        account.usdt_equity = balance.eq
+        account.avail_equity = balance.avail_eq
+        checks = (
+            RiskEngine.check_drawdown(account.hwm_equity, balance.eq, binding.max_drawdown_pct),
+            RiskEngine.check_daily_loss(account.day_start_equity, balance.eq, binding.daily_max_loss_pct),
+        )
+        for result in checks:
+            if not result.allowed:
+                binding.circuit_breaker_tripped = True
+                binding.circuit_breaker_reason = result.reason
+                break
+        await db.commit()
 
     async def sync_lead(
         self,
@@ -193,6 +234,7 @@ class EngineOrchestrator:
         lead: LeadSource,
         proxies: Optional[List[ProxyNode]] = None,
     ) -> Dict[str, Any]:
+        started_ms = int(time.time() * 1000)
         if proxies is None:
             proxies = list((await db.scalars(select(ProxyNode).order_by(ProxyNode.priority))).all())
 
@@ -205,27 +247,102 @@ class EngineOrchestrator:
         last_err: Optional[Exception] = None
         for p_url in proxy_urls:
             try:
-                snapshot = await self.collector.sync_snapshot(
-                    portfolio_id=lead.portfolio_id,
-                    orders_store=orders_store,
-                    closed_cache=closed_cache,
-                    proxy_url=p_url,
-                    full_sweep=full_sweep,
-                    with_analysis=True,
+                snapshot = await asyncio.wait_for(
+                    self.collector.sync_snapshot(
+                        portfolio_id=lead.portfolio_id,
+                        orders_store=orders_store,
+                        closed_cache=closed_cache,
+                        proxy_url=p_url,
+                        full_sweep=full_sweep,
+                        with_analysis=False,
+                    ),
+                    timeout=30.0,
                 )
                 break
             except Exception as exc:
                 last_err = exc
 
         if snapshot is None:
-            lead.status = "error"
-            lead.last_error = str(last_err)[:480] if last_err else "Sync failed"
-            await db.commit()
-            return {"ok": False, "error": lead.last_error}
+            error = str(last_err)[:480] if last_err else "Sync failed"
+            published = await self._record_lead_sync_failure(db, lead, started_ms, error)
+            return {"ok": False, "error": error, "superseded": not published}
 
         if full_sweep:
             self._last_full_sweep[lead.id] = time.time()
 
+        if not await self._publish_lead_snapshot(db, lead, snapshot, orders_store, started_ms):
+            return {"ok": True, "superseded": True}
+
+        if is_authoritative_snapshot(snapshot):
+            await self.router.process_lead_events(
+                db=db,
+                lead=lead,
+                raw_orders=list(orders_store.values()),
+                raw_closed=(snapshot.get("closed") or []) if (snapshot.get("meta") or {}).get("closedHistoryComplete") else [],
+                snapshot=snapshot,
+                proxies=proxies,
+            )
+        else:
+            logger.warning("Lead %s snapshot is unverified; financial routing deferred", lead.id)
+
+        await self.ws_hub.broadcast(
+            {
+                "type": "lead_update",
+                "leadId": lead.id,
+                "name": lead.name,
+                "marginBalance": lead.margin_balance,
+                "openPositions": snapshot.get("openPositions", []),
+                "summary": snapshot.get("openPositionsSummary", {}),
+                "updatedAt": int(time.time() * 1000),
+            }
+        )
+        return {"ok": True, "snapshot": snapshot}
+
+    @serialized_execution
+    async def _record_lead_sync_failure(self, db: AsyncSession, lead: LeadSource, started_ms: int, error: str) -> bool:
+        await db.refresh(lead)
+        last_sync_ms = lead.last_sync_at.replace(tzinfo=timezone.utc).timestamp() * 1000 if lead.last_sync_at else 0
+        if last_sync_ms > started_ms:
+            return False
+        current = json.loads(lead.snapshot_json or "{}")
+        meta = current.setdefault("openPositionsMeta", {})
+        if (meta.get("lastFailureStartedAtMs") or 0) > started_ms:
+            return False
+        meta.update(authoritative=False, complete=False, lastFailureStartedAtMs=started_ms)
+        lead.snapshot_json = json.dumps(current, separators=(",", ":"))
+        lead.status = "error"
+        lead.last_error = error
+        await db.commit()
+        return True
+
+    @serialized_execution
+    async def _publish_lead_snapshot(self, db: AsyncSession, lead: LeadSource,
+                                    snapshot: Dict[str, Any], orders_store: Dict[str, Any], started_ms: int) -> bool:
+        """Publish observation times monotonically in a short transaction after collection."""
+        await db.refresh(lead)
+        current = json.loads(lead.snapshot_json or "{}")
+        current_meta = current.get("openPositionsMeta") or {}
+        current_observed = max(current_meta.get("asOf") or 0, current_meta.get("lastFailureStartedAtMs") or 0,
+                               (current.get("meta") or {}).get("collectionStartedAtMs") or 0)
+        incoming_observed = (snapshot.get("openPositionsMeta") or {}).get("asOf") or 0
+        if (incoming_observed and current_observed > incoming_observed) or (
+            not incoming_observed and current_observed > started_ms
+        ):
+            return False
+        # Concurrent collectors can start from different stores. Keep every observed
+        # cumulative fill until per-binding ingestion has durably acknowledged it.
+        merged = json.loads(lead.orders_store_json or "{}")
+        for key, record in orders_store.items():
+            previous = merged.get(key)
+            if previous is None or exact(record.get("q") or 0) >= exact(previous.get("q") or 0):
+                merged[key] = record
+            for legacy_key in [*(record.get("legacySourceKeys") or []), *(record.get("legacyKeys") or [])]:
+                if legacy_key != key:
+                    merged.pop(legacy_key, None)
+        orders_store.clear()
+        retained = sorted(merged.values(), key=lambda record: (record.get("ot") or record.get("t") or 0, record.get("h") or ""))[-STORE_MAX:]
+        orders_store.update({record["h"]: record for record in retained})
+        snapshot.setdefault("meta", {})["collectionStartedAtMs"] = started_ms
         profile = snapshot.get("profile") or {}
         lead.avatar_url = profile.get("avatarUrl") or lead.avatar_url
         lead.description = profile.get("description") or lead.description
@@ -243,28 +360,9 @@ class EngineOrchestrator:
         lead.snapshot_json = json.dumps(snapshot, separators=(",", ":"))
         await db.commit()
 
-        await self.router.process_lead_events(
-            db=db,
-            lead=lead,
-            raw_orders=list(orders_store.values()),
-            raw_closed=snapshot.get("closed") or [],
-            snapshot=snapshot,
-            proxies=proxies,
-        )
+        return True
 
-        await self.ws_hub.broadcast(
-            {
-                "type": "lead_update",
-                "leadId": lead.id,
-                "name": lead.name,
-                "marginBalance": lead.margin_balance,
-                "openPositions": snapshot.get("openPositions", []),
-                "summary": snapshot.get("openPositionsSummary", {}),
-                "updatedAt": int(time.time() * 1000),
-            }
-        )
-        return {"ok": True, "snapshot": snapshot}
-
+    @serialized_execution
     async def sync_account(
         self,
         db: AsyncSession,
@@ -272,6 +370,7 @@ class EngineOrchestrator:
         proxies: Optional[List[ProxyNode]] = None,
         resilience_cfg: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        await db.refresh(account)
         if proxies is None:
             proxies = list((await db.scalars(select(ProxyNode).order_by(ProxyNode.priority))).all())
         try:
@@ -289,6 +388,7 @@ class EngineOrchestrator:
                 margin_mode=account.margin_mode,
                 position_mode=account.position_mode,
             )
+            adapter._time_offset_ms = int(getattr(account, "clock_offset_ms", 0) or 0)
             clock_sec = int((resilience_cfg or {}).get("clock_sync_interval_sec", 300))
             now = time.time()
             if clock_sec > 0 and (now - self._last_clock_sync.get(account.id, 0.0)) >= clock_sec:
@@ -297,9 +397,7 @@ class EngineOrchestrator:
                     account.clock_offset_ms = int(offset_ms)
                     self._last_clock_sync[account.id] = now
                 except Exception:
-                    pass
-            else:
-                adapter._time_offset_ms = int(getattr(account, "clock_offset_ms", 0) or 0)
+                    logger.warning("Clock calibration failed for account %s; retaining prior offset", account.id)
 
             bal = await adapter.get_usdt_balance()
             positions = await adapter.get_positions()

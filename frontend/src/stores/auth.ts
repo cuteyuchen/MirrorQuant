@@ -102,11 +102,15 @@ export const useAuthStore = defineStore("auth", () => {
     }
   }
 
-  async function setup(username: string, password: string) {
+  async function setup(username: string, password: string, bootstrapToken: string) {
     loading.value = true;
     error.value = null;
     try {
-      const res = await api.post<{ user: User }>("/api/auth/setup", { username, password });
+      const res = await api.request<{ user: User }>("/api/auth/setup", {
+        method: "POST",
+        headers: { "X-MQ-Bootstrap-Token": bootstrapToken },
+        body: JSON.stringify({ username, password }),
+      });
       initialized.value = true;
       authenticated.value = true;
       user.value = res.user;

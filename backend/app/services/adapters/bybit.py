@@ -73,7 +73,10 @@ class BybitAdapter(BaseExchangeAdapter):
         auth: bool = True,
         retries: int = 3,
     ) -> Dict[str, Any]:
+        self._check_rate_limit()
         method = method.upper()
+        # A mutation may already have reached the exchange when its response is lost.
+        attempts = max(1, retries) if method == "GET" else 1
         clean_params = [(k, v) for k, v in sorted((params or {}).items()) if v is not None]
         query_str = urlencode(clean_params)
         body_str = json.dumps(body, separators=(",", ":")) if body is not None else ""
@@ -82,7 +85,7 @@ class BybitAdapter(BaseExchangeAdapter):
 
         last_err: Optional[Exception] = None
         async with ProxyManager.build_client(proxy_url=self.proxy_url, timeout=self.timeout) as client:
-            for attempt in range(retries):
+            for attempt in range(attempts):
                 headers: Dict[str, str] = {
                     "Content-Type": "application/json",
                     "User-Agent": "MirrorQuant/1.0",
@@ -104,27 +107,23 @@ class BybitAdapter(BaseExchangeAdapter):
                     else:
                         raise ValueError(f"Unsupported HTTP method: {method}")
 
-                    if resp.status_code == 429 and attempt < retries - 1:
-                        await asyncio.sleep(0.8 * (attempt + 1))
-                        continue
+                    if resp.status_code == 429:
+                        self._note_rate_limit(resp)
                     if resp.status_code >= 400:
                         raise ExchangeAPIError("bybit", str(resp.status_code), f"HTTP {resp.status_code}: {resp.text[:200]}")
 
                     payload = resp.json()
                     ret_code = int(payload.get("retCode", -1))
                     if ret_code != 0:
-                        if ret_code in (10006, 10018) and attempt < retries - 1:
-                            await asyncio.sleep(0.8 * (attempt + 1))
-                            continue
+                        if ret_code in (10006, 10018):
+                            self._note_rate_limit(resp)
                         raise ExchangeAPIError("bybit", str(ret_code), payload.get("retMsg", ""), payload)
                     return payload.get("result") or {}
-                except ExchangeAPIError as exc:
-                    last_err = exc
-                    if exc.code not in ("10006", "10018"):
-                        raise
+                except ExchangeAPIError:
+                    raise
                 except Exception as exc:
                     last_err = exc
-                    if attempt < retries - 1:
+                    if attempt < attempts - 1:
                         await asyncio.sleep(0.5 * (attempt + 1))
                     else:
                         raise
@@ -140,17 +139,37 @@ class BybitAdapter(BaseExchangeAdapter):
             inst_id = symbol_map[lead_symbol]
         else:
             inst_id = lead_symbol
-        return inst_id, inst_id in instruments
+        return inst_id, self._symbol_matches(lead_symbol, inst_id, instruments)
 
     async def sync_time(self) -> int:
-        res = await self._request("GET", "/v5/market/time", auth=False)
+        sent_ms = time.time() * 1000
+        res = await self._request("GET", "/v5/market/time", auth=False, retries=1)
         if res.get("timeNano"):
-            srv_ms = int(int(res["timeNano"]) // 1_000_000)
-            self._time_offset_ms = srv_ms - int(time.time() * 1000)
+            server_ms = int(res["timeNano"]) // 1_000_000
         elif res.get("timeSecond"):
-            srv_ms = int(res["timeSecond"]) * 1000
-            self._time_offset_ms = srv_ms - int(time.time() * 1000)
-        return self._time_offset_ms
+            server_ms = int(res["timeSecond"]) * 1000
+        else:
+            raise RuntimeError("Missing Bybit server time")
+        return self._calibrate_time(server_ms, sent_ms)
+
+    async def _all_pages(self, path: str, params: Dict[str, Any], auth: bool = True) -> List[Dict[str, Any]]:
+        rows, seen = [], set()
+        cursor = None
+        while True:
+            request = dict(params)
+            if cursor:
+                request["cursor"] = cursor
+            result = await self._request("GET", path, params=request, auth=auth)
+            page = result.get("list")
+            if not isinstance(page, list):
+                raise ValueError("Incomplete Bybit paginated response")
+            rows.extend(page)
+            cursor = result.get("nextPageCursor") or None
+            if cursor is None:
+                return rows
+            if cursor in seen:
+                raise RuntimeError("Repeated exchange pagination cursor; snapshot incomplete")
+            seen.add(cursor)
 
     async def test_connection(self) -> Dict[str, Any]:
         bal = await self.get_usdt_balance()
@@ -166,44 +185,27 @@ class BybitAdapter(BaseExchangeAdapter):
         }
 
     async def get_usdt_balance(self) -> BalanceInfo:
-        res = await self._request(
-            "GET",
-            "/v5/account/wallet-balance",
-            params={"accountType": "UNIFIED", "coin": "USDT"},
-        )
-        acct_list = res.get("list") or []
-        if not acct_list:
-            return BalanceInfo(eq=0.0, avail_eq=0.0, cash_bal=0.0, upl=0.0)
-        acct = acct_list[0]
-        for c in acct.get("coin") or []:
-            if c.get("coin") == "USDT":
-                eq = float(c.get("equity") or 0.0)
-                wallet = float(c.get("walletBalance") or 0.0)
-                upl = float(c.get("unrealisedPnl") or 0.0)
-                avail = float(c.get("availableToWithdraw") or acct.get("totalAvailableBalance") or eq)
-                return BalanceInfo(
-                    eq=eq,
-                    avail_eq=avail,
-                    cash_bal=wallet,
-                    upl=upl,
-                    raw=c,
-                )
-        return BalanceInfo(
-            eq=float(acct.get("totalEquity") or 0.0),
-            avail_eq=float(acct.get("totalAvailableBalance") or 0.0),
-            cash_bal=float(acct.get("totalWalletBalance") or 0.0),
-            upl=float(acct.get("totalPerpUPL") or 0.0),
-            raw=acct,
-        )
+        res = await self._request("GET", "/v5/account/wallet-balance", params={"accountType": "UNIFIED"})
+        accounts = res.get("list") or []
+        if not accounts:
+            return BalanceInfo(eq=0, avail_eq=0, cash_bal=0, upl=0)
+        acct = accounts[0]
+        coins = acct.get("coin") or []
+        single_collateral = all(c.get("coin") == "USDT" or Decimal(str(c.get("equity") or "0")) == 0 for c in coins)
+        for coin in coins:
+            if coin.get("coin") == "USDT":
+                equity = float(coin.get("equity") or 0)
+                # totalAvailableBalance is qualified only for a USDT-only UTA.
+                available = acct.get("totalAvailableBalance")
+                avail = min(max(0.0, equity), max(0.0, float(available))) if single_collateral and available not in (None, "") else 0.0
+                return BalanceInfo(eq=equity, avail_eq=avail,
+                    cash_bal=float(coin.get("walletBalance") or 0), upl=float(coin.get("unrealisedPnl") or 0), raw=acct)
+        return BalanceInfo(eq=0, avail_eq=0, cash_bal=0, upl=0, raw=acct)
 
     async def get_positions(self) -> List[ExchangePosition]:
-        res = await self._request(
-            "GET",
-            "/v5/position/list",
-            params={"category": "linear", "settleCoin": "USDT"},
-        )
+        rows = await self._all_pages("/v5/position/list", {"category": "linear", "settleCoin": "USDT", "limit": 200})
         positions: List[ExchangePosition] = []
-        for p in res.get("list") or []:
+        for p in rows:
             sz = float(p.get("size") or 0.0)
             if sz <= 0:
                 continue
@@ -240,42 +242,28 @@ class BybitAdapter(BaseExchangeAdapter):
 
     async def get_instruments(self, force_refresh: bool = False) -> Dict[str, InstrumentSpec]:
         now = time.time()
-        if not force_refresh and self._instruments_cache and (now - self._instruments_cache_ts < self._cache_ttl_sec):
+        if not force_refresh and self._instruments_cache and now - self._instruments_cache_ts < self._cache_ttl_sec:
             return self._instruments_cache
-
-        res = await self._request(
-            "GET",
-            "/v5/market/instruments-info",
-            params={"category": "linear", "limit": 1000},
-            auth=False,
-        )
+        rows = await self._all_pages("/v5/market/instruments-info", {"category": "linear", "limit": 1000}, auth=False)
         result: Dict[str, InstrumentSpec] = {}
-        for item in res.get("list") or []:
-            if item.get("status") != "Trading" or item.get("quoteCoin") != "USDT":
+        for item in rows:
+            if (item.get("status") != "Trading" or item.get("quoteCoin") != "USDT"
+                    or item.get("settleCoin") != "USDT" or item.get("contractType") != "LinearPerpetual"):
                 continue
-            sym = item.get("symbol")
-            if not sym:
-                continue
-            lot = item.get("lotSizeFilter") or {}
-            px = item.get("priceFilter") or {}
-            lvr = item.get("leverageFilter") or {}
             try:
+                sym = item["symbol"]
+                lot, price, leverage = item["lotSizeFilter"], item["priceFilter"], item["leverageFilter"]
                 result[sym] = InstrumentSpec(
-                    inst_id=sym,
-                    ct_val=Decimal("1"),
-                    min_sz=Decimal(str(lot.get("minOrderQty") or "0.001")).normalize(),
-                    lot_sz=Decimal(str(lot.get("qtyStep") or "0.001")).normalize(),
-                    tick_sz=Decimal(str(px.get("tickSize") or "0.01")).normalize(),
-                    max_lvr=float(lvr.get("maxLeverage") or 20.0),
-                    min_notional=Decimal(str(lot.get("minNotionalValue") or "5")),
-                    settle_ccy=str(item.get("settleCoin") or "USDT"),
+                    inst_id=sym, ct_val=Decimal("1"), min_sz=Decimal(str(lot["minOrderQty"])),
+                    lot_sz=Decimal(str(lot["qtyStep"])), max_sz=Decimal(str(lot["maxOrderQty"])),
+                    market_max_sz=Decimal(str(lot["maxMktOrderQty"])), tick_sz=Decimal(str(price["tickSize"])),
+                    max_lvr=float(leverage["maxLeverage"]), min_notional=Decimal(str(lot["minNotionalValue"])),
+                    settle_ccy="USDT", base_ccy=item["baseCoin"],
                 )
-            except Exception:
+            except (ValueError, KeyError, ArithmeticError, TypeError):
                 continue
-        if result:
-            self._instruments_cache = result
-            self._instruments_cache_ts = now
-        return self._instruments_cache
+        self._instruments_cache, self._instruments_cache_ts = result, now
+        return result
 
     async def get_orderbook(self, inst_id: str, depth: int = 5) -> OrderBook:
         res = await self._request(
@@ -289,29 +277,31 @@ class BybitAdapter(BaseExchangeAdapter):
             asks=[[float(x[0]), float(x[1])] for x in res.get("a", [])],
         )
 
-    async def ensure_leverage(
-        self,
-        inst_id: str,
-        lever: int,
-        pos_side: str = "long",
-        mgn_mode: str = "cross",
-    ) -> bool:
+    async def ensure_leverage(self, inst_id: str, lever: int, pos_side: str = "long", mgn_mode: str = "cross") -> bool:
+        self._assert_supported_entry_mode(mgn_mode)
+        account = await self._request("GET", "/v5/account/info")
+        if account.get("marginMode") != "REGULAR_MARGIN":
+            raise ExchangeAPIError(self.exchange, "UNSUPPORTED_MODE", "Bybit requires regular cross-margin UTA")
+        params = {"category": "linear", "symbol": inst_id}
+        rows = await self._all_pages("/v5/position/list", params)
+        if not rows or any(int(row.get("positionIdx") or 0) not in (1, 2) for row in rows):
+            raise ExchangeAPIError(self.exchange, "UNSUPPORTED_MODE", "Bybit symbol must already use hedge mode")
         try:
-            await self._request(
-                "POST",
-                "/v5/position/set-leverage",
-                body={
-                    "category": "linear",
-                    "symbol": inst_id,
-                    "buyLeverage": str(lever),
-                    "sellLeverage": str(lever),
-                },
-            )
-            return True
+            await self._request("POST", "/v5/position/set-leverage", body={
+                "category": "linear", "symbol": inst_id, "buyLeverage": str(lever), "sellLeverage": str(lever)
+            })
         except ExchangeAPIError as exc:
-            if exc.code == "110043" or "not modified" in exc.msg.lower():
-                return True
-            return False
+            if str(exc.code) != "110043":
+                return False
+        rows = await self._all_pages("/v5/position/list", params)
+        return bool(rows) and all(float(row.get("leverage") or 0) == lever for row in rows)
+
+    async def get_max_leverage(self, inst_id: str, target_notional: Any) -> int:
+        rows = await self._all_pages("/v5/market/risk-limit", {"category": "linear", "symbol": inst_id}, auth=False)
+        for tier in sorted(rows, key=lambda row: Decimal(str(row["riskLimitValue"]))):
+            if Decimal(str(target_notional)) <= Decimal(str(tier["riskLimitValue"])):
+                return int(float(tier["maxLeverage"]))
+        raise ValueError("Target exposure exceeds qualified Bybit tiers")
 
     async def place_order(
         self,
@@ -325,6 +315,7 @@ class BybitAdapter(BaseExchangeAdapter):
         reduce_only: bool = False,
         td_mode: str = "cross",
     ) -> OrderResult:
+        await self.validate_order(inst_id, ord_type, sz, px, reduce_only)
         ot = ord_type.lower()
         body: Dict[str, Any] = {
             "category": "linear",
@@ -367,9 +358,19 @@ class BybitAdapter(BaseExchangeAdapter):
             params["orderLinkId"] = cl_ord_id
         try:
             res = await self._request("GET", "/v5/order/realtime", params=params)
-        except ExchangeAPIError:
-            return None
+        except ExchangeAPIError as exc:
+            if str(exc.code) in ("110001", "170213"):
+                return None
+            raise
         rows = res.get("list") or []
+        if not rows:
+            try:
+                history = await self._request("GET", "/v5/order/history", params=params)
+            except ExchangeAPIError as exc:
+                if str(exc.code) in ("110001", "170213"):
+                    return None
+                raise
+            rows = history.get("list") or []
         if not rows:
             return None
         row = rows[0]
@@ -381,6 +382,12 @@ class BybitAdapter(BaseExchangeAdapter):
             "state": row.get("orderStatus"),
             "raw": row,
         }
+
+    async def get_open_orders(self) -> List[Dict[str, Any]]:
+        # Without orderFilter, unified linear returns active ordinary and conditional orders.
+        return await self._all_pages("/v5/order/realtime", {
+            "category": "linear", "settleCoin": "USDT", "openOnly": 0, "limit": 50,
+        })
 
     async def place_tp_sl(
         self,

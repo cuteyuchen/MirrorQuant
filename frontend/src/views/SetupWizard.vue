@@ -13,6 +13,7 @@ const { t } = useI18n();
 const username = ref("admin");
 const password = ref("");
 const confirmPassword = ref("");
+const bootstrapToken = ref("");
 const localError = ref("");
 
 async function handleSetup() {
@@ -25,7 +26,7 @@ async function handleSetup() {
     localError.value = t("setup.errMismatch");
     return;
   }
-  const ok = await authStore.setup(username.value, password.value);
+  const ok = await authStore.setup(username.value, password.value, bootstrapToken.value);
   if (ok) {
     router.push("/dashboard");
   }
@@ -89,6 +90,12 @@ async function handleSetup() {
             placeholder="••••••••••••"
             class="w-full px-4 py-2.5 rounded-xl bg-background border border-slate-700 text-slate-100 focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent text-sm"
           />
+        </div>
+
+        <div>
+          <label class="block text-xs font-medium text-slate-400 uppercase tracking-wider mb-1.5">{{ t("setup.bootstrapToken") }}</label>
+          <input v-model="bootstrapToken" type="password" required autocomplete="off"
+            class="w-full px-4 py-2.5 rounded-xl bg-background border border-slate-700 text-slate-100 focus:outline-none focus:border-accent text-sm" />
         </div>
 
         <button

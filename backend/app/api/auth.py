@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import (
@@ -36,6 +37,7 @@ from app.schemas.api import (
     LoginRequest,
     SetupRequest,
     TotpDisableRequest,
+    TotpSetupRequest,
     TotpVerifyRequest,
     UserOut,
 )
@@ -223,7 +225,20 @@ async def setup_admin(
     request: Request,
     response: Response,
     db: AsyncSession = Depends(get_db),
+    bootstrap_token: str = Header(default="", alias="X-MQ-Bootstrap-Token"),
 ):
+    expected = get_settings().bootstrap_token
+    if not expected or not hmac.compare_digest(bootstrap_token.encode("utf-8"), expected.encode("utf-8")):
+        raise HTTPException(status_code=403, detail="Bootstrap authorization required")
+    # Claim before reading: SQLite must acquire its write lock before the
+    # transaction observes setup state; all workers contend on the same row.
+    claim = await db.execute(
+        update(SystemConfig)
+        .where(SystemConfig.key == "bootstrap_claimed", SystemConfig.value_json == "false")
+        .values(value_json="true")
+    )
+    if claim.rowcount != 1:
+        raise HTTPException(status_code=409, detail="System is already initialized")
     count = await db.scalar(select(func.count(User.id))) or 0
     if count > 0:
         raise HTTPException(
@@ -243,7 +258,7 @@ async def setup_admin(
     await db.commit()
     await db.refresh(user)
 
-    token = create_access_token(user.id, user.username, user.role)
+    token = create_access_token(user.id, user.username, user.role, session_version=user.session_version)
     _set_auth_cookie(response, token)
     return {"user": _user_dict(user), "token": token}
 
@@ -370,7 +385,9 @@ async def login(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account disabled")
 
     # 4. Enforce TOTP 2FA if enabled
-    if user.totp_enabled and user.totp_secret_enc:
+    if user.totp_enabled and not user.totp_secret_enc:
+        raise HTTPException(status_code=403, detail="2FA state corrupted; administrator recovery required")
+    if user.totp_enabled:
         if not payload.totp_code or not payload.totp_code.strip():
             return JSONResponse(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -382,7 +399,10 @@ async def login(
                 },
             )
         vault = CredentialVault()
-        totp_secret = vault.decrypt_string(user.totp_secret_enc)
+        try:
+            totp_secret = vault.decrypt_string(user.totp_secret_enc)
+        except Exception as exc:
+            raise HTTPException(status_code=403, detail="2FA state corrupted; administrator recovery required") from exc
         if not verify_totp_code(totp_secret, payload.totp_code):
             fails, lock_sec = await _record_login_failure(
                 db, request, client_ip, username, "Invalid 2FA code", audit_action="LOGIN_2FA_FAILED"
@@ -425,7 +445,7 @@ async def login(
     await record_audit(db, "LOGIN", "user", str(user.id), "Admin logged in", user, request)
     await db.commit()
 
-    token = create_access_token(user.id, user.username, user.role)
+    token = create_access_token(user.id, user.username, user.role, session_version=user.session_version)
     _set_auth_cookie(response, token)
     return {"user": _user_dict(user), "token": token}
 
@@ -440,6 +460,7 @@ async def logout(
     settings = get_settings()
     response.delete_cookie(key=settings.cookie_name, path="/")
     if current_user:
+        await _revoke_sessions(db, current_user)
         await record_audit(db, "LOGOUT", "user", str(current_user.id), "Logged out", current_user, request)
         await db.commit()
     return {"ok": True}
@@ -460,6 +481,7 @@ async def change_password(
     if not verify_password(payload.current_password, current_user.password_hash):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Current password incorrect")
     current_user.password_hash = hash_password(payload.new_password)
+    await _revoke_sessions(db, current_user)
     await record_audit(db, "CHANGE_PASSWORD", "user", str(current_user.id), "Password rotated", current_user, request)
     await db.commit()
     return {"ok": True}
@@ -467,13 +489,25 @@ async def change_password(
 
 @router.post("/2fa/setup")
 async def setup_totp(
+    payload: TotpSetupRequest,
     request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    if current_user.totp_enabled:
+        raise HTTPException(status_code=400, detail="Existing 2FA must be disabled with current code before re-enrolling")
+    if not verify_password(payload.current_password, current_user.password_hash):
+        raise HTTPException(status_code=400, detail="Current password incorrect")
     secret = generate_totp_secret()
     vault = CredentialVault()
-    current_user.totp_pending_secret_enc = vault.encrypt_string(secret)
+    pending = vault.encrypt_dict({"secret": secret, "expires_at": int((_utcnow() + timedelta(minutes=10)).timestamp())})
+    result = await db.execute(
+        update(User)
+        .where(User.id == current_user.id, User.totp_enabled.is_(False), User.session_version == current_user.session_version)
+        .values(totp_pending_secret_enc=pending)
+    )
+    if result.rowcount != 1:
+        raise HTTPException(status_code=409, detail="2FA state changed; sign in again")
     otpauth_uri = build_totp_uri(secret, current_user.username)
     qr_svg = totp_qr_svg_data_uri(otpauth_uri)
     await record_audit(db, "SETUP_2FA_INIT", "user", str(current_user.id), "Generated pending TOTP secret", current_user, request)
@@ -492,15 +526,30 @@ async def enable_totp(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    if current_user.totp_enabled:
+        raise HTTPException(status_code=400, detail="Existing 2FA must be disabled with current code before re-enrolling")
     if not current_user.totp_pending_secret_enc:
         raise HTTPException(status_code=400, detail="No pending 2FA setup found; generate QR first")
     vault = CredentialVault()
-    pending_secret = vault.decrypt_string(current_user.totp_pending_secret_enc)
+    pending_encrypted = current_user.totp_pending_secret_enc
+    try:
+        pending = vault.decrypt_dict(pending_encrypted)
+        if pending["expires_at"] <= int(_utcnow().timestamp()):
+            raise ValueError("Expired enrollment")
+        pending_secret = pending["secret"]
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="2FA enrollment expired or invalid; generate QR again") from exc
     if not verify_totp_code(pending_secret, payload.code):
         raise HTTPException(status_code=400, detail="Invalid 6-digit verification code")
-    current_user.totp_secret_enc = current_user.totp_pending_secret_enc
-    current_user.totp_pending_secret_enc = None
-    current_user.totp_enabled = True
+    result = await db.execute(
+        update(User)
+        .where(User.id == current_user.id, User.totp_enabled.is_(False), User.totp_pending_secret_enc == pending_encrypted,
+               User.session_version == current_user.session_version)
+        .values(totp_secret_enc=vault.encrypt_string(pending_secret), totp_pending_secret_enc=None,
+                totp_enabled=True, session_version=User.session_version + 1)
+    )
+    if result.rowcount != 1:
+        raise HTTPException(status_code=409, detail="2FA state changed; sign in again")
     await record_audit(db, "ENABLE_2FA", "user", str(current_user.id), "TOTP 2FA enabled", current_user, request)
     await db.commit()
     await db.refresh(current_user)
@@ -516,15 +565,33 @@ async def disable_totp(
 ):
     if not verify_password(payload.current_password, current_user.password_hash):
         raise HTTPException(status_code=400, detail="Current password incorrect")
-    if current_user.totp_enabled and current_user.totp_secret_enc and payload.code:
+    if current_user.totp_enabled:
+        if not current_user.totp_secret_enc or not payload.code or not payload.code.strip():
+            raise HTTPException(status_code=400, detail="Current 2FA verification code required")
         vault = CredentialVault()
-        sec = vault.decrypt_string(current_user.totp_secret_enc)
-        if not verify_totp_code(sec, payload.code):
+        try:
+            sec = vault.decrypt_string(current_user.totp_secret_enc)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="2FA state corrupted; administrator recovery required") from exc
+        if not verify_totp_code(sec, payload.code.strip()):
             raise HTTPException(status_code=400, detail="Invalid 2FA verification code")
-    current_user.totp_enabled = False
-    current_user.totp_secret_enc = None
-    current_user.totp_pending_secret_enc = None
+    result = await db.execute(
+        update(User)
+        .where(User.id == current_user.id, User.session_version == current_user.session_version,
+               User.totp_enabled == current_user.totp_enabled, User.totp_secret_enc == current_user.totp_secret_enc)
+        .values(totp_enabled=False, totp_secret_enc=None, totp_pending_secret_enc=None,
+                session_version=User.session_version + 1)
+    )
+    if result.rowcount != 1:
+        raise HTTPException(status_code=409, detail="2FA state changed; sign in again")
     await record_audit(db, "DISABLE_2FA", "user", str(current_user.id), "TOTP 2FA disabled", current_user, request)
     await db.commit()
     await db.refresh(current_user)
     return {"ok": True, "user": _user_dict(current_user)}
+
+
+async def _revoke_sessions(db: AsyncSession, user: User) -> None:
+    """Increment in SQL so concurrent security changes cannot lose revocations."""
+    await db.execute(
+        update(User).where(User.id == user.id).values(session_version=User.session_version + 1)
+    )

@@ -44,7 +44,7 @@ def get_engine(database_url: str | None = None) -> AsyncEngine:
             def _set_sqlite_pragmas(dbapi_conn, _conn_record):
                 cursor = dbapi_conn.cursor()
                 cursor.execute("PRAGMA journal_mode=WAL;")
-                cursor.execute("PRAGMA synchronous=NORMAL;")
+                cursor.execute("PRAGMA synchronous=FULL;")
                 cursor.execute("PRAGMA foreign_keys=ON;")
                 cursor.execute("PRAGMA busy_timeout=5000;")
                 cursor.close()
@@ -85,6 +85,7 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 
 DEFAULT_SYSTEM_CONFIG = {
+    "bootstrap_claimed": False,
     "global_kill_switch": False,
     "public_monitoring_enabled": True,
     "notifications": {
@@ -124,8 +125,8 @@ DEFAULT_SYSTEM_CONFIG = {
         "hard_stop_loss_pct": 15.0,
     },
     "resilience": {
-        "missed_order_max_age_sec": 120,
-        "catchup_max_price_dev_pct": 0.8,
+        "missed_order_max_age_sec": 900,
+        "catchup_max_price_dev_pct": 0.5,
         "reconcile_interval_sec": 60,
         "auto_close_orphan_positions": "alert_only",  # alert_only | auto_close
         "insufficient_margin_policy": "auto_scale_down",  # auto_scale_down | skip_alert
@@ -138,7 +139,16 @@ DEFAULT_SYSTEM_CONFIG = {
 
 # Idempotent SQLite column additions for upgrading existing databases without wiping data
 SQLITE_MIGRATIONS: Dict[str, List[Tuple[str, str]]] = {
+    "position_allocations": [
+        ("owned_qty_exact", "VARCHAR(100)"),
+        ("entry_cost_exact", "VARCHAR(100)"),
+        ("generation", "INTEGER NOT NULL DEFAULT 0"),
+        ("opened_at_ms", "BIGINT NOT NULL DEFAULT 0"),
+    ],
+    "order_intents": [("source_time_ms", "BIGINT NOT NULL DEFAULT 0")],
+    "binding_debts": [("pending_usd_exact", "VARCHAR(100)")],
     "users": [
+        ("session_version", "INTEGER NOT NULL DEFAULT 0"),
         ("totp_enabled", "BOOLEAN NOT NULL DEFAULT 0"),
         ("totp_secret_enc", "TEXT"),
         ("totp_pending_secret_enc", "TEXT"),

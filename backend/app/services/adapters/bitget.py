@@ -65,7 +65,10 @@ class BitgetAdapter(BaseExchangeAdapter):
         auth: bool = True,
         retries: int = 3,
     ) -> Any:
+        self._check_rate_limit()
         method = method.upper()
+        # A mutation may already have reached the exchange when its response is lost.
+        attempts = max(1, retries) if method == "GET" else 1
         clean_params = [(k, v) for k, v in sorted((params or {}).items()) if v is not None]
         query_str = urlencode(clean_params)
         request_path = path + (f"?{query_str}" if query_str else "")
@@ -74,7 +77,7 @@ class BitgetAdapter(BaseExchangeAdapter):
 
         last_err: Optional[Exception] = None
         async with ProxyManager.build_client(proxy_url=self.proxy_url, timeout=self.timeout) as client:
-            for attempt in range(retries):
+            for attempt in range(attempts):
                 headers: Dict[str, str] = {
                     "Content-Type": "application/json",
                     "locale": "en-US",
@@ -97,27 +100,23 @@ class BitgetAdapter(BaseExchangeAdapter):
                     else:
                         raise ValueError(f"Unsupported HTTP method: {method}")
 
-                    if resp.status_code == 429 and attempt < retries - 1:
-                        await asyncio.sleep(0.8 * (attempt + 1))
-                        continue
+                    if resp.status_code == 429:
+                        self._note_rate_limit(resp)
                     if resp.status_code >= 400:
                         raise ExchangeAPIError("bitget", str(resp.status_code), f"HTTP {resp.status_code}: {resp.text[:200]}")
 
                     payload = resp.json()
                     code = str(payload.get("code", ""))
                     if code != "00000":
-                        if code in ("40014", "40019") and attempt < retries - 1:
-                            await asyncio.sleep(0.8 * (attempt + 1))
-                            continue
+                        if code == "429":
+                            self._note_rate_limit(resp)
                         raise ExchangeAPIError("bitget", code, payload.get("msg", ""), payload)
                     return payload.get("data")
-                except ExchangeAPIError as exc:
-                    last_err = exc
-                    if exc.code not in ("40014", "40019"):
-                        raise
+                except ExchangeAPIError:
+                    raise
                 except Exception as exc:
                     last_err = exc
-                    if attempt < retries - 1:
+                    if attempt < attempts - 1:
                         await asyncio.sleep(0.5 * (attempt + 1))
                     else:
                         raise
@@ -133,13 +132,14 @@ class BitgetAdapter(BaseExchangeAdapter):
             inst_id = symbol_map[lead_symbol]
         else:
             inst_id = lead_symbol
-        return inst_id, inst_id in instruments
+        return inst_id, self._symbol_matches(lead_symbol, inst_id, instruments)
 
     async def sync_time(self) -> int:
-        data = await self._request("GET", "/api/v2/public/time", auth=False)
-        if isinstance(data, dict) and data.get("serverTime"):
-            self._time_offset_ms = int(data["serverTime"]) - int(time.time() * 1000)
-        return self._time_offset_ms
+        sent_ms = time.time() * 1000
+        data = await self._request("GET", "/api/v2/public/time", auth=False, retries=1)
+        if not isinstance(data, dict) or not data.get("serverTime"):
+            raise RuntimeError("Missing Bitget server time")
+        return self._calibrate_time(int(data["serverTime"]), sent_ms)
 
     async def test_connection(self) -> Dict[str, Any]:
         bal = await self.get_usdt_balance()
@@ -163,8 +163,11 @@ class BitgetAdapter(BaseExchangeAdapter):
         )
         for acct in data or []:
             if str(acct.get("marginCoin") or "").upper() in ("USDT", "SUSDT"):
-                eq = float(acct.get("accountEquity") or acct.get("usdtEquity") or 0.0)
-                avail = float(acct.get("available") or acct.get("crossedMaxAvailable") or eq)
+                raw_eq = acct.get("accountEquity")
+                eq = float(raw_eq if raw_eq not in (None, "") else acct.get("usdtEquity") or 0)
+                # An explicit zero or unknown availability is never replaced by equity.
+                raw_avail = acct.get("crossedMaxAvailable") if self.margin_mode == "cross" else acct.get("available")
+                avail = float(raw_avail) if raw_avail not in (None, "") else 0.0
                 upl = float(acct.get("unrealizedPL") or 0.0)
                 cash = eq - upl
                 return BalanceInfo(eq=eq, avail_eq=avail, cash_bal=cash, upl=upl, raw=acct)
@@ -183,7 +186,10 @@ class BitgetAdapter(BaseExchangeAdapter):
             if sz <= 0:
                 continue
             sym = str(p.get("symbol") or "")
-            hold_side = str(p.get("holdSide") or "long").lower()
+            hold_side = str(p.get("holdSide") or "").lower()
+            hold_side = {"buy": "long", "sell": "short"}.get(hold_side, hold_side)
+            if hold_side not in ("long", "short"):
+                raise ValueError("Unknown Bitget position direction")
             avg_px = float(p.get("openPriceAvg") or 0.0)
             mark_px = float(p.get("markPrice") or avg_px)
             notional = abs(sz * mark_px)
@@ -195,7 +201,7 @@ class BitgetAdapter(BaseExchangeAdapter):
                     pos_side=hold_side,
                     mgn_mode="isolated" if str(p.get("marginMode") or "").lower() == "isolated" else "cross",
                     pos=abs(sz),
-                    avail_pos=abs(float(p.get("available") or sz)),
+                    avail_pos=abs(float(p["available"])) if p.get("available") not in (None, "") else 0.0,
                     avg_px=avg_px,
                     upl=upl,
                     upl_ratio=(upl / notional) if notional > 0 else 0.0,
@@ -209,78 +215,65 @@ class BitgetAdapter(BaseExchangeAdapter):
 
     async def get_instruments(self, force_refresh: bool = False) -> Dict[str, InstrumentSpec]:
         now = time.time()
-        if not force_refresh and self._instruments_cache and (now - self._instruments_cache_ts < self._cache_ttl_sec):
+        if not force_refresh and self._instruments_cache and now - self._instruments_cache_ts < self._cache_ttl_sec:
             return self._instruments_cache
-
-        data = await self._request(
-            "GET",
-            "/api/v2/mix/market/contracts",
-            params={"productType": self.product_type},
-            auth=False,
-        )
+        data = await self._request("GET", "/api/v2/mix/market/contracts", params={"productType": self.product_type}, auth=False)
         result: Dict[str, InstrumentSpec] = {}
         for item in data or []:
-            if str(item.get("symbolStatus") or "normal").lower() != "normal":
-                continue
-            sym = item.get("symbol")
-            if not sym:
+            if item.get("symbolStatus") != "normal" or item.get("symbolType") != "perpetual":
                 continue
             try:
-                price_place = int(item.get("pricePlace") or 2)
-                vol_place = int(item.get("volumePlace") or 3)
-                tick_sz = Decimal("10") ** (-price_place)
-                lot_sz = Decimal(str(item.get("sizeMultiplier") or (Decimal("10") ** (-vol_place))))
-                min_sz = Decimal(str(item.get("minTradeNum") or lot_sz))
+                sym = item["symbol"]
+                if item["quoteCoin"] not in ("USDT", "SUSDT"):
+                    continue
+                tick_sz = Decimal(str(item["priceEndStep"])) * Decimal("10") ** -int(item["pricePlace"])
                 result[sym] = InstrumentSpec(
-                    inst_id=sym,
-                    ct_val=Decimal("1"),
-                    min_sz=min_sz.normalize(),
-                    lot_sz=lot_sz.normalize(),
-                    tick_sz=tick_sz.normalize(),
-                    max_lvr=float(item.get("maxLever") or 20.0),
-                    min_notional=Decimal(str(item.get("minTradeUSDT") or "5")),
-                    settle_ccy="USDT",
+                    inst_id=sym, ct_val=Decimal("1"), min_sz=Decimal(str(item["minTradeNum"])),
+                    lot_sz=Decimal(str(item["sizeMultiplier"])), tick_sz=tick_sz,
+                    max_sz=Decimal(str(item["maxOrderQty"])), market_max_sz=Decimal(str(item["maxMarketOrderQty"])),
+                    max_lvr=float(item["maxLever"]), min_notional=Decimal(str(item["minTradeUSDT"])),
+                    settle_ccy="USDT", base_ccy=item["baseCoin"],
                 )
-            except Exception:
+            except (ValueError, KeyError, ArithmeticError, TypeError):
                 continue
-        if result:
-            self._instruments_cache = result
-            self._instruments_cache_ts = now
-        return self._instruments_cache
+        self._instruments_cache, self._instruments_cache_ts = result, now
+        return result
 
     async def get_orderbook(self, inst_id: str, depth: int = 5) -> OrderBook:
-        data = await self._request(
-            "GET",
-            "/api/v2/mix/market/merge-depth",
-            params={"productType": self.product_type, "symbol": inst_id, "limit": str(depth)},
-            auth=False,
-        )
+        if not 1 <= depth <= 50:
+            raise ValueError("Invalid requested book depth")
+        wire_depth = next(n for n in (1, 5, 15, 50) if n >= depth)
+        data = await self._request("GET", "/api/v2/mix/market/merge-depth", params={
+            "productType": self.product_type, "symbol": inst_id, "limit": str(wire_depth)
+        }, auth=False)
         book = data if isinstance(data, dict) else {}
         return OrderBook(
-            bids=[[float(x[0]), float(x[1])] for x in book.get("bids", [])],
-            asks=[[float(x[0]), float(x[1])] for x in book.get("asks", [])],
+            bids=[[float(x[0]), float(x[1])] for x in book.get("bids", [])[:depth]],
+            asks=[[float(x[0]), float(x[1])] for x in book.get("asks", [])[:depth]],
         )
 
-    async def ensure_leverage(
-        self,
-        inst_id: str,
-        lever: int,
-        pos_side: str = "long",
-        mgn_mode: str = "cross",
-    ) -> bool:
-        body: Dict[str, Any] = {
-            "symbol": inst_id,
-            "productType": self.product_type,
-            "marginCoin": "SUSDT" if self.is_demo else "USDT",
-            "leverage": str(lever),
-        }
-        if self.position_mode == "hedge":
-            body["holdSide"] = pos_side.lower()
+    async def ensure_leverage(self, inst_id: str, lever: int, pos_side: str = "long", mgn_mode: str = "cross") -> bool:
+        self._assert_supported_entry_mode(mgn_mode)
+        params = {"symbol": inst_id, "productType": self.product_type, "marginCoin": "SUSDT" if self.is_demo else "USDT"}
+        account = await self._request("GET", "/api/v2/mix/account/account", params=params)
+        if not account or account.get("posMode") != "hedge_mode" or account.get("marginMode") != "crossed":
+            raise ExchangeAPIError(self.exchange, "UNSUPPORTED_MODE", "Bitget symbol must already use hedge and cross margin")
+        body = dict(params, leverage=str(lever))
         try:
             await self._request("POST", "/api/v2/mix/account/set-leverage", body=body)
-            return True
         except ExchangeAPIError:
             return False
+        account = await self._request("GET", "/api/v2/mix/account/account", params=params)
+        return bool(account) and float(account.get("crossedMarginLeverage") or 0) == lever
+
+    async def get_max_leverage(self, inst_id: str, target_notional: Any) -> int:
+        rows = await self._request("GET", "/api/v2/mix/market/query-position-lever", params={
+            "productType": self.product_type, "symbol": inst_id
+        }, auth=False)
+        for tier in sorted(rows or [], key=lambda row: Decimal(str(row["endUnit"]))):
+            if Decimal(str(tier["startUnit"])) <= Decimal(str(target_notional)) <= Decimal(str(tier["endUnit"])):
+                return int(float(tier["leverage"]))
+        raise ValueError("Target exposure exceeds qualified Bitget tiers")
 
     async def place_order(
         self,
@@ -294,6 +287,7 @@ class BitgetAdapter(BaseExchangeAdapter):
         reduce_only: bool = False,
         td_mode: str = "cross",
     ) -> OrderResult:
+        await self.validate_order(inst_id, ord_type, sz, px, reduce_only)
         ot = ord_type.lower()
         bg_margin_mode = "isolated" if td_mode == "isolated" else "crossed"
         body: Dict[str, Any] = {
@@ -346,10 +340,14 @@ class BitgetAdapter(BaseExchangeAdapter):
             params["clientOid"] = cl_ord_id
         try:
             row = await self._request("GET", "/api/v2/mix/order/detail", params=params)
-        except ExchangeAPIError:
+        except ExchangeAPIError as exc:
+            if str(exc.code) in ("40768", "40762"):
+                return None
+            raise
+        if not row:
             return None
         if not isinstance(row, dict):
-            return None
+            raise ValueError("Malformed Bitget order lookup response")
         return {
             "ordId": row.get("orderId"),
             "clOrdId": row.get("clientOid"),
@@ -358,6 +356,25 @@ class BitgetAdapter(BaseExchangeAdapter):
             "state": row.get("state"),
             "raw": row,
         }
+
+    async def get_open_orders(self) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        queries = [("/api/v2/mix/order/orders-pending", {})]
+        queries.extend(("/api/v2/mix/order/orders-plan-pending", {"planType": kind})
+                       for kind in ("normal_plan", "profit_loss", "track_plan"))
+        for path, extra in queries:
+            result = await self._request("GET", path, params={
+                "productType": self.product_type, "limit": 100, **extra,
+            })
+            page = (result or {}).get("entrustedList")
+            if not isinstance(page, list):
+                raise ValueError("Incomplete Bitget pending-order inventory")
+            # A full page cannot prove absence of additional orders. Fail closed
+            # until this venue's page boundary is explicitly reconciled.
+            if len(page) >= 100:
+                raise ValueError("Bitget pending-order inventory exceeds one qualified page")
+            rows.extend(page)
+        return rows
 
     async def place_tp_sl(
         self,
@@ -381,11 +398,14 @@ class BitgetAdapter(BaseExchangeAdapter):
                 "planType": plan_type,
                 "triggerPrice": str(trig_px),
                 "triggerType": "mark_price",
-                "holdSide": pos_side.lower() if self.position_mode == "hedge" else ("long" if pos_side.lower() == "long" else "short"),
+                "holdSide": pos_side.lower() if self.position_mode == "hedge" else ("buy" if pos_side.lower() == "long" else "sell"),
                 "size": str(sz),
             }
             res = await self._request("POST", "/api/v2/mix/order/place-tpsl-order", body=body)
-            return str((res or {}).get("orderId") or "")
+            order_id = str((res or {}).get("orderId") or "")
+            if not order_id:
+                raise ExchangeAPIError(self.exchange, "AMBIGUOUS", "Missing protective order identity")
+            return order_id
 
         if tp_px:
             out["tpOrderId"] = await _submit_plan("pos_profit", tp_px)

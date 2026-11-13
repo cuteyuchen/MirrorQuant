@@ -4,15 +4,18 @@ import json
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import ValidationError
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, record_audit
+from app.api.exposure import require_binding_flat
 from app.core.config import get_settings
 from app.core.database import DEFAULT_SYSTEM_CONFIG, get_db
 from app.models.domain import AuditLog, CopyBinding, LoginAttemptGuard, SystemConfig, User
-from app.schemas.api import SettingsUpdate
+from app.schemas.api import RiskDefaults, SettingsUpdate
 from app.services.notifier.service import NotificationService
+from app.services.engine.serialization import serialized_execution
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
@@ -58,6 +61,7 @@ async def get_settings_view(db: AsyncSession = Depends(get_db), current_user: Us
 
 
 @router.put("")
+@serialized_execution
 async def update_settings_view(
     payload: SettingsUpdate,
     request: Request,
@@ -72,13 +76,13 @@ async def update_settings_view(
         await _save_cfg(db, "public_monitoring_enabled", payload.public_monitoring_enabled)
         updated.append("public_monitoring_enabled")
     if payload.notifications is not None:
-        await _save_cfg(db, "notifications", payload.notifications)
+        await _save_cfg(db, "notifications", payload.notifications.model_dump(exclude_unset=True))
         updated.append("notifications")
     if payload.risk_defaults is not None:
-        await _save_cfg(db, "risk_defaults", payload.risk_defaults)
+        await _save_cfg(db, "risk_defaults", payload.risk_defaults.model_dump(exclude_unset=True))
         updated.append("risk_defaults")
     if payload.resilience is not None:
-        await _save_cfg(db, "resilience", payload.resilience)
+        await _save_cfg(db, "resilience", payload.resilience.model_dump(exclude_unset=True))
         updated.append("resilience")
 
     await record_audit(
@@ -89,36 +93,24 @@ async def update_settings_view(
 
 
 @router.post("/apply-defaults-to-bindings")
+@serialized_execution
 async def apply_defaults_to_bindings(
     request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    defaults = await _load_cfg(db, "risk_defaults") or {}
+    try:
+        defaults = RiskDefaults.model_validate(await _load_cfg(db, "risk_defaults") or {}).model_dump()
+    except (ValidationError, ValueError, TypeError) as exc:
+        raise HTTPException(status_code=422, detail="Invalid stored risk defaults; correct settings before applying") from exc
     bindings = list((await db.scalars(select(CopyBinding))).all())
-    field_map = {
-        "max_total_leverage": float,
-        "max_single_leverage": float,
-        "max_instrument_leverage": int,
-        "max_drawdown_pct": float,
-        "daily_max_loss_pct": float,
-        "max_slippage_pct": float,
-        "max_spread_pct": float,
-        "ioc_offset_pct": float,
-        "order_mode": str,
-        "tp_sl_mode": str,
-        "enable_stop_loss": bool,
-        "stop_loss_pct": float,
-        "enable_take_profit": bool,
-        "take_profit_pct": float,
-        "enable_trailing_stop": bool,
-        "trailing_callback_pct": float,
-        "hard_stop_loss_pct": float,
-    }
     for b in bindings:
-        for key, cast_fn in field_map.items():
-            if key in defaults and defaults[key] is not None:
-                setattr(b, key, cast_fn(defaults[key]))
+        protection_fields = ("tp_sl_mode", "enable_stop_loss", "stop_loss_pct", "enable_take_profit",
+                             "take_profit_pct", "enable_trailing_stop", "trailing_callback_pct", "hard_stop_loss_pct")
+        if any(getattr(b, field) != defaults[field] for field in protection_fields):
+            await require_binding_flat(db, b)
+        for key, value in defaults.items():
+            setattr(b, key, value)
 
     await record_audit(
         db,

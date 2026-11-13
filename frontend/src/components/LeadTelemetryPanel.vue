@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import { useI18n } from "@/i18n";
+import PositionCalculatorCard from "@/components/PositionCalculatorCard.vue";
 
 const props = defineProps<{
   snapshot: any;
@@ -874,6 +875,15 @@ const priceAgeSec = computed(() => {
         </div>
       </div>
     </div>
+
+    <!-- 2.5 Position Sizing & Dynamic Leverage Calculator -->
+    <PositionCalculatorCard
+      :snapshot="snapshot"
+      :open-positions="openPositions"
+      :open-positions-summary="summary"
+      :lead-margin-balance="summary.marginBalance ?? profile.marginBalance"
+      :display-name="displayName || profile.nickname"
+    />
 
     <!-- 3. 365D ROI Curve + 90D Asset Allocation -->
     <div class="grid grid-cols-1 lg:grid-cols-3 gap-5">

@@ -34,6 +34,7 @@ class User(Base):
     totp_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     totp_secret_enc: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     totp_pending_secret_enc: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    session_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     last_login_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -209,6 +210,67 @@ class CopyBinding(Base):
     guards: Mapped[list["PositionGuardState"]] = relationship(
         back_populates="binding", cascade="all, delete-orphan"
     )
+    allocations: Mapped[list["PositionAllocation"]] = relationship(
+        back_populates="binding", cascade="all, delete-orphan"
+    )
+
+
+class PositionAllocation(Base):
+    __tablename__ = "position_allocations"
+    __table_args__ = (
+        UniqueConstraint("binding_id", "inst_id", "pos_side", name="uq_pos_alloc_binding_inst_side"),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    binding_id: Mapped[int] = mapped_column(Integer, ForeignKey("copy_bindings.id", ondelete="CASCADE"), nullable=False)
+    account_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    inst_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    pos_side: Mapped[str] = mapped_column(String(16), nullable=False)
+    owned_qty: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    entry_cost: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    owned_qty_exact: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    entry_cost_exact: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    # Generations keep old history/stop intents from closing a reopened allocation.
+    generation: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    opened_at_ms: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    binding: Mapped["CopyBinding"] = relationship(back_populates="allocations")
+
+
+class BindingSourceProgress(Base):
+    __tablename__ = "binding_source_progress"
+    binding_id: Mapped[int] = mapped_column(Integer, ForeignKey("copy_bindings.id", ondelete="CASCADE"), primary_key=True)
+    source_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    cumulative_qty: Mapped[str] = mapped_column(String(100), default="0", nullable=False)
+    cumulative_notional: Mapped[str] = mapped_column(String(100), default="0", nullable=False)
+
+
+class BindingDelivery(Base):
+    __tablename__ = "binding_deliveries"
+    binding_id: Mapped[int] = mapped_column(Integer, ForeignKey("copy_bindings.id", ondelete="CASCADE"), primary_key=True)
+    source_event_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    source_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    state: Mapped[str] = mapped_column(String(32), default="PENDING", nullable=False)
+
+
+class OrderIntent(Base):
+    __tablename__ = "order_intents"
+    __table_args__ = (UniqueConstraint("binding_id", "source_event_id", name="uq_intent_binding_source"),)
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    binding_id: Mapped[int] = mapped_column(Integer, ForeignKey("copy_bindings.id", ondelete="RESTRICT"), nullable=False)
+    account_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    inst_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    pos_side: Mapped[str] = mapped_column(String(16), nullable=False)
+    source_event_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    requested_qty: Mapped[str] = mapped_column(String(100), nullable=False)
+    filled_qty: Mapped[str] = mapped_column(String(100), default="0", nullable=False)
+    avg_px: Mapped[str] = mapped_column(String(100), default="0", nullable=False)
+    reduce_only: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    target_usd: Mapped[str] = mapped_column(String(100), default="0", nullable=False)
+    source_time_ms: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    exchange_order_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 
 class PositionGuardState(Base):
@@ -246,6 +308,7 @@ class BindingDebt(Base):
     symbol: Mapped[str] = mapped_column(String(64), nullable=False)
     position_side: Mapped[str] = mapped_column(String(16), nullable=False)  # LONG | SHORT
     pending_usd: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    pending_usd_exact: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
     )

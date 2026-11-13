@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictBool
 from pydantic.alias_generators import to_camel
 
 
@@ -31,6 +31,10 @@ class ChangePasswordRequest(CamelModel):
 
 class TotpVerifyRequest(CamelModel):
     code: str = Field(min_length=6, max_length=12)
+
+
+class TotpSetupRequest(CamelModel):
+    current_password: str
 
 
 class TotpDisableRequest(CamelModel):
@@ -167,9 +171,64 @@ class KillSwitchRequest(CamelModel):
     enabled: bool
 
 
+class RiskDefaults(CamelModel):
+    """The same bounds as binding creation, also applied to stored policies."""
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    max_total_leverage: float = Field(default=8.0, gt=0.0, le=100.0)
+    max_single_leverage: float = Field(default=4.0, gt=0.0, le=100.0)
+    max_instrument_leverage: int = Field(default=20, ge=1, le=125)
+    max_drawdown_pct: float = Field(default=30.0, gt=0.0, le=100.0)
+    daily_max_loss_pct: float = Field(default=10.0, gt=0.0, le=100.0)
+    max_slippage_pct: float = Field(default=1.0, gt=0.0, le=50.0)
+    max_spread_pct: float = Field(default=0.3, ge=0.0, le=20.0)
+    ioc_offset_pct: float = Field(default=0.5, ge=0.0, le=10.0)
+    order_mode: Literal["ioc_then_market", "ioc_only", "market_only"] = "ioc_then_market"
+    tp_sl_mode: Literal["follow_lead", "independent", "hybrid_guard"] = "follow_lead"
+    enable_stop_loss: StrictBool = False
+    stop_loss_pct: float = Field(default=5.0, gt=0.0, le=95.0)
+    enable_take_profit: StrictBool = False
+    take_profit_pct: float = Field(default=10.0, gt=0.0, le=500.0)
+    enable_trailing_stop: StrictBool = False
+    trailing_callback_pct: float = Field(default=2.0, gt=0.0, le=50.0)
+    hard_stop_loss_pct: float = Field(default=15.0, gt=0.0, le=95.0)
+
+
+class ResilienceSettings(CamelModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    missed_order_max_age_sec: int = Field(default=900, ge=10, le=3600)
+    catchup_max_price_dev_pct: float = Field(default=0.5, gt=0, le=10)
+    reconcile_interval_sec: int = Field(default=60, ge=15, le=600)
+    auto_close_orphan_positions: Literal["alert_only", "auto_close"] = "alert_only"
+    insufficient_margin_policy: Literal["auto_scale_down", "skip_alert"] = "auto_scale_down"
+    flip_close_first: StrictBool = False  # Retained for config compatibility; chronology always wins.
+    clock_sync_interval_sec: int = Field(default=300, ge=30, le=3600)
+    max_consecutive_failures: int = Field(default=5, ge=1, le=100)
+
+
+class NotificationSettings(CamelModel):
+    model_config = ConfigDict(extra="forbid")
+    webhook_enabled: StrictBool = False
+    webhook_url: str = ""
+    telegram_enabled: StrictBool = False
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+    wecom_enabled: StrictBool = False
+    wecom_webhook_url: str = ""
+    dingtalk_enabled: StrictBool = False
+    dingtalk_webhook_url: str = ""
+    outbox_enabled: StrictBool = False
+    outbox_path: str = ""
+    notify_on_execution: StrictBool = True
+    notify_on_lead_order: StrictBool = True
+    notify_on_risk_block: StrictBool = True
+    notify_on_security_alert: StrictBool = True
+
+
 class SettingsUpdate(CamelModel):
-    global_kill_switch: Optional[bool] = None
-    public_monitoring_enabled: Optional[bool] = None
-    notifications: Optional[Dict[str, Any]] = None
-    risk_defaults: Optional[Dict[str, Any]] = None
-    resilience: Optional[Dict[str, Any]] = None
+    model_config = ConfigDict(extra="forbid")
+    global_kill_switch: Optional[StrictBool] = None
+    public_monitoring_enabled: Optional[StrictBool] = None
+    notifications: Optional[NotificationSettings] = None
+    risk_defaults: Optional[RiskDefaults] = None
+    resilience: Optional[ResilienceSettings] = None

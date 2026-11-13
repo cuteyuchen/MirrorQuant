@@ -1,23 +1,31 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_HALF_UP
+import math
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from typing import Any
 
 from app.services.adapters.base import InstrumentSpec
 
 
+def exact(val: Any) -> Decimal:
+    res = val if isinstance(val, Decimal) else Decimal(str(val))
+    if not res.is_finite():
+        raise ValueError("Non-finite financial input")
+    return res
+
+
 def quantize_down(val: Any, step: Any) -> Decimal:
-    d_val = Decimal(str(val))
-    d_step = Decimal(str(step))
-    if d_step <= 0:
-        return d_val
-    return (d_val // d_step) * d_step
+    d_val = exact(val)
+    d_step = exact(step)
+    if d_val < 0 or d_step <= 0:
+        return Decimal("0")
+    return (d_val / d_step).to_integral_value(rounding=ROUND_DOWN) * d_step
 
 
 def quantize_step(val: Any, step: Any) -> Decimal:
-    d_val = Decimal(str(val))
-    d_step = Decimal(str(step))
+    d_val = exact(val)
+    d_step = exact(step)
     if d_step <= 0:
         return d_val
     return (d_val / d_step).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * d_step
@@ -45,64 +53,88 @@ class PositionSizer:
 
     @staticmethod
     def calculate_target_usd(
-        follower_equity: float,
-        lead_margin_balance: float,
-        risk_scale: float,
-        lead_notional: float,
-        pending_debt_usd: float = 0.0,
-    ) -> float:
-        if follower_equity <= 0 or lead_margin_balance <= 0 or lead_notional <= 0:
-            return max(0.0, pending_debt_usd)
-        ratio = (follower_equity / lead_margin_balance) * risk_scale
-        return max(0.0, lead_notional * ratio + pending_debt_usd)
+        follower_equity: Any,
+        lead_margin_balance: Any,
+        risk_scale: Any,
+        lead_notional: Any,
+        pending_debt_usd: Any = 0.0,
+    ) -> Decimal:
+        equity, balance, scale, notional, debt = map(
+            exact, (follower_equity, lead_margin_balance, risk_scale, lead_notional, pending_debt_usd)
+        )
+        if equity <= 0 or balance <= 0 or notional <= 0 or scale <= 0:
+            return Decimal("0")
+        lead_order_ratio = notional / balance
+        return max(Decimal("0"), equity * lead_order_ratio * scale + debt)
+
+    @staticmethod
+    def compute_dynamic_leverage(
+        target_notional: Any,
+        equity: Any,
+        max_symbol_leverage: int = 100,
+        target_im_fraction: float = 0.08,
+    ) -> int:
+        """Choose cross-margin initial-margin leverage without changing exposure size."""
+        notional, eq, fraction = map(exact, (target_notional, equity, target_im_fraction))
+        maximum = int(exact(max_symbol_leverage))
+        if maximum < 1 or fraction <= 0 or fraction > 1:
+            raise ValueError("Invalid leverage ceiling or initial margin fraction")
+        if notional <= 0 or eq <= 0:
+            return min(10, maximum)
+        desired_lvr = math.ceil(notional / (eq * fraction))
+        return min(maximum, max(2, desired_lvr))
 
     @staticmethod
     def size_open_order(
-        target_usd: float,
-        ref_price: float,
+        target_usd: Any,
+        ref_price: Any,
         spec: InstrumentSpec,
     ) -> SizeResult:
-        if ref_price <= 0 or target_usd <= 0:
+        target, price, ct_val = map(exact, (target_usd, ref_price, spec.ct_val))
+        if price <= 0 or target <= 0 or ct_val <= 0:
             return SizeResult(
                 contracts=Decimal("0"),
                 below_min=True,
-                target_usd=target_usd,
+                target_usd=float(target),
                 one_unit_usd=0.0,
                 min_usd=0.0,
                 estimated_notional=0.0,
             )
 
-        one_unit_usd = ref_price * float(spec.ct_val)
-        raw_units = target_usd / one_unit_usd if one_unit_usd > 0 else 0.0
+        one_unit_usd = price * ct_val
+        raw_units = target / one_unit_usd
         qty = quantize_down(raw_units, spec.lot_sz)
-        est_notional = float(qty) * one_unit_usd
-        min_usd = max(float(spec.min_sz) * one_unit_usd, float(spec.min_notional))
-        below_min = (qty < spec.min_sz) or (est_notional < float(spec.min_notional))
+        est_notional = qty * one_unit_usd
+        min_usd = max(exact(spec.min_sz) * one_unit_usd, exact(spec.min_notional))
+        below_min = qty <= 0 or (qty < spec.min_sz) or (est_notional < spec.min_notional)
 
         return SizeResult(
             contracts=qty,
             below_min=below_min,
-            target_usd=target_usd,
-            one_unit_usd=one_unit_usd,
-            min_usd=min_usd,
-            estimated_notional=est_notional,
+            target_usd=float(target),
+            one_unit_usd=float(one_unit_usd),
+            min_usd=float(min_usd),
+            estimated_notional=float(est_notional),
         )
 
     @staticmethod
     def size_close_order(
-        local_pos_sz: float,
+        local_pos_sz: Any,
         is_full_close: bool,
-        lead_close_qty: float,
-        lead_remaining_qty: float,
+        lead_close_qty: Any,
+        lead_remaining_qty: Any,
         spec: InstrumentSpec,
     ) -> Decimal:
-        local_dec = Decimal(str(local_pos_sz))
-        if is_full_close or local_dec <= spec.min_sz:
-            return local_dec
-        prior_lead_qty = lead_remaining_qty + lead_close_qty
-        reduce_frac = min(1.0, lead_close_qty / prior_lead_qty) if prior_lead_qty > 0 else 1.0
-        raw_close = local_dec * Decimal(str(reduce_frac))
-        close_sz = quantize_down(raw_close, spec.lot_sz)
-        if close_sz < spec.min_sz:
-            close_sz = spec.min_sz if local_dec >= spec.min_sz else local_dec
-        return min(close_sz, local_dec)
+        local, closing, remaining = map(exact, (local_pos_sz, lead_close_qty, lead_remaining_qty))
+        if local <= 0 or closing <= 0:
+            return Decimal("0")
+        if remaining < 0:
+            raise ValueError("Invalid lead inventory")
+        if is_full_close:
+            return quantize_down(local, spec.lot_sz)
+        prior = closing + remaining
+        if prior <= 0:
+            return quantize_down(local, spec.lot_sz)
+        fraction = min(Decimal("1"), closing / prior)
+        qty = quantize_down(local * fraction, spec.lot_sz)
+        return qty if qty >= spec.min_sz else Decimal("0")

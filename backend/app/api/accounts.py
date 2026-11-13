@@ -7,12 +7,14 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, record_audit
+from app.api.exposure import require_account_flat
 from app.core.database import get_db
 from app.core.security import CredentialVault
 from app.models.domain import ProxyNode, TradingAccount, User
 from app.schemas.api import AccountCreate, AccountUpdate
 from app.services.adapters.factory import create_exchange_adapter
 from app.services.engine.orchestrator import orchestrator
+from app.services.engine.serialization import serialized_execution
 from app.services.proxy.manager import ProxyManager
 
 router = APIRouter(prefix="/api/accounts", tags=["accounts"])
@@ -103,6 +105,7 @@ async def create_account(
 
 
 @router.put("/{account_id}")
+@serialized_execution
 async def update_account(
     account_id: int,
     payload: AccountUpdate,
@@ -116,6 +119,12 @@ async def update_account(
 
     vault = CredentialVault()
     data = payload.model_dump(exclude_unset=True)
+    identity_fields = {"environment", "api_key", "secret_key", "passphrase", "margin_mode", "position_mode"}
+    if any(field in {"api_key", "secret_key", "passphrase"} or getattr(acct, field) != data[field]
+           for field in identity_fields.intersection(data)):
+        if acct.is_enabled:
+            raise HTTPException(status_code=409, detail="Disable the account and drain exposure before changing account identity or mode")
+        await require_account_flat(db, acct)
     if any(k in data and data[k] for k in ("api_key", "secret_key", "passphrase")):
         current_creds = vault.decrypt_dict(acct.encrypted_credentials)
         if data.get("api_key"):
@@ -138,6 +147,7 @@ async def update_account(
 
 
 @router.delete("/{account_id}")
+@serialized_execution
 async def delete_account(
     account_id: int,
     request: Request,
@@ -147,6 +157,9 @@ async def delete_account(
     acct = await db.get(TradingAccount, account_id)
     if not acct:
         raise HTTPException(status_code=404, detail="Account not found")
+    if acct.is_enabled:
+        raise HTTPException(status_code=409, detail="Disable the account and drain exposure before deletion")
+    await require_account_flat(db, acct, deleting=True)
     name = acct.name
     await db.delete(acct)
     await record_audit(db, "DELETE_ACCOUNT", "account", str(account_id), f"Deleted account {name}", current_user, request)

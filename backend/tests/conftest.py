@@ -13,8 +13,9 @@ sys.path.insert(0, str(backend_dir))
 os.environ["MQ_ENV"] = "test"
 os.environ["MQ_ENABLE_BACKGROUND_ENGINE"] = "false"
 os.environ["MQ_DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
-os.environ["MQ_MASTER_KEY"] = "TestMasterKeyForAES256GCMEncryptionMustBeStrong32!"
+os.environ["MQ_MASTER_KEY"] = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
 os.environ["MQ_JWT_SECRET"] = "TestJWTSecretKeyForTokenSigningAndValidation32!"
+os.environ["MQ_BOOTSTRAP_TOKEN"] = "TestBootstrapAuthorizationSecretForSetupOnly!"
 
 from app.core.database import get_db, init_db, reset_db_engine
 from app.main import app
@@ -31,5 +32,9 @@ async def setup_test_db():
 @pytest.fixture
 async def async_client():
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+        headers={"X-MQ-Bootstrap-Token": os.environ["MQ_BOOTSTRAP_TOKEN"]},
+    ) as client:
         yield client

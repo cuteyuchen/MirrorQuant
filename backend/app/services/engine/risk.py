@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
+import math
 from typing import List, Optional, Sequence, Tuple
 
 from app.services.adapters.base import ExchangePosition, InstrumentSpec
-from app.services.engine.sizer import quantize_down
+from app.services.engine.sizer import exact, quantize_down
 
 
 @dataclass
@@ -40,8 +41,8 @@ class RiskEngine:
         lead_avg_price: float,
         max_slippage_pct: float,
     ) -> RiskCheckResult:
-        if lead_avg_price <= 0:
-            return RiskCheckResult(True, value=0.0)
+        if not all(math.isfinite(v) for v in (ref_price, lead_avg_price, max_slippage_pct)) or ref_price <= 0 or lead_avg_price <= 0 or max_slippage_pct < 0:
+            return RiskCheckResult(False, "Invalid slippage price or limit", code="BLOCKED_SLIPPAGE")
         slip_pct = abs(ref_price - lead_avg_price) / lead_avg_price * 100.0
         if slip_pct > max_slippage_pct:
             return RiskCheckResult(
@@ -58,7 +59,9 @@ class RiskEngine:
         best_ask: float,
         max_spread_pct: float,
     ) -> RiskCheckResult:
-        if max_spread_pct <= 0 or best_bid <= 0 or best_ask <= 0:
+        if not all(math.isfinite(v) for v in (best_bid, best_ask, max_spread_pct)) or not 0 < best_bid <= best_ask:
+            return RiskCheckResult(False, "Executable orderbook unavailable or crossed", code="BLOCKED_SPREAD")
+        if max_spread_pct <= 0:
             return RiskCheckResult(True, value=0.0)
         mid = (best_bid + best_ask) / 2.0
         if mid <= 0:
@@ -79,6 +82,8 @@ class RiskEngine:
         current_equity: float,
         max_drawdown_pct: float,
     ) -> RiskCheckResult:
+        if not all(math.isfinite(v) for v in (hwm_equity, current_equity, max_drawdown_pct)):
+            return RiskCheckResult(False, "Invalid account equity or drawdown limit", code="BLOCKED_DRAWDOWN")
         if hwm_equity <= 0:
             return RiskCheckResult(True, value=0.0)
         dd_pct = max(0.0, (hwm_equity - current_equity) / hwm_equity * 100.0)
@@ -97,6 +102,8 @@ class RiskEngine:
         current_equity: float,
         daily_max_loss_pct: float,
     ) -> RiskCheckResult:
+        if not all(math.isfinite(v) for v in (day_start_equity, current_equity, daily_max_loss_pct)):
+            return RiskCheckResult(False, "Invalid account equity or daily loss limit", code="BLOCKED_DAILY_LOSS")
         if day_start_equity <= 0 or daily_max_loss_pct <= 0:
             return RiskCheckResult(True, value=0.0)
         loss_pct = max(0.0, (day_start_equity - current_equity) / day_start_equity * 100.0)
@@ -118,18 +125,20 @@ class RiskEngine:
         lead_avg_price: float,
         catchup_max_price_dev_pct: float,
     ) -> RiskCheckResult:
-        if order_time_ms <= 0 or max_age_sec <= 0:
-            return RiskCheckResult(True)
+        """Catch-up gate: price drift decides, age is only a wide sanity backstop.
+
+        Rationale: Binance public copy-trade BAPI exposes lead fills with a 2-3 minute
+        aggregation lag. Rejecting on age alone silently drops every position the lead
+        opens. The real economic risk of a late entry is paying a worse price than the
+        lead, so the drift gate is authoritative; max_age_sec is only a hard ceiling
+        against replaying ancient history.
+        """
+        if order_time_ms <= 0 or order_time_ms > now_ms:
+            return RiskCheckResult(False, "Missing or future source order timestamp", code="SKIPPED_STALE_MISSED_ORDER")
         age_sec = max(0.0, (now_ms - order_time_ms) / 1000.0)
-        if age_sec > max_age_sec:
-            return RiskCheckResult(
-                False,
-                f"Missed order stale: age {age_sec:.0f}s > max {max_age_sec}s",
-                value=round(age_sec, 1),
-                code="SKIPPED_STALE_MISSED_ORDER",
-            )
-        # If delayed (>= 20s), apply tighter catch-up price deviation guard
-        if age_sec >= 20.0 and lead_avg_price > 0 and catchup_max_price_dev_pct > 0:
+
+        # Authoritative gate: price must still be inside the lead's entry cost window.
+        if lead_avg_price > 0 and catchup_max_price_dev_pct > 0:
             dev_pct = abs(ref_price - lead_avg_price) / lead_avg_price * 100.0
             if dev_pct > catchup_max_price_dev_pct:
                 return RiskCheckResult(
@@ -138,6 +147,15 @@ class RiskEngine:
                     value=round(dev_pct, 4),
                     code="BLOCKED_CATCHUP_DRIFT",
                 )
+
+        # Wide backstop: never replay genuinely ancient history even if price matches.
+        if max_age_sec > 0 and age_sec > max_age_sec:
+            return RiskCheckResult(
+                False,
+                f"Missed order stale: age {age_sec:.0f}s > max {max_age_sec}s",
+                value=round(age_sec, 1),
+                code="SKIPPED_STALE_MISSED_ORDER",
+            )
         return RiskCheckResult(True, value=round(age_sec, 1))
 
     @staticmethod
@@ -151,36 +169,41 @@ class RiskEngine:
         max_single_leverage: float,
         max_total_leverage: float,
     ) -> tuple[Decimal, Optional[str]]:
-        if follower_equity <= 0 or ref_price <= 0:
+        equity, price, single_limit, total_limit = map(
+            exact, (follower_equity, ref_price, max_single_leverage, max_total_leverage)
+        )
+        if equity <= 0 or price <= 0:
             return Decimal("0"), "Follower equity or reference price <= 0"
 
-        one_unit_usd = ref_price * float(spec.ct_val)
+        one_unit_usd = price * exact(spec.ct_val)
         if one_unit_usd <= 0:
             return Decimal("0"), "Invalid contract value"
 
-        cur_total_notional = sum(p.notional_usd for p in positions)
-        cur_sym_notional = sum(p.notional_usd for p in positions if p.inst_id == inst_id)
-        qty = requested_qty
+        cur_total_notional = sum((abs(exact(p.notional_usd)) for p in positions), Decimal("0"))
+        cur_sym_notional = sum((abs(exact(p.notional_usd)) for p in positions if p.inst_id == inst_id), Decimal("0"))
+        qty = quantize_down(requested_qty, spec.lot_sz)
         reason = None
 
-        req_notional = float(qty) * one_unit_usd
-        if (cur_sym_notional + req_notional) / follower_equity > max_single_leverage:
-            avail = max(0.0, max_single_leverage * follower_equity - cur_sym_notional)
+        req_notional = qty * one_unit_usd
+        if (cur_sym_notional + req_notional) / equity > single_limit:
+            avail = max(Decimal("0"), single_limit * equity - cur_sym_notional)
             capped = quantize_down(avail / one_unit_usd, spec.lot_sz)
             if capped < spec.min_sz:
                 return Decimal("0"), f"Single symbol leverage cap ({max_single_leverage}x) reached for {inst_id}"
             qty = capped
-            req_notional = float(qty) * one_unit_usd
+            req_notional = qty * one_unit_usd
             reason = f"Capped by single symbol leverage ({max_single_leverage}x)"
 
-        if (cur_total_notional + req_notional) / follower_equity > max_total_leverage:
-            avail = max(0.0, max_total_leverage * follower_equity - cur_total_notional)
+        if (cur_total_notional + req_notional) / equity > total_limit:
+            avail = max(Decimal("0"), total_limit * equity - cur_total_notional)
             capped = quantize_down(avail / one_unit_usd, spec.lot_sz)
             if capped < spec.min_sz:
                 return Decimal("0"), f"Total portfolio leverage cap ({max_total_leverage}x) reached"
             qty = capped
             reason = f"Capped by total leverage ({max_total_leverage}x)"
 
+        if qty < spec.min_sz or qty * one_unit_usd < spec.min_notional:
+            return Decimal("0"), "Exposure cap leaves quantity below minimum order"
         return qty, reason
 
     @staticmethod
@@ -194,14 +217,20 @@ class RiskEngine:
         max_usage: float = 0.92,
     ) -> Tuple[Decimal, Optional[str], Optional[str]]:
         """Check available margin; either auto-scale down or block with alert."""
-        if requested_qty <= 0 or ref_price <= 0:
+        requested_qty = quantize_down(requested_qty, spec.lot_sz)
+        price, available, usage = map(exact, (ref_price, avail_equity, max_usage))
+        if requested_qty <= 0 or price <= 0:
             return Decimal("0"), "Invalid qty or price", None
-        one_unit_usd = ref_price * float(spec.ct_val)
+        one_unit_usd = price * exact(spec.ct_val)
         if one_unit_usd <= 0:
             return Decimal("0"), "Invalid contract value", None
         lvr = max(1, int(leverage))
-        usable_margin = max(0.0, avail_equity * max_usage)
-        req_notional = float(requested_qty) * one_unit_usd
+        if usage <= 0 or usage > 1:
+            return Decimal("0"), "Invalid margin usage fraction", None
+        usable_margin = max(Decimal("0"), available * usage)
+        req_notional = requested_qty * one_unit_usd
+        if requested_qty < spec.min_sz or req_notional < spec.min_notional:
+            return Decimal("0"), "Quantity below minimum order", None
         req_margin = req_notional / lvr
         if req_margin <= usable_margin:
             return requested_qty, None, None
@@ -215,7 +244,7 @@ class RiskEngine:
 
         max_notional = usable_margin * lvr
         scaled = quantize_down(max_notional / one_unit_usd, spec.lot_sz)
-        if scaled < spec.min_sz or (float(scaled) * one_unit_usd) < float(spec.min_notional):
+        if scaled < spec.min_sz or (scaled * one_unit_usd) < spec.min_notional:
             return (
                 Decimal("0"),
                 f"Insufficient margin after auto-scale: usable ${usable_margin:.2f} below min order",

@@ -121,6 +121,30 @@ def test_missed_order_catchup_and_stale_guards():
     assert res_drift.allowed is False
     assert res_drift.code == "BLOCKED_CATCHUP_DRIFT"
 
+    # Case 4: BAPI aggregation lag (150s) but price is still inside the lead's cost
+    # window -> allowed. Price drift, not wall-clock age, is the authoritative gate.
+    res_lag_in_price = RiskEngine.check_missed_order_catchup(
+        order_time_ms=now_ms - 150000,
+        now_ms=now_ms,
+        max_age_sec=900,
+        ref_price=60100.0,  # 0.17% above lead entry
+        lead_avg_price=60000.0,
+        catchup_max_price_dev_pct=0.5,
+    )
+    assert res_lag_in_price.allowed is True
+
+    # Case 5: Ancient order (> wide backstop) is still rejected even at a perfect price.
+    res_ancient = RiskEngine.check_missed_order_catchup(
+        order_time_ms=now_ms - 1000000,
+        now_ms=now_ms,
+        max_age_sec=900,
+        ref_price=60000.0,
+        lead_avg_price=60000.0,
+        catchup_max_price_dev_pct=0.5,
+    )
+    assert res_ancient.allowed is False
+    assert res_ancient.code == "SKIPPED_STALE_MISSED_ORDER"
+
 
 def test_insufficient_margin_auto_scale_down():
     spec = InstrumentSpec(

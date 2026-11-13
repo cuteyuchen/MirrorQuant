@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, record_audit
+from app.api.exposure import require_binding_flat
 from app.core.database import get_db
 from app.models.domain import (
     BindingDebt,
@@ -17,6 +18,7 @@ from app.models.domain import (
     User,
 )
 from app.schemas.api import BindingCreate, BindingUpdate, KillSwitchRequest
+from app.services.engine.serialization import serialized_execution
 
 router = APIRouter(prefix="/api/bindings", tags=["bindings"])
 
@@ -140,6 +142,7 @@ async def create_binding(
 
 
 @router.put("/{binding_id}")
+@serialized_execution
 async def update_binding(
     binding_id: int,
     payload: BindingUpdate,
@@ -152,6 +155,14 @@ async def update_binding(
         raise HTTPException(status_code=404, detail="Binding not found")
 
     data = payload.model_dump(exclude_unset=True)
+    protection_fields = {"symbol_map", "tp_sl_mode", "enable_stop_loss", "stop_loss_pct", "enable_take_profit",
+                         "take_profit_pct", "enable_trailing_stop", "trailing_callback_pct", "hard_stop_loss_pct"}
+    changed_protection = any(
+        (json.loads(binding.symbol_map_json or "{}") if field == "symbol_map" else getattr(binding, field)) != data[field]
+        for field in protection_fields.intersection(data)
+    )
+    if changed_protection:
+        await require_binding_flat(db, binding)
     if "symbol_whitelist" in data:
         binding.symbol_whitelist_json = json.dumps([s.upper() for s in (data.pop("symbol_whitelist") or [])])
     if "symbol_blacklist" in data:
@@ -168,6 +179,7 @@ async def update_binding(
 
 
 @router.delete("/{binding_id}")
+@serialized_execution
 async def delete_binding(
     binding_id: int,
     request: Request,
@@ -177,6 +189,9 @@ async def delete_binding(
     binding = await db.get(CopyBinding, binding_id)
     if not binding:
         raise HTTPException(status_code=404, detail="Binding not found")
+    if binding.is_enabled:
+        raise HTTPException(status_code=409, detail="Disable the binding and drain exposure before deletion")
+    await require_binding_flat(db, binding, deleting=True)
     name = binding.name
     await db.delete(binding)
     await record_audit(db, "DELETE_BINDING", "binding", str(binding_id), f"Deleted binding {name}", current_user, request)
@@ -185,6 +200,7 @@ async def delete_binding(
 
 
 @router.post("/{binding_id}/toggle")
+@serialized_execution
 async def toggle_binding(
     binding_id: int,
     request: Request,
@@ -239,6 +255,7 @@ async def reset_debt(
 
 
 @router.post("/kill-switch")
+@serialized_execution
 async def set_global_kill_switch(
     payload: KillSwitchRequest,
     request: Request,

@@ -58,6 +58,8 @@ async def get_current_user_optional(
     except (TypeError, ValueError):
         return None
     user = await db.scalar(select(User).where(User.id == user_id, User.is_active == True))  # noqa: E712
+    if user is None or payload.get("ver") != user.session_version:
+        return None
     return user
 
 

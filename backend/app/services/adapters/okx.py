@@ -64,7 +64,10 @@ class OKXAdapter(BaseExchangeAdapter):
         auth: bool = True,
         retries: int = 3,
     ) -> Any:
+        self._check_rate_limit()
         method = method.upper()
+        # A mutation may already have reached the exchange when its response is lost.
+        attempts = max(1, retries) if method == "GET" else 1
         query_str = ""
         if params:
             parts = [f"{k}={v}" for k, v in sorted(params.items()) if v is not None]
@@ -77,7 +80,7 @@ class OKXAdapter(BaseExchangeAdapter):
 
         last_err: Optional[Exception] = None
         async with ProxyManager.build_client(proxy_url=self.proxy_url, timeout=self.timeout) as client:
-            for attempt in range(retries):
+            for attempt in range(attempts):
                 headers: Dict[str, str] = {
                     "Content-Type": "application/json",
                     "User-Agent": "MirrorQuant/1.0",
@@ -101,6 +104,8 @@ class OKXAdapter(BaseExchangeAdapter):
                     else:
                         raise ValueError(f"Unsupported HTTP method: {method}")
 
+                    if resp.status_code == 429:
+                        self._note_rate_limit(resp)
                     if resp.status_code != 200:
                         raise ExchangeAPIError("okx", str(resp.status_code), f"HTTP {resp.status_code}: {resp.text[:200]}")
 
@@ -108,18 +113,15 @@ class OKXAdapter(BaseExchangeAdapter):
                     code = str(payload.get("code", ""))
                     msg = payload.get("msg", "")
                     if code != "0":
-                        if code == "50011" and attempt < retries - 1:
-                            await asyncio.sleep(0.8 * (attempt + 1))
-                            continue
+                        if code in ("50011", "50061"):
+                            self._note_rate_limit(resp)
                         raise ExchangeAPIError("okx", code, msg, payload.get("data"))
                     return payload.get("data", [])
-                except ExchangeAPIError as exc:
-                    last_err = exc
-                    if exc.code != "50011":
-                        raise
+                except ExchangeAPIError:
+                    raise
                 except Exception as exc:
                     last_err = exc
-                    if attempt < retries - 1:
+                    if attempt < attempts - 1:
                         await asyncio.sleep(0.5 * (attempt + 1))
                     else:
                         raise
@@ -136,7 +138,7 @@ class OKXAdapter(BaseExchangeAdapter):
         else:
             base = lead_symbol[:-4] if lead_symbol.endswith("USDT") else lead_symbol
             inst_id = f"{base}-USDT-SWAP"
-        return inst_id, inst_id in instruments
+        return inst_id, self._symbol_matches(lead_symbol, inst_id, instruments)
 
     async def test_connection(self) -> Dict[str, Any]:
         cfg_data = await self._request("GET", "/api/v5/account/config")
@@ -169,13 +171,8 @@ class OKXAdapter(BaseExchangeAdapter):
                     upl=float(det.get("upl") or 0.0),
                     raw=det,
                 )
-        return BalanceInfo(
-            eq=float(bal.get("totalEq") or 0.0),
-            avail_eq=float(bal.get("availEq") or 0.0),
-            cash_bal=float(bal.get("cashBal") or 0.0),
-            upl=float(bal.get("upl") or 0.0),
-            raw=bal,
-        )
+        # Other collateral does not become USDT capital when the USDT row is absent.
+        return BalanceInfo(eq=0.0, avail_eq=0.0, cash_bal=0.0, upl=0.0, raw=bal)
 
     async def get_positions(self) -> List[ExchangePosition]:
         data = await self._request("GET", "/api/v5/account/positions", params={"instType": "SWAP"})
@@ -186,11 +183,13 @@ class OKXAdapter(BaseExchangeAdapter):
                 continue
             inst_id = str(p.get("instId") or "")
             base_sym = inst_id.replace("-USDT-SWAP", "USDT") if inst_id.endswith("-USDT-SWAP") else inst_id
+            raw_side = str(p.get("posSide") or "net").lower()
+            logical_side = ("long" if pos_sz > 0 else "short") if raw_side == "net" else raw_side
             positions.append(
                 ExchangePosition(
                     inst_id=inst_id,
                     symbol=base_sym,
-                    pos_side=str(p.get("posSide") or "net").lower(),
+                    pos_side=logical_side,
                     mgn_mode=str(p.get("mgnMode") or "cross").lower(),
                     pos=abs(pos_sz),
                     avail_pos=abs(float(p.get("availPos") or 0.0)),
@@ -207,33 +206,31 @@ class OKXAdapter(BaseExchangeAdapter):
 
     async def get_instruments(self, force_refresh: bool = False) -> Dict[str, InstrumentSpec]:
         now = time.time()
-        if not force_refresh and self._instruments_cache and (now - self._instruments_cache_ts < self._cache_ttl_sec):
+        if not force_refresh and self._instruments_cache and now - self._instruments_cache_ts < self._cache_ttl_sec:
             return self._instruments_cache
-
         data = await self._request("GET", "/api/v5/public/instruments", params={"instType": "SWAP"}, auth=False)
         result: Dict[str, InstrumentSpec] = {}
         for item in data:
-            if item.get("state") != "live":
+            inst_id = str(item.get("instId") or "")
+            if (item.get("state") != "live" or item.get("ctType") != "linear"
+                    or item.get("settleCcy") != "USDT" or not inst_id.endswith("-USDT-SWAP")):
                 continue
-            inst_id = item.get("instId")
-            if not inst_id:
+            base = inst_id.removesuffix("-USDT-SWAP")
+            if item.get("ctValCcy") != base or item.get("ctMult") not in (None, "", "1", 1):
                 continue
             try:
                 result[inst_id] = InstrumentSpec(
-                    inst_id=inst_id,
-                    ct_val=Decimal(str(item.get("ctVal") or "1")),
-                    min_sz=Decimal(str(item.get("minSz") or "1")),
-                    lot_sz=Decimal(str(item.get("lotSz") or "1")),
-                    tick_sz=Decimal(str(item.get("tickSz") or "0.01")),
-                    max_lvr=float(item.get("lever") or 20.0),
-                    settle_ccy=str(item.get("settleCcy") or "USDT"),
+                    inst_id=inst_id, ct_val=Decimal(str(item["ctVal"])),
+                    min_sz=Decimal(str(item["minSz"])), lot_sz=Decimal(str(item["lotSz"])),
+                    tick_sz=Decimal(str(item["tickSz"])), max_lvr=float(item["lever"]),
+                    max_sz=Decimal(str(item["maxLmtSz"])), market_max_sz=Decimal(str(item["maxMktSz"])),
+                    settle_ccy="USDT", base_ccy=base,
                 )
-            except Exception:
+            except (ValueError, KeyError, ArithmeticError, TypeError):
+                # Incomplete metadata suspends this instrument; never invent its units.
                 continue
-        if result:
-            self._instruments_cache = result
-            self._instruments_cache_ts = now
-        return self._instruments_cache
+        self._instruments_cache, self._instruments_cache_ts = result, now
+        return result
 
     async def get_orderbook(self, inst_id: str, depth: int = 5) -> OrderBook:
         data = await self._request(
@@ -247,27 +244,37 @@ class OKXAdapter(BaseExchangeAdapter):
             asks=[[float(x[0]), float(x[1])] for x in book.get("asks", [])],
         )
 
-    async def ensure_leverage(
-        self,
-        inst_id: str,
-        lever: int,
-        pos_side: str = "long",
-        mgn_mode: str = "cross",
-    ) -> bool:
-        body: Dict[str, Any] = {
-            "instId": inst_id,
-            "lever": str(lever),
-            "mgnMode": mgn_mode,
-        }
-        if pos_side in ("long", "short") and self.position_mode == "hedge":
-            body["posSide"] = pos_side
+    async def ensure_leverage(self, inst_id: str, lever: int, pos_side: str = "long", mgn_mode: str = "cross") -> bool:
+        self._assert_supported_entry_mode(mgn_mode)
+        config = await self._request("GET", "/api/v5/account/config")
+        if not config or config[0].get("posMode") != "long_short_mode" or str(config[0].get("acctLv")) != "2":
+            raise ExchangeAPIError(self.exchange, "UNSUPPORTED_MODE", "OKX requires single-currency futures and hedge mode")
+        body = {"instId": inst_id, "lever": str(lever), "mgnMode": mgn_mode}
+        # Cross-margin SWAP leverage is instrument-wide; posSide is for isolated hedge mode.
         try:
             await self._request("POST", "/api/v5/account/set-leverage", body=body)
-            return True
-        except ExchangeAPIError as exc:
-            if "not changed" in exc.msg.lower() or exc.code == "59000":
-                return True
+        except ExchangeAPIError:
             return False
+        rows = await self._request("GET", "/api/v5/account/leverage-info", params={"instId": inst_id, "mgnMode": mgn_mode})
+        return bool(rows) and all(float(row.get("lever") or 0) == lever for row in rows)
+
+    async def get_max_leverage(self, inst_id: str, target_notional: Any) -> int:
+        spec = (await self.get_instruments()).get(inst_id)
+        if spec is None:
+            raise ValueError("Unqualified instrument")
+        rows = await self._request("GET", "/api/v5/public/position-tiers", params={
+            "instType": "SWAP", "tdMode": "cross", "instFamily": inst_id.removesuffix("-SWAP")
+        }, auth=False)
+        book = await self.get_orderbook(inst_id, depth=1)
+        if not rows or not book.bids or not book.asks:
+            raise ValueError("Missing OKX tier or mark data")
+        # Tier bounds are contracts. Use the lower quote conservatively.
+        price = min(Decimal(str(book.bids[0][0])), Decimal(str(book.asks[0][0])))
+        qty = Decimal(str(target_notional)) / (price * spec.ct_val)
+        for tier in sorted(rows, key=lambda row: Decimal(str(row["maxSz"]))):
+            if Decimal(str(tier["minSz"])) <= qty <= Decimal(str(tier["maxSz"])):
+                return min(int(spec.max_lvr), int(float(tier["maxLever"])))
+        raise ValueError("Target exposure exceeds qualified OKX tiers")
 
     async def place_order(
         self,
@@ -281,6 +288,7 @@ class OKXAdapter(BaseExchangeAdapter):
         reduce_only: bool = False,
         td_mode: str = "cross",
     ) -> OrderResult:
+        await self.validate_order(inst_id, ord_type, sz, px, reduce_only)
         body: Dict[str, Any] = {
             "instId": inst_id,
             "tdMode": td_mode,
@@ -323,7 +331,12 @@ class OKXAdapter(BaseExchangeAdapter):
             params["ordId"] = ord_id
         if cl_ord_id:
             params["clOrdId"] = cl_ord_id
-        data = await self._request("GET", "/api/v5/trade/order", params=params)
+        try:
+            data = await self._request("GET", "/api/v5/trade/order", params=params)
+        except ExchangeAPIError as exc:
+            if str(exc.code) in ("51603", "51001"):
+                return None
+            raise
         if not data:
             return None
         row = data[0]
@@ -336,12 +349,35 @@ class OKXAdapter(BaseExchangeAdapter):
             "raw": row,
         }
 
+    async def get_open_orders(self) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        queries = [("/api/v5/trade/orders-pending", {}, "ordId")]
+        queries.extend(("/api/v5/trade/orders-algo-pending", {"ordType": kind}, "algoId")
+                       for kind in ("conditional", "oco", "trigger", "move_order", "iceberg", "twap"))
+        for path, extra, key in queries:
+            after, seen = None, set()
+            while True:
+                params = {"instType": "SWAP", "limit": 100, **extra}
+                if after:
+                    params["after"] = after
+                page = await self._request("GET", path, params=params)
+                if not isinstance(page, list):
+                    raise ValueError("Incomplete OKX pending-order inventory")
+                rows.extend(page)
+                if len(page) < 100:
+                    break
+                after = page[-1].get(key)
+                if not after or after in seen:
+                    raise ValueError("Repeated OKX pending-order cursor")
+                seen.add(after)
+        return rows
+
     async def sync_time(self) -> int:
-        data = await self._request("GET", "/api/v5/public/time", auth=False)
-        if data and isinstance(data, list) and data[0].get("ts"):
-            srv_ms = int(data[0]["ts"])
-            self._time_offset_ms = srv_ms - int(time.time() * 1000)
-        return self._time_offset_ms
+        sent_ms = time.time() * 1000
+        data = await self._request("GET", "/api/v5/public/time", auth=False, retries=1)
+        if not data or not data[0].get("ts"):
+            raise RuntimeError("Missing OKX server time")
+        return self._calibrate_time(int(data[0]["ts"]), sent_ms)
 
     async def place_tp_sl(
         self,
@@ -376,10 +412,12 @@ class OKXAdapter(BaseExchangeAdapter):
 
         data = await self._request("POST", "/api/v5/trade/order-algo", body=body)
         item = data[0] if data else {}
-        s_code = str(item.get("sCode", "0"))
+        s_code = str(item.get("sCode", ""))
         if s_code != "0":
             raise ExchangeAPIError("okx", s_code, item.get("sMsg", "TP/SL algo order rejected"), item)
         algo_id = str(item.get("algoId") or "")
+        if not algo_id:
+            raise ExchangeAPIError(self.exchange, "AMBIGUOUS", "Missing protective order identity")
         return {"ok": True, "algoId": algo_id, "tpOrderId": algo_id if tp_px else None, "slOrderId": algo_id if sl_px else None}
 
     async def cancel_tp_sl(self, inst_id: str, pos_side: Optional[str] = None) -> bool:

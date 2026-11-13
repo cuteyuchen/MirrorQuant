@@ -115,15 +115,20 @@ def create_access_token(
     user_id: int,
     username: str,
     role: str = "admin",
+    session_version: int = 0,
     expires_minutes: Optional[int] = None,
 ) -> str:
     settings = get_settings()
-    exp_min = expires_minutes or settings.access_token_expire_minutes
+    exp_min = settings.access_token_expire_minutes if expires_minutes is None else expires_minutes
     now = datetime.now(timezone.utc)
     payload = {
         "sub": str(user_id),
         "username": username,
         "role": role,
+        "typ": "mq_access",
+        "ver": session_version,
+        "iss": "mirrorquant",
+        "aud": "mirrorquant-console",
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(minutes=exp_min)).timestamp()),
     }
@@ -133,12 +138,20 @@ def create_access_token(
 def decode_access_token(token: str) -> Optional[Dict[str, Any]]:
     settings = get_settings()
     try:
-        return jwt.decode(
+        payload = jwt.decode(
             token,
             settings.resolved_jwt_secret(),
             algorithms=["HS256"],
+            issuer="mirrorquant",
+            audience="mirrorquant-console",
+            options={"require": ["exp", "iat", "sub", "typ", "ver", "iss", "aud"]},
         )
-    except jwt.PyJWTError:
+        if payload.get("typ") != "mq_access" or type(payload.get("ver")) is not int:
+            return None
+        if int(payload["sub"]) <= 0:
+            return None
+        return payload
+    except (jwt.PyJWTError, TypeError, ValueError):
         return None
 
 

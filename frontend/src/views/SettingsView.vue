@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onActivated, onMounted, ref } from "vue";
+import { useRouter } from "vue-router";
 import {
   AlertTriangle,
   ArrowRight,
@@ -56,7 +57,9 @@ const pwError = ref("");
 const changingPw = ref(false);
 
 // TOTP modal/flow
-const totpSetupData = ref<{ secret: string; otpauth_url: string; qr_svg_data_uri: string } | null>(null);
+const securityRouter = useRouter();
+const totpPassword = ref("");
+const totpSetupData = ref<{ secret: string; otpauthUri: string; qrSvgDataUri: string } | null>(null);
 const totpCodeInput = ref("");
 const totpError = ref("");
 const totpSuccess = ref("");
@@ -144,7 +147,8 @@ async function startTotpSetup() {
   totpError.value = "";
   totpCodeInput.value = "";
   try {
-    const res = await api.post<any>("/api/auth/totp/setup");
+    const res = await api.post<any>("/api/auth/2fa/setup", { currentPassword: totpPassword.value });
+    totpPassword.value = "";
     totpSetupData.value = res;
     showTotpModal.value = true;
   } catch (e: any) {
@@ -156,15 +160,15 @@ async function verifyAndEnableTotp() {
   if (!totpCodeInput.value || !totpSetupData.value) return;
   totpError.value = "";
   try {
-    await api.post("/api/auth/totp/verify", {
-      secret: totpSetupData.value.secret,
+    await api.post("/api/auth/2fa/enable", {
       code: totpCodeInput.value.trim(),
     });
     showTotpModal.value = false;
+    totpSetupData.value = null;
     totpSuccess.value = "TOTP 2FA enabled successfully!";
     setTimeout(() => (totpSuccess.value = ""), 4000);
     await authStore.checkStatus();
-    await loadData(true);
+    await securityRouter.push("/login");
   } catch (e: any) {
     totpError.value = e.message;
   }
@@ -174,11 +178,12 @@ async function confirmDisableTotp() {
   if (!totpDisableCode.value) return;
   totpError.value = "";
   try {
-    await api.post("/api/auth/totp/disable", { code: totpDisableCode.value.trim() });
+    await api.post("/api/auth/2fa/disable", { code: totpDisableCode.value.trim(), currentPassword: totpPassword.value });
+    totpPassword.value = "";
     showDisableModal.value = false;
     totpDisableCode.value = "";
     await authStore.checkStatus();
-    await loadData(true);
+    await securityRouter.push("/login");
   } catch (e: any) {
     totpError.value = e.message;
   }
@@ -191,13 +196,15 @@ async function changePassword() {
   pwError.value = "";
   try {
     await api.post("/api/auth/change-password", {
-      oldPassword: oldPassword.value,
+      currentPassword: oldPassword.value,
       newPassword: newPassword.value,
     });
     pwMsg.value = t("set.pwChangedSuccess");
     oldPassword.value = "";
     newPassword.value = "";
     setTimeout(() => (pwMsg.value = ""), 3500);
+    await authStore.checkStatus();
+    await securityRouter.push("/login");
   } catch (e: any) {
     pwError.value = e.message;
   } finally {
@@ -818,6 +825,12 @@ onActivated(() => {
             </button>
           </div>
 
+          <div>
+            <label class="block text-xs text-slate-400 mb-1">{{ t("set.oldPw") }}</label>
+            <input v-model="totpPassword" type="password" autocomplete="current-password"
+              class="w-full px-3 py-2 rounded-xl bg-background border border-slate-700 text-white text-sm" />
+          </div>
+
           <div class="pt-3 border-t border-slate-800/80">
             <label class="flex items-center justify-between cursor-pointer gap-3">
               <div>
@@ -963,7 +976,7 @@ onActivated(() => {
         <div class="space-y-3 text-xs text-slate-300">
           <p>{{ t("set.totpStep1") }}</p>
           <div class="flex justify-center p-4 bg-white rounded-xl">
-            <img :src="totpSetupData.qr_svg_data_uri" alt="TOTP QR" class="w-44 h-44" />
+            <img :src="totpSetupData.qrSvgDataUri" alt="TOTP QR" class="w-44 h-44" />
           </div>
           <p class="font-mono text-[11px] text-center text-slate-400 select-all">{{ t("set.totpSecret", { sec: totpSetupData.secret }) }}</p>
 

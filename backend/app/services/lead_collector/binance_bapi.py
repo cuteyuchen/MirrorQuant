@@ -3,15 +3,18 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 import httpx
 
 from app.services.lead_collector.base import BaseLeadCollector
+from app.services.engine.sizer import exact
 from app.services.proxy.manager import ProxyManager
 
 FRIENDLY_ROOT = "https://www.binance.com/bapi/futures/v1/friendly/future"
@@ -30,22 +33,22 @@ def fnum(val: Any) -> Optional[float]:
     try:
         if val is None or val == "":
             return None
-        return float(val)
+        number = float(val)
+        return number if math.isfinite(number) else None
     except (TypeError, ValueError):
         return None
 
 
 def order_dedup_key(o: Dict[str, Any]) -> str:
-    """Stable SHA-1 dedup key excluding mutable orderUpdateTime."""
+    """Stable identity excluding mutable timestamps, filled quantity and average price."""
     raw = json.dumps(
         [
+            o.get("orderId") or o.get("id"),
             o.get("orderTime"),
             o.get("symbol"),
             o.get("side"),
             o.get("positionSide"),
             o.get("type"),
-            o.get("executedQty"),
-            o.get("avgPrice"),
         ],
         sort_keys=True,
     ).encode("utf-8")
@@ -72,20 +75,28 @@ def direction_label(side: Optional[str], ps: Optional[str], closing: bool) -> st
 def slim_order(o: Dict[str, Any]) -> Dict[str, Any]:
     t = o.get("orderUpdateTime") or o.get("orderTime") or 0
     ot = o.get("orderTime") or t
-    q = fnum(o.get("executedQty")) or 0.0
-    p = fnum(o.get("avgPrice")) or 0.0
-    return {
+    q = exact(o.get("executedQty") or "0")
+    p = exact(o.get("avgPrice") or "0")
+    if q < 0 or p < 0:
+        raise ValueError("Negative source fill or price")
+    result = {
         "h": order_dedup_key(o),
+        "oid": o.get("orderId") or o.get("id"),
         "t": t,
         "ot": ot,
         "sym": o.get("symbol"),
         "side": o.get("side"),
         "ps": o.get("positionSide"),
         "ty": o.get("type"),
-        "q": q,
-        "p": p,
+        "q": str(q),
+        "p": str(p),
         "pnl": fnum(o.get("totalPnl")) or 0.0,
     }
+    if o.get("_legacy_keys"):
+        result["legacyKeys"] = list(o["_legacy_keys"])
+    if o.get("_legacy_source_keys"):
+        result["legacySourceKeys"] = list(o["_legacy_source_keys"])
+    return result
 
 
 def expand_slim_order(o: Dict[str, Any]) -> Dict[str, Any]:
@@ -93,6 +104,7 @@ def expand_slim_order(o: Dict[str, Any]) -> Dict[str, Any]:
     if "symbol" in o and "executedQty" in o:
         return o
     return {
+        "orderId": o.get("oid"),
         "symbol": o.get("sym"),
         "side": o.get("side"),
         "positionSide": o.get("ps"),
@@ -102,6 +114,8 @@ def expand_slim_order(o: Dict[str, Any]) -> Dict[str, Any]:
         "executedQty": o.get("q") or 0.0,
         "avgPrice": o.get("p") or 0.0,
         "totalPnl": o.get("pnl") or 0.0,
+        "_legacy_keys": o.get("legacyKeys") or [],
+        "_legacy_source_keys": o.get("legacySourceKeys") or [],
     }
 
 
@@ -130,9 +144,9 @@ def reconstruct_open_positions(
     closed_rows: Sequence[Dict[str, Any]] = (),
 ) -> List[Dict[str, Any]]:
     """Walk net position chronologically per (symbol, positionSide) and reconcile with position-history."""
-    orders = sorted(store.values(), key=lambda o: o.get("t") or 0)
-    net: Dict[Tuple[str, str], float] = defaultdict(float)
-    pv: Dict[Tuple[str, str], float] = defaultdict(float)
+    orders = sorted(store.values(), key=lambda o: (o.get("ot") or o.get("t") or 0, o.get("h") or ""))
+    net: Dict[Tuple[str, str], Decimal] = defaultdict(Decimal)
+    pv: Dict[Tuple[str, str], Decimal] = defaultdict(Decimal)
     legs: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
     open_time: Dict[Tuple[str, str], int] = {}
 
@@ -142,30 +156,32 @@ def reconstruct_open_positions(
         if not sym or not ps:
             continue
         k = (sym, ps)
-        q = float(o.get("q") or 0.0)
-        p = float(o.get("p") or 0.0)
-        t = int(o.get("t") or 0)
+        q = exact(o.get("q") or 0)
+        p = exact(o.get("p") or 0)
+        t = int(o.get("ot") or o.get("t") or 0)
         if q <= 0:
             continue
         if is_open_leg(o.get("side"), ps):
-            if abs(net[k]) < 1e-9:
+            if net[k] == 0:
                 open_time[k] = t
                 legs[k] = []
             net[k] += q
             pv[k] += q * p
-            legs[k].append({"t": t, "q": q, "p": p})
+            legs[k].append({"t": t, "q": float(q), "p": float(p)})
         else:
-            net[k] -= q
-            if net[k] <= 1e-9:
-                net[k] = 0.0
-                pv[k] = 0.0
+            previous = net[k]
+            removed = min(q, previous)
+            if previous > 0:
+                pv[k] *= (previous - removed) / previous
+            net[k] = max(Decimal("0"), previous - q)
+            if net[k] == 0:
+                pv[k] = Decimal("0")
                 legs[k] = []
                 open_time.pop(k, None)
 
-    tol_ms = 120 * 1000
     out: List[Dict[str, Any]] = []
     for k, q in net.items():
-        if q <= 1e-9:
+        if q <= 0:
             continue
         sym, ps = k
         ot = open_time.get(k)
@@ -175,7 +191,7 @@ def reconstruct_open_positions(
                 if (
                     c.get("symbol") == sym
                     and str(c.get("side") or "").upper() == ps
-                    and (c.get("opened") or 0) - tol_ms <= ot <= (c.get("closed") or 0) + tol_ms
+                    and (c.get("opened") or 0) <= ot <= (c.get("closed") or 0)
                 ):
                     stale = True
                     break
@@ -187,9 +203,9 @@ def reconstruct_open_positions(
                 "symbol": sym,
                 "baseAsset": sym.replace("USDT", ""),
                 "positionSide": ps,
-                "qty": round(q, 6),
-                "avgEntry": round(avg, 6) if avg else None,
-                "notional": round(q * avg, 2) if avg else None,
+                "qty": float(q),
+                "avgEntry": float(avg) if avg else None,
+                "notional": float(q * avg) if avg else None,
                 "openTime": ot,
                 "entryOrders": sorted(legs[k], key=lambda x: x["t"]),
                 "source": "derived",
@@ -199,10 +215,63 @@ def reconstruct_open_positions(
     return out
 
 
+def normalize_holdings(holdings: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Normalize direct positions; an unknown row invalidates the entire snapshot."""
+    positions: List[Dict[str, Any]] = []
+    seen = set()
+    for row in holdings:
+        if not isinstance(row, dict):
+            raise ValueError("Malformed direct lead position")
+        symbol = row.get("symbol")
+        amount = next((row[key] for key in ("positionAmount", "positionAmt", "qty") if row.get(key) is not None), None)
+        if not symbol or amount is None:
+            raise ValueError("Lead position lacks symbol or quantity")
+        qty = exact(amount)
+        if qty == 0:
+            continue
+        side = str(row.get("positionSide") or "").upper()
+        if side == "BOTH":
+            side = "LONG" if qty > 0 else "SHORT"
+        if side not in ("LONG", "SHORT"):
+            raise ValueError("Unknown lead position side")
+        key = (symbol, side)
+        if key in seen:
+            raise ValueError("Duplicate direct lead position")
+        seen.add(key)
+        entry = exact(next((row[key] for key in ("entryPrice", "avgEntry", "avgCost") if row.get(key) is not None), 0))
+        if entry <= 0:
+            raise ValueError("Invalid lead entry price")
+        positions.append({
+            "symbol": symbol,
+            "baseAsset": symbol.removesuffix("USDT"),
+            "positionSide": side,
+            "qty": float(abs(qty)),
+            "qtyExact": str(abs(qty)),
+            "avgEntry": float(entry),
+            "notional": float(abs(qty) * entry),
+            "openTime": row.get("openTime") or row.get("opened"),
+            "entryOrders": [],
+            "source": "api",
+        })
+    return positions
+
+
+def is_authoritative_snapshot(snapshot: Dict[str, Any], now_ms: Optional[int] = None, max_age_ms: int = 30000) -> bool:
+    """UNKNOWN, hidden, derived and stale holdings can never authorize financial actions."""
+    meta = snapshot.get("openPositionsMeta") or {}
+    if meta.get("source") != "api" or meta.get("complete") is not True or meta.get("authoritative") is not True or meta.get("positionShow") is not True:
+        return False
+    observed = meta.get("asOf")
+    if not isinstance(observed, (int, float)) or not math.isfinite(observed):
+        return False
+    age = (int(time.time() * 1000) if now_ms is None else now_ms) - observed
+    return 0 <= age <= max_age_ms and isinstance(snapshot.get("openPositions"), list)
+
+
 def group_orders_into_batches(orders: Sequence[Dict[str, Any]], gap_ms: int = BATCH_GAP_MS) -> List[Dict[str, Any]]:
     """Group contiguous same-symbol/side/positionSide orders within gap_ms."""
     normalized = [expand_slim_order(o) for o in orders]
-    asc = sorted(normalized, key=lambda o: o.get("orderTime") or 0)
+    asc = sorted(normalized, key=lambda o: (o.get("orderTime") or 0, order_dedup_key(o)))
     batches: List[Dict[str, Any]] = []
     cur: Optional[Dict[str, Any]] = None
 
@@ -212,9 +281,11 @@ def group_orders_into_batches(orders: Sequence[Dict[str, Any]], gap_ms: int = BA
         ps = o.get("positionSide") or ""
         ot = int(o.get("orderTime") or 0)
         ut = int(o.get("orderUpdateTime") or ot)
-        q = float(o.get("executedQty") or 0.0)
-        p = float(o.get("avgPrice") or 0.0)
-        pnl = float(o.get("totalPnl") or 0.0)
+        q = exact(o.get("executedQty") or 0)
+        p = exact(o.get("avgPrice") or 0)
+        pnl = exact(o.get("totalPnl") or 0)
+        if q <= 0 or p <= 0:
+            continue
         closing = not is_open_leg(side, ps)
 
         if (
@@ -224,12 +295,12 @@ def group_orders_into_batches(orders: Sequence[Dict[str, Any]], gap_ms: int = BA
             and cur["side"] == side
             and ut - cur["endTime"] <= gap_ms
         ):
-            cur["endTime"] = ut
+            cur["endTime"] = max(ut, cur["endTime"])
             cur["orders"] += 1
             cur["qty"] += q
             cur["_pv"] += q * p
             cur["pnl"] += pnl
-            cur["items"].append({"time": ut, "orderTime": ot, "qty": q, "price": p, "pnl": pnl})
+            cur["items"].append({"time": ut, "orderTime": ot, "qty": float(q), "price": float(p), "pnl": float(pnl), "sourceKey": order_dedup_key(o)})
         else:
             if cur:
                 batches.append(cur)
@@ -247,22 +318,25 @@ def group_orders_into_batches(orders: Sequence[Dict[str, Any]], gap_ms: int = BA
                 "_pv": q * p,
                 "pnl": pnl,
                 "isClose": closing,
-                "items": [{"time": ut, "orderTime": ot, "qty": q, "price": p, "pnl": pnl}],
+                "items": [{"time": ut, "orderTime": ot, "qty": float(q), "price": float(p), "pnl": float(pnl), "sourceKey": order_dedup_key(o)}],
             }
     if cur:
         batches.append(cur)
 
     for b in batches:
         pv = b.pop("_pv")
-        b["avgPrice"] = round(pv / b["qty"], 6) if b["qty"] else None
-        b["notional"] = round(pv, 2) if b["qty"] else None
+        b["avgPriceExact"] = str(pv / b["qty"]) if b["qty"] else None
+        b["notionalExact"] = str(pv) if b["qty"] else None
+        b["qtyExact"] = str(b["qty"])
+        b["avgPrice"] = float(pv / b["qty"]) if b["qty"] else None
+        b["notional"] = float(pv) if b["qty"] else None
         b["dir"] = direction_label(b["side"], b["positionSide"], b["isClose"])
-        b["key"] = hashlib.sha1(f"{b['key']}|{b['orders']}|{round(b['qty'], 6)}".encode()).hexdigest()[:20]
+        b["key"] = hashlib.sha1("|".join(item["sourceKey"] for item in b["items"]).encode()).hexdigest()[:20]
         b["orderCount"] = b["orders"]
-        b["qty"] = round(b["qty"], 6)
-        b["pnl"] = round(b["pnl"], 4)
+        b["qty"] = float(b["qty"])
+        b["pnl"] = float(b["pnl"])
 
-    batches.sort(key=lambda x: x["time"], reverse=True)
+    batches.sort(key=lambda x: (x.get("startTime", 0), x.get("endTime", 0), x.get("key", "")))
     return batches
 
 
@@ -407,8 +481,8 @@ class BinanceBapiCollector(BaseLeadCollector):
         body: Optional[Dict[str, Any]] = None,
         proxy_url: Optional[str] = None,
         time_range: str = "7D",
-        retries: int = 5,
-        timeout: float = 20.0,
+        retries: int = 2,
+        timeout: float = 8.0,
     ) -> Any:
         headers = self._headers(portfolio_id, time_range)
         last_err: Optional[Exception] = None
@@ -509,16 +583,15 @@ class BinanceBapiCollector(BaseLeadCollector):
         )
 
     async def fetch_holdings(self, portfolio_id: str, proxy_url: Optional[str] = None) -> List[Dict[str, Any]]:
-        try:
-            data = await self._http_json(
-                f"{PUBLIC_COPY}/lead-data/positions?portfolioId={quote(portfolio_id)}",
-                portfolio_id=portfolio_id,
-                proxy_url=proxy_url,
-                retries=2,
-            )
-            return data if isinstance(data, list) else []
-        except Exception:
-            return []
+        data = await self._http_json(
+            f"{PUBLIC_COPY}/lead-data/positions?portfolioId={quote(portfolio_id)}",
+            portfolio_id=portfolio_id,
+            proxy_url=proxy_url,
+            retries=2,
+        )
+        if not isinstance(data, list):
+            raise RuntimeError("Malformed direct holdings response")
+        return data
 
     async def fetch_roi_chart(
         self, portfolio_id: str, time_range: str = "365D", proxy_url: Optional[str] = None
@@ -682,26 +755,56 @@ class BinanceBapiCollector(BaseLeadCollector):
         full_sweep: bool = False,
         proxy_url: Optional[str] = None,
     ) -> int:
+        # Work on a copy: a page gap must not partially advance the durable source cursor.
+        pending = {}
+        for old in store.values():
+            expanded = expand_slim_order(old)
+            rec = slim_order(expanded)
+            legacy_hash = hashlib.sha1(json.dumps([
+                expanded.get("orderTime"), expanded.get("symbol"), expanded.get("side"),
+                expanded.get("positionSide"), expanded.get("type"),
+                float(expanded.get("executedQty") or 0), float(expanded.get("avgPrice") or 0),
+            ], sort_keys=True).encode()).hexdigest()[:24]
+            rec["legacyKeys"] = list(dict.fromkeys([*(rec.get("legacyKeys") or []), old.get("h"), legacy_hash]))[:8]
+            rec["legacyKeys"] = [key for key in rec["legacyKeys"] if key]
+            previous = pending.get(rec["h"])
+            if previous is None or exact(rec["q"]) >= exact(previous["q"]):
+                pending[rec["h"]] = rec
+        existing_keys = set(pending)
         new_count = 0
         dup_streak = 0
         max_pages = 25 if full_sweep else 3
+        complete = False
         for pn in range(1, max_pages + 1):
-            try:
-                lst = await self.fetch_order_history(
-                    portfolio_id, page_number=pn, page_size=100, proxy_url=proxy_url
-                )
-            except Exception:
-                dup_streak += 1
-                if dup_streak >= 2:
-                    break
-                continue
+            lst = await self.fetch_order_history(
+                portfolio_id, page_number=pn, page_size=100, proxy_url=proxy_url
+            )
             added = 0
             for raw in lst:
                 rec = slim_order(raw)
-                if rec["h"] not in store:
-                    store[rec["h"]] = rec
+                previous = pending.get(rec["h"])
+                # Older stores discarded orderId. Adopt its newly available identity
+                # without retaining a second copy of the same cumulative execution.
+                legacy_key = order_dedup_key({**raw, "orderId": None, "id": None})
+                if previous is None and rec.get("oid") is not None and legacy_key in pending:
+                    previous = pending.pop(legacy_key)
+                    rec["legacySourceKeys"] = list(dict.fromkeys([*(previous.get("legacySourceKeys") or []), legacy_key]))
+                    if legacy_key in existing_keys:
+                        existing_keys.add(rec["h"])
+                if previous is not None:
+                    rec["legacyKeys"] = previous.get("legacyKeys") or []
+                    rec.setdefault("legacySourceKeys", previous.get("legacySourceKeys") or [])
+                if previous is not None and exact(rec["q"]) < exact(previous["q"]):
+                    raise RuntimeError("Regressing cumulative lead fill")
+                if previous is None:
                     added += 1
+                pending[rec["h"]] = rec
+                if rec["h"] in existing_keys:
+                    complete = True
             new_count += added
+            if len(lst) < 100:
+                complete = True
+                break
             if not lst or added == 0:
                 dup_streak += 1
             else:
@@ -710,11 +813,12 @@ class BinanceBapiCollector(BaseLeadCollector):
                 break
             await asyncio.sleep(0.15)
 
-        if len(store) > STORE_MAX:
-            trimmed = sorted(store.values(), key=lambda x: x.get("t") or 0)[-STORE_MAX:]
-            store.clear()
-            for item in trimmed:
-                store[item["h"]] = item
+        if not complete:
+            raise RuntimeError("Lead order history is truncated without continuity")
+        trimmed = sorted(pending.values(), key=lambda x: (x.get("ot") or x.get("t") or 0, x["h"]))[-STORE_MAX:]
+        store.clear()
+        for item in trimmed:
+            store[item["h"]] = item
         return new_count
 
     async def sync_snapshot(
@@ -735,12 +839,14 @@ class BinanceBapiCollector(BaseLeadCollector):
         # Fetch closed positions for reconciliation (fallback to closed_cache on failure)
         closed_rows = list(closed_cache)
         closed_total = None
+        closed_history_complete = False
         try:
             ph1 = await self.fetch_position_history(
                 portfolio_id, page_number=1, page_size=100, proxy_url=proxy_url
             )
             lst = (ph1 or {}).get("list") or []
             closed_total = (ph1 or {}).get("total")
+            closed_history_complete = closed_total is not None and int(closed_total) <= len(lst)
             if lst:
                 seen_c: Dict[Tuple[str, Any], Dict[str, Any]] = {}
                 for p in lst:
@@ -751,50 +857,65 @@ class BinanceBapiCollector(BaseLeadCollector):
         except Exception:
             pass
 
-        # Performance & direct holdings (cached to keep 5s live price ticks fast)
+        # Holdings must be freshly observed; a cached/failed response is UNKNOWN,
+        # never a fabricated empty position set. Historical reconstruction is display-only.
         now_s = time.time()
+        holdings: List[Dict[str, Any]] = []
+        holdings_observed_ms = None
+        holdings_error = None
+        authoritative = False
+        open_positions = reconstruct_open_positions(orders_store, closed_rows=closed_rows)
+        if detail.get("positionShow") is True:
+            try:
+                holdings = await self.fetch_holdings(portfolio_id, proxy_url=proxy_url)
+                open_positions = normalize_holdings(holdings)
+                holdings_observed_ms = int(time.time() * 1000)
+                authoritative = True
+            except Exception as exc:
+                holdings_error = str(exc)[:240]
+
+        # Optional dashboard requests cannot delay the execution collector.
         cached_perf = self._perf_cache.get(portfolio_id)
-        if cached_perf and (now_s - cached_perf[0]) < 180.0 and cached_perf[1]:
-            perf = dict(cached_perf[1])
-        else:
-            async def _get_perf(tr: str):
-                try:
-                    return tr, await self.fetch_performance(portfolio_id, time_range=tr, proxy_url=proxy_url)
-                except Exception:
-                    return tr, None
-
-            perf_items = await asyncio.gather(*(_get_perf(tr) for tr in ("7D", "30D", "90D", "180D", "365D")))
-            perf = {tr: val for tr, val in perf_items if val is not None}
-            if perf:
-                self._perf_cache[portfolio_id] = (now_s, perf)
-
-        cached_holdings = self._holdings_cache.get(portfolio_id)
-        if cached_holdings and (now_s - cached_holdings[0]) < 60.0:
-            holdings = list(cached_holdings[1])
-        else:
-            holdings = await self.fetch_holdings(portfolio_id, proxy_url=proxy_url)
-            self._holdings_cache[portfolio_id] = (now_s, holdings)
-
+        perf = dict(cached_perf[1]) if cached_perf else {}
         cached_chart = self._chart_cache.get(portfolio_id)
-        if cached_chart and (now_s - cached_chart[0]) < 300.0 and cached_chart[1]:
-            roi_chart = list(cached_chart[1])
-        else:
-            roi_chart = await self.fetch_roi_chart(portfolio_id, time_range="365D", proxy_url=proxy_url)
-            if roi_chart:
-                self._chart_cache[portfolio_id] = (now_s, roi_chart)
-
+        roi_chart = list(cached_chart[1]) if cached_chart else []
         cached_alloc = self._alloc_cache.get(portfolio_id)
-        if cached_alloc and (now_s - cached_alloc[0]) < 300.0 and cached_alloc[1].get("items"):
-            allocation = dict(cached_alloc[1])
-        else:
-            allocation = await self.fetch_allocation(portfolio_id, time_range="90D", proxy_url=proxy_url)
-            if allocation.get("items"):
-                self._alloc_cache[portfolio_id] = (now_s, allocation)
+        allocation = dict(cached_alloc[1]) if cached_alloc else {}
+        if with_analysis:
+            if not cached_perf or now_s - cached_perf[0] >= 180.0:
+                async def _get_perf(tr: str):
+                    try:
+                        return tr, await self.fetch_performance(portfolio_id, time_range=tr, proxy_url=proxy_url)
+                    except Exception:
+                        return tr, None
+                perf_items = await asyncio.gather(*(_get_perf(tr) for tr in ("7D", "30D", "90D", "180D", "365D")))
+                perf = {tr: val for tr, val in perf_items if val is not None}
+                if perf:
+                    self._perf_cache[portfolio_id] = (now_s, perf)
+            if not cached_chart or now_s - cached_chart[0] >= 300.0:
+                roi_chart = await self.fetch_roi_chart(portfolio_id, time_range="365D", proxy_url=proxy_url)
+                if roi_chart:
+                    self._chart_cache[portfolio_id] = (now_s, roi_chart)
+            if not cached_alloc or now_s - cached_alloc[0] >= 300.0:
+                allocation = await self.fetch_allocation(portfolio_id, time_range="90D", proxy_url=proxy_url)
+                if allocation.get("items"):
+                    self._alloc_cache[portfolio_id] = (now_s, allocation)
 
         margin_balance = fnum(detail.get("marginBalance"))
-        open_positions = reconstruct_open_positions(orders_store, closed_rows=closed_rows)
-        marks = await self.fetch_marks([p["symbol"] for p in open_positions], proxy_url=proxy_url)
-        brackets = await self.fetch_brackets(proxy_url=proxy_url)
+        if with_analysis:
+            marks = await self.fetch_marks([p["symbol"] for p in open_positions], proxy_url=proxy_url)
+            brackets = await self.fetch_brackets(proxy_url=proxy_url)
+        else:
+            marks = {
+                row["symbol"]: {
+                    "markPrice": fnum(row.get("markPrice")),
+                    "currentPrice": fnum(row.get("markPrice")),
+                    "priceTime": holdings_observed_ms,
+                    "source": "direct-holdings",
+                }
+                for row in holdings if row.get("symbol")
+            }
+            brackets = self._brackets_map
 
         now_ms = int(time.time() * 1000)
         for p in open_positions:
@@ -893,7 +1014,7 @@ class BinanceBapiCollector(BaseLeadCollector):
                 pos["analysis"] = res
 
         recent_raw = sorted(orders_store.values(), key=lambda x: x.get("t") or 0, reverse=True)[:200]
-        batches = group_orders_into_batches(recent_raw)[:60]
+        batches = group_orders_into_batches(recent_raw)[-60:]
         trade_cycles = reconstruct_trade_cycles(list(orders_store.values()))[:40]
         orders_view = [
             {
@@ -903,8 +1024,8 @@ class BinanceBapiCollector(BaseLeadCollector):
                 "side": o.get("side"),
                 "positionSide": o.get("ps"),
                 "type": o.get("ty"),
-                "qty": o.get("q"),
-                "avgPrice": o.get("p"),
+                "qty": fnum(o.get("q")),
+                "avgPrice": fnum(o.get("p")),
                 "pnl": o.get("pnl"),
                 "isClose": not is_open_leg(o.get("side"), o.get("ps")),
                 "dir": direction_label(o.get("side"), o.get("ps"), not is_open_leg(o.get("side"), o.get("ps"))),
@@ -929,6 +1050,7 @@ class BinanceBapiCollector(BaseLeadCollector):
                 "orderStoreSize": len(orders_store),
                 "ordersAddedThisRound": added,
                 "fullSweep": full_sweep,
+                "closedHistoryComplete": closed_history_complete,
             },
             "profile": {
                 "nickname": detail.get("nickname"),
@@ -961,9 +1083,12 @@ class BinanceBapiCollector(BaseLeadCollector):
             "holdings": holdings,
             "openPositions": open_positions,
             "openPositionsMeta": {
-                "source": "api" if (detail.get("positionShow") and holdings) else "derived-from-order-history",
+                "source": "api" if authoritative else "derived-from-order-history",
                 "positionShow": detail.get("positionShow"),
-                "asOf": now_ms,
+                "asOf": holdings_observed_ms,
+                "complete": authoritative,
+                "authoritative": authoritative,
+                "error": holdings_error,
             },
             "openPositionsSummary": {
                 "positionCount": len(open_positions),

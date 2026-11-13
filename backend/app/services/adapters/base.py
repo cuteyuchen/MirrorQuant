@@ -3,7 +3,11 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Any, Dict, List, Optional
+from email.utils import parsedate_to_datetime
+import math
+import random
+import time
+from typing import Any, ClassVar, Dict, List, Optional
 
 
 class ExchangeAPIError(RuntimeError):
@@ -69,6 +73,43 @@ class InstrumentSpec:
     max_lvr: float = 20.0
     min_notional: Decimal = Decimal("0")
     settle_ccy: str = "USDT"
+    base_ccy: str = ""
+    quote_ccy: str = "USDT"
+    contract_type: str = "linear"
+    max_sz: Optional[Decimal] = None
+    market_min_sz: Optional[Decimal] = None
+    market_lot_sz: Optional[Decimal] = None
+    market_max_sz: Optional[Decimal] = None
+
+    def __post_init__(self) -> None:
+        for name in ("ct_val", "min_sz", "lot_sz", "tick_sz", "max_sz",
+                     "market_min_sz", "market_lot_sz", "market_max_sz"):
+            value = getattr(self, name)
+            if value is not None and (not Decimal(str(value)).is_finite() or value <= 0):
+                raise ValueError(f"Invalid {name} for {self.inst_id}")
+        if not Decimal(str(self.min_notional)).is_finite() or self.min_notional < 0:
+            raise ValueError(f"Invalid minimum notional for {self.inst_id}")
+        if not Decimal(str(self.max_lvr)).is_finite() or self.max_lvr < 1:
+            raise ValueError(f"Invalid leverage for {self.inst_id}")
+
+    def validate_order(self, ord_type: str, quantity: Any, price: Any = None,
+                       reduce_only: bool = False) -> None:
+        qty = Decimal(str(quantity))
+        market = ord_type.lower() == "market"
+        minimum = self.market_min_sz if market and self.market_min_sz is not None else self.min_sz
+        step = self.market_lot_sz if market and self.market_lot_sz is not None else self.lot_sz
+        maximum = self.market_max_sz if market else self.max_sz
+        if (not qty.is_finite() or qty <= 0 or qty < minimum or qty % step != 0
+                or (maximum is not None and qty > maximum)):
+            raise ValueError(f"Order quantity fails {self.inst_id} {ord_type} filters")
+        if price is not None:
+            px = Decimal(str(price))
+            if not px.is_finite() or px <= 0 or (not market and px % self.tick_sz != 0):
+                raise ValueError(f"Order price fails {self.inst_id} filters")
+            if not reduce_only and qty * px * self.ct_val < self.min_notional:
+                raise ValueError(f"Order below {self.inst_id} minimum notional")
+        elif not market:
+            raise ValueError("Limit/IOC order requires a price")
 
 
 @dataclass
@@ -89,6 +130,8 @@ class OrderResult:
 
 class BaseExchangeAdapter(ABC):
     exchange: str = "base"
+    # Shared by all clients/accounts in this worker because public limits can be IP-wide.
+    _rate_limit_until: ClassVar[Dict[str, float]] = {}
 
     def __init__(
         self,
@@ -106,6 +149,84 @@ class BaseExchangeAdapter(ABC):
         self.position_mode = position_mode
         self.timeout = timeout
         self._time_offset_ms: int = 0
+        self._clock_calibrated_at: float = 0.0
+        self._clock_uncertainty_ms: float = 0.0
+
+    def _check_rate_limit(self) -> None:
+        remaining = self._rate_limit_until.get(self.exchange, 0) - time.monotonic()
+        if remaining > 0:
+            raise ExchangeAPIError(self.exchange, "RATE_LIMITED", f"Exchange cooldown active for {remaining:.2f}s")
+
+    def _note_rate_limit(self, response: Any) -> None:
+        delay = 1.0
+        headers = response.headers
+        retry_after = headers.get("Retry-After")
+        if retry_after:
+            try:
+                delay = float(retry_after)
+            except ValueError:
+                try:
+                    delay = parsedate_to_datetime(retry_after).timestamp() - time.time()
+                except (TypeError, ValueError, OverflowError):
+                    pass
+        reset = headers.get("X-Bapi-Limit-Reset-Timestamp")
+        if reset:
+            try:
+                delay = max(delay, float(reset) / 1000 - time.time())
+            except ValueError:
+                pass
+        if not math.isfinite(delay):
+            delay = 1.0
+        deadline = time.monotonic() + max(1.0, delay) + random.uniform(0.05, 0.25)
+        self._rate_limit_until[self.exchange] = max(self._rate_limit_until.get(self.exchange, 0), deadline)
+
+    def _calibrate_time(self, server_ms: int, sent_ms: float) -> int:
+        received_ms = time.time() * 1000
+        rtt = received_ms - sent_ms
+        if server_ms <= 0 or not 0 <= rtt <= 2000:
+            raise RuntimeError("Exchange clock sample is missing or too uncertain")
+        self._time_offset_ms = int(server_ms - (sent_ms + received_ms) / 2)
+        self._clock_uncertainty_ms = rtt / 2
+        self._clock_calibrated_at = time.time()
+        return self._time_offset_ms
+
+    def _assert_supported_entry_mode(self, mgn_mode: str) -> None:
+        # A one-way account can net another binding's opposite position. Until
+        # a netting policy exists, new allocation-owned entries require hedge mode.
+        if self.position_mode != "hedge" or mgn_mode != "cross" or self.margin_mode != "cross":
+            raise ExchangeAPIError(self.exchange, "UNSUPPORTED_MODE", "New entries require cross margin and hedge mode")
+
+    def _symbol_matches(self, lead_symbol: str, inst_id: str,
+                        instruments: Dict[str, InstrumentSpec]) -> bool:
+        spec = instruments.get(inst_id)
+        if spec is None or spec.contract_type != "linear" or spec.settle_ccy != "USDT":
+            return False
+        lead_base = lead_symbol.removesuffix("USDT")
+        target_base = spec.base_ccy or inst_id.removesuffix("-USDT-SWAP").removesuffix("USDT")
+        return lead_symbol.endswith("USDT") and target_base == lead_base and spec.quote_ccy == "USDT"
+
+    async def validate_order(self, inst_id: str, ord_type: str, sz: str,
+                             px: Optional[str] = None, reduce_only: bool = False) -> None:
+        if ord_type.lower() not in ("market", "limit", "ioc"):
+            raise ValueError("Unsupported order type")
+        spec = (await self.get_instruments()).get(inst_id)
+        if spec is None:
+            raise ValueError(f"Unqualified instrument: {inst_id}")
+        ref_px = px
+        if px is None and not reduce_only:
+            book = await self.get_orderbook(inst_id, depth=1)
+            if not book.bids or not book.asks:
+                raise ValueError("Missing price for final order validation")
+            ref_px = str(min(book.bids[0][0], book.asks[0][0]))
+        spec.validate_order(ord_type, sz, ref_px, reduce_only)
+
+    async def get_max_leverage(self, inst_id: str, target_notional: Any) -> int:
+        """Return an exchange-confirmed tier limit. Concrete adapters must qualify it."""
+        raise ExchangeAPIError(self.exchange, "UNQUALIFIED_TIERS", "Exchange leverage tiers unavailable")
+
+    async def get_open_orders(self) -> List[Dict[str, Any]]:
+        """Read all ordinary and conditional pending orders, or reject an incomplete view."""
+        raise ExchangeAPIError(self.exchange, "UNQUALIFIED_ORDERS", "Complete pending-order inventory unavailable")
 
     async def sync_time(self) -> int:
         """Synchronize clock offset (server_ms - local_ms) to prevent timestamp drift rejections."""

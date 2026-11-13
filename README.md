@@ -88,8 +88,10 @@
 git clone https://github.com/cuteyuchen/MirrorQuant.git
 cd MirrorQuant
 
-# Optional: customize environment variables
+# Configure the deployment before allowing access
 cp .env.example .env
+# Generate a private bootstrap token, then put it in MQ_BOOTSTRAP_TOKEN in .env
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"
 
 # Build and start MirrorQuant + Nginx reverse proxy
 docker compose up -d --build
@@ -99,7 +101,8 @@ docker compose up -d --build
 
 - **Web UI (via Nginx)**: `http://localhost:8080`
 - **Direct FastAPI / API Docs**: `http://localhost:8000` (Swagger UI at `/docs`)
-- On first visit, you will be guided through the **Setup Wizard** (`/setup`) to create your root admin account.
+- On first visit, use the **Setup Wizard** (`/setup`) and your deployment's private `MQ_BOOTSTRAP_TOKEN` to create the administrator account. Remove that environment value after setup. The API equivalent requires the `X-MQ-Bootstrap-Token` header.
+- Add your exact console origin to `MQ_CORS_ORIGINS` for authenticated WebSockets. Use HTTPS and `MQ_COOKIE_SECURE=true` for remote deployments.
 
 ---
 
@@ -143,10 +146,14 @@ npm run build
 | `MQ_WEB_PORT` | `8080` | Nginx reverse-proxy public port |
 | `MQ_DATA_DIR` | `/app/data` | Persistent storage for SQLite DB & auto-generated `.master_key` |
 | `MQ_DATABASE_URL` | `sqlite+aiosqlite:///./data/mirrorquant.db` | Async SQLAlchemy DB URL (WAL mode auto-enabled) |
-| `MQ_MASTER_KEY` | *(auto-generated)* | 32-byte key for AES-256-GCM vault (auto-created in `MQ_DATA_DIR` if omitted) |
+| `MQ_MASTER_KEY` | *(auto-generated for a new local database)* | URL-safe base64 encoding of 32 random bytes; missing keys for an existing database must be restored, never regenerated |
 | `MQ_JWT_SECRET` | *(auto-generated)* | HS256 secret for HttpOnly JWT cookies |
+| `MQ_BOOTSTRAP_TOKEN` | *(required for initial setup)* | Private random token of at least 32 characters authorizing the first administrator |
+| `MQ_CORS_ORIGINS` | *(local console origins)* | Exact allowed HTTP/WebSocket origins; add the deployed console's HTTPS origin |
 | `MQ_ENABLE_BACKGROUND_ENGINE` | `true` | Enable background lead polling & copy routing loop |
 | `MQ_COOKIE_SECURE` | `false` | Set `true` when serving strictly over HTTPS |
+
+Password changes, logout, and 2FA changes invalidate all existing sessions, including WebSockets. Existing pre-upgrade access tokens also require signing in again. 2FA enrollment requires the current password, expires after ten minutes, and cannot replace an active factor until it has been disabled with its current code. Back up database and vault keys together; startup refuses unreadable credentials. Existing installations using a non-base64 master-key string need a deliberate key migration before upgrading.
 
 ---
 

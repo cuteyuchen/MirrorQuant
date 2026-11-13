@@ -62,12 +62,15 @@ class BinanceAdapter(BaseExchangeAdapter):
         auth: bool = True,
         retries: int = 3,
     ) -> Any:
+        self._check_rate_limit()
         method = method.upper()
+        # A mutation may already have reached the exchange when its response is lost.
+        attempts = max(1, retries) if method == "GET" else 1
         base_params = dict(params or {})
 
         async with ProxyManager.build_client(proxy_url=self.proxy_url, timeout=self.timeout) as client:
             last_err: Optional[Exception] = None
-            for attempt in range(retries):
+            for attempt in range(attempts):
                 req_params = dict(base_params)
                 headers: Dict[str, str] = {"User-Agent": "MirrorQuant/1.0"}
                 if auth:
@@ -89,21 +92,22 @@ class BinanceAdapter(BaseExchangeAdapter):
                     else:
                         raise ValueError(f"Unsupported HTTP method: {method}")
 
-                    if resp.status_code == 429 and attempt < retries - 1:
-                        await asyncio.sleep(1.0 * (attempt + 1))
-                        continue
+                    if resp.status_code in (418, 429):
+                        self._note_rate_limit(resp)
 
                     data = resp.json()
                     if resp.status_code >= 400 or (isinstance(data, dict) and "code" in data and data["code"] < 0):
                         code = str(data.get("code", resp.status_code)) if isinstance(data, dict) else str(resp.status_code)
                         msg = data.get("msg", resp.text[:200]) if isinstance(data, dict) else resp.text[:200]
+                        if code in ("-1003", "-1015"):
+                            self._note_rate_limit(resp)
                         raise ExchangeAPIError("binance", code, msg, data)
                     return data
                 except ExchangeAPIError:
                     raise
                 except Exception as exc:
                     last_err = exc
-                    if attempt < retries - 1:
+                    if attempt < attempts - 1:
                         await asyncio.sleep(0.4 * (attempt + 1))
                     else:
                         raise
@@ -119,7 +123,7 @@ class BinanceAdapter(BaseExchangeAdapter):
             inst_id = symbol_map[lead_symbol]
         else:
             inst_id = lead_symbol
-        return inst_id, inst_id in instruments
+        return inst_id, self._symbol_matches(lead_symbol, inst_id, instruments)
 
     async def test_connection(self) -> Dict[str, Any]:
         acct = await self._request("GET", "/fapi/v2/account")
@@ -138,20 +142,15 @@ class BinanceAdapter(BaseExchangeAdapter):
         }
 
     async def get_usdt_balance(self) -> BalanceInfo:
-        data = await self._request("GET", "/fapi/v2/balance")
-        for item in data or []:
+        data = await self._request("GET", "/fapi/v2/account")
+        for item in data.get("assets") or []:
             if item.get("asset") == "USDT":
-                wallet = float(item.get("balance") or 0.0)
-                upl = float(item.get("crossUnPnl") or 0.0)
-                avail = float(item.get("availableBalance") or 0.0)
+                # marginBalance includes both cross and isolated unrealized PnL.
                 return BalanceInfo(
-                    eq=wallet + upl,
-                    avail_eq=avail,
-                    cash_bal=wallet,
-                    upl=upl,
-                    raw=item,
+                    eq=float(item["marginBalance"]), avail_eq=float(item.get("availableBalance") or 0),
+                    cash_bal=float(item["walletBalance"]), upl=float(item["unrealizedProfit"]), raw=item,
                 )
-        return BalanceInfo(eq=0.0, avail_eq=0.0, cash_bal=0.0, upl=0.0)
+        return BalanceInfo(eq=0, avail_eq=0, cash_bal=0, upl=0)
 
     async def get_positions(self) -> List[ExchangePosition]:
         data = await self._request("GET", "/fapi/v2/positionRisk")
@@ -190,66 +189,71 @@ class BinanceAdapter(BaseExchangeAdapter):
 
     async def get_instruments(self, force_refresh: bool = False) -> Dict[str, InstrumentSpec]:
         now = time.time()
-        if not force_refresh and self._instruments_cache and (now - self._instruments_cache_ts < self._cache_ttl_sec):
+        if not force_refresh and self._instruments_cache and now - self._instruments_cache_ts < self._cache_ttl_sec:
             return self._instruments_cache
-
         info = await self._request("GET", "/fapi/v1/exchangeInfo", auth=False)
         result: Dict[str, InstrumentSpec] = {}
         for item in info.get("symbols", []):
-            if item.get("status") != "TRADING" or item.get("quoteAsset") != "USDT":
+            if (item.get("status") != "TRADING" or item.get("quoteAsset") != "USDT"
+                    or item.get("marginAsset") != "USDT" or item.get("contractType") != "PERPETUAL"):
                 continue
-            sym = item.get("symbol")
-            if not sym:
+            try:
+                sym = item["symbol"]
+                filters = {row["filterType"]: row for row in item["filters"]}
+                lot, market, price = filters["LOT_SIZE"], filters["MARKET_LOT_SIZE"], filters["PRICE_FILTER"]
+                result[sym] = InstrumentSpec(
+                    inst_id=sym, ct_val=Decimal("1"), min_sz=Decimal(str(lot["minQty"])),
+                    lot_sz=Decimal(str(lot["stepSize"])), max_sz=Decimal(str(lot["maxQty"])),
+                    market_min_sz=Decimal(str(market["minQty"])), market_lot_sz=Decimal(str(market["stepSize"])),
+                    market_max_sz=Decimal(str(market["maxQty"])), tick_sz=Decimal(str(price["tickSize"])),
+                    # Binance publishes actual caps in signed leverageBracket, consulted before entry.
+                    max_lvr=125, min_notional=Decimal(str(filters["MIN_NOTIONAL"]["notional"])),
+                    settle_ccy="USDT", base_ccy=item["baseAsset"],
+                )
+            except (ValueError, KeyError, ArithmeticError, TypeError):
                 continue
-            tick_sz = Decimal("0.01")
-            lot_sz = Decimal("0.001")
-            min_sz = Decimal("0.001")
-            min_notional = Decimal("5")
-            for f in item.get("filters", []):
-                ft = f.get("filterType")
-                if ft == "PRICE_FILTER":
-                    tick_sz = Decimal(str(f.get("tickSize") or "0.01")).normalize()
-                elif ft == "LOT_SIZE":
-                    lot_sz = Decimal(str(f.get("stepSize") or "0.001")).normalize()
-                    min_sz = Decimal(str(f.get("minQty") or "0.001")).normalize()
-                elif ft == "MIN_NOTIONAL":
-                    min_notional = Decimal(str(f.get("notional") or "5"))
-            result[sym] = InstrumentSpec(
-                inst_id=sym,
-                ct_val=Decimal("1"),
-                min_sz=min_sz,
-                lot_sz=lot_sz,
-                tick_sz=tick_sz,
-                max_lvr=20.0,
-                min_notional=min_notional,
-                settle_ccy="USDT",
-            )
-        if result:
-            self._instruments_cache = result
-            self._instruments_cache_ts = now
-        return self._instruments_cache
+        self._instruments_cache, self._instruments_cache_ts = result, now
+        return result
 
     async def get_orderbook(self, inst_id: str, depth: int = 5) -> OrderBook:
-        data = await self._request(
-            "GET", "/fapi/v1/depth", params={"symbol": inst_id, "limit": depth}, auth=False
-        )
+        if not 1 <= depth <= 1000:
+            raise ValueError("Invalid requested book depth")
+        wire_depth = next(n for n in (5, 10, 20, 50, 100, 500, 1000) if n >= depth)
+        data = await self._request("GET", "/fapi/v1/depth", params={"symbol": inst_id, "limit": wire_depth}, auth=False)
         return OrderBook(
-            bids=[[float(x[0]), float(x[1])] for x in data.get("bids", [])],
-            asks=[[float(x[0]), float(x[1])] for x in data.get("asks", [])],
+            bids=[[float(x[0]), float(x[1])] for x in data.get("bids", [])[:depth]],
+            asks=[[float(x[0]), float(x[1])] for x in data.get("asks", [])[:depth]],
         )
 
-    async def ensure_leverage(
-        self,
-        inst_id: str,
-        lever: int,
-        pos_side: str = "long",
-        mgn_mode: str = "cross",
-    ) -> bool:
+    async def ensure_leverage(self, inst_id: str, lever: int, pos_side: str = "long", mgn_mode: str = "cross") -> bool:
+        self._assert_supported_entry_mode(mgn_mode)
+        dual = await self._request("GET", "/fapi/v1/positionSide/dual")
+        assets = await self._request("GET", "/fapi/v1/multiAssetsMargin")
+        if dual.get("dualSidePosition") is not True or assets.get("multiAssetsMargin") is not False:
+            raise ExchangeAPIError(self.exchange, "UNSUPPORTED_MODE", "Binance requires hedge mode and single-asset margin")
+        rows = await self._request("GET", "/fapi/v2/positionRisk", params={"symbol": inst_id})
+        if not rows or any(row.get("marginType") not in ("cross", "crossed") for row in rows):
+            raise ExchangeAPIError(self.exchange, "UNSUPPORTED_MODE", "Binance symbol must already use cross margin")
         try:
-            await self._request("POST", "/fapi/v1/leverage", params={"symbol": inst_id, "leverage": lever})
-            return True
+            result = await self._request("POST", "/fapi/v1/leverage", params={"symbol": inst_id, "leverage": lever})
         except ExchangeAPIError:
             return False
+        if int(result.get("leverage") or 0) != lever:
+            return False
+        rows = await self._request("GET", "/fapi/v2/positionRisk", params={"symbol": inst_id})
+        return bool(rows) and all(float(row.get("leverage") or 0) == lever for row in rows)
+
+    async def get_max_leverage(self, inst_id: str, target_notional: Any) -> int:
+        data = await self._request("GET", "/fapi/v1/leverageBracket", params={"symbol": inst_id})
+        records = data if isinstance(data, list) else [data]
+        for record in records:
+            if record.get("symbol") != inst_id:
+                continue
+            coefficient = Decimal(str(record.get("notionalCoef") or "1"))
+            for bracket in record.get("brackets") or []:
+                if Decimal(str(bracket["notionalFloor"])) * coefficient <= Decimal(str(target_notional)) < Decimal(str(bracket["notionalCap"])) * coefficient:
+                    return int(bracket["initialLeverage"])
+        raise ValueError("Target exposure exceeds qualified Binance tiers")
 
     async def place_order(
         self,
@@ -263,6 +267,7 @@ class BinanceAdapter(BaseExchangeAdapter):
         reduce_only: bool = False,
         td_mode: str = "cross",
     ) -> OrderResult:
+        await self.validate_order(inst_id, ord_type, sz, px, reduce_only)
         params: Dict[str, Any] = {
             "symbol": inst_id,
             "side": side.upper(),
@@ -315,8 +320,10 @@ class BinanceAdapter(BaseExchangeAdapter):
             params["origClientOrderId"] = cl_ord_id
         try:
             row = await self._request("GET", "/fapi/v1/order", params=params)
-        except ExchangeAPIError:
-            return None
+        except ExchangeAPIError as exc:
+            if str(exc.code) in ("-2013", "-2011"):
+                return None
+            raise
         return {
             "ordId": str(row.get("orderId") or ""),
             "clOrdId": row.get("clientOrderId"),
@@ -326,11 +333,21 @@ class BinanceAdapter(BaseExchangeAdapter):
             "raw": row,
         }
 
+    async def get_open_orders(self) -> List[Dict[str, Any]]:
+        ordinary = await self._request("GET", "/fapi/v1/openOrders")
+        conditional = await self._request("GET", "/fapi/v1/openAlgoOrders")
+        if isinstance(conditional, dict):
+            conditional = conditional.get("orders")
+        if not isinstance(ordinary, list) or not isinstance(conditional, list):
+            raise ValueError("Incomplete Binance pending-order inventory")
+        return ordinary + conditional
+
     async def sync_time(self) -> int:
-        data = await self._request("GET", "/fapi/v1/time", auth=False)
-        if isinstance(data, dict) and data.get("serverTime"):
-            self._time_offset_ms = int(data["serverTime"]) - int(time.time() * 1000)
-        return self._time_offset_ms
+        sent_ms = time.time() * 1000
+        data = await self._request("GET", "/fapi/v1/time", auth=False, retries=1)
+        if not data.get("serverTime"):
+            raise RuntimeError("Missing Binance server time")
+        return self._calibrate_time(int(data["serverTime"]), sent_ms)
 
     async def place_tp_sl(
         self,
@@ -351,7 +368,8 @@ class BinanceAdapter(BaseExchangeAdapter):
                 "symbol": inst_id,
                 "side": close_side,
                 "type": ord_type,
-                "stopPrice": str(stop_px),
+                "triggerPrice": str(stop_px),
+                "algoType": "CONDITIONAL",
                 "quantity": str(sz),
                 "workingType": "MARK_PRICE",
                 "priceProtect": "TRUE",
@@ -361,8 +379,11 @@ class BinanceAdapter(BaseExchangeAdapter):
             else:
                 params["positionSide"] = "BOTH"
                 params["reduceOnly"] = "true"
-            res = await self._request("POST", "/fapi/v1/order", params=params)
-            return str(res.get("orderId") or "")
+            res = await self._request("POST", "/fapi/v1/algoOrder", params=params)
+            order_id = str(res.get("algoId") or "")
+            if not order_id:
+                raise ExchangeAPIError(self.exchange, "AMBIGUOUS", "Missing protective order identity")
+            return order_id
 
         if tp_px:
             out["tpOrderId"] = await _submit_cond("TAKE_PROFIT_MARKET", tp_px)
@@ -372,16 +393,16 @@ class BinanceAdapter(BaseExchangeAdapter):
 
     async def cancel_tp_sl(self, inst_id: str, pos_side: Optional[str] = None) -> bool:
         try:
-            open_orders = await self._request("GET", "/fapi/v1/openOrders", params={"symbol": inst_id})
+            open_orders = await self._request("GET", "/fapi/v1/openAlgoOrders", params={"symbol": inst_id})
             cancelled = False
-            for o in open_orders or []:
-                if o.get("type") in ("STOP_MARKET", "TAKE_PROFIT_MARKET", "STOP", "TAKE_PROFIT"):
+            for o in (open_orders.get("orders", []) if isinstance(open_orders, dict) else open_orders or []):
+                if (o.get("orderType") or o.get("type")) in ("STOP_MARKET", "TAKE_PROFIT_MARKET", "STOP", "TAKE_PROFIT"):
                     if pos_side and str(o.get("positionSide") or "").lower() not in (pos_side.lower(), "both"):
                         continue
                     await self._request(
                         "DELETE",
-                        "/fapi/v1/order",
-                        params={"symbol": inst_id, "orderId": o["orderId"]},
+                        "/fapi/v1/algoOrder",
+                        params={"symbol": inst_id, "algoId": o["algoId"]},
                     )
                     cancelled = True
             return cancelled

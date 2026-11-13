@@ -4,18 +4,24 @@ import asyncio
 import json
 import logging
 import time
-import uuid
+import hashlib
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_UP
 from typing import Any, Callable, Coroutine, Dict, List, Optional
 
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import DEFAULT_SYSTEM_CONFIG
 from app.core.security import CredentialVault
+from app.schemas.api import ResilienceSettings, RiskDefaults
 from app.models.domain import (
     BindingDebt,
+    BindingDelivery,
+    BindingSourceProgress,
+    OrderIntent,
+    PositionAllocation,
     CopyBinding,
     ExecutionRecord,
     LeadSource,
@@ -26,19 +32,20 @@ from app.models.domain import (
 )
 from app.services.adapters.base import (
     BaseExchangeAdapter,
-    ExchangeAPIError,
     ExchangePosition,
     OrderResult,
 )
 from app.services.adapters.factory import create_exchange_adapter
 from app.services.engine.risk import RiskEngine
-from app.services.engine.sizer import PositionSizer, format_decimal, quantize_step
+from app.services.engine.sizer import PositionSizer, exact, format_decimal, quantize_down
+from app.services.engine.serialization import serialized_execution
 from app.services.lead_collector.binance_bapi import (
     direction_label,
     expand_slim_order,
     group_orders_into_batches,
     is_open_leg,
     order_dedup_key,
+    is_authoritative_snapshot,
 )
 from app.services.notifier.service import NotificationService
 from app.services.proxy.manager import ProxyManager
@@ -46,6 +53,13 @@ from app.services.proxy.manager import ProxyManager
 logger = logging.getLogger("mirrorquant.router")
 
 BroadcastFn = Optional[Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]]
+
+
+class UnknownOrderOutcome(RuntimeError):
+    """A mutation may have been accepted; reconciliation must precede further work."""
+
+
+TERMINAL_STATES = {"filled", "canceled", "rejected", "expired"}
 
 
 class CopyRouter:
@@ -59,21 +73,23 @@ class CopyRouter:
     async def _emit(self, event: Dict[str, Any]) -> None:
         if self.broadcast_fn:
             try:
-                await self.broadcast_fn(event)
+                await asyncio.wait_for(self.broadcast_fn(event), timeout=1.0)
             except Exception:
                 pass
 
     @staticmethod
     async def _get_config(db: AsyncSession, key: str, default: Any) -> Any:
-        row = await db.scalar(select(SystemConfig).where(SystemConfig.key == key))
+        row = await db.scalar(select(SystemConfig).where(SystemConfig.key == key).execution_options(populate_existing=True))
         if row:
-            try:
-                val = json.loads(row.value_json)
-                if isinstance(default, dict) and isinstance(val, dict):
-                    return {**default, **val}
-                return val
-            except Exception:
-                pass
+            val = json.loads(row.value_json)
+            if isinstance(default, dict) and isinstance(val, dict):
+                val = {**default, **val}
+            schema = {"resilience": ResilienceSettings, "risk_defaults": RiskDefaults}.get(key)
+            if schema is not None:
+                return schema.model_validate(val).model_dump()
+            if key == "global_kill_switch" and not isinstance(val, bool):
+                raise ValueError("Invalid persisted kill switch")
+            return val
         return default
 
     async def _get_debt(
@@ -163,50 +179,215 @@ class CopyRouter:
         reduce_only: bool,
         td_mode: str,
     ) -> OrderResult:
-        """Query exchange by clOrdId on transient/timeout failure before retrying."""
+        """Submit once; an ambiguous result authorizes lookup, never another POST."""
         try:
             return await adapter.place_order(
-                inst_id=inst_id,
-                side=side,
-                pos_side=pos_side,
-                ord_type=ord_type,
-                sz=sz,
-                px=px,
-                cl_ord_id=cl_ord_id,
-                reduce_only=reduce_only,
-                td_mode=td_mode,
+                inst_id=inst_id, side=side, pos_side=pos_side, ord_type=ord_type,
+                sz=sz, px=px, cl_ord_id=cl_ord_id, reduce_only=reduce_only, td_mode=td_mode,
             )
-        except ExchangeAPIError:
-            raise
         except Exception as first_exc:
-            # Query first so a slow/timed-out request doesn't double-open
-            await asyncio.sleep(0.35)
             try:
                 existing = await adapter.get_order(inst_id, cl_ord_id=cl_ord_id)
                 if existing and existing.get("ordId"):
                     return OrderResult(
-                        ord_id=str(existing["ordId"]),
-                        cl_ord_id=cl_ord_id,
-                        fill_sz=float(existing.get("accFillSz") or 0.0),
-                        avg_px=float(existing.get("avgPx") or 0.0),
-                        state=str(existing.get("state") or "submitted"),
-                        raw=existing.get("raw") or existing,
+                        ord_id=str(existing["ordId"]), cl_ord_id=cl_ord_id,
+                        fill_sz=float(existing.get("accFillSz") or 0),
+                        avg_px=float(existing.get("avgPx") or 0),
+                        state=str(existing.get("state") or "submitted"), raw=existing,
                     )
             except Exception:
-                pass
-            # Safe single retry with same cl_ord_id
-            logger.warning("Retrying idempotent order %s after transient error: %s", cl_ord_id, first_exc)
-            return await adapter.place_order(
-                inst_id=inst_id,
-                side=side,
-                pos_side=pos_side,
-                ord_type=ord_type,
-                sz=sz,
-                px=px,
-                cl_ord_id=cl_ord_id,
-                reduce_only=reduce_only,
-                td_mode=td_mode,
-            )
+                logger.exception("Order lookup failed for %s", cl_ord_id)
+            logger.critical("Order placement outcome ambiguous for %s: %s", cl_ord_id, first_exc)
+            raise UnknownOrderOutcome(f"Order placement outcome ambiguous for {cl_ord_id}") from first_exc
+
+    async def _get_allocation(
+        self, db: AsyncSession, binding_id: int, account_id: int, inst_id: str, pos_side: str,
+    ) -> PositionAllocation:
+        allocation = await db.scalar(select(PositionAllocation).where(
+            PositionAllocation.binding_id == binding_id, PositionAllocation.inst_id == inst_id,
+            PositionAllocation.pos_side == pos_side,
+        ))
+        if allocation is None:
+            allocation = PositionAllocation(binding_id=binding_id, account_id=account_id,
+                inst_id=inst_id, pos_side=pos_side, owned_qty=0.0, entry_cost=0.0,
+                generation=0, opened_at_ms=0)
+            db.add(allocation)
+            await db.flush()
+        return allocation
+
+    @staticmethod
+    def _owned_qty(allocation):
+        return exact(allocation.owned_qty_exact if allocation.owned_qty_exact is not None else allocation.owned_qty)
+
+    @staticmethod
+    def _entry_cost(allocation):
+        return exact(allocation.entry_cost_exact if allocation.entry_cost_exact is not None else allocation.entry_cost)
+
+    @staticmethod
+    def _pending_debt(debt):
+        return exact(debt.pending_usd_exact if debt.pending_usd_exact is not None else debt.pending_usd)
+
+    @staticmethod
+    def _set_debt(debt, value):
+        debt.pending_usd_exact = str(exact(value))
+        debt.pending_usd = float(value)
+
+    @staticmethod
+    def _state(value: Any) -> str:
+        raw = str(value or "unknown").lower().replace("-", "_")
+        return {"cancelled": "canceled", "partiallyfilledcanceled": "canceled",
+                "partially_filled_canceled": "canceled", "deactivated": "canceled",
+                "full_fill": "filled", "live": "new", "partiallyfilled": "partially_filled"}.get(raw, raw)
+
+    @staticmethod
+    def _confirmed_fill(info: Optional[Dict[str, Any]], res: OrderResult) -> float:
+        raw = info.get("accFillSz") if info is not None else None
+        value = exact(raw if raw is not None else (res.fill_sz if res.fill_sz is not None else 0))
+        if value < 0:
+            raise ValueError("Invalid negative cumulative fill")
+        return float(value)
+
+    async def _apply_intent_info(self, db, intent, info, spec, source_time_ms=0):
+        cumulative = exact(info.get("accFillSz") if info.get("accFillSz") is not None else intent.filled_qty)
+        prior = exact(intent.filled_qty)
+        if cumulative < prior or cumulative > exact(intent.requested_qty):
+            raise UnknownOrderOutcome(f"Invalid cumulative fill for {intent.id}")
+        delta = cumulative - prior
+        avg_px = exact(info.get("avgPx") or intent.avg_px)
+        if delta > 0 and avg_px <= 0:
+            raise UnknownOrderOutcome(f"Missing fill price for {intent.id}")
+        allocation = await self._get_allocation(db, intent.binding_id, intent.account_id, intent.inst_id, intent.pos_side)
+        debt = await self._get_debt(db, intent.binding_id, intent.inst_id, intent.pos_side.upper())
+        if delta > 0:
+            owned = self._owned_qty(allocation)
+            if intent.reduce_only:
+                if delta > owned:
+                    raise UnknownOrderOutcome("Confirmed close exceeds binding allocation")
+                remaining = max(Decimal("0"), owned - delta)
+                allocation.entry_cost_exact = str(self._entry_cost(allocation) * remaining / owned if owned else Decimal("0"))
+                allocation.entry_cost = float(allocation.entry_cost_exact)
+                allocation.owned_qty_exact = str(remaining)
+                allocation.owned_qty = float(remaining)
+                if remaining > 0 and owned > 0:
+                    self._set_debt(debt, self._pending_debt(debt) * remaining / owned)
+                if remaining == 0:
+                    self._set_debt(debt, 0)
+                    await self._clear_guard(db, intent.binding_id, intent.inst_id, intent.pos_side)
+            else:
+                if owned == 0:
+                    allocation.generation += 1
+                    allocation.opened_at_ms = source_time_ms or intent.source_time_ms or int(time.time() * 1000)
+                    await self._clear_guard(db, intent.binding_id, intent.inst_id, intent.pos_side)
+                # Average fill prices are cumulative: subtract previous cost, not delta * average.
+                new_cost = cumulative * avg_px - prior * exact(intent.avg_px)
+                if new_cost <= 0:
+                    raise UnknownOrderOutcome(f"Invalid incremental fill cost for {intent.id}")
+                allocation.entry_cost_exact = str(self._entry_cost(allocation) + new_cost)
+                allocation.entry_cost = float(allocation.entry_cost_exact)
+                allocation.owned_qty_exact = str(owned + delta)
+                allocation.owned_qty = float(allocation.owned_qty_exact)
+                self._set_debt(debt, max(Decimal("0"), exact(intent.target_usd) - cumulative * avg_px * spec.ct_val))
+                await self._upsert_guard(db, intent.binding_id, intent.inst_id, intent.pos_side,
+                    float(self._entry_cost(allocation) / self._owned_qty(allocation)))
+        intent.filled_qty = str(cumulative)
+        intent.avg_px = str(avg_px)
+        intent.exchange_order_id = str(info.get("ordId") or intent.exchange_order_id or "") or None
+        state = self._state(info.get("state"))
+        intent.state = state.upper() if state in TERMINAL_STATES else "UNKNOWN"
+        if state in TERMINAL_STATES:
+            delivery = await db.get(BindingDelivery, (intent.binding_id, intent.source_event_id))
+            if delivery is not None:
+                delivery.state = "APPLIED"
+        await db.commit()  # Confirmed fill and its allocation/debt commit together.
+        return float(delta), float(avg_px), state
+
+    async def _submit_confirmed(self, db, binding, account, adapter, spec,
+                                source_event_id, target_usd=0, source_time_ms=0, observed_at_ms=0, **order):
+        material = f"{account.id}:{binding.id}:{source_event_id}"
+        cid = "mq" + hashlib.sha256(material.encode()).hexdigest()[:30]
+        order["cl_ord_id"] = cid
+        intent = await db.get(OrderIntent, cid)
+        if intent is None:
+            if not order["reduce_only"]:
+                if observed_at_ms and not 0 <= int(time.time() * 1000) - int(observed_at_ms) <= 30000:
+                    raise RuntimeError("Lead snapshot expired before submission")
+                # Reload policy immediately before the durable submission boundary.
+                await db.refresh(binding)
+                await db.refresh(account)
+                if (not binding.is_enabled or not account.is_enabled or
+                        await self._get_config(db, "global_kill_switch", False)):
+                    raise RuntimeError("Opening admission disabled")
+            intent = OrderIntent(id=cid, binding_id=binding.id, account_id=account.id,
+                inst_id=order["inst_id"], pos_side=order["pos_side"],
+                source_event_id=source_event_id, state="SUBMITTING", requested_qty=order["sz"],
+                filled_qty="0", avg_px="0", reduce_only=order["reduce_only"], target_usd=str(target_usd), source_time_ms=source_time_ms)
+            db.add(intent)
+            await db.commit()  # Durable before POST; restart can only query this client ID.
+            try:
+                res = await self._place_order_idempotent(adapter=adapter, **order)
+            except BaseException:
+                intent.state = "UNKNOWN"
+                await db.commit()
+                raise
+        else:
+            if intent.state.lower() in TERMINAL_STATES:
+                return OrderResult(intent.exchange_order_id or "", cid, 0.0, float(intent.avg_px), intent.state.lower())
+            res = OrderResult(intent.exchange_order_id or "", cid, float(intent.filled_qty), float(intent.avg_px))
+        # ACK is not a fill. Poll briefly; unresolved outcomes are durable and block increases.
+        for attempt in range(4):
+            try:
+                info = await adapter.get_order(order["inst_id"], cl_ord_id=cid)
+            except Exception as exc:
+                intent.state = "UNKNOWN"
+                await db.commit()
+                raise UnknownOrderOutcome(f"Order lookup failed for {cid}") from exc
+            if info is None and self._state(res.state) in TERMINAL_STATES:
+                info = {"ordId": res.ord_id, "accFillSz": res.fill_sz, "avgPx": res.avg_px, "state": res.state}
+            if info is not None:
+                info = dict(info)
+                if info.get("accFillSz") is None:
+                    info["accFillSz"] = res.fill_sz if res.fill_sz is not None and res.fill_sz > 0 else intent.filled_qty
+                if info.get("avgPx") in (None, "") and res.avg_px:
+                    info["avgPx"] = res.avg_px
+                delta, price, state = await self._apply_intent_info(db, intent, info, spec, source_time_ms)
+                if state in TERMINAL_STATES:
+                    return OrderResult(intent.exchange_order_id or "", cid, delta, price, state)
+                if delta > 0:
+                    # Allocation is already protected; avoid losing this delta in execution accounting.
+                    await self._record_execution(db, binding, await db.get(LeadSource, binding.lead_id),
+                        account, order["inst_id"], order["inst_id"], order["side"], order["pos_side"],
+                        "PARTIAL_FILL", "PARTIAL", 0, 0, 0, my_qty=delta, my_price=price,
+                        order_id=intent.exchange_order_id, details="Partial fill confirmed; remaining order unresolved")
+                    await db.commit()
+            if attempt < 3:
+                await asyncio.sleep(0.1)
+        intent.state = "UNKNOWN"
+        await db.commit()
+        raise UnknownOrderOutcome(f"Order placement outcome ambiguous for {cid}")
+
+    async def reconcile_pending_orders(self, db, account, adapter, instruments):
+        intents = (await db.scalars(select(OrderIntent).where(
+            OrderIntent.account_id == account.id,
+            OrderIntent.state.notin_([s.upper() for s in TERMINAL_STATES]),
+        ))).all()
+        unresolved = False
+        for intent in intents:
+            spec = instruments.get(intent.inst_id)
+            if spec is None:
+                unresolved = True
+                continue
+            try:
+                await db.commit()
+                info = await adapter.get_order(intent.inst_id, cl_ord_id=intent.id)
+                if info is None:
+                    unresolved = True
+                    continue
+                _, _, state = await self._apply_intent_info(db, intent, info, spec)
+                unresolved |= state not in TERMINAL_STATES
+            except Exception:
+                logger.exception("Pending order remains unresolved: %s", intent.id)
+                unresolved = True
+        return not unresolved
 
     async def _record_execution(
         self,
@@ -243,9 +424,9 @@ class CopyRouter:
             position_side=position_side,
             action=action,
             status=status,
-            lead_qty=lead_qty,
-            lead_price=lead_price,
-            lead_notional=lead_notional,
+            lead_qty=float(lead_qty),
+            lead_price=float(lead_price),
+            lead_notional=float(lead_notional),
             my_qty=my_qty,
             my_price=my_price,
             my_notional=my_notional,
@@ -254,6 +435,9 @@ class CopyRouter:
             details=details,
         )
         db.add(rec)
+        delivery = db.info.get("delivery")
+        if delivery is not None and status not in ("FAILED", "UNKNOWN", "PARTIAL"):
+            delivery.state = "APPLIED"
         await db.flush()
 
         payload = {
@@ -275,6 +459,7 @@ class CopyRouter:
                 "createdAt": rec.created_at.isoformat() if rec.created_at else None,
             },
         }
+        await db.commit()
         await self._emit(payload)
 
         if notify_cfg:
@@ -320,162 +505,191 @@ class CopyRouter:
                     pass
         return rec
 
+    @serialized_execution
     async def process_lead_events(
-        self,
-        db: AsyncSession,
-        lead: LeadSource,
-        raw_orders: List[Dict[str, Any]],
-        raw_closed: List[Dict[str, Any]],
-        snapshot: Dict[str, Any],
-        proxies: List[ProxyNode],
+        self, db: AsyncSession, lead: LeadSource, raw_orders: List[Dict[str, Any]],
+        raw_closed: List[Dict[str, Any]], snapshot: Dict[str, Any], proxies: List[ProxyNode],
     ) -> None:
-        """Compare newly observed orders/closures against lead seen state and route to bindings."""
-        seen_order_keys = set(json.loads(lead.seen_order_keys_json or "[]"))
-        seen_closed_ids = set(json.loads(lead.seen_closed_ids_json or "[]"))
-
-        expanded_orders = [expand_slim_order(o) for o in raw_orders]
-        new_orders = [o for o in expanded_orders if order_dedup_key(o) not in seen_order_keys]
-        new_closed = [c for c in raw_closed if str(c.get("id") or c.get("positionId") or "") not in seen_closed_ids]
-
-        bindings = (
-            await db.scalars(
-                select(CopyBinding).where(
-                    CopyBinding.lead_id == lead.id,
-                    CopyBinding.is_enabled == True,  # noqa: E712
-                )
-            )
-        ).all()
-
-        # Seed cold-start baselines silently without placing historical trades
-        unseeded = [b for b in bindings if not b.baseline_seeded]
-        if unseeded or not seen_order_keys:
-            for o in expanded_orders:
-                seen_order_keys.add(order_dedup_key(o))
-            for c in raw_closed:
-                cid = str(c.get("id") or c.get("positionId") or "")
-                if cid:
-                    seen_closed_ids.add(cid)
-            for b in unseeded:
-                b.baseline_seeded = True
-            lead.seen_order_keys_json = json.dumps(list(seen_order_keys)[-3000:])
-            lead.seen_closed_ids_json = json.dumps(list(seen_closed_ids)[-500:])
-            await db.commit()
+        """Durably enqueue each follower's cumulative-fill deltas before acknowledging ingestion."""
+        if not is_authoritative_snapshot(snapshot):
             return
-
-        if not new_orders and not new_closed:
+        await db.refresh(lead)
+        latest = json.loads(lead.snapshot_json or "{}")
+        latest_observed = (latest.get("openPositionsMeta") or {}).get("asOf") or 0
+        failed_at = (latest.get("openPositionsMeta") or {}).get("lastFailureStartedAtMs") or 0
+        if (latest_observed > snapshot["openPositionsMeta"]["asOf"]
+                or failed_at >= snapshot["openPositionsMeta"]["asOf"]):
             return
-
-        global_kill = bool(await self._get_config(db, "global_kill_switch", False))
+        seen_keys = list(json.loads(lead.seen_order_keys_json or "[]"))
+        seen_closed = list(json.loads(lead.seen_closed_ids_json or "[]"))
+        old_seen = set(seen_keys)
+        expanded_orders = sorted([expand_slim_order(o) for o in raw_orders],
+            key=lambda o: (o.get("orderTime") or 0, order_dedup_key(o)))
+        bindings = (await db.scalars(select(CopyBinding).where(CopyBinding.lead_id == lead.id)
+                    .execution_options(populate_existing=True))).all()
+        for binding in bindings:
+            baseline = not binding.baseline_seeded
+            for order in expanded_orders:
+                key = order_dedup_key(order)
+                cumulative = exact(order.get("executedQty") or 0)
+                notional = cumulative * exact(order.get("avgPrice") or 0)
+                progress = await db.get(BindingSourceProgress, (binding.id, key))
+                if progress is None:
+                    for alias in order.get("_legacy_source_keys", []):
+                        progress = await db.get(BindingSourceProgress, (binding.id, alias))
+                        if progress is not None:
+                            progress.source_key = key
+                            break
+                if progress is None:
+                    progress = BindingSourceProgress(binding_id=binding.id, source_key=key,
+                        cumulative_qty="0", cumulative_notional="0")
+                    db.add(progress)
+                    legacy_payload = [order.get("orderTime"), order.get("symbol"), order.get("side"),
+                        order.get("positionSide"), order.get("type"), float(cumulative), float(order.get("avgPrice") or 0)]
+                    legacy_key = hashlib.sha1(json.dumps(legacy_payload, sort_keys=True).encode()).hexdigest()[:24]
+                    if baseline or key in old_seen or legacy_key in old_seen or any(k in old_seen for k in order.get("_legacy_keys", [])):
+                        progress.cumulative_qty, progress.cumulative_notional = str(cumulative), str(notional)
+                        continue
+                previous = exact(progress.cumulative_qty)
+                if cumulative < previous:
+                    logger.error("Regressing source fill %s; suspending source event", key)
+                    continue
+                delta = cumulative - previous
+                if delta <= 0:
+                    continue
+                delta_notional = notional - exact(progress.cumulative_notional)
+                if delta_notional <= 0:
+                    continue
+                updated = {**order, "executedQty": str(delta), "avgPrice": str(delta_notional / delta)}
+                batches = sorted(group_orders_into_batches([updated]),
+                    key=lambda b: (b.get("startTime", 0), b.get("endTime", 0), b.get("key", "")))
+                for batch in batches:
+                    event_id = key + ":" + str(cumulative)
+                    batch.update(qty=str(delta), qtyExact=str(delta), notional=str(delta_notional), notionalExact=str(delta_notional), avgPrice=str(delta_notional / delta), _event_id=event_id)
+                    sequence = int((order.get("orderUpdateTime") if previous > 0 else None) or batch.get("startTime") or 0)
+                    prior_sequence = await db.scalar(select(BindingDelivery.source_sequence).where(
+                        BindingDelivery.binding_id == binding.id, BindingDelivery.source_event_id.startswith(key + ":"))
+                        .order_by(BindingDelivery.source_sequence.desc()).limit(1))
+                    if prior_sequence is not None:
+                        sequence = max(sequence, prior_sequence + 1)
+                    db.add(BindingDelivery(binding_id=binding.id, source_event_id=event_id,
+                        source_sequence=sequence, payload_json=json.dumps(batch), state="PENDING"))
+                progress.cumulative_qty, progress.cumulative_notional = str(cumulative), str(notional)
+            # Historical closures cannot authorize closing a subsequently reopened cycle.
+            if not baseline:
+                for closed in raw_closed:
+                    cid = str(closed.get("id") or closed.get("positionId") or "")
+                    if cid and cid not in seen_closed:
+                        event_id = "closed:" + cid
+                        if await db.get(BindingDelivery, (binding.id, event_id)) is None:
+                            db.add(BindingDelivery(binding_id=binding.id, source_event_id=event_id,
+                                source_sequence=int(closed.get("closed") or closed.get("updateTime") or 0),
+                                payload_json=json.dumps({"_closed": closed, "_event_id": event_id}), state="PENDING"))
+            binding.baseline_seeded = True
+        for order in expanded_orders:
+            key = order_dedup_key(order)
+            if key not in old_seen:
+                seen_keys.append(key)
+                old_seen.add(key)
+        for closed in raw_closed:
+            cid = str(closed.get("id") or closed.get("positionId") or "")
+            if cid and cid not in seen_closed:
+                seen_closed.append(cid)
+        lead.seen_order_keys_json = json.dumps(seen_keys[-6000:])
+        lead.seen_closed_ids_json = json.dumps(seen_closed[-1000:])
+        await db.commit()
         notify_cfg = await self._get_config(db, "notifications", DEFAULT_SYSTEM_CONFIG["notifications"])
         resilience_cfg = await self._get_config(db, "resilience", DEFAULT_SYSTEM_CONFIG["resilience"])
-
-        batches = group_orders_into_batches(new_orders) if new_orders else []
-        if resilience_cfg.get("flip_close_first", True) and len(batches) > 1:
-            # Close/reduce batches first to release margin before opposite opens
-            batches = sorted(
-                batches,
-                key=lambda b: (1 if is_open_leg(b.get("side"), b.get("positionSide")) else 0, b.get("startTime") or 0),
-            )
-
-        lead_margin_balance = float((snapshot.get("profile") or {}).get("marginBalance") or lead.margin_balance or 0.0)
-
-        active_lead_positions: Dict[str, float] = {}
-        for pos in snapshot.get("openPositions") or []:
-            active_lead_positions[f"{pos['symbol']}_{pos['positionSide']}"] = float(pos.get("qty") or 0.0)
-
+        lead_margin_balance = (snapshot.get("profile") or {}).get("marginBalance") or lead.margin_balance or 0
+        active = {f"{p['symbol']}_{p['positionSide']}": exact(p.get("qtyExact", p.get("qty")) or 0)
+                  for p in snapshot.get("openPositions") or []}
         for binding in bindings:
-            account = await db.get(TradingAccount, binding.account_id)
-            if not account or not account.is_enabled:
+            await db.refresh(binding)
+            await db.refresh(lead)
+            account = await db.get(TradingAccount, binding.account_id, populate_existing=True)
+            if account is None:
                 continue
-
             try:
-                creds = self.vault.decrypt_dict(account.encrypted_credentials)
-                proxy_url = (
-                    ProxyManager.select_proxy_url(proxies, account.proxy_id)
-                    if account.proxy_id is not None
-                    else None
-                )
-                adapter = create_exchange_adapter(
-                    exchange=account.exchange,
-                    credentials=creds,
+                adapter = create_exchange_adapter(exchange=account.exchange,
+                    credentials=self.vault.decrypt_dict(account.encrypted_credentials),
                     environment=account.environment,
-                    proxy_url=proxy_url,
-                    margin_mode=account.margin_mode,
-                    position_mode=account.position_mode,
-                )
-                adapter._time_offset_ms = int(getattr(account, "clock_offset_ms", 0) or 0)
-                bal = await adapter.get_usdt_balance()
-                positions = await adapter.get_positions()
+                    proxy_url=ProxyManager.select_proxy_url(proxies, account.proxy_id) if account.proxy_id else None,
+                    margin_mode=account.margin_mode, position_mode=account.position_mode)
+                adapter._time_offset_ms = int(account.clock_offset_ms or 0)
+                await db.commit()
+                account.clock_offset_ms = await adapter.sync_time()
                 instruments = await adapter.get_instruments()
-            except Exception as exc:
-                logger.error("Adapter init/sync failed for account %s: %s", account.name, exc)
-                account.status = "error"
-                account.last_error = str(exc)[:400]
-                continue
-
-            if bal.eq > account.hwm_equity:
-                account.hwm_equity = bal.eq
-            self._refresh_day_start(account, bal.eq)
-            account.usdt_equity = bal.eq
-            account.avail_equity = bal.avail_eq
-            account.total_notional = sum(p.notional_usd for p in positions)
-            account.unrealized_pnl = sum(p.upl for p in positions)
-            account.positions_json = json.dumps([p.to_dict() for p in positions])
-            account.status = "connected"
-            account.last_error = None
-
-            for batch in batches:
-                await self._execute_batch_for_binding(
-                    db=db,
-                    binding=binding,
-                    lead=lead,
-                    account=account,
-                    adapter=adapter,
-                    batch=batch,
-                    lead_margin_balance=lead_margin_balance,
-                    active_lead_positions=active_lead_positions,
-                    my_equity=bal.eq,
-                    positions=positions,
-                    instruments=instruments,
-                    global_kill=global_kill,
-                    notify_cfg=notify_cfg,
-                    resilience_cfg=resilience_cfg,
-                )
-                # Refresh local positions & avail balance after each batch (critical for close-before-open flip!)
-                try:
-                    positions = await adapter.get_positions()
+                if not await self.reconcile_pending_orders(db, account, adapter, instruments):
+                    continue
+                deliveries = (await db.scalars(select(BindingDelivery).where(
+                    BindingDelivery.binding_id == binding.id, BindingDelivery.state != "APPLIED")
+                    .order_by(BindingDelivery.source_sequence, BindingDelivery.source_event_id))).all()
+                # Recover inventory immediately after each pending source event from
+                # the current snapshot and the chronological suffix of known events.
+                remaining_by_event = {}
+                inventory = dict(active)
+                for pending in reversed(deliveries):
+                    payload = json.loads(pending.payload_json)
+                    if "_closed" in payload:
+                        continue
+                    leg = f"{payload['symbol']}_{payload['positionSide']}"
+                    quantity = exact(payload.get("qtyExact", payload.get("qty")) or 0)
+                    remaining_by_event[pending.source_event_id] = inventory.get(leg, Decimal("0"))
+                    if is_open_leg(payload.get("side"), payload.get("positionSide")):
+                        inventory[leg] = max(Decimal("0"), inventory.get(leg, Decimal("0")) - quantity)
+                    else:
+                        inventory[leg] = inventory.get(leg, Decimal("0")) + quantity
+                for delivery in deliveries:
+                    if not is_authoritative_snapshot(snapshot):
+                        break
+                    await db.commit()
                     bal = await adapter.get_usdt_balance()
-                    account.usdt_equity = bal.eq
-                    account.avail_equity = bal.avail_eq
+                    positions = await adapter.get_positions()
+                    account.hwm_equity = max(account.hwm_equity, bal.eq)
+                    self._refresh_day_start(account, bal.eq)
+                    account.usdt_equity, account.avail_equity = bal.eq, bal.avail_eq
+                    account.total_notional = sum(p.notional_usd for p in positions)
                     account.positions_json = json.dumps([p.to_dict() for p in positions])
-                except Exception:
-                    pass
-
-            # Safety reconciliation for full closed positions from position-history
-            for c in new_closed:
-                await self._reconcile_closed_position(
-                    db=db,
-                    binding=binding,
-                    lead=lead,
-                    account=account,
-                    adapter=adapter,
-                    closed_pos=c,
-                    positions=positions,
-                    instruments=instruments,
-                    notify_cfg=notify_cfg,
-                )
-
-        # Mark processed orders & closures as seen
-        for o in new_orders:
-            seen_order_keys.add(order_dedup_key(o))
-        for c in new_closed:
-            cid = str(c.get("id") or c.get("positionId") or "")
-            if cid:
-                seen_closed_ids.add(cid)
-
-        lead.seen_order_keys_json = json.dumps(list(seen_order_keys)[-3000:])
-        lead.seen_closed_ids_json = json.dumps(list(seen_closed_ids)[-500:])
-        await db.commit()
+                    account.status, account.last_error = "connected", None
+                    batch = json.loads(delivery.payload_json)
+                    batch["_observed_at_ms"] = snapshot["openPositionsMeta"]["asOf"]
+                    batch["_lead_remaining_qty"] = remaining_by_event.get(delivery.source_event_id, 0)
+                    # Historical openings inside a known completed lead cycle must not
+                    # attach to the same symbol's currently reopened position.
+                    if "_closed" not in batch and is_open_leg(batch.get("side"), batch.get("positionSide")):
+                        timestamp = int(batch.get("startTime") or 0)
+                        for closed in raw_closed:
+                            if (closed.get("symbol") == batch.get("symbol") and
+                                str(closed.get("side") or "").upper() == batch.get("positionSide") and
+                                int(closed.get("opened") or 0) <= timestamp <= int(closed.get("closed") or 0)):
+                                batch["_closed_cycle"] = True
+                    db.info["delivery"] = delivery
+                    if "_closed" in batch:
+                        c = batch["_closed"]
+                        if active.get(f"{c.get('symbol')}_{str(c.get('side', '')).upper()}", 0) <= 0:
+                            await self._reconcile_closed_position(db, binding, lead, account, adapter, c, positions, instruments, notify_cfg)
+                        delivery.state = "APPLIED"
+                    else:
+                        await self._execute_batch_for_binding(db, binding, lead, account, adapter,
+                            batch, lead_margin_balance, active, bal.eq, positions, instruments,
+                            bool(await self._get_config(db, "global_kill_switch", False)), notify_cfg, resilience_cfg)
+                    db.info.pop("delivery", None)
+                    await db.commit()
+                    if not await self.reconcile_pending_orders(db, account, adapter, instruments):
+                        break
+                    if delivery.state != "APPLIED":
+                        break
+            except Exception as exc:
+                db.info.pop("delivery", None)
+                logger.exception("Follower delivery deferred")
+                if isinstance(exc, SQLAlchemyError) or not db.is_active:
+                    await db.rollback()
+                    await db.refresh(account)
+                    await db.refresh(lead)
+                    for stale_binding in bindings:
+                        await db.refresh(stale_binding)
+                account.status, account.last_error = "error", str(exc)[:400]
+                await db.commit()
 
     async def _execute_batch_for_binding(
         self,
@@ -498,9 +712,9 @@ class CopyRouter:
         symbol = batch["symbol"]
         side = batch["side"]
         ps = batch["positionSide"]
-        lead_qty = float(batch["qty"] or 0.0)
+        lead_qty = exact(batch.get("qtyExact", batch["qty"]) or 0)
         lead_avg_px = float(batch.get("avgPrice") or 0.0)
-        lead_notional = float(batch.get("notional") or (lead_qty * lead_avg_px))
+        lead_notional = batch.get("notionalExact", batch.get("notional")) or (exact(batch["qty"]) * exact(batch.get("avgPrice") or 0))
         is_open = is_open_leg(side, ps)
         action = direction_label(side, ps, not is_open)
 
@@ -519,7 +733,7 @@ class CopyRouter:
             return
 
         filt = RiskEngine.check_symbol_filter(symbol, whitelist, blacklist)
-        if not filt.allowed:
+        if is_open and not filt.allowed:
             await self._record_execution(
                 db, binding, lead, account, symbol, inst_id, side, ps, action,
                 "BLOCKED_FILTER", lead_qty, lead_avg_px, lead_notional,
@@ -527,6 +741,13 @@ class CopyRouter:
             )
             return
 
+        if is_open and (batch.get("_closed_cycle") or active_lead_positions.get(f"{symbol}_{ps}", 0.0) <= 0):
+            await self._record_execution(
+                db, binding, lead, account, symbol, inst_id, side, ps, action,
+                "SKIPPED_CLOSED_CYCLE", lead_qty, lead_avg_px, lead_notional,
+                details="Lead position is already closed in current snapshot; skipping historical open",
+                notify_cfg=notify_cfg)
+            return
         spec = instruments[inst_id]
         local_pos_side = "long" if ps == "LONG" else "short"
         local_pos = next(
@@ -536,80 +757,66 @@ class CopyRouter:
         local_pos_sz = local_pos.pos if local_pos else 0.0
         debt = await self._get_debt(db, binding.id, inst_id, ps)
 
-        # CASE A: REDUCE / CLOSE (always permitted even under drawdown/daily breaker)
-        if not is_open:
-            if local_pos_sz <= 0:
-                debt.pending_usd = 0.0
-                await self._clear_guard(db, binding.id, inst_id, local_pos_side)
-                await self._record_execution(
-                    db, binding, lead, account, symbol, inst_id, side, ps, action,
-                    "SKIPPED_NO_LOCAL_POS", lead_qty, lead_avg_px, lead_notional,
-                    details="No local position to close; reset pending debt",
-                    notify_cfg=notify_cfg,
-                )
-                return
+        allocation = await self._get_allocation(db, binding.id, account.id, inst_id, local_pos_side)
+        event_id = batch.get("_event_id") or hashlib.sha256(json.dumps(batch, sort_keys=True).encode()).hexdigest()
 
-            lead_rem_qty = active_lead_positions.get(f"{symbol}_{ps}", 0.0)
-            is_full_close = lead_rem_qty <= 1e-6
-            close_sz = PositionSizer.size_close_order(
-                local_pos_sz=local_pos_sz,
-                is_full_close=is_full_close,
-                lead_close_qty=lead_qty,
-                lead_remaining_qty=lead_rem_qty,
-                spec=spec,
-            )
-            order_side = "sell" if ps == "LONG" else "buy"
-            cl_ord_id = f"mqc{int(time.time()*1000)}{uuid.uuid4().hex[:6]}"[:32]
+        # Exits are limited by both binding ownership and physically reducible quantity.
+        if not is_open:
+            source_time = int(batch.get("startTime") or 0)
+            if source_time and source_time < allocation.opened_at_ms:
+                await self._record_execution(db, binding, lead, account, symbol, inst_id, side, ps, action,
+                    "SKIPPED_CLOSED_CYCLE", lead_qty, lead_avg_px, lead_notional,
+                    details="Historical reduction predates this allocation's opening cycle", notify_cfg=notify_cfg)
+                return
+            local_pos_sz = min(self._owned_qty(allocation), exact(local_pos_sz),
+                               exact(local_pos.avail_pos) if local_pos else Decimal("0"))
+            if local_pos_sz <= 0:
+                await self._record_execution(db, binding, lead, account, symbol, inst_id, side, ps, action,
+                    "SKIPPED_NO_LOCAL_POS", lead_qty, lead_avg_px, lead_notional,
+                    details="This binding owns no reducible local position", notify_cfg=notify_cfg)
+                return
+            lead_rem_qty = batch.get("_lead_remaining_qty", active_lead_positions.get(f"{symbol}_{ps}", 0.0))
+            is_full_close = exact(lead_rem_qty) <= 0
+            close_sz = PositionSizer.size_close_order(local_pos_sz, is_full_close, lead_qty, lead_rem_qty, spec)
+            if close_sz <= Decimal("0"):
+                await self._record_execution(db, binding, lead, account, symbol, inst_id, side, ps, action,
+                    "SKIPPED_BELOW_MIN", lead_qty, lead_avg_px, lead_notional,
+                    details="Partial close below min_sz; no quantity rounded up", notify_cfg=notify_cfg)
+                return
             try:
-                res = await self._place_order_idempotent(
-                    adapter=adapter,
-                    inst_id=inst_id,
-                    side=order_side,
-                    pos_side=local_pos_side,
-                    ord_type="market",
-                    sz=format_decimal(close_sz, spec.lot_sz),
-                    px=None,
-                    cl_ord_id=cl_ord_id,
-                    reduce_only=True,
-                    td_mode=account.margin_mode,
-                )
-                await asyncio.sleep(0.2)
-                ord_info = await adapter.get_order(inst_id, ord_id=res.ord_id, cl_ord_id=cl_ord_id)
-                fill_sz = float((ord_info or {}).get("accFillSz") or res.fill_sz or close_sz)
-                fill_px = float((ord_info or {}).get("avgPx") or res.avg_px or lead_avg_px)
-                my_notional = fill_sz * float(spec.ct_val) * fill_px
-                slip = ((fill_px - lead_avg_px) / lead_avg_px * 100.0) if lead_avg_px > 0 else 0.0
-                if is_full_close:
-                    debt.pending_usd = 0.0
-                    await self._clear_guard(db, binding.id, inst_id, local_pos_side)
-                    try:
-                        await adapter.cancel_tp_sl(inst_id, local_pos_side)
-                    except Exception:
-                        pass
-                binding.consecutive_failures = 0
-                await self._record_execution(
-                    db, binding, lead, account, symbol, inst_id, side, ps,
-                    "FULL_CLOSE" if is_full_close else "PARTIAL_REDUCE",
-                    "EXECUTED", lead_qty, lead_avg_px, lead_notional,
-                    my_qty=fill_sz, my_price=fill_px, my_notional=round(my_notional, 2),
-                    slippage_pct=round(slip, 3), order_id=res.ord_id,
-                    details=f"Closed {fill_sz} @ {fill_px}", notify_cfg=notify_cfg,
-                )
+                await self._close_owned(db, binding, lead, account, adapter, local_pos, spec,
+                    close_sz, event_id, "FULL_CLOSE" if is_full_close else "PARTIAL_REDUCE", notify_cfg,
+                    lead_qty=lead_qty, lead_price=lead_avg_px, lead_notional=lead_notional)
             except Exception as exc:
-                await self._handle_order_failure(
-                    db, binding, lead, account, symbol, inst_id, side, ps, action,
-                    lead_qty, lead_avg_px, lead_notional, f"Close order error: {exc}",
-                    notify_cfg, resilience_cfg,
-                )
+                await self._handle_order_failure(db, binding, lead, account, symbol, inst_id, side, ps, action,
+                    lead_qty, lead_avg_px, lead_notional, f"Close order error: {exc}", notify_cfg, resilience_cfg)
             return
 
         # CASE B: OPEN / ADD
-        if global_kill:
+        if global_kill or not binding.is_enabled or not account.is_enabled:
             await self._record_execution(
                 db, binding, lead, account, symbol, inst_id, side, ps, action,
                 "BLOCKED_KILL_SWITCH", lead_qty, lead_avg_px, lead_notional,
                 details="Global kill switch is active", notify_cfg=notify_cfg,
             )
+            return
+
+        if not await self.reconcile_pending_orders(db, account, adapter, instruments):
+            await self._record_execution(db, binding, lead, account, symbol, inst_id, side, ps, action,
+                "UNKNOWN", lead_qty, lead_avg_px, lead_notional,
+                details="Account has unresolved orders; increases suspended", notify_cfg=notify_cfg)
+            return
+
+        allocations = (await db.scalars(select(PositionAllocation).where(PositionAllocation.account_id == account.id))).all()
+        physical = {(p.inst_id, p.pos_side): exact(p.pos) for p in positions}
+        claimed = {}
+        for owned in allocations:
+            key = (owned.inst_id, owned.pos_side)
+            claimed[key] = claimed.get(key, Decimal("0")) + self._owned_qty(owned)
+        if any(qty > physical.get(key, Decimal("0")) for key, qty in claimed.items()):
+            await self._record_execution(db, binding, lead, account, symbol, inst_id, side, ps, action,
+                "BLOCKED_ALLOCATION_MISMATCH", lead_qty, lead_avg_px, lead_notional,
+                details="Exchange inventory is below allocated quantity; reconciliation required", notify_cfg=notify_cfg)
             return
 
         dd_res = RiskEngine.check_drawdown(account.hwm_equity, my_equity, binding.max_drawdown_pct)
@@ -638,6 +845,7 @@ class CopyRouter:
             )
             return
 
+        await db.commit()
         book = await adapter.get_orderbook(inst_id, depth=5)
         order_side = "buy" if ps == "LONG" else "sell"
         best_bid = book.bids[0][0] if book.bids else 0.0
@@ -653,10 +861,10 @@ class CopyRouter:
             catchup_res = RiskEngine.check_missed_order_catchup(
                 order_time_ms=batch_ts_ms,
                 now_ms=int(time.time() * 1000),
-                max_age_sec=int(resilience_cfg.get("missed_order_max_age_sec", 120)),
+                max_age_sec=int(resilience_cfg.get("missed_order_max_age_sec", 900)),
                 ref_price=ref_px,
                 lead_avg_price=lead_avg_px,
-                catchup_max_price_dev_pct=float(resilience_cfg.get("catchup_max_price_dev_pct", 0.8)),
+                catchup_max_price_dev_pct=float(resilience_cfg.get("catchup_max_price_dev_pct", 0.5)),
             )
             if not catchup_res.allowed:
                 await self._record_execution(
@@ -693,12 +901,12 @@ class CopyRouter:
             lead_margin_balance=lead_margin_balance,
             risk_scale=binding.risk_scale,
             lead_notional=lead_notional,
-            pending_debt_usd=debt.pending_usd,
+            pending_debt_usd=self._pending_debt(debt),
         )
 
         sized = PositionSizer.size_open_order(target_usd, ref_px, spec)
         if sized.below_min:
-            debt.pending_usd = target_usd
+            self._set_debt(debt, target_usd)
             await self._record_execution(
                 db, binding, lead, account, symbol, inst_id, side, ps, action,
                 "ACCUMULATED_DEBT", lead_qty, lead_avg_px, lead_notional,
@@ -727,9 +935,15 @@ class CopyRouter:
             )
             return
 
-        target_lvr = int(min(binding.max_instrument_leverage, spec.max_lvr))
+        projected_notional = sum(exact(p.notional_usd) for p in positions if p.inst_id == inst_id) + exact(sized.estimated_notional)
+        tier_max = await adapter.get_max_leverage(inst_id, projected_notional)
+        max_allowed_lvr = int(min(binding.max_instrument_leverage, spec.max_lvr, tier_max))
+        target_lvr = PositionSizer.compute_dynamic_leverage(
+            target_notional=sized.estimated_notional or (exact(sized.contracts) * exact(ref_px) * spec.ct_val),
+            equity=my_equity, max_symbol_leverage=max_allowed_lvr,
+        )
         margin_policy = str(resilience_cfg.get("insufficient_margin_policy", "auto_scale_down"))
-        avail_eq = account.avail_equity if account.avail_equity > 0 else my_equity
+        avail_eq = account.avail_equity
         capped_qty, margin_err, margin_note = RiskEngine.adjust_for_available_margin(
             requested_qty=capped_qty,
             ref_price=ref_px,
@@ -747,101 +961,69 @@ class CopyRouter:
             )
             return
 
-        await adapter.ensure_leverage(inst_id, target_lvr, pos_side=local_pos_side, mgn_mode=account.margin_mode)
+        await db.commit()  # Never hold a write transaction across leverage/book/order I/O.
+        confirmed = await adapter.ensure_leverage(inst_id, target_lvr, pos_side=local_pos_side, mgn_mode=account.margin_mode)
+        if confirmed is not True:
+            raise RuntimeError("Exchange leverage could not be confirmed")
 
-        cl_ord_id = f"mqo{int(time.time()*1000)}{uuid.uuid4().hex[:6]}"[:32]
-        use_market_only = binding.order_mode == "market_only"
-        ioc_offset = binding.ioc_offset_pct / 100.0
-        ioc_px = ref_px * (1.0 + ioc_offset) if order_side == "buy" else ref_px * (1.0 - ioc_offset)
-        ioc_px_dec = quantize_step(ioc_px, spec.tick_sz)
-
+        # A price-limited IOC makes the configured slippage limit an execution bound.
+        # Market-only and IOC-then-market settings cannot bypass that bound.
+        offset = exact(binding.ioc_offset_pct) / Decimal("100")
+        slippage = exact(binding.max_slippage_pct) / Decimal("100")
+        if order_side == "buy":
+            limit = min(exact(ref_px) * (1 + offset), exact(lead_avg_px) * (1 + slippage))
+            ioc_px_dec = quantize_down(limit, spec.tick_sz)
+        else:
+            limit = max(exact(ref_px) * (1 - offset), exact(lead_avg_px) * (1 - slippage))
+            ioc_px_dec = (limit / spec.tick_sz).to_integral_value(rounding=ROUND_UP) * spec.tick_sz
+        spec.validate_order("ioc", capped_qty, ioc_px_dec)
         try:
-            res = await self._place_order_idempotent(
-                adapter=adapter,
-                inst_id=inst_id,
-                side=order_side,
-                pos_side=local_pos_side,
-                ord_type="market" if use_market_only else "ioc",
-                sz=format_decimal(capped_qty, spec.lot_sz),
-                px=None if use_market_only else format_decimal(ioc_px_dec, spec.tick_sz),
-                cl_ord_id=cl_ord_id,
-                reduce_only=False,
-                td_mode=account.margin_mode,
-            )
-            await asyncio.sleep(0.2)
-            ord_info = await adapter.get_order(inst_id, ord_id=res.ord_id, cl_ord_id=cl_ord_id)
-            fill_sz = float((ord_info or {}).get("accFillSz") or res.fill_sz or 0.0)
-            fill_px = float((ord_info or {}).get("avgPx") or res.avg_px or ref_px)
-
-            # Fallback to market if IOC didn't fill and policy allows
-            if fill_sz <= 0 and binding.order_mode == "ioc_then_market":
-                book2 = await adapter.get_orderbook(inst_id, depth=2)
-                ref_px2 = (
-                    (book2.asks[0][0] if book2.asks else ref_px)
-                    if order_side == "buy"
-                    else (book2.bids[0][0] if book2.bids else ref_px)
-                )
-                slip2 = RiskEngine.check_slippage(ref_px2, lead_avg_px, binding.max_slippage_pct)
-                if slip2.allowed:
-                    mkt_cid = f"mqm{int(time.time()*1000)}{uuid.uuid4().hex[:6]}"[:32]
-                    res = await self._place_order_idempotent(
-                        adapter=adapter,
-                        inst_id=inst_id,
-                        side=order_side,
-                        pos_side=local_pos_side,
-                        ord_type="market",
-                        sz=format_decimal(capped_qty, spec.lot_sz),
-                        px=None,
-                        cl_ord_id=mkt_cid,
-                        reduce_only=False,
-                        td_mode=account.margin_mode,
-                    )
-                    await asyncio.sleep(0.2)
-                    ord_info2 = await adapter.get_order(inst_id, ord_id=res.ord_id, cl_ord_id=mkt_cid)
-                    fill_sz = float((ord_info2 or {}).get("accFillSz") or res.fill_sz or float(capped_qty))
-                    fill_px = float((ord_info2 or {}).get("avgPx") or res.avg_px or ref_px2)
-
+            res = await self._submit_confirmed(db, binding, account, adapter, spec,
+                source_event_id=event_id, target_usd=target_usd,
+                source_time_ms=int(batch.get("startTime") or 0), observed_at_ms=batch.get("_observed_at_ms", 0), inst_id=inst_id,
+                side=order_side, pos_side=local_pos_side, ord_type="ioc",
+                sz=format_decimal(capped_qty, spec.lot_sz), px=format_decimal(ioc_px_dec, spec.tick_sz),
+                reduce_only=False, td_mode=account.margin_mode)
+            fill_sz, fill_px = res.fill_sz, res.avg_px
             if fill_sz > 0:
-                actual_usd = fill_sz * float(spec.ct_val) * fill_px
-                debt.pending_usd = max(0.0, target_usd - actual_usd)
-                slip_actual = ((fill_px - lead_avg_px) / lead_avg_px * 100.0) if lead_avg_px > 0 else 0.0
+                actual_usd = exact(fill_sz) * spec.ct_val * exact(fill_px)
                 binding.consecutive_failures = 0
-
-                # Update software guard & exchange conditional TP/SL per tp_sl_mode
-                tp_sl_note = await self._apply_tp_sl_after_fill(
-                    db=db,
-                    binding=binding,
-                    account=account,
-                    adapter=adapter,
-                    inst_id=inst_id,
-                    local_pos_side=local_pos_side,
-                    fill_px=fill_px,
-                    total_pos_sz=local_pos_sz + fill_sz,
-                    spec=spec,
-                )
-
-                notes = [n for n in (cap_reason, margin_note, f"Filled {fill_sz} @ {fill_px}; debt=${debt.pending_usd:.2f}", tp_sl_note) if n]
-                await self._record_execution(
-                    db, binding, lead, account, symbol, inst_id, side, ps, action,
+                owned_entry = float(self._entry_cost(allocation) / self._owned_qty(allocation))
+                tp_sl_note = await self._apply_tp_sl_after_fill(db, binding, account, adapter,
+                    inst_id, local_pos_side, owned_entry, allocation.owned_qty, spec)
+                notes = [n for n in (cap_reason, margin_note, f"Filled {fill_sz} @ {fill_px}", tp_sl_note) if n]
+                await self._record_execution(db, binding, lead, account, symbol, inst_id, side, ps, action,
                     "EXECUTED", lead_qty, lead_avg_px, lead_notional,
-                    my_qty=fill_sz, my_price=fill_px, my_notional=round(actual_usd, 2),
-                    slippage_pct=round(slip_actual, 3), order_id=res.ord_id,
-                    details="; ".join(notes), notify_cfg=notify_cfg,
-                )
+                    my_qty=fill_sz, my_price=fill_px, my_notional=float(actual_usd),
+                    order_id=res.ord_id, details="; ".join(notes), notify_cfg=notify_cfg)
             else:
-                debt.pending_usd = target_usd
-                await self._record_execution(
-                    db, binding, lead, account, symbol, inst_id, side, ps, action,
-                    "ACCUMULATED_DEBT", lead_qty, lead_avg_px, lead_notional,
-                    my_price=ref_px, details="IOC expired unfilled; debt retained",
-                    notify_cfg=notify_cfg,
-                )
+                # Zero fill never consumes debt or removes protection.
+                await self._record_execution(db, binding, lead, account, symbol, inst_id, side, ps, action,
+                    "UNFILLED", lead_qty, lead_avg_px, lead_notional, order_id=res.ord_id,
+                    details="Terminal order has no newly confirmed fills; debt retained", notify_cfg=notify_cfg)
         except Exception as exc:
-            await self._handle_order_failure(
-                db, binding, lead, account, symbol, inst_id, side, ps, action,
-                lead_qty, lead_avg_px, lead_notional, f"Order execution failed: {exc}",
-                notify_cfg, resilience_cfg,
-            )
+            await self._handle_order_failure(db, binding, lead, account, symbol, inst_id, side, ps, action,
+                lead_qty, lead_avg_px, lead_notional, f"Order execution failed: {exc}", notify_cfg, resilience_cfg)
+
+    async def _close_owned(self, db, binding, lead, account, adapter, pos, spec, quantity,
+                           source_event_id, action, notify_cfg, lead_qty=0.0, lead_price=0.0, lead_notional=0.0):
+        allocation = await self._get_allocation(db, binding.id, account.id, pos.inst_id, pos.pos_side)
+        qty = quantize_down(min(exact(quantity), self._owned_qty(allocation), exact(pos.pos), exact(pos.avail_pos)), spec.lot_sz)
+        if qty <= 0:
+            return False
+        order_side = "sell" if pos.pos_side == "long" else "buy"
+        res = await self._submit_confirmed(db, binding, account, adapter, spec,
+            source_event_id=source_event_id, inst_id=pos.inst_id, side=order_side,
+            pos_side=pos.pos_side, ord_type="market", sz=format_decimal(qty, spec.lot_sz),
+            px=None, reduce_only=True, td_mode=account.margin_mode)
+        fill_sz, fill_px = res.fill_sz, res.avg_px
+        await self._record_execution(db, binding, lead, account, pos.symbol, pos.inst_id,
+            order_side.upper(), pos.pos_side.upper(), action, "EXECUTED" if fill_sz > 0 else "UNFILLED",
+            lead_qty, lead_price, lead_notional, my_qty=fill_sz, my_price=fill_px,
+            my_notional=float(exact(fill_sz) * spec.ct_val * exact(fill_px)), order_id=res.ord_id,
+            details=f"Confirmed close fill {fill_sz}; binding remaining {allocation.owned_qty}", notify_cfg=notify_cfg)
+        await db.commit()
+        return fill_sz > 0
 
     async def _apply_tp_sl_after_fill(
         self,
@@ -860,38 +1042,9 @@ class CopyRouter:
         if mode == "follow_lead":
             return None
 
-        tp_px, sl_px = RiskEngine.compute_tp_sl_prices(
-            pos_side=local_pos_side,
-            entry_px=fill_px,
-            tp_sl_mode=mode,
-            enable_tp=bool(getattr(binding, "enable_take_profit", False)),
-            tp_pct=float(getattr(binding, "take_profit_pct", 10.0)),
-            enable_sl=bool(getattr(binding, "enable_stop_loss", False)),
-            sl_pct=float(getattr(binding, "stop_loss_pct", 5.0)),
-            hard_sl_pct=float(getattr(binding, "hard_stop_loss_pct", 15.0)),
-        )
-        if not tp_px and not sl_px:
-            return None
-
-        tp_str = format_decimal(quantize_step(tp_px, spec.tick_sz), spec.tick_sz) if tp_px else None
-        sl_str = format_decimal(quantize_step(sl_px, spec.tick_sz), spec.tick_sz) if sl_px else None
-        sz_str = format_decimal(Decimal(str(total_pos_sz)), spec.lot_sz)
-        try:
-            await adapter.cancel_tp_sl(inst_id, local_pos_side)
-            res = await adapter.place_tp_sl(
-                inst_id=inst_id,
-                pos_side=local_pos_side,
-                sz=sz_str,
-                tp_px=tp_str,
-                sl_px=sl_str,
-                td_mode=account.margin_mode,
-            )
-            if res.get("ok"):
-                return f"TP/SL({mode}): tp={tp_str or '-'} sl={sl_str or '-'}"
-            return f"TP/SL({mode}) software-guard active (tp={tp_str or '-'} sl={sl_str or '-'})"
-        except Exception as exc:
-            logger.warning("Exchange TP/SL placement failed (%s); software guard active: %s", inst_id, exc)
-            return f"TP/SL({mode}) software-guard fallback"
+        # Native position-wide stops cannot express binding ownership on shared accounts.
+        # Keep the durable software guard; never cancel another strategy's conditional orders.
+        return f"TP/SL({mode}) binding allocation software guard active"
 
     async def _handle_order_failure(
         self,
@@ -938,44 +1091,24 @@ class CopyRouter:
         raw_side = str(closed_pos.get("side") or "").upper()
         if not sym or raw_side not in ("LONG", "SHORT"):
             return
-        symbol_map = json.loads(binding.symbol_map_json or "{}")
-        inst_id, is_supported = adapter.resolve_symbol(sym, instruments, symbol_map)
-        if not is_supported:
+        inst_id, supported = adapter.resolve_symbol(sym, instruments, json.loads(binding.symbol_map_json or "{}"))
+        if not supported:
             return
-        local_side = "long" if raw_side == "LONG" else "short"
-        target_pos = next((p for p in positions if p.inst_id == inst_id and p.pos_side == local_side), None)
-        if not target_pos or target_pos.pos <= 0:
+        local_side = raw_side.lower()
+        allocation = await self._get_allocation(db, binding.id, account.id, inst_id, local_side)
+        if allocation.owned_qty <= 0:
             return
-        spec = instruments[inst_id]
-        order_side = "sell" if raw_side == "LONG" else "buy"
-        cl_ord_id = f"mqr{int(time.time()*1000)}{uuid.uuid4().hex[:6]}"[:32]
-        try:
-            res = await self._place_order_idempotent(
-                adapter=adapter,
-                inst_id=inst_id,
-                side=order_side,
-                pos_side=local_side,
-                ord_type="market",
-                sz=format_decimal(Decimal(str(target_pos.pos)), spec.lot_sz),
-                px=None,
-                cl_ord_id=cl_ord_id,
-                reduce_only=True,
-                td_mode=account.margin_mode,
-            )
-            debt = await self._get_debt(db, binding.id, inst_id, raw_side)
-            debt.pending_usd = 0.0
-            await self._clear_guard(db, binding.id, inst_id, local_side)
-            await self._record_execution(
-                db, binding, lead, account, sym, inst_id, order_side.upper(), raw_side,
-                "RECONCILE_CLOSE", "EXECUTED", 0.0, 0.0, 0.0,
-                my_qty=target_pos.pos, my_price=target_pos.avg_px,
-                my_notional=round(target_pos.notional_usd, 2), order_id=res.ord_id,
-                details="Closed residual position matching lead position-history closure",
-                notify_cfg=notify_cfg,
-            )
-        except Exception as exc:
-            logger.error("Reconcile close failed for %s: %s", inst_id, exc)
+        closed_at = int(closed_pos.get("closed") or closed_pos.get("updateTime") or 0)
+        if closed_at <= allocation.opened_at_ms:
+            return
+        pos = next((p for p in positions if p.inst_id == inst_id and p.pos_side == local_side), None)
+        if pos is None or pos.pos <= 0:
+            return
+        event_id = "closed:" + str(closed_pos.get("id") or closed_pos.get("positionId") or closed_at)
+        await self._close_owned(db, binding, lead, account, adapter, pos, instruments[inst_id],
+            min(allocation.owned_qty, pos.pos), event_id, "RECONCILE_CLOSE", notify_cfg)
 
+    @serialized_execution
     async def reconcile_orphan_positions(
         self,
         db: AsyncSession,
@@ -990,6 +1123,11 @@ class CopyRouter:
         notify_cfg: Optional[Dict[str, Any]] = None,
     ) -> List[str]:
         """Detect follower positions whose lead leg no longer exists (e.g. closed during outage)."""
+        await db.refresh(binding)
+        if not await self.reconcile_pending_orders(db, account, adapter, instruments):
+            return []
+        await db.commit()
+        local_positions = await adapter.get_positions()
         res_cfg: Dict[str, Any] = resilience_cfg or await self._get_config(db, "resilience", DEFAULT_SYSTEM_CONFIG["resilience"]) or {}
         ntf_cfg: Dict[str, Any] = notify_cfg or await self._get_config(db, "notifications", DEFAULT_SYSTEM_CONFIG["notifications"]) or {}
         mode = str(res_cfg.get("auto_close_orphan_positions", "alert_only"))
@@ -1012,10 +1150,8 @@ class CopyRouter:
                 continue
             if (pos.inst_id, pos.pos_side) in lead_keys:
                 continue
-            # Check if this binding actually ever traded or holds a guard on this position, OR symbol passes binding filter
-            whitelist = json.loads(binding.symbol_whitelist_json or "[]")
-            blacklist = json.loads(binding.symbol_blacklist_json or "[]")
-            if not RiskEngine.check_symbol_filter(pos.symbol, whitelist, blacklist).allowed:
+            allocation = await self._get_allocation(db, binding.id, account.id, pos.inst_id, pos.pos_side)
+            if allocation.owned_qty <= 0:
                 continue
 
             raw_ps = "LONG" if pos.pos_side == "long" else "SHORT"
@@ -1023,33 +1159,13 @@ class CopyRouter:
                 spec = instruments.get(pos.inst_id)
                 if not spec:
                     continue
-                order_side = "sell" if pos.pos_side == "long" else "buy"
-                cl_ord_id = f"mqo_orp{int(now*1000)}"[:32]
                 try:
-                    res = await self._place_order_idempotent(
-                        adapter=adapter,
-                        inst_id=pos.inst_id,
-                        side=order_side,
-                        pos_side=pos.pos_side,
-                        ord_type="market",
-                        sz=format_decimal(Decimal(str(pos.pos)), spec.lot_sz),
-                        px=None,
-                        cl_ord_id=cl_ord_id,
-                        reduce_only=True,
-                        td_mode=account.margin_mode,
-                    )
-                    await self._clear_guard(db, binding.id, pos.inst_id, pos.pos_side)
-                    await self._record_execution(
-                        db, binding, lead, account, pos.symbol, pos.inst_id, order_side.upper(), raw_ps,
-                        "ORPHAN_AUTO_CLOSE", "EXECUTED", 0.0, 0.0, 0.0,
-                        my_qty=pos.pos, my_price=pos.avg_px,
-                        my_notional=round(pos.notional_usd, 2), order_id=res.ord_id,
-                        details="Auto-closed ghost/orphan position missing from lead openPositions",
-                        notify_cfg=ntf_cfg,
-                    )
-                    actions_taken.append(f"closed:{pos.inst_id}:{pos.pos_side}")
-                except Exception as exc:
-                    logger.error("Orphan auto-close failed for %s: %s", pos.inst_id, exc)
+                    event_id = await self._exit_event_id(db, binding, allocation, "orphan")
+                    if await self._close_owned(db, binding, lead, account, adapter, pos, spec,
+                        min(allocation.owned_qty, pos.pos), event_id, "ORPHAN_AUTO_CLOSE", ntf_cfg):
+                        actions_taken.append(f"closed:{pos.inst_id}:{pos.pos_side}")
+                except Exception:
+                    logger.exception("Orphan auto-close failed for %s", pos.inst_id)
             else:
                 alert_key = f"{binding.id}:{pos.inst_id}:{pos.pos_side}"
                 if now - self._orphan_alert_ts.get(alert_key, 0.0) >= 900.0:
@@ -1057,7 +1173,7 @@ class CopyRouter:
                     await self._record_execution(
                         db, binding, lead, account, pos.symbol, pos.inst_id, "ALERT", raw_ps,
                         "ORPHAN_ALERT", "BLOCKED_ORPHAN_DETECTED", 0.0, 0.0, 0.0,
-                        my_qty=pos.pos, my_price=pos.avg_px,
+                        my_qty=allocation.owned_qty, my_price=pos.avg_px,
                         my_notional=round(pos.notional_usd, 2),
                         details="Ghost position detected: present locally but absent from lead openPositions",
                         notify_cfg=ntf_cfg,
@@ -1065,6 +1181,13 @@ class CopyRouter:
                     actions_taken.append(f"alerted:{pos.inst_id}:{pos.pos_side}")
         return actions_taken
 
+    async def _exit_event_id(self, db, binding, allocation, action):
+        prefix = f"{action}:{allocation.id}:{allocation.generation}:"
+        ids = (await db.scalars(select(OrderIntent.id).where(OrderIntent.binding_id == binding.id,
+                    OrderIntent.source_event_id.startswith(prefix)))).all()
+        return prefix + str(len(ids))
+
+    @serialized_execution
     async def check_position_guards(
         self,
         db: AsyncSession,
@@ -1077,11 +1200,16 @@ class CopyRouter:
         notify_cfg: Optional[Dict[str, Any]] = None,
     ) -> List[str]:
         """Software TP/SL & Trailing Stop fallback monitor for independent / hybrid_guard modes."""
+        await db.refresh(binding)
+        if not await self.reconcile_pending_orders(db, account, adapter, instruments):
+            return []
         mode = getattr(binding, "tp_sl_mode", "follow_lead") or "follow_lead"
         if mode == "follow_lead":
             return []
         notify_cfg = notify_cfg or await self._get_config(db, "notifications", DEFAULT_SYSTEM_CONFIG["notifications"])
         triggered: List[str] = []
+        await db.commit()
+        local_positions = await adapter.get_positions()
 
         for pos in local_positions:
             if pos.pos <= 0 or pos.pos_side not in ("long", "short"):
@@ -1090,16 +1218,24 @@ class CopyRouter:
             if not spec:
                 continue
 
+            allocation = await self._get_allocation(db, binding.id, account.id, pos.inst_id, pos.pos_side)
+            if allocation.owned_qty <= 0:
+                continue
+            await db.commit()
             try:
                 book = await adapter.get_orderbook(pos.inst_id, depth=1)
-                cur_px = (book.bids[0][0] if pos.pos_side == "long" and book.bids else
-                          book.asks[0][0] if pos.pos_side == "short" and book.asks else pos.avg_px)
-            except Exception:
-                cur_px = pos.avg_px
-            if cur_px <= 0:
+                if not book.bids or not book.asks or not RiskEngine.check_spread(book.bids[0][0], book.asks[0][0], 100).allowed:
+                    raise ValueError("Invalid protective quote")
+                cur_px = book.bids[0][0] if pos.pos_side == "long" else book.asks[0][0]
+            except Exception as exc:
+                account.status = "error"
+                account.last_error = f"Protective quote unavailable: {exc}"[:400]
+                binding.circuit_breaker_tripped = True
+                binding.circuit_breaker_reason = "Protective quote unavailable"
+                await db.commit()
                 continue
-
-            guard = await self._upsert_guard(db, binding.id, pos.inst_id, pos.pos_side, pos.avg_px or cur_px)
+            entry = float(self._entry_cost(allocation) / self._owned_qty(allocation))
+            guard = await self._upsert_guard(db, binding.id, pos.inst_id, pos.pos_side, entry)
             entry_px = guard.entry_px or pos.avg_px or cur_px
             if cur_px > (guard.peak_px or entry_px):
                 guard.peak_px = cur_px
@@ -1131,31 +1267,11 @@ class CopyRouter:
                     reason = f"Trailing Stop triggered @ {cur_px:.4f} (trough {guard.trough_px:.4f}, cb {cb_pct*100:.1f}%)"
 
             if reason:
-                order_side = "sell" if is_long else "buy"
-                raw_ps = "LONG" if is_long else "SHORT"
-                cl_ord_id = f"mqtpsl{int(time.time()*1000)}"[:32]
                 try:
-                    res = await self._place_order_idempotent(
-                        adapter=adapter,
-                        inst_id=pos.inst_id,
-                        side=order_side,
-                        pos_side=pos.pos_side,
-                        ord_type="market",
-                        sz=format_decimal(Decimal(str(pos.pos)), spec.lot_sz),
-                        px=None,
-                        cl_ord_id=cl_ord_id,
-                        reduce_only=True,
-                        td_mode=account.margin_mode,
-                    )
-                    await self._clear_guard(db, binding.id, pos.inst_id, pos.pos_side)
-                    await self._record_execution(
-                        db, binding, lead, account, pos.symbol, pos.inst_id, order_side.upper(), raw_ps,
-                        "TPSL_CLOSE", "EXECUTED", 0.0, 0.0, 0.0,
-                        my_qty=pos.pos, my_price=cur_px,
-                        my_notional=round(pos.pos * float(spec.ct_val) * cur_px, 2),
-                        order_id=res.ord_id, details=reason, notify_cfg=notify_cfg,
-                    )
-                    triggered.append(f"{pos.inst_id}:{pos.pos_side}")
-                except Exception as exc:
-                    logger.error("Software TP/SL close failed for %s: %s", pos.inst_id, exc)
+                    event_id = await self._exit_event_id(db, binding, allocation, "guard")
+                    if await self._close_owned(db, binding, lead, account, adapter, pos, spec,
+                        min(allocation.owned_qty, pos.pos), event_id, "TPSL_CLOSE", notify_cfg):
+                        triggered.append(f"{pos.inst_id}:{pos.pos_side}")
+                except Exception:
+                    logger.exception("Software TP/SL close failed for %s", pos.inst_id)
         return triggered

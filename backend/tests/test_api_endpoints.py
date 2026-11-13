@@ -162,7 +162,9 @@ async def test_api_full_workflow(async_client: AsyncClient):
     from app.main import app
 
     with TestClient(app) as client:
-        with client.websocket_connect(f"/ws/stream?token={token}") as ws:
+        with client.websocket_connect(
+            "/ws/stream", headers={"Origin": "http://localhost:8000", "Cookie": f"mq_access_token={token}"}
+        ) as ws:
             msg = ws.receive_json()
             assert msg["type"] == "connected"
             assert msg["user"] == "superadmin"
@@ -226,4 +228,3 @@ async def test_login_brute_force_lockout_and_captcha(async_client: AsyncClient):
     assert "Retry-After" in res.headers
     assert res.json().get("code") == "ACCOUNT_LOCKED"
     assert res.json().get("lockRemainingSec", 0) > 0
-
