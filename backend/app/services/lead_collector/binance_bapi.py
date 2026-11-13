@@ -13,6 +13,7 @@ from urllib.parse import quote
 
 import httpx
 
+from app.core.secret_mask import redact_proxy_userinfo
 from app.services.lead_collector.base import BaseLeadCollector
 from app.services.engine.sizer import exact
 from app.services.proxy.manager import ProxyManager
@@ -494,7 +495,7 @@ class BinanceBapiCollector(BaseLeadCollector):
                     else:
                         resp = await client.get(url)
                     if resp.status_code != 200:
-                        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:160]}")
+                        raise RuntimeError(f"HTTP {resp.status_code}: {redact_proxy_userinfo(resp.text)[:160]}")
                     payload = resp.json()
                     code = payload.get("code")
                     if code == BUSY_CODE:
@@ -872,7 +873,7 @@ class BinanceBapiCollector(BaseLeadCollector):
                 holdings_observed_ms = int(time.time() * 1000)
                 authoritative = True
             except Exception as exc:
-                holdings_error = str(exc)[:240]
+                holdings_error = redact_proxy_userinfo(str(exc))[:240]
 
         # Optional dashboard requests cannot delay the execution collector.
         cached_perf = self._perf_cache.get(portfolio_id)
@@ -1007,7 +1008,7 @@ class BinanceBapiCollector(BaseLeadCollector):
                         proxy_url=proxy_url,
                     )
                 except Exception as exc:
-                    return {"ok": False, "reason": str(exc)}
+                    return {"ok": False, "reason": redact_proxy_userinfo(str(exc))}
 
             analyses = await asyncio.gather(*(_analyze(p) for p in open_positions))
             for pos, res in zip(open_positions, analyses):

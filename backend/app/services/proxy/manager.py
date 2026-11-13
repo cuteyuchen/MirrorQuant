@@ -7,6 +7,7 @@ from typing import Optional, Sequence
 import httpx
 
 from app.core.config import get_settings
+from app.core.secret_mask import redact_proxy_userinfo
 from app.models.domain import ProxyNode
 
 
@@ -111,5 +112,5 @@ class ProxyManager:
             return ProxyTestResult(
                 healthy=False,
                 latency_ms=None,
-                error=str(exc)[:400],
+                error=redact_proxy_userinfo(str(exc))[:400],
             )

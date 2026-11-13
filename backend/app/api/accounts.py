@@ -10,7 +10,7 @@ from app.api.deps import get_current_admin, get_current_user, record_audit
 from app.api.exposure import require_account_flat
 from app.core.database import get_db
 from app.core.security import CredentialVault
-from app.core.secret_mask import redact_proxy_userinfo
+from app.core.secret_mask import mask_sensitive_payload, redact_proxy_userinfo
 from app.models.domain import ProxyNode, TradingAccount, User
 from app.schemas.api import AccountCreate, AccountUpdate
 from app.services.adapters.factory import create_exchange_adapter
@@ -45,7 +45,7 @@ def _account_out(a: TradingAccount) -> dict:
         "clockOffsetMs": int(getattr(a, "clock_offset_ms", 0) or 0),
         "totalNotional": round(a.total_notional, 2),
         "unrealizedPnl": round(a.unrealized_pnl, 2),
-        "positions": positions,
+        "positions": mask_sensitive_payload(positions),
         "lastSyncAt": a.last_sync_at.isoformat() if a.last_sync_at else None,
         "lastError": redact_proxy_userinfo(a.last_error) if a.last_error else None,
         "status": a.status,
@@ -202,10 +202,10 @@ async def test_account_connectivity(
         if acct.usdt_equity > acct.hwm_equity:
             acct.hwm_equity = acct.usdt_equity
         await db.commit()
-        return res
+        return mask_sensitive_payload(res)
     except Exception as exc:
         acct.status = "error"
-        acct.last_error = str(exc)[:480]
+        acct.last_error = redact_proxy_userinfo(str(exc))[:480]
         await db.commit()
         return {"ok": False, "error": redact_proxy_userinfo(str(exc))}
 
@@ -221,4 +221,4 @@ async def sync_account_now(
         raise HTTPException(status_code=404, detail="Account not found")
     res = await orchestrator.sync_account(db, acct)
     await db.refresh(acct)
-    return {"item": _account_out(acct), **res}
+    return mask_sensitive_payload({"item": _account_out(acct), **res})

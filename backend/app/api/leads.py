@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_current_admin, get_current_user, record_audit
 from app.api.exposure import require_binding_flat
 from app.core.database import get_db
-from app.core.secret_mask import redact_proxy_userinfo
+from app.core.secret_mask import mask_sensitive_payload, redact_proxy_userinfo
 from app.models.domain import CopyBinding, LeadSource, ProxyNode, User
 from app.schemas.api import LeadCreate, LeadUpdate
 from app.services.engine.orchestrator import orchestrator
@@ -152,7 +152,7 @@ async def get_lead_snapshot(
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
     snapshot = json.loads(lead.snapshot_json) if lead.snapshot_json else None
-    return {"lead": _lead_summary(lead), "snapshot": snapshot}
+    return mask_sensitive_payload({"lead": _lead_summary(lead), "snapshot": snapshot})
 
 
 @router.post("/{lead_id}/sync")
@@ -169,7 +169,7 @@ async def sync_lead_now(
     await record_audit(db, "SYNC_LEAD", "lead", str(lead.id), f"Manual sync ok={res.get('ok')}", current_user, request)
     await db.commit()
     await db.refresh(lead)
-    return {"lead": _lead_summary(lead), **res}
+    return mask_sensitive_payload({"lead": _lead_summary(lead), **res})
 
 
 @router.get("/{lead_id}/analysis")
@@ -195,7 +195,7 @@ async def analyze_lead_symbol(
         res = await orchestrator.pa_analyzer.analyze_position(
             symbol.upper(), position_side.upper(), avg_entry, proxy_url=proxy_url,
         )
-        return {"items": [res]}
+        return mask_sensitive_payload({"items": [res]})
 
     snap = json.loads(lead.snapshot_json) if lead.snapshot_json else {}
     items = []
@@ -210,7 +210,7 @@ async def analyze_lead_symbol(
                 proxy_url=proxy_url,
             )
         )
-    return {"items": items}
+    return mask_sensitive_payload({"items": items})
 
 
 @router.get("/{lead_id}/export-csv")
