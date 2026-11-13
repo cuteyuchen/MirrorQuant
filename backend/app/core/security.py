@@ -11,6 +11,8 @@ import secrets
 import struct
 import threading
 import time
+import weakref
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 from urllib.parse import quote
@@ -24,6 +26,19 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from app.core.config import get_settings
 
 _ph = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=2)
+_password_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mirrorquant-password")
+_password_slots: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _password_admission(loop: asyncio.AbstractEventLoop) -> asyncio.Semaphore:
+    slot_ref = _password_slots.get(loop)
+    semaphore = slot_ref() if slot_ref is not None else None
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(2)
+        # Tasks retain the semaphore while using it. Weak values avoid keeping
+        # old loops alive through a contended semaphore's internal loop pointer.
+        _password_slots[loop] = weakref.ref(semaphore)
+    return semaphore
 
 
 def hash_password(password: str) -> str:
@@ -38,11 +53,15 @@ def verify_password(password: str, password_hash: str) -> bool:
 
 
 async def hash_password_async(password: str) -> str:
-    return await asyncio.to_thread(hash_password, password)
+    loop = asyncio.get_running_loop()
+    async with _password_admission(loop):
+        return await loop.run_in_executor(_password_executor, hash_password, password)
 
 
 async def verify_password_async(password: str, password_hash: str) -> bool:
-    return await asyncio.to_thread(verify_password, password, password_hash)
+    loop = asyncio.get_running_loop()
+    async with _password_admission(loop):
+        return await loop.run_in_executor(_password_executor, verify_password, password, password_hash)
 
 
 def _derive_aes_key(master_key: str) -> bytes:

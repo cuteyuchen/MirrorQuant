@@ -27,16 +27,15 @@ def extract_client_ip(request: Optional[Request]) -> str:
         return str(address)
     forwarded = request.headers.get("X-Forwarded-For")
     if forwarded:
-        try:
-            hops = [ip_address(hop.strip()) for hop in forwarded.split(",")]
-        except ValueError:
-            return str(address)
         # Walk from the socket peer toward the client. A client-supplied prefix
         # must never override the first untrusted hop appended by our proxy.
-        for hop in reversed(hops):
+        for hop in reversed(forwarded.split(",")):
             if not any(address in network for network in trusted):
                 break
-            address = hop
+            try:
+                address = ip_address(hop.strip())
+            except ValueError:
+                return peer[:64]
         return str(address)
     for header in ("X-Real-IP", "CF-Connecting-IP"):
         value = request.headers.get(header)

@@ -1,3 +1,4 @@
+import asyncio
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -41,9 +42,13 @@ def test_trusted_proxy_accepts_validated_single_address(header):
     assert deps.extract_client_ip(request_from("::1", {header: "not-an-ip"})) == "::1"
 
 
-def test_malformed_forwarded_chain_fails_closed():
-    request = request_from("127.0.0.1", {"X-Forwarded-For": "spoofed, 198.51.100.9"})
-    assert deps.extract_client_ip(request) == "127.0.0.1"
+@pytest.mark.parametrize("forwarded,expected", [
+    ("spoofed, 198.51.100.9", "198.51.100.9"),
+    ("198.51.100.9, spoofed", "127.0.0.1"),
+])
+def test_malformed_forwarded_chain_preserves_trusted_boundary(forwarded, expected):
+    request = request_from("127.0.0.1", {"X-Forwarded-For": forwarded})
+    assert deps.extract_client_ip(request) == expected
     assert deps.extract_client_ip(None) == "unknown"
 
 
@@ -121,13 +126,66 @@ async def test_captcha_replay_returns_400_even_after_successful_login(async_clie
 
 
 @pytest.mark.asyncio
-async def test_password_helpers_await_to_thread(monkeypatch):
+async def test_password_helpers_await_worker_executor(monkeypatch):
     off_thread = AsyncMock(side_effect=["synthetic-hash", True])
-    monkeypatch.setattr(security.asyncio, "to_thread", off_thread)
+    monkeypatch.setattr(asyncio.get_running_loop(), "run_in_executor", off_thread)
     assert await security.hash_password_async("synthetic-password") == "synthetic-hash"
     assert await security.verify_password_async("synthetic-password", "synthetic-hash") is True
-    assert off_thread.await_args_list[0].args == (security.hash_password, "synthetic-password")
-    assert off_thread.await_args_list[1].args == (security.verify_password, "synthetic-password", "synthetic-hash")
+    assert off_thread.await_args_list[0].args == (security._password_executor, security.hash_password, "synthetic-password")
+    assert off_thread.await_args_list[1].args == (
+        security._password_executor, security.verify_password, "synthetic-password", "synthetic-hash",
+    )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_password_requests_bound_argon2_work(monkeypatch):
+    loop = asyncio.get_running_loop()
+    two_started = asyncio.Event()
+    release = threading.Event()
+    started = []
+    lock = threading.Lock()
+
+    def slow_hash(password):
+        with lock:
+            started.append(password)
+            if len(started) == 2:
+                loop.call_soon_threadsafe(two_started.set)
+        release.wait(timeout=5)
+        return "synthetic-hash"
+
+    monkeypatch.setattr(security, "hash_password", slow_hash)
+    tasks = [asyncio.create_task(security.hash_password_async(str(index))) for index in range(8)]
+    try:
+        await asyncio.wait_for(two_started.wait(), timeout=2)
+        await asyncio.sleep(0)
+        assert len(started) == 2
+    finally:
+        release.set()
+        await asyncio.gather(*tasks)
+
+
+@pytest.mark.asyncio
+async def test_password_admission_bounds_submitted_work(monkeypatch):
+    admitted = asyncio.Event()
+    release = asyncio.Event()
+    submissions = []
+
+    async def blocked_executor(executor, function, *args):
+        submissions.append(function)
+        if len(submissions) == 2:
+            admitted.set()
+        await release.wait()
+        return "synthetic-hash"
+
+    monkeypatch.setattr(asyncio.get_running_loop(), "run_in_executor", blocked_executor)
+    tasks = [asyncio.create_task(security.hash_password_async(str(index))) for index in range(8)]
+    try:
+        await asyncio.wait_for(admitted.wait(), timeout=2)
+        await asyncio.sleep(0)
+        assert len(submissions) == 2
+    finally:
+        release.set()
+        await asyncio.gather(*tasks)
 
 
 @pytest.mark.asyncio
