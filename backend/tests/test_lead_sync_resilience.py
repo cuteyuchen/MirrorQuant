@@ -1,5 +1,6 @@
 """Detail degradation, durable sync incidents and bounded state-change logging."""
 import copy
+import asyncio
 import importlib
 import json
 import logging
@@ -15,9 +16,12 @@ from sqlalchemy import select
 from app.core.config import get_settings
 from app.core.database import get_session_factory
 from app.models.domain import LeadSource, NotificationOutbox
-from app.services.engine.orchestrator import EngineOrchestrator, SYNC_FAILURE_FIELDS
+from app.services.engine.orchestrator import (
+    EngineOrchestrator, SYNC_FAILURE_ERROR_INTERVAL, SYNC_FAILURE_FIELDS, SYNC_FAILURE_WARN_INTERVAL,
+)
 from app.services.lead_collector.binance_bapi import (
-    BUSY_CODE, BinanceBapiCollector, describe_exception, is_authoritative_snapshot,
+    BUSY_CODE, DETAIL_DEGRADED_WARN_INTERVAL, HISTORY_RETRY_BUDGET,
+    BinanceBapiCollector, describe_exception, is_authoritative_snapshot,
 )
 from app.services.lead_collector.freshness import lead_freshness
 from app.services.notifier.outbox import enqueue_notification
@@ -60,6 +64,17 @@ def monitor(monkeypatch):
 def clock(monkeypatch):
     state = SimpleNamespace(now=time.time())
     monkeypatch.setattr("app.services.engine.orchestrator.time.time", lambda: state.now)
+    return state
+
+
+@pytest.fixture
+def log_clock(monkeypatch):
+    state = SimpleNamespace(now=0.0)
+    # Isolate the log clock from asyncio's timeout/event-loop clock.
+    for name in ("app.services.engine.orchestrator", "app.services.lead_collector.binance_bapi"):
+        monkeypatch.setattr(importlib.import_module(name), "time", SimpleNamespace(
+            time=time.time, perf_counter=time.perf_counter, monotonic=lambda: state.now,
+        ))
     return state
 
 
@@ -171,6 +186,73 @@ async def test_detail_does_not_retry_permanent_http_failure(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["fetch_order_history", "fetch_position_history"])
+@pytest.mark.parametrize("code", [BUSY_CODE, int(BUSY_CODE)])
+async def test_history_busy_twice_then_success(monkeypatch, endpoint, code):
+    data = {"list": [ORDER], "total": 1}
+    calls, sleep = mock_http(monkeypatch, [
+        httpx.Response(200, json={"code": code}),
+        httpx.Response(200, json={"code": code}),
+        httpx.Response(200, json={"code": "000000", "data": data}),
+    ])
+    result = await getattr(BinanceBapiCollector(), endpoint)("test-portfolio")
+    assert result == (data["list"] if endpoint == "fetch_order_history" else data)
+    assert len(calls) == 3
+    assert [call.args[0] for call in sleep.await_args_list] == [0.8, 1.6]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["fetch_order_history", "fetch_position_history"])
+@pytest.mark.parametrize("failure", [
+    httpx.ReadTimeout(""), httpx.ConnectError(""), httpx.RemoteProtocolError(""),
+    httpx.Response(429), httpx.Response(503), httpx.Response(200, json={"code": BUSY_CODE}),
+])
+async def test_history_has_four_attempts_and_capped_exponential_backoff(monkeypatch, endpoint, failure):
+    calls, sleep = mock_http(monkeypatch, [failure])
+    with pytest.raises(RuntimeError):
+        await getattr(BinanceBapiCollector(), endpoint)("test-portfolio")
+    assert len(calls) == 4
+    assert [call.args[0] for call in sleep.await_args_list] == [0.8, 1.6, 2.4]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["fetch_order_history", "fetch_position_history"])
+@pytest.mark.parametrize("failure", [
+    httpx.Response(400), httpx.Response(403), httpx.Response(404),
+    httpx.Response(200, json={"code": "permanent", "message": "invalid portfolio"}),
+])
+async def test_history_permanent_failure_does_not_retry(monkeypatch, endpoint, failure):
+    calls, sleep = mock_http(monkeypatch, [failure])
+    with pytest.raises(RuntimeError):
+        await getattr(BinanceBapiCollector(), endpoint)("test-portfolio")
+    assert len(calls) == 1
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["fetch_order_history", "fetch_position_history"])
+async def test_history_total_retry_budget_cancels_slow_request(monkeypatch, endpoint):
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def respond(request):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    transport = httpx.MockTransport(respond)
+    monkeypatch.setattr(ProxyManager, "build_client", lambda **kwargs: httpx.AsyncClient(transport=transport))
+    monkeypatch.setattr("app.services.lead_collector.binance_bapi.HISTORY_RETRY_BUDGET", 0.02)
+    with pytest.raises(RuntimeError, match="TimeoutError") as caught:
+        await getattr(BinanceBapiCollector(), endpoint)("test-portfolio")
+    assert isinstance(caught.value.__cause__, TimeoutError)
+    assert entered.is_set() and cancelled.is_set()
+    assert HISTORY_RETRY_BUDGET == 10.0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failure", [httpx.RemoteProtocolError(""), httpx.Response(
     503, headers={"x-mbx-request-id": "test-exhausted-request"},
 )])
@@ -235,6 +317,7 @@ async def test_ten_detail_failures_publish_without_alerts_or_repeated_unverified
     monitor, clock, async_client, caplog, monkeypatch,
 ):
     caplog.set_level(logging.DEBUG, logger="mirrorquant.orchestrator")
+    caplog.set_level(logging.DEBUG, logger="mirrorquant.binance_bapi")
     main = importlib.import_module("app.main")
     monkeypatch.setattr(main.settings, "enable_background_engine", True)
     monkeypatch.setattr(main, "orchestrator", SimpleNamespace(heartbeat_age_sec=lambda: 0.1, is_running=True))
@@ -242,7 +325,10 @@ async def test_ten_detail_failures_publish_without_alerts_or_repeated_unverified
     async with get_session_factory()() as db:
         lead = await make_lead(db, clock)
         last_full_sync = lead.last_sync_at
-        results = await run_syncs(db, monitor, lead, clock, 10, ok=True)
+        results = []
+        for _ in range(10):
+            results.extend(await run_syncs(db, monitor, lead, clock, 1, ok=True))
+            assert lead.last_error.startswith("degraded: ") and "RemoteProtocolError" in lead.last_error
         assert not await notices(db)
         assert lead.status == "running" and lead.last_error.startswith("degraded: ")
         assert "RemoteProtocolError" in lead.last_error
@@ -257,6 +343,8 @@ async def test_ten_detail_failures_publish_without_alerts_or_repeated_unverified
     warnings = [record for record in caplog.records if record.levelno == logging.WARNING
                 and "snapshot is unverified" in record.message]
     assert len(warnings) == 1
+    detail_logs = [record for record in caplog.records if "detail degraded" in record.message]
+    assert [record.levelno for record in detail_logs] == [logging.WARNING] + [logging.DEBUG] * 9
     assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
 
 
@@ -273,9 +361,81 @@ async def test_ten_real_failures_alert_once_and_bound_error_logs(monitor, clock,
         assert lead.status == "error" and "RemoteProtocolError" in lead.last_error
         assert json.loads(lead.snapshot_json)["openPositionsMeta"]["consecutiveSyncFailures"] == 10
     errors = [record for record in caplog.records if record.levelno >= logging.ERROR]
-    assert len(errors) == 2
+    assert len(errors) == 1
     assert "consecutiveFailures=1" in errors[0].message
-    assert f"consecutiveFailures={get_settings().lead_sync_failure_limit}" in errors[1].message
+    failure_logs = [record for record in caplog.records if "sync failed" in record.message]
+    assert len(failure_logs) == 10
+    assert [record.levelno for record in failure_logs] == [logging.ERROR] + [logging.DEBUG] * 9
+    assert f"consecutiveFailures={get_settings().lead_sync_failure_limit}" in failure_logs[
+        get_settings().lead_sync_failure_limit - 1
+    ].message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recover_between_failures", [False, True])
+async def test_twenty_failures_in_ten_minutes_bound_all_error_and_warning_logs(
+    monitor, clock, log_clock, caplog, recover_between_failures,
+):
+    caplog.set_level(logging.DEBUG, logger="mirrorquant.orchestrator")
+    async with get_session_factory()() as db:
+        lead = await make_lead(db, clock)
+        for attempt in range(20):
+            elapsed = attempt * SYNC_FAILURE_ERROR_INTERVAL / 19
+            log_clock.now = elapsed
+            clock.now += SYNC_FAILURE_ERROR_INTERVAL / 19
+            if attempt and recover_between_failures:
+                monitor.collector.fetch_order_history.side_effect = None
+                await run_syncs(db, monitor, lead, clock, 1, ok=True)
+            monitor.collector.fetch_order_history.side_effect = RuntimeError("intermittent busy")
+            await run_syncs(db, monitor, lead, clock, 1, ok=False)
+            assert lead.status == "error" and "intermittent busy" in lead.last_error
+        if not recover_between_failures:
+            assert len(await notices(db)) == 1
+            assert json.loads(lead.snapshot_json)["openPositionsMeta"]["consecutiveSyncFailures"] == 20
+    errors = [record for record in caplog.records if record.levelno == logging.ERROR and "sync failed" in record.message]
+    assert len(errors) == 2
+    assert len([record for record in caplog.records if record.levelno == logging.WARNING]) <= 3
+    assert SYNC_FAILURE_WARN_INTERVAL == 300.0
+
+
+@pytest.mark.asyncio
+async def test_error_budget_slides_across_recoveries_and_closed_window_boundary(
+    monitor, clock, log_clock, caplog,
+):
+    caplog.set_level(logging.DEBUG, logger="mirrorquant.orchestrator")
+    error_times = []
+    async with get_session_factory()() as db:
+        lead = await make_lead(db, clock)
+        for elapsed, should_error in [(0, True), (1, True), (2, False), (600, False),
+                                      (600.001, True), (601, False), (601.001, True)]:
+            log_clock.now = elapsed
+            monitor.collector.fetch_order_history.side_effect = RuntimeError("busy")
+            before = len([record for record in caplog.records if record.levelno == logging.ERROR])
+            await run_syncs(db, monitor, lead, clock, 1, ok=False)
+            after = len([record for record in caplog.records if record.levelno == logging.ERROR])
+            assert after - before == int(should_error)
+            if should_error:
+                error_times.append(elapsed)
+            assert len([at for at in error_times if elapsed - at <= SYNC_FAILURE_ERROR_INTERVAL]) <= 2
+            monitor.collector.fetch_order_history.side_effect = None
+            await run_syncs(db, monitor, lead, clock, 1, ok=True)
+
+
+@pytest.mark.asyncio
+async def test_detail_degraded_warning_is_per_portfolio_and_time_bounded(monitor, log_clock, caplog):
+    caplog.set_level(logging.DEBUG, logger="mirrorquant.binance_bapi")
+    monitor.collector.fetch_detail.side_effect = httpx.ReadTimeout("")
+    for portfolio, elapsed in [("a", 0), ("a", 1), ("b", 1), ("a", DETAIL_DEGRADED_WARN_INTERVAL - 0.001),
+                               ("a", DETAIL_DEGRADED_WARN_INTERVAL)]:
+        log_clock.now = elapsed
+        snapshot = await monitor.collector.sync_snapshot(
+            portfolio, {}, [], with_analysis=False, previous_snapshot={"profile": PROFILE},
+        )
+        assert snapshot["meta"]["detailOk"] is False
+        assert snapshot["openPositionsMeta"]["partial"] is True
+    assert [record.levelno for record in caplog.records if "detail degraded" in record.message] == [
+        logging.WARNING, logging.DEBUG, logging.WARNING, logging.DEBUG, logging.WARNING,
+    ]
 
 
 @pytest.mark.asyncio
@@ -376,7 +536,8 @@ async def test_frozen_clock_success_then_failure_is_recorded(monitor, clock, mon
 
 
 @pytest.mark.asyncio
-async def test_full_detail_recovery_clears_failure_state_and_rearms_alert(monitor, clock):
+async def test_full_detail_recovery_clears_failure_state_and_rearms_alert(monitor, clock, log_clock, caplog):
+    caplog.set_level(logging.DEBUG, logger="mirrorquant.orchestrator")
     async with get_session_factory()() as db:
         lead = await make_lead(db, clock)
         monitor.collector.fetch_order_history.side_effect = RuntimeError("history unavailable")
@@ -387,6 +548,7 @@ async def test_full_detail_recovery_clears_failure_state_and_rearms_alert(monito
         monitor.collector.fetch_detail.side_effect = httpx.ReadTimeout("")
         await run_syncs(db, monitor, lead, clock, 1, ok=True)
         assert lead.last_error.startswith("degraded: ")
+        assert not [record for record in caplog.records if "sync recovered" in record.message]
         monitor.collector.fetch_detail.side_effect = None
         result = (await run_syncs(db, monitor, lead, clock, 1, ok=True))[0]
         assert result["snapshot"]["meta"]["detailOk"] is True
@@ -394,9 +556,16 @@ async def test_full_detail_recovery_clears_failure_state_and_rearms_alert(monito
         assert all(field not in result["snapshot"]["openPositionsMeta"] for field in SYNC_FAILURE_FIELDS)
         assert lead.last_error is None and lead.status == "running"
         assert lead.last_sync_at.replace(tzinfo=timezone.utc) > first_notice.created_at.replace(tzinfo=timezone.utc)
+        assert lead.id not in monitor._sync_failure_log_at
+        await run_syncs(db, monitor, lead, clock, 1, ok=True)
+        recovered = [record for record in caplog.records if "sync recovered" in record.message]
+        assert len(recovered) == 1 and recovered[0].levelno == logging.INFO
         monitor.collector.fetch_order_history.side_effect = RuntimeError("history unavailable again")
         await run_syncs(db, monitor, lead, clock, limit, ok=False)
         assert len(await notices(db)) == 2
+    errors = [record for record in caplog.records if record.levelno == logging.ERROR and "sync failed" in record.message]
+    assert len(errors) == 2
+    assert all("consecutiveFailures=1" in record.message for record in errors)
 
 
 @pytest.mark.asyncio

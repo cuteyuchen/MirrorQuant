@@ -26,6 +26,8 @@ FAPI_PRIMARY = "https://www.binance.com"
 FAPI_FALLBACK = "https://fapi.binance.com"
 
 BUSY_CODE = "11012005"
+DETAIL_DEGRADED_WARN_INTERVAL = 300.0
+HISTORY_RETRY_BUDGET = 10.0
 BATCH_GAP_MS = 30 * 60 * 1000
 STORE_MAX = 6000
 BRACKET_TTL_S = 6 * 3600
@@ -530,6 +532,7 @@ class BinanceBapiCollector(BaseLeadCollector):
         self._holdings_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
         self._chart_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
         self._alloc_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self._detail_degraded_log_at: Dict[str, float] = {}
 
     @staticmethod
     def _headers(portfolio_id: str, time_range: str = "7D") -> Dict[str, str]:
@@ -551,39 +554,44 @@ class BinanceBapiCollector(BaseLeadCollector):
         time_range: str = "7D",
         retries: int = 2,
         timeout: float = 8.0,
+        retry_budget: Optional[float] = None,
     ) -> Any:
         headers = self._headers(portfolio_id, time_range)
         last_err: Optional[Exception] = None
         last_response = None
-        async with ProxyManager.build_client(
-            proxy_url=proxy_url, timeout=timeout, headers=headers, exchange=self.exchange,
-        ) as client:
-            for attempt in range(retries):
-                last_response = None
-                try:
-                    if body is not None:
-                        resp = await client.post(url, json=body)
-                    else:
-                        resp = await client.get(url)
-                    last_response = resp
-                    if resp.status_code != 200:
-                        raise httpx.HTTPStatusError(
-                            f"HTTP {resp.status_code}: {redact_proxy_userinfo(resp.text)[:160]}",
-                            request=None, response=resp,
-                        )
-                    payload = resp.json()
-                    code = payload.get("code")
-                    if code == BUSY_CODE:
-                        raise BapiBusyError(f"bapi busy {BUSY_CODE}")
-                    if code not in ("000000", None) or payload.get("data") is None:
-                        raise RuntimeError(f"bapi code={code} msg={payload.get('message')}")
-                    return payload["data"]
-                except Exception as exc:
-                    last_err = exc
-                    if not is_retryable_exception(exc):
-                        break
-                    if attempt + 1 < retries:
-                        await asyncio.sleep(min(0.8 * (attempt + 1), 5.0))
+        try:
+            async with asyncio.timeout(retry_budget), ProxyManager.build_client(
+                proxy_url=proxy_url, timeout=timeout, headers=headers, exchange=self.exchange,
+            ) as client:
+                for attempt in range(retries):
+                    last_response = None
+                    try:
+                        if body is not None:
+                            resp = await client.post(url, json=body)
+                        else:
+                            resp = await client.get(url)
+                        last_response = resp
+                        if resp.status_code != 200:
+                            raise httpx.HTTPStatusError(
+                                f"HTTP {resp.status_code}: {redact_proxy_userinfo(resp.text)[:160]}",
+                                request=None, response=resp,
+                            )
+                        payload = resp.json()
+                        code = payload.get("code")
+                        if str(code) == BUSY_CODE:
+                            raise BapiBusyError(f"bapi busy {BUSY_CODE}")
+                        if code not in ("000000", None) or payload.get("data") is None:
+                            raise RuntimeError(f"bapi code={code} msg={payload.get('message')}")
+                        return payload["data"]
+                    except Exception as exc:
+                        last_err = exc
+                        if not is_retryable_exception(exc):
+                            break
+                        if attempt + 1 < retries:
+                            await asyncio.sleep(min(0.8 * 2 ** attempt, 2.4))
+        except TimeoutError as exc:
+            last_err = exc
+            last_response = None
         raise RuntimeError(
             f"Binance bapi failed ({redact_proxy_userinfo(url)}): {describe_exception(last_err, last_response)}"
         ) from last_err
@@ -648,6 +656,8 @@ class BinanceBapiCollector(BaseLeadCollector):
             portfolio_id=portfolio_id,
             body={"portfolioId": portfolio_id, "pageNumber": page_number, "pageSize": safe_size},
             proxy_url=proxy_url,
+            retries=4,
+            retry_budget=HISTORY_RETRY_BUDGET,
         )
         return (data or {}).get("list") or []
 
@@ -664,6 +674,8 @@ class BinanceBapiCollector(BaseLeadCollector):
             portfolio_id=portfolio_id,
             body={"portfolioId": portfolio_id, "pageNumber": page_number, "pageSize": safe_size},
             proxy_url=proxy_url,
+            retries=4,
+            retry_budget=HISTORY_RETRY_BUDGET,
         )
 
     async def fetch_performance(
@@ -947,7 +959,14 @@ class BinanceBapiCollector(BaseLeadCollector):
             detail = dict(previous_profile)
             if detail.get("positionShow") is None:
                 detail["positionShow"] = False
-            logger.warning("Lead portfolio %s detail degraded: %s", portfolio_id, detail_error)
+            now = time.monotonic()
+            last_warn = self._detail_degraded_log_at.get(portfolio_id)
+            if last_warn is None or now - last_warn >= DETAIL_DEGRADED_WARN_INTERVAL:
+                self._detail_degraded_log_at[portfolio_id] = now
+                log = logger.warning
+            else:
+                log = logger.debug
+            log("Lead portfolio %s detail degraded: %s", portfolio_id, detail_error)
         added = await self.sync_orders_into_store(
             portfolio_id, orders_store, full_sweep=full_sweep, proxy_url=proxy_url,
             history_max_pages=STORE_MAX // 100 + 1 if closed_history is not None else 25,

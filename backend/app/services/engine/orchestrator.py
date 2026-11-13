@@ -32,6 +32,8 @@ from app.services.notifier.outbox import enqueue_notification
 from app.services.proxy.manager import ProxyEgressError, ProxyManager
 
 logger = logging.getLogger("mirrorquant.orchestrator")
+SYNC_FAILURE_ERROR_INTERVAL = 600.0
+SYNC_FAILURE_WARN_INTERVAL = 300.0
 SYNC_FAILURE_FIELDS = (
     "consecutiveSyncFailures", "firstSyncFailureAtMs", "lastFailureStartedAtMs", "syncFailureNotified",
 )
@@ -93,6 +95,9 @@ class EngineOrchestrator:
         self._last_clock_sync: Dict[int, float] = {}
         self._last_reconcile: Dict[int, float] = {}
         self._last_unverified_logged: Dict[int, str] = {}
+        self._sync_failure_log_at: Dict[int, float] = {}
+        self._sync_failure_warn_at: Dict[int, float] = {}
+        self._sync_failure_error_window: Dict[int, List[float]] = {}
 
     async def start(self) -> None:
         if self._running:
@@ -359,7 +364,24 @@ class EngineOrchestrator:
         overdue = age is None or age > settings.lead_snapshot_stale_sec
         exhausted = failures >= settings.lead_sync_failure_limit
         error = redact_proxy_userinfo(error).strip() or "Sync failed (empty message)"
-        log = logger.error if failures in (1, settings.lead_sync_failure_limit) else logger.debug
+        now = time.monotonic()
+        last_error = self._sync_failure_log_at.get(lead.id)
+        error_window = self._sync_failure_error_window.setdefault(lead.id, [])
+        # Keep the closed window boundary: even a window including both endpoints
+        # must contain at most two ERRORs, across recovery/re-failure cycles too.
+        error_window[:] = [at for at in error_window if now - at <= SYNC_FAILURE_ERROR_INTERVAL]
+        error_due = last_error is None or now - last_error >= SYNC_FAILURE_ERROR_INTERVAL
+        last_warn = self._sync_failure_warn_at.get(lead.id)
+        if error_due and len(error_window) < 2:
+            error_window.append(now)
+            self._sync_failure_log_at[lead.id] = now
+            self._sync_failure_warn_at[lead.id] = now
+            log = logger.error
+        elif last_warn is None or now - last_warn >= SYNC_FAILURE_WARN_INTERVAL:
+            self._sync_failure_warn_at[lead.id] = now
+            log = logger.warning
+        else:
+            log = logger.debug
         log("Lead %s sync failed; consecutiveFailures=%s snapshotAgeSec=%s: %s", lead.id, failures, age, error)
         if (overdue or exhausted) and not meta.get("syncFailureNotified"):
             event_key = f"lead-sync-failure:{lead.id}"
@@ -457,6 +479,13 @@ class EngineOrchestrator:
             lead.closed_cache_json = json.dumps(snapshot["closed"], separators=(",", ":"))
         lead.snapshot_json = json.dumps(snapshot, separators=(",", ":"))
         await db.commit()
+
+        if not partial:
+            if current_meta.get("consecutiveSyncFailures") or lead.id in self._sync_failure_log_at:
+                logger.info("Lead %s sync recovered", lead.id)
+            self._sync_failure_log_at.pop(lead.id, None)
+            # The rolling ERROR budget and WARNING timer survive recovery so
+            # alternating successes/failures cannot flood either log level.
 
         return True
 

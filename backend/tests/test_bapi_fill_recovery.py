@@ -261,7 +261,7 @@ async def test_full_sweep_cannot_accept_duplicate_pages_as_complete(monkeypatch)
 
 @pytest.mark.asyncio
 async def test_stale_failure_notifies_once_and_preserves_original_generated_at(async_client, caplog):
-    caplog.set_level(logging.ERROR)
+    caplog.set_level(logging.DEBUG, logger="mirrorquant.orchestrator")
     async with get_session_factory()() as db:
         generated = int((datetime.now(timezone.utc) - timedelta(hours=9)).timestamp() * 1000)
         lead = await make_lead(db, snapshot_json=json.dumps({"meta": {"generatedAt": generated},
@@ -274,6 +274,8 @@ async def test_stale_failure_notifies_once_and_preserves_original_generated_at(a
         assert len(notices) == 1
         assert json.loads(notices[0].payload)["event_type"] == "error"
         assert "consecutiveFailures=3" in caplog.text
+        failure_logs = [record for record in caplog.records if "sync failed" in record.message]
+        assert [record.levelno for record in failure_logs] == [logging.ERROR] + [logging.DEBUG] * 3
         result = (await async_client.get("/api/dashboard/public")).json()["leads"][0]
         assert result["stale"] is True and result["generatedAt"] == generated
         assert result["snapshot"]["meta"]["generatedAt"] == generated
@@ -283,7 +285,7 @@ async def test_stale_failure_notifies_once_and_preserves_original_generated_at(a
 
 @pytest.mark.asyncio
 async def test_consecutive_failures_have_error_log_outbox_and_degraded_readiness(async_client, monkeypatch, caplog):
-    caplog.set_level(logging.ERROR)
+    caplog.set_level(logging.DEBUG, logger="mirrorquant.orchestrator")
     main = importlib.import_module("app.main")
     monkeypatch.setattr(main.settings, "enable_background_engine", True)
     monkeypatch.setattr(main, "orchestrator", SimpleNamespace(heartbeat_age_sec=lambda: 0.1, is_running=True))
@@ -294,6 +296,10 @@ async def test_consecutive_failures_have_error_log_outbox_and_degraded_readiness
         for i in range(get_settings().lead_sync_failure_limit):
             assert await monitor._record_lead_sync_failure(db, lead, now + i, "test failure")
         assert "consecutiveFailures=3" in caplog.text
+        failure_logs = [record for record in caplog.records if "sync failed" in record.message]
+        assert [record.levelno for record in failure_logs] == [logging.ERROR] + [logging.DEBUG] * (
+            get_settings().lead_sync_failure_limit - 1
+        )
         assert len(list((await db.scalars(select(NotificationOutbox))).all())) == 1
         response = await async_client.get("/api/ready")
         assert response.status_code == 503
