@@ -16,7 +16,13 @@ NOTIFICATION_SECRET_FIELDS = {
     "dingtalk_webhook_url": "dingtalkWebhookUrl",
 }
 SECRET_KEYS = frozenset(NOTIFICATION_SECRET_FIELDS) | frozenset(NOTIFICATION_SECRET_FIELDS.values())
-_PROXY_USERINFO = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)[^\s/?#]*@")
+_PROXY_USERINFO = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)[^/?#]*@")
+_ERROR_URL = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://.*", re.DOTALL)
+ERROR_FIELDS = frozenset({
+    "error", "errors", "detail", "details", "reason", "lastError", "last_error",
+    "circuitBreakerReason", "circuit_breaker_reason",
+})
+PROXY_URL_FIELDS = frozenset({"url", "proxyUrl", "proxy_url"})
 
 
 def mask_secret(value: str | None) -> str:
@@ -45,11 +51,33 @@ def redact_proxy_userinfo(value: str) -> str:
 
 
 def mask_proxy_url(value: str) -> str:
-    return redact_proxy_userinfo(value)
+    try:
+        parsed = urlsplit(value)
+        if not parsed.scheme or not parsed.netloc or not parsed.hostname:
+            return mask_secret(value)
+        parsed.port  # Reject malformed ports rather than expose an ambiguous netloc.
+        _, separator, host = parsed.netloc.rpartition("@")
+        if separator:
+            return urlunsplit(parsed._replace(netloc=PROXY_USERINFO_MASK + "@" + host))
+        return value
+    except ValueError:
+        return mask_secret(value)
 
 
 def proxy_credentials_configured(value: str) -> bool:
-    return bool(_PROXY_USERINFO.search(value))
+    try:
+        return "@" in urlsplit(value).netloc
+    except ValueError:
+        return "@" in value
+
+
+def redact_error_urls(value: str) -> str:
+    """Hide diagnostic URI tails, including old truncated or spaced userinfo.
+
+    Once an error was truncated, its URI boundary cannot be recovered reliably.
+    Removing the remainder also avoids exposing password fragments after spaces.
+    """
+    return _ERROR_URL.sub("[redacted URL]", value)
 
 
 def merge_proxy_url(stored: str, incoming: str | None) -> str:
@@ -69,7 +97,7 @@ def merge_proxy_url(stored: str, incoming: str | None) -> str:
     return incoming
 
 
-def mask_sensitive_payload(value: Any) -> Any:
+def mask_sensitive_payload(value: Any, *, error_context: bool = False) -> Any:
     """Sanitize outward-facing telemetry, including nested proxy error strings."""
     if isinstance(value, dict):
         result = {}
@@ -77,11 +105,13 @@ def mask_sensitive_payload(value: Any) -> Any:
             if key in SECRET_KEYS:
                 result[key] = mask_secret(item)
                 result[key + "_configured"] = bool(item)
+            elif not error_context and key in PROXY_URL_FIELDS and isinstance(item, str):
+                result[key] = mask_proxy_url(item)
             else:
-                result[key] = mask_sensitive_payload(item)
+                result[key] = mask_sensitive_payload(item, error_context=error_context or key in ERROR_FIELDS)
         return result
     if isinstance(value, (list, tuple)):
-        return [mask_sensitive_payload(item) for item in value]
+        return [mask_sensitive_payload(item, error_context=error_context) for item in value]
     if isinstance(value, str):
-        return redact_proxy_userinfo(value)
+        return redact_error_urls(value) if error_context else redact_proxy_userinfo(value)
     return value

@@ -10,7 +10,7 @@ from app.api.deps import get_current_admin, get_current_user, record_audit
 from app.api.exposure import require_account_flat
 from app.core.database import get_db
 from app.core.security import CredentialVault
-from app.core.secret_mask import mask_sensitive_payload, redact_proxy_userinfo
+from app.core.secret_mask import mask_sensitive_payload, redact_error_urls, redact_proxy_userinfo
 from app.models.domain import ProxyNode, TradingAccount, User
 from app.schemas.api import AccountCreate, AccountUpdate
 from app.services.adapters.factory import create_exchange_adapter
@@ -47,7 +47,7 @@ def _account_out(a: TradingAccount) -> dict:
         "unrealizedPnl": round(a.unrealized_pnl, 2),
         "positions": mask_sensitive_payload(positions),
         "lastSyncAt": a.last_sync_at.isoformat() if a.last_sync_at else None,
-        "lastError": redact_proxy_userinfo(a.last_error) if a.last_error else None,
+        "lastError": redact_error_urls(a.last_error) if a.last_error else None,
         "status": a.status,
     }
 
@@ -207,7 +207,7 @@ async def test_account_connectivity(
         acct.status = "error"
         acct.last_error = redact_proxy_userinfo(str(exc))[:480]
         await db.commit()
-        return {"ok": False, "error": redact_proxy_userinfo(str(exc))}
+        return {"ok": False, "error": redact_error_urls(str(exc))}
 
 
 @router.post("/{account_id}/sync")

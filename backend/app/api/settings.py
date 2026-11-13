@@ -12,7 +12,7 @@ from app.api.deps import get_current_admin, get_current_user, record_audit
 from app.api.exposure import require_binding_flat
 from app.core.config import get_settings
 from app.core.database import DEFAULT_SYSTEM_CONFIG, get_db
-from app.core.secret_mask import NOTIFICATION_SECRET_FIELDS, mask_sensitive_payload, merge_secrets
+from app.core.secret_mask import NOTIFICATION_SECRET_FIELDS, mask_sensitive_payload, merge_secrets, redact_error_urls
 from app.models.domain import AuditLog, CopyBinding, LoginAttemptGuard, SystemConfig, User
 from app.schemas.api import RiskDefaults, SettingsUpdate
 from app.services.notifier.service import NotificationService
@@ -226,7 +226,7 @@ async def list_audit_logs(
                 "action": r.action,
                 "resourceType": r.resource_type,
                 "resourceId": r.resource_id,
-                "details": r.details,
+                "details": redact_error_urls(r.details),
                 "ipAddress": r.ip_address,
                 "createdAt": r.created_at.isoformat(),
             }

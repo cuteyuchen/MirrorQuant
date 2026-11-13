@@ -148,7 +148,7 @@ def test_nested_telemetry_masks_explicit_secret_keys_and_proxy_errors():
     ]}
     result = mask_sensitive_payload(original)
     assert result["notifications"]["telegramBotToken"] == MASK_SENTINEL
-    assert result["errors"] == ["Cannot connect http://***:***@proxy.invalid:8080"]
+    assert result["errors"] == ["Cannot connect [redacted URL]"]
     assert original["notifications"]["telegramBotToken"] == "synthetic-token"
 
 

@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_admin, get_current_user, record_audit
 from app.core.database import get_db
-from app.core.secret_mask import mask_proxy_url, merge_proxy_url, proxy_credentials_configured, redact_proxy_userinfo
+from app.core.secret_mask import mask_proxy_url, merge_proxy_url, proxy_credentials_configured, redact_error_urls
 from app.models.domain import ProxyNode, User
 from app.schemas.api import ProxyCreate, ProxyUpdate
 from app.services.proxy.manager import ProxyManager
@@ -28,7 +28,7 @@ def _proxy_out(p: ProxyNode) -> dict:
         "isHealthy": p.is_healthy,
         "latencyMs": p.latency_ms,
         "lastCheckedAt": p.last_checked_at.isoformat() if p.last_checked_at else None,
-        "lastError": redact_proxy_userinfo(p.last_error) if p.last_error else None,
+        "lastError": redact_error_urls(p.last_error) if p.last_error else None,
     }
 
 
@@ -131,6 +131,6 @@ async def test_proxy_node(
         "test": {
             "healthy": res.healthy,
             "latencyMs": res.latency_ms,
-            "error": redact_proxy_userinfo(res.error) if res.error else None,
+            "error": redact_error_urls(res.error) if res.error else None,
         },
     }

@@ -4,9 +4,12 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from app.core.database import get_session_factory
-from app.core.secret_mask import mask_proxy_url
+from app.core.secret_mask import (
+    ERROR_FIELDS, MASK_SENTINEL, mask_proxy_url, mask_sensitive_payload,
+    proxy_credentials_configured, redact_error_urls,
+)
 from app.core.security import CredentialVault, create_access_token
-from app.models.domain import LeadSource, TradingAccount, User
+from app.models.domain import AuditLog, CopyBinding, ExecutionRecord, LeadSource, ProxyNode, TradingAccount, User
 from app.services.engine.orchestrator import orchestrator
 from app.services.lead_collector.binance_bapi import BinanceBapiCollector
 from app.services.proxy.manager import ProxyManager
@@ -20,7 +23,7 @@ def assert_masked(value):
     encoded = json.dumps(value)
     assert "synthetic-user" not in encoded
     assert "synthetic-pass" not in encoded
-    assert "***:***@proxy.invalid:8080" in encoded
+    assert "***:***@proxy.invalid:8080" in encoded or "[redacted URL]" in encoded
 
 
 @pytest.fixture
@@ -122,3 +125,81 @@ async def test_collector_masks_http_error_body_before_truncation(monkeypatch):
         await BinanceBapiCollector()._http_json("https://example.invalid", retries=1, proxy_url=PROXY_URL)
     assert_masked(str(error.value))
     assert mask_proxy_url(PROXY_URL) in str(error.value)
+
+
+@pytest.mark.parametrize("error", [
+    "Failure http://synthetic-user:synthetic-pass",
+    "Failure http://synthetic-user:synthetic-pass second-fragment",
+    "Failure http://synthetic-user:synthetic-pass second-fragment@proxy.invalid:8080",
+    "Failure socks5://synthetic-user:synthetic-pass\nsecond-fragment",
+])
+def test_error_redaction_handles_historical_truncation_and_whitespace(error):
+    assert redact_error_urls(error) == "Failure [redacted URL]"
+
+
+@pytest.mark.parametrize("field", sorted(ERROR_FIELDS))
+def test_recursive_error_fields_hide_partial_credentials(field):
+    error = "Failure http://synthetic-user:synthetic-pass second-fragment"
+    result = mask_sensitive_payload({field: [{"message": error}]})
+    assert result == {field: [{"message": "Failure [redacted URL]"}]}
+
+
+def test_actual_proxy_urls_mask_literal_whitespace_userinfo_and_keep_host():
+    url = "http://synthetic-user:synthetic-pass second-fragment@proxy.invalid:8080"
+    expected = "http://***:***@proxy.invalid:8080"
+    assert mask_proxy_url(url) == expected
+    assert proxy_credentials_configured(url) is True
+    result = mask_sensitive_payload({"url": url, "proxyUrl": url, "proxy_url": url,
+                                     "avatarUrl": "https://images.invalid/avatar.png"})
+    assert result == {"url": expected, "proxyUrl": expected, "proxy_url": expected,
+                      "avatarUrl": "https://images.invalid/avatar.png"}
+
+
+@pytest.mark.parametrize("url", ["http://synthetic-user:synthetic-pass", "http://[broken"])
+def test_malformed_proxy_urls_fail_safe(url):
+    assert mask_proxy_url(url) == MASK_SENTINEL
+
+
+@pytest.mark.parametrize("endpoint", [
+    "proxies", "proxy_detail", "snapshot", "public", "overview", "executions", "accounts", "leads", "bindings", "audit",
+])
+@pytest.mark.asyncio
+async def test_historical_partial_credentials_hidden_on_all_diagnostic_reads(telemetry, endpoint):
+    client, lead_id, account_id, snapshot = telemetry
+    historical = "Failure http://synthetic-user:synthetic-pass second-fragment"
+    snapshot["openPositionsMeta"]["error"] = historical
+    snapshot["openPositions"][0]["analysis"]["reason"] = historical
+    snapshot["profile"] = {"avatarUrl": "https://images.invalid/avatar.png"}
+    async with get_session_factory()() as db:
+        lead = await db.get(LeadSource, lead_id)
+        lead.last_error = historical
+        lead.snapshot_json = json.dumps(snapshot)
+        (await db.get(TradingAccount, account_id)).last_error = historical
+        proxy = ProxyNode(name="synthetic", url=PROXY_URL, last_error=historical)
+        record = ExecutionRecord(lead_id=lead_id, account_id=account_id, lead_name="synthetic", account_name="synthetic",
+                                 symbol="BTCUSDT", inst_id="BTCUSDT", side="BUY", position_side="LONG",
+                                 action="OPEN", status="ERROR", details=historical)
+        binding = CopyBinding(name="synthetic", lead_id=lead_id, account_id=account_id, circuit_breaker_reason=historical)
+        audit = AuditLog(username="synthetic", action="TEST", resource_type="synthetic", details=historical)
+        db.add_all([proxy, record, binding, audit])
+        await db.commit()
+        proxy_id = proxy.id
+    path = {
+        "proxies": "/api/proxies", "proxy_detail": f"/api/proxies/{proxy_id}",
+        "snapshot": f"/api/leads/{lead_id}/snapshot", "public": "/api/dashboard/public",
+        "overview": "/api/dashboard/overview", "executions": "/api/dashboard/executions",
+        "accounts": "/api/accounts", "leads": "/api/leads", "bindings": "/api/bindings",
+        "audit": "/api/settings/audit-logs",
+    }[endpoint]
+    if endpoint == "public":
+        client.headers.pop("Authorization")
+    response = await client.get(path)
+    assert response.status_code == 200
+    assert "synthetic-user" not in response.text and "synthetic-pass" not in response.text
+    assert "second-fragment" not in response.text
+    assert "[redacted URL]" in response.text
+    if endpoint in ("proxies", "proxy_detail"):
+        item = response.json()["items"][0] if endpoint == "proxies" else response.json()["item"]
+        assert item["url"] == "http://***:***@proxy.invalid:8080"
+    if endpoint in ("snapshot", "public"):
+        assert "https://images.invalid/avatar.png" in response.text

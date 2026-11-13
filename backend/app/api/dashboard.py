@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
 from app.core.database import get_db
-from app.core.secret_mask import mask_sensitive_payload, redact_proxy_userinfo
+from app.core.secret_mask import mask_sensitive_payload, redact_error_urls
 from app.models.domain import (
     CopyBinding,
     ExecutionRecord,
@@ -108,7 +108,7 @@ async def dashboard_overview(
                 "myNotional": r.my_notional,
                 "slippagePct": r.slippage_pct,
                 "orderId": r.order_id,
-                "details": redact_proxy_userinfo(r.details),
+                "details": redact_error_urls(r.details),
                 "createdAt": r.created_at.isoformat(),
             }
             for r in recent_execs
@@ -154,7 +154,7 @@ async def list_executions(
                 "myNotional": r.my_notional,
                 "slippagePct": r.slippage_pct,
                 "orderId": r.order_id,
-                "details": redact_proxy_userinfo(r.details),
+                "details": redact_error_urls(r.details),
                 "createdAt": r.created_at.isoformat(),
             }
             for r in rows

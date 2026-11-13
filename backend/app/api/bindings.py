@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_current_admin, get_current_user, record_audit
 from app.api.exposure import require_binding_flat
 from app.core.database import get_db
+from app.core.secret_mask import redact_error_urls
 from app.models.domain import (
     BindingDebt,
     CopyBinding,
@@ -60,7 +61,7 @@ async def _binding_out(db: AsyncSession, b: CopyBinding) -> dict:
         "symbolBlacklist": json.loads(b.symbol_blacklist_json or "[]"),
         "symbolMap": json.loads(b.symbol_map_json or "{}"),
         "circuitBreakerTripped": b.circuit_breaker_tripped,
-        "circuitBreakerReason": b.circuit_breaker_reason,
+        "circuitBreakerReason": redact_error_urls(b.circuit_breaker_reason) if b.circuit_breaker_reason else None,
         "consecutiveFailures": getattr(b, "consecutive_failures", 0),
         "baselineSeeded": b.baseline_seeded,
         "pendingDebtUsd": round(total_debt, 2),
