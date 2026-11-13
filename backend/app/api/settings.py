@@ -12,6 +12,7 @@ from app.api.deps import get_current_user, record_audit
 from app.api.exposure import require_binding_flat
 from app.core.config import get_settings
 from app.core.database import DEFAULT_SYSTEM_CONFIG, get_db
+from app.core.secret_mask import NOTIFICATION_SECRET_FIELDS, mask_sensitive_payload, merge_secrets
 from app.models.domain import AuditLog, CopyBinding, LoginAttemptGuard, SystemConfig, User
 from app.schemas.api import RiskDefaults, SettingsUpdate
 from app.services.notifier.service import NotificationService
@@ -55,7 +56,7 @@ async def get_settings_view(db: AsyncSession = Depends(get_db), current_user: Us
     return {
         "global_kill_switch": await _load_cfg(db, "global_kill_switch"),
         "public_monitoring_enabled": await _load_cfg(db, "public_monitoring_enabled"),
-        "notifications": await _load_cfg(db, "notifications"),
+        "notifications": mask_sensitive_payload(await _load_cfg(db, "notifications")),
         "risk_defaults": await _load_cfg(db, "risk_defaults"),
         "resilience": await _load_cfg(db, "resilience"),
         "security": {
@@ -85,7 +86,9 @@ async def update_settings_view(
         await _save_cfg(db, "public_monitoring_enabled", payload.public_monitoring_enabled)
         updated.append("public_monitoring_enabled")
     if payload.notifications is not None:
-        await _save_cfg(db, "notifications", payload.notifications.model_dump(exclude_unset=True), merge=True)
+        stored = await _load_cfg(db, "notifications") or {}
+        incoming = payload.notifications.model_dump(exclude_unset=True)
+        await _save_cfg(db, "notifications", merge_secrets(stored, incoming, NOTIFICATION_SECRET_FIELDS))
         updated.append("notifications")
     if payload.risk_defaults is not None:
         await _save_cfg(db, "risk_defaults", payload.risk_defaults.model_dump(exclude_unset=True), merge=True)

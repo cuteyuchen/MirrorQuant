@@ -217,6 +217,11 @@ class NotificationSettings(CamelModel):
     wecom_webhook_url: str = ""
     dingtalk_enabled: StrictBool = False
     dingtalk_webhook_url: str = ""
+    # Read-only hints are accepted on a GET/PUT round trip and never persisted.
+    telegram_bot_token_configured: Optional[StrictBool] = Field(default=None, exclude=True)
+    webhook_url_configured: Optional[StrictBool] = Field(default=None, exclude=True)
+    wecom_webhook_url_configured: Optional[StrictBool] = Field(default=None, exclude=True)
+    dingtalk_webhook_url_configured: Optional[StrictBool] = Field(default=None, exclude=True)
     outbox_enabled: StrictBool = False
     outbox_path: str = ""
     notify_on_execution: StrictBool = True

@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_current_user, record_audit
 from app.api.exposure import require_binding_flat
 from app.core.database import get_db
+from app.core.secret_mask import redact_proxy_userinfo
 from app.models.domain import CopyBinding, LeadSource, User
 from app.schemas.api import LeadCreate, LeadUpdate
 from app.services.engine.orchestrator import orchestrator
@@ -46,7 +47,7 @@ def _lead_summary(lead: LeadSource) -> dict:
         "aumAmount": lead.aum_amount,
         "lastTradeTime": lead.last_trade_time,
         "lastSyncAt": lead.last_sync_at.isoformat() if lead.last_sync_at else None,
-        "lastError": lead.last_error,
+        "lastError": redact_proxy_userinfo(lead.last_error) if lead.last_error else None,
         "status": lead.status,
         "openPositionsCount": open_count,
         "openUnrealizedPnl": round(total_upnl, 2),

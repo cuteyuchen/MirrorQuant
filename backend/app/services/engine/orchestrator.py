@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import DEFAULT_SYSTEM_CONFIG, get_session_factory
 from app.core.security import CredentialVault
+from app.core.secret_mask import mask_sensitive_payload
 from app.models.domain import CopyBinding, LeadSource, ProxyNode, TradingAccount
 from app.services.adapters.factory import create_exchange_adapter
 from app.services.analysis.pa_analyzer import PAAnalyzer
@@ -45,6 +46,7 @@ class WebSocketHub:
             self._validators.pop(ws, None)
 
     async def broadcast(self, message: Dict[str, Any]) -> None:
+        message = mask_sensitive_payload(message)
         async with self._lock:
             clients = list(self._clients)
         if not clients:
