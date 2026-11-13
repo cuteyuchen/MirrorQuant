@@ -63,6 +63,40 @@ def test_catchup_schema_and_database_defaults_agree():
 
 
 @pytest.mark.asyncio
+async def test_partial_put_preserves_operator_pinned_catchup_values(settings_client):
+    """A partial PUT must not reset keys the operator never sent back to defaults."""
+    pinned = {
+        **DEFAULT_SYSTEM_CONFIG["resilience"],
+        "missed_order_max_age_sec": 120,
+        "catchup_max_price_dev_pct": 0.8,
+        "reconcile_interval_sec": 45,
+    }
+    async with get_session_factory()() as db:
+        row = await db.scalar(select(SystemConfig).where(SystemConfig.key == "resilience"))
+        row.value_json = json.dumps(pinned)
+        await db.commit()
+
+    # Operator edits only the age ceiling.
+    response = await settings_client.put("/api/settings", json={"resilience": {"missed_order_max_age_sec": 300}})
+    assert response.status_code == 200
+    returned = response.json()["resilience"]
+    assert returned["missed_order_max_age_sec"] == 300
+    # Untouched keys keep the pinned values instead of snapping to 900 / 0.5.
+    assert returned["catchup_max_price_dev_pct"] == 0.8
+    assert returned["reconcile_interval_sec"] == 45
+
+    async with get_session_factory()() as db:
+        row = await db.scalar(select(SystemConfig).where(SystemConfig.key == "resilience"))
+        stored = json.loads(row.value_json)
+        assert stored["missed_order_max_age_sec"] == 300
+        assert stored["catchup_max_price_dev_pct"] == 0.8
+        assert stored["reconcile_interval_sec"] == 45
+        routed = await CopyRouter._get_config(db, "resilience", DEFAULT_SYSTEM_CONFIG["resilience"])
+        assert routed["catchup_max_price_dev_pct"] == 0.8
+        assert routed["missed_order_max_age_sec"] == 300
+
+
+@pytest.mark.asyncio
 async def test_legacy_catchup_settings_are_not_rewritten_and_keep_their_policy(settings_client):
     legacy = {
         **DEFAULT_SYSTEM_CONFIG["resilience"],

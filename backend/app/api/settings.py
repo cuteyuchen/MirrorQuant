@@ -31,8 +31,17 @@ async def _load_cfg(db: AsyncSession, key: str):
     return default
 
 
-async def _save_cfg(db: AsyncSession, key: str, value) -> None:
+async def _save_cfg(db: AsyncSession, key: str, value, merge: bool = False) -> None:
     row = await db.scalar(select(SystemConfig).where(SystemConfig.key == key))
+    if merge and row is not None and isinstance(value, dict):
+        # A partial PUT must not silently reset keys the operator never sent
+        # (e.g. a pinned catchup_max_price_dev_pct of 0.8 back to the 0.5 default).
+        try:
+            existing = json.loads(row.value_json)
+        except (TypeError, ValueError):
+            existing = None
+        if isinstance(existing, dict):
+            value = {**existing, **value}
     raw = json.dumps(value, ensure_ascii=False)
     if row is None:
         db.add(SystemConfig(key=key, value_json=raw))
@@ -76,13 +85,13 @@ async def update_settings_view(
         await _save_cfg(db, "public_monitoring_enabled", payload.public_monitoring_enabled)
         updated.append("public_monitoring_enabled")
     if payload.notifications is not None:
-        await _save_cfg(db, "notifications", payload.notifications.model_dump(exclude_unset=True))
+        await _save_cfg(db, "notifications", payload.notifications.model_dump(exclude_unset=True), merge=True)
         updated.append("notifications")
     if payload.risk_defaults is not None:
-        await _save_cfg(db, "risk_defaults", payload.risk_defaults.model_dump(exclude_unset=True))
+        await _save_cfg(db, "risk_defaults", payload.risk_defaults.model_dump(exclude_unset=True), merge=True)
         updated.append("risk_defaults")
     if payload.resilience is not None:
-        await _save_cfg(db, "resilience", payload.resilience.model_dump(exclude_unset=True))
+        await _save_cfg(db, "resilience", payload.resilience.model_dump(exclude_unset=True), merge=True)
         updated.append("resilience")
 
     await record_audit(
