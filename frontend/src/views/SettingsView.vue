@@ -611,7 +611,7 @@ onActivated(() => {
             <div>
               <label class="block text-slate-300 font-semibold mb-0.5">{{ t("set.missedOrderSec") }}</label>
               <p class="text-[11px] text-slate-500 mb-1.5">{{ t("set.missedOrderSecHint") }}</p>
-              <input v-model.number="settingsData.resilience.missed_order_max_age_sec" type="number" step="10" min="10" max="3600" class="w-full px-3 py-2 rounded-xl bg-background border border-slate-700 text-white font-mono text-sm" />
+              <input v-model.number="settingsData.resilience.missed_order_max_age_sec" type="number" step="30" min="60" max="3600" class="w-full px-3 py-2 rounded-xl bg-background border border-slate-700 text-white font-mono text-sm" />
             </div>
             <div>
               <label class="block text-slate-300 font-semibold mb-0.5">{{ t("set.catchupDevPct") }}</label>
