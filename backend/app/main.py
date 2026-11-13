@@ -16,6 +16,7 @@ from app.core.database import get_session_factory, init_db
 from app.core.security import CredentialVault
 from app.models.domain import TradingAccount, User
 from app.services.engine.orchestrator import orchestrator
+from app.services.notifier.outbox import notification_outbox
 
 settings = get_settings()
 logging.basicConfig(
@@ -44,10 +45,14 @@ async def lifespan(_app: FastAPI):
             raise RuntimeError("Stored credentials cannot be decrypted; restore the correct master key") from exc
     if settings.enable_background_engine:
         await orchestrator.start()
+    await notification_outbox.start()
     try:
         yield
     finally:
-        await orchestrator.stop()
+        try:
+            await orchestrator.stop()
+        finally:
+            await notification_outbox.stop()
 
 
 def create_app() -> FastAPI:

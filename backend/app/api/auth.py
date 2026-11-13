@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import hmac
 import json
 from datetime import datetime, timedelta, timezone
@@ -41,7 +40,7 @@ from app.schemas.api import (
     TotpVerifyRequest,
     UserOut,
 )
-from app.services.notifier.service import NotificationService
+from app.services.notifier.outbox import enqueue_notification
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -132,10 +131,7 @@ async def _emit_security_alert(
         f"[MirrorQuant 安全告警] 检测到控制台登录爆破，来源 IP: {client_ip}，"
         f"目标账号: {username}，连续失败 {fail_count} 次，已触发 {lock_sec // 60} 分钟封锁。"
     )
-    try:
-        asyncio.create_task(NotificationService.dispatch(cfg, title=title, message=msg, event_type="security_alert"))
-    except RuntimeError:
-        pass
+    enqueue_notification(db, cfg, title=title, message=msg, event_type="security_alert")
 
 
 async def _record_login_failure(

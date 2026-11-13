@@ -87,6 +87,8 @@ class Settings(BaseSettings):
     ]
 
     enable_background_engine: bool = True
+    notification_outbox_max_attempts: int = Field(default=3, ge=1, le=20)
+    notification_outbox_poll_sec: float = Field(default=1.0, gt=0, le=60, allow_inf_nan=False)
     default_lead_poll_sec: int = 15
     price_tick_sec: int = 5
     pa_kline_max_staleness_multiplier: float = Field(default=3.0, gt=0, allow_inf_nan=False)

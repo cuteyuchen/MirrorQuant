@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import json
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any, Dict
@@ -16,6 +18,18 @@ class NotificationService:
     """Async multi-channel dispatcher (Webhook, Telegram Bot, WeCom/DingTalk, JSONL Outbox)."""
 
     @staticmethod
+    def _append_outbox(path: Path, record: Dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a+", encoding="utf-8") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            try:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+
+    @staticmethod
     async def dispatch(config: Dict[str, Any], title: str, message: str, event_type: str = "info") -> Dict[str, Any]:
         results: Dict[str, Any] = {}
         clean_msg = message.strip()
@@ -24,23 +38,15 @@ class NotificationService:
         if config.get("outbox_enabled") and config.get("outbox_path"):
             outbox_file = Path(str(config["outbox_path"]).strip()).expanduser()
             try:
-                outbox_file.parent.mkdir(parents=True, exist_ok=True)
-                with open(outbox_file, "a+", encoding="utf-8") as f:
-                    fcntl.flock(f, fcntl.LOCK_EX)
-                    try:
-                        record = {
-                            "text": clean_msg,
-                            "title": title,
-                            "eventType": event_type,
-                            "ts": int(time.time() * 1000),
-                        }
-                        f.write(json.dumps(record, ensure_ascii=False) + "\n")
-                        f.flush()
-                    finally:
-                        fcntl.flock(f, fcntl.LOCK_UN)
+                await asyncio.to_thread(NotificationService._append_outbox, outbox_file, {
+                    "text": clean_msg,
+                    "title": title,
+                    "eventType": event_type,
+                    "ts": int(time.time() * 1000),
+                })
                 results["outbox"] = {"ok": True, "path": str(outbox_file)}
             except Exception as exc:
-                results["outbox"] = {"ok": False, "error": str(exc)}
+                results["outbox"] = {"ok": False, "error": type(exc).__name__}
 
         async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
             if config.get("webhook_enabled") and config.get("webhook_url"):
@@ -51,7 +57,7 @@ class NotificationService:
                     )
                     results["webhook"] = {"ok": resp.status_code < 400, "status": resp.status_code}
                 except Exception as exc:
-                    results["webhook"] = {"ok": False, "error": str(exc)}
+                    results["webhook"] = {"ok": False, "error": type(exc).__name__}
 
             if config.get("telegram_enabled") and config.get("telegram_bot_token") and config.get("telegram_chat_id"):
                 token = config["telegram_bot_token"].strip()
@@ -63,7 +69,7 @@ class NotificationService:
                     )
                     results["telegram"] = {"ok": resp.status_code < 400, "status": resp.status_code}
                 except Exception as exc:
-                    results["telegram"] = {"ok": False, "error": str(exc)}
+                    results["telegram"] = {"ok": False, "error": type(exc).__name__}
 
             if config.get("wecom_enabled") and config.get("wecom_webhook_url"):
                 try:
@@ -73,7 +79,7 @@ class NotificationService:
                     )
                     results["wecom"] = {"ok": resp.status_code < 400, "status": resp.status_code}
                 except Exception as exc:
-                    results["wecom"] = {"ok": False, "error": str(exc)}
+                    results["wecom"] = {"ok": False, "error": type(exc).__name__}
 
             if config.get("dingtalk_enabled") and config.get("dingtalk_webhook_url"):
                 try:
@@ -83,6 +89,6 @@ class NotificationService:
                     )
                     results["dingtalk"] = {"ok": resp.status_code < 400, "status": resp.status_code}
                 except Exception as exc:
-                    results["dingtalk"] = {"ok": False, "error": str(exc)}
+                    results["dingtalk"] = {"ok": False, "error": type(exc).__name__}
 
         return results

@@ -48,7 +48,7 @@ from app.services.lead_collector.binance_bapi import (
     order_dedup_key,
     is_authoritative_snapshot,
 )
-from app.services.notifier.service import NotificationService
+from app.services.notifier.outbox import enqueue_notification
 from app.services.proxy.manager import ProxyManager
 
 logger = logging.getLogger("mirrorquant.router")
@@ -460,9 +460,6 @@ class CopyRouter:
                 "createdAt": rec.created_at.isoformat() if rec.created_at else None,
             },
         }
-        await db.commit()
-        await self._emit(payload)
-
         if notify_cfg:
             should_notify = (
                 (status == "EXECUTED" and notify_cfg.get("notify_on_execution", True))
@@ -500,10 +497,9 @@ class CopyRouter:
                 else:
                     msg = f"{tag}: {status} {symbol} ({details})"
 
-                try:
-                    asyncio.create_task(NotificationService.dispatch(notify_cfg, title, msg, event_type=status))
-                except RuntimeError:
-                    pass
+                enqueue_notification(db, notify_cfg, title, msg, event_type=status, execution_id=rec.id)
+        await db.commit()  # The execution and notification become visible together.
+        await self._emit(payload)
         return rec
 
     @serialized_execution
