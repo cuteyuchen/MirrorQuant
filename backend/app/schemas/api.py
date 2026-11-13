@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 from pydantic.alias_generators import to_camel
 
 
@@ -111,6 +111,14 @@ class AccountUpdate(CamelModel):
     is_enabled: Optional[bool] = None
     margin_mode: Optional[str] = Field(default=None, pattern="^(cross|isolated)$")
     position_mode: Optional[str] = Field(default=None, pattern="^(hedge|one_way)$")
+
+    @field_validator("name", "environment", "api_key", "secret_key", "is_enabled", "margin_mode", "position_mode")
+    @classmethod
+    def reject_explicit_null(cls, value):
+        # Defaults are not validated: omitted fields stay absent from exclude_unset.
+        if value is None:
+            raise ValueError("Field cannot be null; omit it to keep the current value")
+        return value
 
 
 class BindingCreate(CamelModel):
