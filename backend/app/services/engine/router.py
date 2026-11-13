@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 import hashlib
 from datetime import datetime, timezone
@@ -714,7 +715,13 @@ class CopyRouter:
         ps = batch["positionSide"]
         lead_qty = exact(batch.get("qtyExact", batch["qty"]) or 0)
         lead_avg_px = float(batch.get("avgPrice") or 0.0)
-        lead_notional = batch.get("notionalExact", batch.get("notional")) or (exact(batch["qty"]) * exact(batch.get("avgPrice") or 0))
+        # Zero denotes unavailable pricing. Keep invalid prices recordable (NaN
+        # becomes SQL NULL) while letting the catch-up guard reject the entry.
+        if not math.isfinite(lead_avg_px):
+            lead_avg_px = 0.0
+        lead_notional = (
+            batch.get("notionalExact", batch.get("notional")) or (exact(batch["qty"]) * exact(batch.get("avgPrice") or 0))
+        ) if lead_avg_px > 0 else 0
         is_open = is_open_leg(side, ps)
         action = direction_label(side, ps, not is_open)
 
@@ -850,30 +857,30 @@ class CopyRouter:
         order_side = "buy" if ps == "LONG" else "sell"
         best_bid = book.bids[0][0] if book.bids else 0.0
         best_ask = book.asks[0][0] if book.asks else 0.0
-        if order_side == "buy":
-            ref_px = best_ask if best_ask > 0 else lead_avg_px
-        else:
-            ref_px = best_bid if best_bid > 0 else lead_avg_px
+        best_bid = best_bid if math.isfinite(best_bid) else 0.0
+        best_ask = best_ask if math.isfinite(best_ask) else 0.0
+        # Use only the executable side; substituting the lead price would fabricate
+        # zero drift on an unavailable book. Zero is rejected and safely recorded.
+        ref_px = best_ask if order_side == "buy" else best_bid
 
-        # Disconnect / missed order catch-up check
+        # Every opening must pass, including batches with missing timestamps.
         batch_ts_ms = int(batch.get("endTime") or batch.get("time") or 0)
-        if batch_ts_ms > 0:
-            catchup_res = RiskEngine.check_missed_order_catchup(
-                order_time_ms=batch_ts_ms,
-                now_ms=int(time.time() * 1000),
-                max_age_sec=int(resilience_cfg.get("missed_order_max_age_sec", 900)),
-                ref_price=ref_px,
-                lead_avg_price=lead_avg_px,
-                catchup_max_price_dev_pct=float(resilience_cfg.get("catchup_max_price_dev_pct", 0.5)),
+        catchup_res = RiskEngine.check_missed_order_catchup(
+            order_time_ms=batch_ts_ms,
+            now_ms=int(time.time() * 1000),
+            max_age_sec=int(resilience_cfg.get("missed_order_max_age_sec", 900)),
+            ref_price=ref_px,
+            lead_avg_price=lead_avg_px,
+            catchup_max_price_dev_pct=float(resilience_cfg.get("catchup_max_price_dev_pct", 0.5)),
+        )
+        if not catchup_res.allowed:
+            await self._record_execution(
+                db, binding, lead, account, symbol, inst_id, side, ps, action,
+                catchup_res.code, lead_qty, lead_avg_px, lead_notional,
+                my_price=ref_px, slippage_pct=catchup_res.value,
+                details=catchup_res.reason or "Missed order rejected", notify_cfg=notify_cfg,
             )
-            if not catchup_res.allowed:
-                await self._record_execution(
-                    db, binding, lead, account, symbol, inst_id, side, ps, action,
-                    catchup_res.code, lead_qty, lead_avg_px, lead_notional,
-                    my_price=ref_px, slippage_pct=catchup_res.value,
-                    details=catchup_res.reason or "Missed order rejected", notify_cfg=notify_cfg,
-                )
-                return
+            return
 
         # Orderbook spread guard
         spread_res = RiskEngine.check_spread(best_bid, best_ask, getattr(binding, "max_spread_pct", 0.3))

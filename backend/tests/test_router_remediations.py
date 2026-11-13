@@ -1,7 +1,8 @@
 """State-machine regressions using only in-memory DBs and an offline exchange."""
+import json
 from decimal import Decimal
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from sqlalchemy import select
@@ -10,10 +11,15 @@ from app.core.database import get_session_factory
 from app.core.security import CredentialVault
 from app.models.domain import (
     BindingDebt, CopyBinding, ExecutionRecord, LeadSource, OrderIntent,
-    PositionAllocation, PositionGuardState, TradingAccount,
+    PositionAllocation, PositionGuardState, SystemConfig, TradingAccount,
 )
-from app.services.adapters.base import ExchangePosition, InstrumentSpec, OrderBook, OrderResult
+from app.services.adapters.base import BalanceInfo, ExchangePosition, InstrumentSpec, OrderBook, OrderResult
+from app.services.engine.risk import RiskEngine
 from app.services.engine.router import CopyRouter, UnknownOrderOutcome
+from app.services.engine.sizer import PositionSizer
+
+
+NOW_MS = 2_000_000
 
 
 class OfflineExchange:
@@ -46,7 +52,8 @@ class OfflineExchange:
 
 
 @pytest.fixture
-async def trading():
+async def trading(monkeypatch):
+    monkeypatch.setattr("app.services.engine.router.time.time", lambda: NOW_MS / 1000)
     async with get_session_factory()() as db:
         lead = LeadSource(name="test lead", portfolio_id="test-portfolio")
         other_lead = LeadSource(name="other lead", portfolio_id="other-portfolio")
@@ -79,14 +86,18 @@ async def seed_allocation(t, qty=1, debt=25):
     return allocation, other, pending, guard
 
 
-async def execute_batch(t, exchange, side="SELL", qty=1, remaining=0, event="test-event"):
+async def execute_batch(t, exchange, side="SELL", qty=1, remaining=0, event="test-event",
+                        position_side="LONG", avg_price="100", batch_fields=None, resilience_cfg=None):
+    batch = {"symbol": "BTCUSDT", "side": side, "positionSide": position_side, "qty": str(qty),
+             "avgPrice": avg_price, "notional": str(Decimal(str(qty)) * 100), "_event_id": event,
+             "startTime": NOW_MS - 150_000, "endTime": NOW_MS - 150_000}
+    batch.update(batch_fields or {})
+    is_open = (side, position_side) in (("BUY", "LONG"), ("SELL", "SHORT"))
     await t.router._execute_batch_for_binding(
-        t.db, t.binding, t.lead, t.account, exchange,
-        {"symbol": "BTCUSDT", "side": side, "positionSide": "LONG", "qty": str(qty), "avgPrice": "100",
-         "notional": str(Decimal(str(qty)) * 100), "_event_id": event},
-        lead_margin_balance=1000, active_lead_positions={"BTCUSDT_LONG": remaining}, my_equity=1000,
-        positions=[t.pos] if side == "SELL" else [], instruments={"BTCUSDT": t.spec}, global_kill=False,
-        notify_cfg={},
+        t.db, t.binding, t.lead, t.account, exchange, batch,
+        lead_margin_balance=1000, active_lead_positions={f"BTCUSDT_{position_side}": remaining}, my_equity=1000,
+        positions=[] if is_open else [t.pos], instruments={"BTCUSDT": t.spec}, global_kill=False,
+        notify_cfg={}, resilience_cfg=resilience_cfg,
     )
     await t.db.commit()
 
@@ -169,6 +180,214 @@ async def test_historical_open_is_skipped_when_lead_is_flat(trading):
     await execute_batch(t, exchange, side="BUY", remaining=0)
     assert exchange.orders == []
     assert (await t.db.scalar(select(ExecutionRecord))).status == "SKIPPED_CLOSED_CYCLE"
+
+
+@pytest.mark.parametrize("side,position_side,bid,ask,status", (
+    ("BUY", "LONG", 100.4, 100.6, "BLOCKED_CATCHUP_DRIFT"),
+    ("SELL", "SHORT", 99.4, 99.6, "BLOCKED_CATCHUP_DRIFT"),
+    ("BUY", "LONG", 99.4, 99.6, "EXECUTED"),
+    ("SELL", "SHORT", 100.4, 100.6, "EXECUTED"),
+    # Favorable moves also leave the lead's entry window and remain blocked.
+    ("BUY", "LONG", 99.3, 99.4, "BLOCKED_CATCHUP_DRIFT"),
+    ("SELL", "SHORT", 100.6, 100.7, "BLOCKED_CATCHUP_DRIFT"),
+))
+async def test_catchup_uses_executable_side_and_symmetric_drift(trading, side, position_side, bid, ask, status):
+    t = trading
+    executable_price = ask if side == "BUY" else bid
+    exchange = OfflineExchange(price=executable_price)
+    exchange.get_orderbook.return_value = OrderBook([[bid, 100]], [[ask, 100]])
+    await execute_batch(t, exchange, side=side, position_side=position_side, remaining=1)
+    record = await t.db.scalar(select(ExecutionRecord))
+    assert record.status == status and record.my_price == executable_price
+    if status == "EXECUTED":
+        assert len(exchange.orders) == 1
+        assert exchange.orders[0]["side"] == side.lower()
+        assert exchange.orders[0]["pos_side"] == position_side.lower()
+    else:
+        assert exchange.orders == []
+        exchange.ensure_leverage.assert_not_awaited()
+
+
+@pytest.mark.parametrize("side,position_side", (("BUY", "LONG"), ("SELL", "SHORT")))
+@pytest.mark.parametrize("price", (None, 0, -1, float("nan"), float("inf")))
+async def test_catchup_missing_or_invalid_executable_quote_is_recorded(trading, side, position_side, price):
+    t = trading
+    exchange = OfflineExchange()
+    invalid_side = [] if price is None else [[price, 100]]
+    exchange.get_orderbook.return_value = (OrderBook([[100, 100]], invalid_side) if side == "BUY"
+                                          else OrderBook(invalid_side, [[100, 100]]))
+    await execute_batch(t, exchange, side=side, position_side=position_side, remaining=1)
+    assert exchange.orders == []
+    record = await t.db.scalar(select(ExecutionRecord))
+    assert record.status == "BLOCKED_CATCHUP_PRICE" and record.details
+    exchange.ensure_leverage.assert_not_awaited()
+
+
+@pytest.mark.parametrize("side,position_side", (("BUY", "LONG"), ("SELL", "SHORT")))
+async def test_catchup_empty_book_cannot_reuse_lead_price(trading, side, position_side):
+    t = trading
+    exchange = OfflineExchange()
+    exchange.get_orderbook.return_value = OrderBook([], [])
+    await execute_batch(t, exchange, side=side, position_side=position_side, remaining=1)
+    assert exchange.orders == []
+    assert (await t.db.scalar(select(ExecutionRecord))).status == "BLOCKED_CATCHUP_PRICE"
+
+
+@pytest.mark.parametrize("side,position_side", (("BUY", "LONG"), ("SELL", "SHORT")))
+@pytest.mark.parametrize("price", (None, 0, -1, float("nan"), float("inf")))
+async def test_valid_executable_quote_still_requires_valid_opposite_book(trading, side, position_side, price):
+    t = trading
+    exchange = OfflineExchange()
+    invalid_side = [] if price is None else [[price, 100]]
+    exchange.get_orderbook.return_value = (OrderBook(invalid_side, [[100, 100]]) if side == "BUY"
+                                          else OrderBook([[100, 100]], invalid_side))
+    await execute_batch(t, exchange, side=side, position_side=position_side, remaining=1)
+    assert exchange.orders == []
+    assert (await t.db.scalar(select(ExecutionRecord))).status == "BLOCKED_SPREAD"
+
+
+@pytest.mark.parametrize("side,position_side", (("BUY", "LONG"), ("SELL", "SHORT")))
+@pytest.mark.parametrize("lead_price", (None, "0", "-1", "nan", "inf", "-inf"))
+async def test_catchup_invalid_lead_price_is_recorded(trading, side, position_side, lead_price):
+    t = trading
+    exchange = OfflineExchange()
+    await execute_batch(t, exchange, side=side, position_side=position_side, remaining=1, avg_price=lead_price)
+    assert exchange.orders == []
+    record = await t.db.scalar(select(ExecutionRecord))
+    assert record.status == "BLOCKED_CATCHUP_PRICE" and record.details
+    exchange.ensure_leverage.assert_not_awaited()
+
+
+@pytest.mark.parametrize("field", ("missed_order_max_age_sec", "catchup_max_price_dev_pct"))
+@pytest.mark.parametrize("value", (0, -1))
+async def test_invalid_catchup_limits_are_recorded_before_execution(trading, field, value):
+    t = trading
+    exchange = OfflineExchange()
+    await execute_batch(t, exchange, side="BUY", remaining=1, resilience_cfg={field: value})
+    assert exchange.orders == []
+    record = await t.db.scalar(select(ExecutionRecord))
+    assert record.status == "BLOCKED_CATCHUP_CONFIG" and record.details
+    exchange.ensure_leverage.assert_not_awaited()
+
+
+@pytest.mark.parametrize("timestamp", (0, -1, NOW_MS + 1))
+async def test_catchup_missing_or_future_timestamp_cannot_bypass_gate(trading, timestamp):
+    t = trading
+    exchange = OfflineExchange()
+    await execute_batch(t, exchange, side="BUY", remaining=1,
+                        batch_fields={"startTime": timestamp, "endTime": timestamp})
+    assert exchange.orders == []
+    assert (await t.db.scalar(select(ExecutionRecord))).status == "SKIPPED_STALE_MISSED_ORDER"
+
+
+async def test_catchup_rejects_before_spread_slippage_sizing_and_leverage(trading, monkeypatch):
+    t = trading
+    exchange = OfflineExchange()
+    # This book also violates spread; catch-up drift must be the recorded reason.
+    exchange.get_orderbook.return_value = OrderBook([[99, 100]], [[101, 100]])
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("A later guard or sizer ran after catch-up rejected the order")
+
+    monkeypatch.setattr(RiskEngine, "check_spread", unexpected)
+    monkeypatch.setattr(RiskEngine, "check_slippage", unexpected)
+    monkeypatch.setattr(PositionSizer, "calculate_target_usd", unexpected)
+    monkeypatch.setattr(RiskEngine, "cap_by_leverage", unexpected)
+    await execute_batch(t, exchange, side="BUY", remaining=1,
+                        batch_fields={"endTime": NOW_MS - 1_000_000})
+    assert exchange.orders == []
+    assert (await t.db.scalar(select(ExecutionRecord))).status == "BLOCKED_CATCHUP_DRIFT"
+    exchange.ensure_leverage.assert_not_awaited()
+
+
+async def test_old_exit_event_cannot_close_newer_allocation(trading):
+    t = trading
+    own, other, debt, _ = await seed_allocation(t)
+    own.opened_at_ms = NOW_MS - 100_000
+    await t.db.commit()
+    exchange = OfflineExchange()
+    await execute_batch(t, exchange)
+    assert exchange.orders == [] and own.owned_qty == 1 and other.owned_qty == 9 and debt.pending_usd == 25
+    assert (await t.db.scalar(select(ExecutionRecord))).status == "SKIPPED_CLOSED_CYCLE"
+    exchange.get_orderbook.assert_not_awaited()
+
+
+async def test_closed_cycle_open_cannot_attach_to_current_reopened_position(trading):
+    t = trading
+    exchange = OfflineExchange()
+    await execute_batch(t, exchange, side="BUY", remaining=1, batch_fields={"_closed_cycle": True})
+    assert exchange.orders == []
+    assert (await t.db.scalar(select(ExecutionRecord))).status == "SKIPPED_CLOSED_CYCLE"
+    exchange.get_orderbook.assert_not_awaited()
+
+
+async def prepare_event_router(t, exchange, monkeypatch):
+    t.binding.baseline_seeded = True
+    notifications = await t.db.get(SystemConfig, "notifications")
+    notifications.value_json = json.dumps({"notify_on_execution": False, "notify_on_risk_block": False})
+    await t.db.commit()
+    monkeypatch.setattr(t.router.vault, "decrypt_dict", lambda value: {})
+    monkeypatch.setattr("app.services.engine.router.create_exchange_adapter", lambda **kwargs: exchange)
+    exchange.sync_time = AsyncMock(return_value=0)
+    exchange.get_instruments = AsyncMock(return_value={"BTCUSDT": t.spec})
+    exchange.get_usdt_balance = AsyncMock(return_value=BalanceInfo(eq=1000, avail_eq=1000, cash_bal=1000, upl=0))
+
+
+def source_order(event_id, position_side, side, timestamp, price="100"):
+    return {"orderId": event_id, "orderTime": timestamp, "orderUpdateTime": timestamp,
+            "symbol": "BTCUSDT", "side": side, "positionSide": position_side, "type": "MARKET",
+            "executedQty": "1", "avgPrice": price}
+
+
+def current_snapshot(position_side):
+    return {"profile": {"marginBalance": 1000}, "openPositions": [
+        {"symbol": "BTCUSDT", "positionSide": position_side, "qty": 1, "qtyExact": "1"}],
+        "openPositionsMeta": {"source": "api", "authoritative": True, "complete": True,
+                              "positionShow": True, "asOf": NOW_MS}}
+
+
+async def test_fresh_snapshot_routes_150_second_delayed_fill_once(trading, monkeypatch):
+    t = trading
+    exchange = OfflineExchange()
+    exchange.get_positions.return_value = []
+    await prepare_event_router(t, exchange, monkeypatch)
+    orders = [source_order("delayed", "LONG", "BUY", NOW_MS - 150_000)]
+    snapshot = current_snapshot("LONG")
+    await t.router.process_lead_events(t.db, t.lead, orders, [], snapshot, [])
+    assert len(exchange.orders) == 1
+    assert (await t.db.scalar(select(ExecutionRecord))).status == "EXECUTED"
+    # The age did not suppress ingestion; replay is suppressed by source identity.
+    await t.router.process_lead_events(t.db, t.lead, orders, [], snapshot, [])
+    assert len(exchange.orders) == 1
+    assert len((await t.db.scalars(select(ExecutionRecord))).all()) == 1
+
+
+@pytest.mark.parametrize("flip_close_first", (False, True))
+async def test_flip_closes_long_before_catchup_short_for_both_legacy_flags(trading, monkeypatch, flip_close_first):
+    t = trading
+    own, other, _, _ = await seed_allocation(t)
+    resilience = await t.db.get(SystemConfig, "resilience")
+    resilience.value_json = json.dumps({**json.loads(resilience.value_json), "flip_close_first": flip_close_first})
+    exchange = OfflineExchange()
+    await prepare_event_router(t, exchange, monkeypatch)
+    catchup = Mock(wraps=RiskEngine.check_missed_order_catchup)
+    monkeypatch.setattr(RiskEngine, "check_missed_order_catchup", catchup)
+    # Supply reverse input order. An old close with a distant lead price must reduce
+    # first, without entering the catch-up gate or borrowing the short's book side.
+    orders = [source_order("new-short", "SHORT", "SELL", NOW_MS - 150_000),
+              source_order("close-long", "LONG", "SELL", NOW_MS - 151_000, price="200")]
+    await t.router.process_lead_events(t.db, t.lead, orders, [], current_snapshot("SHORT"), [])
+    assert [(order["side"], order["pos_side"], order["reduce_only"]) for order in exchange.orders] == [
+        ("sell", "long", True), ("sell", "short", False)]
+    assert own.owned_qty == 0 and other.owned_qty == 9
+    short = await t.db.scalar(select(PositionAllocation).where(
+        PositionAllocation.binding_id == t.binding.id, PositionAllocation.pos_side == "short"))
+    assert short.owned_qty == 1 and short.opened_at_ms == NOW_MS - 150_000
+    catchup.assert_called_once()
+    assert catchup.call_args.kwargs["ref_price"] == 99.9
+    assert catchup.call_args.kwargs["lead_avg_price"] == 100
+    assert [record.status for record in (await t.db.scalars(select(ExecutionRecord).order_by(ExecutionRecord.id))).all()] == [
+        "EXECUTED", "EXECUTED"]
 
 
 async def test_leverage_is_dynamic_and_quantity_uses_equity_ratio(trading):

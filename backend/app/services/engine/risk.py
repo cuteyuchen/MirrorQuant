@@ -128,28 +128,34 @@ class RiskEngine:
         """Catch-up gate: price drift decides, age is only a wide sanity backstop.
 
         Rationale: Binance public copy-trade BAPI exposes lead fills with a 2-3 minute
-        aggregation lag. Rejecting on age alone silently drops every position the lead
-        opens. The real economic risk of a late entry is paying a worse price than the
-        lead, so the drift gate is authoritative; max_age_sec is only a hard ceiling
-        against replaying ancient history.
+        aggregation lag. A short age cutoff can discard valid entries before they
+        are published. The entry must still be inside the lead's price window;
+        max_age_sec is a hard ceiling against replaying ancient history.
         """
-        if order_time_ms <= 0 or order_time_ms > now_ms:
+        # Missing/non-finite prices are not evidence of zero drift. Fail closed even
+        # when this guard is called without the router's spread/slippage checks.
+        if not all(math.isfinite(v) and v > 0 for v in (ref_price, lead_avg_price)):
+            return RiskCheckResult(False, "Catch-up requires positive finite reference and lead prices", code="BLOCKED_CATCHUP_PRICE")
+        if not all(math.isfinite(v) and v > 0 for v in (max_age_sec, catchup_max_price_dev_pct)):
+            return RiskCheckResult(False, "Catch-up requires positive finite age and drift limits", code="BLOCKED_CATCHUP_CONFIG")
+        if not all(math.isfinite(v) for v in (order_time_ms, now_ms)) or order_time_ms <= 0 or order_time_ms > now_ms:
             return RiskCheckResult(False, "Missing or future source order timestamp", code="SKIPPED_STALE_MISSED_ORDER")
         age_sec = max(0.0, (now_ms - order_time_ms) / 1000.0)
 
-        # Authoritative gate: price must still be inside the lead's entry cost window.
-        if lead_avg_price > 0 and catchup_max_price_dev_pct > 0:
-            dev_pct = abs(ref_price - lead_avg_price) / lead_avg_price * 100.0
-            if dev_pct > catchup_max_price_dev_pct:
-                return RiskCheckResult(
-                    False,
-                    f"Catch-up price drift {dev_pct:.2f}% > max {catchup_max_price_dev_pct:.2f}% (age {age_sec:.0f}s)",
-                    value=round(dev_pct, 4),
-                    code="BLOCKED_CATCHUP_DRIFT",
-                )
+        # Keep the window symmetric: even a favorable move can mean the lead's
+        # entry thesis is stale. Buy at the ask / sell at the bid; neither direction
+        # should bypass this guard merely because its price appears better.
+        dev_pct = abs(ref_price - lead_avg_price) / lead_avg_price * 100.0
+        if dev_pct > catchup_max_price_dev_pct:
+            return RiskCheckResult(
+                False,
+                f"Catch-up price drift {dev_pct:.2f}% > max {catchup_max_price_dev_pct:.2f}% (age {age_sec:.0f}s)",
+                value=round(dev_pct, 4),
+                code="BLOCKED_CATCHUP_DRIFT",
+            )
 
         # Wide backstop: never replay genuinely ancient history even if price matches.
-        if max_age_sec > 0 and age_sec > max_age_sec:
+        if age_sec > max_age_sec:
             return RiskCheckResult(
                 False,
                 f"Missed order stale: age {age_sec:.0f}s > max {max_age_sec}s",

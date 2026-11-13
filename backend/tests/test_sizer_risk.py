@@ -1,4 +1,7 @@
 from decimal import Decimal
+
+import pytest
+
 from app.services.adapters.base import InstrumentSpec
 from app.services.engine.risk import RiskEngine
 from app.services.engine.sizer import PositionSizer, format_decimal, quantize_down, quantize_step
@@ -83,6 +86,7 @@ def test_risk_engine_checks():
 def test_missed_order_catchup_and_stale_guards():
     now_ms = 1700000100000  # 100s after
 
+    # Explicit legacy operator settings remain supported; defaults are 900s / 0.5%.
     # Case 1: Fresh order (age 10s <= max_age 120s) -> allowed
     order_time_fresh = now_ms - 10000
     res_fresh = RiskEngine.check_missed_order_catchup(
@@ -144,6 +148,48 @@ def test_missed_order_catchup_and_stale_guards():
     )
     assert res_ancient.allowed is False
     assert res_ancient.code == "SKIPPED_STALE_MISSED_ORDER"
+
+
+@pytest.mark.parametrize("ref_price", [99.5, 100.5])
+def test_catchup_allows_exact_drift_and_age_boundaries(ref_price):
+    result = RiskEngine.check_missed_order_catchup(1_000_000, 1_900_000, 900, ref_price, 100, 0.5)
+    assert result.allowed and result.code == "OK"
+
+
+@pytest.mark.parametrize("ref_price", [99.49, 100.51])
+@pytest.mark.parametrize("age_ms", [0, 150_000, 1_000_000])
+def test_catchup_absolute_drift_precedes_age_backstop(ref_price, age_ms):
+    # Both favorable and adverse moves are bounded, even for fresh or ancient fills.
+    result = RiskEngine.check_missed_order_catchup(2_000_000 - age_ms, 2_000_000, 900, ref_price, 100, 0.5)
+    assert not result.allowed and result.code == "BLOCKED_CATCHUP_DRIFT"
+
+
+@pytest.mark.parametrize("field", ["ref_price", "lead_avg_price"])
+@pytest.mark.parametrize("invalid", [0, -1, float("nan"), float("inf"), float("-inf")])
+def test_catchup_requires_valid_prices(field, invalid):
+    values = dict(order_time_ms=1_000_000, now_ms=1_150_000, max_age_sec=900,
+                  ref_price=100, lead_avg_price=100, catchup_max_price_dev_pct=0.5)
+    values[field] = invalid
+    result = RiskEngine.check_missed_order_catchup(**values)
+    assert not result.allowed and result.code == "BLOCKED_CATCHUP_PRICE"
+    assert "positive finite reference and lead prices" in result.reason
+
+
+@pytest.mark.parametrize("field", ["max_age_sec", "catchup_max_price_dev_pct"])
+@pytest.mark.parametrize("invalid", [0, -1, float("nan"), float("inf"), float("-inf")])
+def test_catchup_invalid_limits_cannot_disable_guards(field, invalid):
+    values = dict(order_time_ms=1_000_000, now_ms=1_150_000, max_age_sec=900,
+                  ref_price=100, lead_avg_price=100, catchup_max_price_dev_pct=0.5)
+    values[field] = invalid
+    result = RiskEngine.check_missed_order_catchup(**values)
+    assert not result.allowed and result.code == "BLOCKED_CATCHUP_CONFIG"
+    assert "positive finite age and drift limits" in result.reason
+
+
+@pytest.mark.parametrize("order_time_ms", [0, -1, 2_000_001, float("nan"), float("inf")])
+def test_catchup_invalid_timestamp_is_stale(order_time_ms):
+    result = RiskEngine.check_missed_order_catchup(order_time_ms, 2_000_000, 900, 100, 100, 0.5)
+    assert not result.allowed and result.code == "SKIPPED_STALE_MISSED_ORDER"
 
 
 def test_insufficient_margin_auto_scale_down():
