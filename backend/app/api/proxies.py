@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_current_user, record_audit
+from app.api.deps import get_current_admin, get_current_user, record_audit
 from app.core.database import get_db
 from app.core.secret_mask import mask_proxy_url, merge_proxy_url, proxy_credentials_configured, redact_proxy_userinfo
 from app.models.domain import ProxyNode, User
@@ -51,7 +51,7 @@ async def create_proxy(
     payload: ProxyCreate,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin),
 ):
     node = ProxyNode(
         name=payload.name.strip(),
@@ -74,7 +74,7 @@ async def update_proxy(
     payload: ProxyUpdate,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin),
 ):
     node = await db.get(ProxyNode, proxy_id)
     if not node:
@@ -98,7 +98,7 @@ async def delete_proxy(
     proxy_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin),
 ):
     node = await db.get(ProxyNode, proxy_id)
     if not node:
@@ -114,7 +114,7 @@ async def delete_proxy(
 async def test_proxy_node(
     proxy_id: int,
     db: AsyncSession = Depends(get_db),
-    _user: User = Depends(get_current_user),
+    _user: User = Depends(get_current_admin),
 ):
     node = await db.get(ProxyNode, proxy_id)
     if not node:

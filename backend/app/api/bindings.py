@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_current_user, record_audit
+from app.api.deps import get_current_admin, get_current_user, record_audit
 from app.api.exposure import require_binding_flat
 from app.core.database import get_db
 from app.models.domain import (
@@ -88,7 +88,7 @@ async def create_binding(
     payload: BindingCreate,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin),
 ):
     lead = await db.get(LeadSource, payload.lead_id)
     acct = await db.get(TradingAccount, payload.account_id)
@@ -148,7 +148,7 @@ async def update_binding(
     payload: BindingUpdate,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin),
 ):
     binding = await db.get(CopyBinding, binding_id)
     if not binding:
@@ -184,7 +184,7 @@ async def delete_binding(
     binding_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin),
 ):
     binding = await db.get(CopyBinding, binding_id)
     if not binding:
@@ -205,7 +205,7 @@ async def toggle_binding(
     binding_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin),
 ):
     binding = await db.get(CopyBinding, binding_id)
     if not binding:
@@ -223,7 +223,7 @@ async def reset_circuit_breaker(
     binding_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin),
 ):
     binding = await db.get(CopyBinding, binding_id)
     if not binding:
@@ -241,7 +241,7 @@ async def reset_debt(
     binding_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin),
 ):
     binding = await db.get(CopyBinding, binding_id)
     if not binding:
@@ -260,7 +260,7 @@ async def set_global_kill_switch(
     payload: KillSwitchRequest,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin),
 ):
     row = await db.scalar(select(SystemConfig).where(SystemConfig.key == "global_kill_switch"))
     if row is None:

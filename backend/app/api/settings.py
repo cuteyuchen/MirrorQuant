@@ -8,7 +8,7 @@ from pydantic import ValidationError
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_current_user, record_audit
+from app.api.deps import get_current_admin, get_current_user, record_audit
 from app.api.exposure import require_binding_flat
 from app.core.config import get_settings
 from app.core.database import DEFAULT_SYSTEM_CONFIG, get_db
@@ -76,7 +76,7 @@ async def update_settings_view(
     payload: SettingsUpdate,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin),
 ):
     updated = []
     if payload.global_kill_switch is not None:
@@ -109,7 +109,7 @@ async def update_settings_view(
 async def apply_defaults_to_bindings(
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin),
 ):
     try:
         defaults = RiskDefaults.model_validate(await _load_cfg(db, "risk_defaults") or {}).model_dump()
@@ -140,7 +140,7 @@ async def apply_defaults_to_bindings(
 @router.post("/test-notify")
 async def test_notification(
     db: AsyncSession = Depends(get_db),
-    _user: User = Depends(get_current_user),
+    _user: User = Depends(get_current_admin),
 ):
     cfg = await _load_cfg(db, "notifications") or {}
     res = await NotificationService.dispatch(
@@ -189,7 +189,7 @@ async def unlock_security_guard(
     guard_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin),
 ):
     guard = await db.get(LoginAttemptGuard, guard_id)
     if not guard:

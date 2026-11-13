@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response,
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_current_user, record_audit
+from app.api.deps import get_current_admin, get_current_user, record_audit
 from app.api.exposure import require_binding_flat
 from app.core.database import get_db
 from app.core.secret_mask import redact_proxy_userinfo
@@ -66,7 +66,7 @@ async def create_lead(
     payload: LeadCreate,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin),
 ):
     existing = await db.scalar(
         select(LeadSource).where(
@@ -104,7 +104,7 @@ async def update_lead(
     payload: LeadUpdate,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin),
 ):
     lead = await db.get(LeadSource, lead_id)
     if not lead:
@@ -125,7 +125,7 @@ async def delete_lead(
     lead_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin),
 ):
     lead = await db.get(LeadSource, lead_id)
     if not lead:
@@ -160,7 +160,7 @@ async def sync_lead_now(
     lead_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin),
 ):
     lead = await db.get(LeadSource, lead_id)
     if not lead:

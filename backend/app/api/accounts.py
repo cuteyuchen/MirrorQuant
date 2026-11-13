@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_current_user, record_audit
+from app.api.deps import get_current_admin, get_current_user, record_audit
 from app.api.exposure import require_account_flat
 from app.core.database import get_db
 from app.core.security import CredentialVault
@@ -63,7 +63,7 @@ async def create_account(
     payload: AccountCreate,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin),
 ):
     if payload.exchange in ("okx", "bitget") and not (payload.passphrase or "").strip():
         raise HTTPException(
@@ -112,7 +112,7 @@ async def update_account(
     payload: AccountUpdate,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin),
 ):
     acct = await db.get(TradingAccount, account_id)
     if not acct:
@@ -153,7 +153,7 @@ async def delete_account(
     account_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin),
 ):
     acct = await db.get(TradingAccount, account_id)
     if not acct:
@@ -172,7 +172,7 @@ async def delete_account(
 async def test_account_connectivity(
     account_id: int,
     db: AsyncSession = Depends(get_db),
-    _user: User = Depends(get_current_user),
+    _user: User = Depends(get_current_admin),
 ):
     acct = await db.get(TradingAccount, account_id)
     if not acct:
@@ -214,7 +214,7 @@ async def test_account_connectivity(
 async def sync_account_now(
     account_id: int,
     db: AsyncSession = Depends(get_db),
-    _user: User = Depends(get_current_user),
+    _user: User = Depends(get_current_admin),
 ):
     acct = await db.get(TradingAccount, account_id)
     if not acct:
