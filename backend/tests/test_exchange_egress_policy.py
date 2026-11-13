@@ -115,7 +115,7 @@ def test_okx_prefers_configured_healthy_proxy_and_appends_direct(monkeypatch):
     selected = ProxyManager.select_proxy_url(nodes, preferred_proxy_id=2, exchange="okx")
     assert selected == nodes[1].url
     assert ProxyManager.ordered_proxy_urls(nodes, preferred_proxy_id=2, exchange="okx") == [
-        nodes[1].url, nodes[0].url, None,
+        nodes[1].url, None,
     ]
     constructor = Mock()
     monkeypatch.setattr("app.services.proxy.manager.httpx.AsyncClient", constructor)
@@ -124,12 +124,66 @@ def test_okx_prefers_configured_healthy_proxy_and_appends_direct(monkeypatch):
     assert constructor.call_args.kwargs["trust_env"] is False
 
 
+@pytest.mark.parametrize("exchange", ["okx", "bybit", "bitget", " OKX "])
+def test_direct_exchange_unassigned_proxy_orders_direct_only_with_healthy_pool(exchange):
+    node = proxy()
+    assert ProxyManager.ordered_proxy_urls([node], preferred_proxy_id=None, exchange=exchange) == [None]
+
+
+def test_okx_unassigned_proxy_selects_direct_with_healthy_pool():
+    node = proxy()
+    assert ProxyManager.select_proxy_url([node], preferred_proxy_id=None, exchange="okx") is None
+
+
+@pytest.mark.parametrize("preferred_proxy_id", [1, 2])
+def test_okx_explicit_proxy_excludes_pool_favourite(preferred_proxy_id):
+    favourite, assigned = proxy(3 - preferred_proxy_id), proxy(preferred_proxy_id)
+    favourite.priority = 1
+    assert ProxyManager.select_proxy_url([favourite, assigned], preferred_proxy_id=assigned.id, exchange="okx") == assigned.url
+    assert ProxyManager.ordered_proxy_urls([favourite, assigned], preferred_proxy_id=assigned.id, exchange="okx") == [
+        assigned.url, None,
+    ]
+
+
+def test_okx_unhealthy_assigned_proxy_does_not_borrow_healthy_pool():
+    assigned, other = proxy(1), proxy(2)
+    assigned.is_healthy = False
+    assert ProxyManager.ordered_proxy_urls([assigned, other], preferred_proxy_id=assigned.id, exchange="okx") == [None]
+    assert ProxyManager.select_proxy_url([assigned, other], preferred_proxy_id=assigned.id, exchange="okx") is None
+
+
+def test_okx_missing_assigned_proxy_does_not_borrow_healthy_pool():
+    nodes = [proxy(1), proxy(2)]
+    assert ProxyManager.ordered_proxy_urls(nodes, preferred_proxy_id=99, exchange="okx") == [None]
+    assert ProxyManager.select_proxy_url(nodes, preferred_proxy_id=99, exchange="okx") is None
+
+
+def test_binance_unassigned_proxy_uses_healthy_pool_without_direct():
+    node = proxy()
+    assert ProxyManager.ordered_proxy_urls([node], preferred_proxy_id=None, exchange="binance") == [node.url]
+    assert ProxyManager.select_proxy_url([node], preferred_proxy_id=None, exchange="binance") == node.url
+
+
+def test_binance_unassigned_proxy_with_empty_pool_fails_closed():
+    for select in (ProxyManager.ordered_proxy_urls, ProxyManager.select_proxy_url):
+        with pytest.raises(ProxyEgressError):
+            select([], preferred_proxy_id=None, exchange="binance")
+
+
+async def test_okx_explicit_none_builds_direct_client_despite_global_false():
+    assert get_settings().allow_direct_egress is False
+    async with ProxyManager.build_client(proxy_url=None, exchange="okx") as client:
+        assert isinstance(client, httpx.AsyncClient)
+        assert client._trust_env is False
+        assert not client._mounts
+
+
 @pytest.mark.parametrize("availability", ["missing", "disabled", "unhealthy"])
 async def test_okx_unavailable_configured_proxy_falls_back_to_direct(availability):
     node = proxy()
     node.is_enabled = availability != "disabled"
     node.is_healthy = availability != "unhealthy"
-    nodes = [] if availability == "missing" else [node]
+    nodes = [proxy(2)] if availability == "missing" else [node, proxy(2)]
     assert ProxyManager.ordered_proxy_urls(nodes, preferred_proxy_id=node.id, exchange="okx") == [None]
     selected = ProxyManager.select_proxy_url(nodes, preferred_proxy_id=node.id, exchange="okx")
     async with ProxyManager.build_client(proxy_url=selected, exchange="okx") as client:
@@ -187,9 +241,9 @@ async def test_binance_public_clients_fail_closed_without_proxy(monkeypatch, pat
             await PAAnalyzer().fetch_klines("BTCUSDT")
 
 
-@pytest.mark.parametrize("exchange", ["okx", "binance"])
+@pytest.mark.parametrize("exchange, assigned_proxy", [("okx", True), ("binance", True), ("okx", False)])
 @pytest.mark.parametrize("path", ["sync_account", "risk_tick", "router", "connectivity", "flat"])
-async def test_unhealthy_account_proxy_applies_policy_at_every_entry_point(monkeypatch, exchange, path):
+async def test_account_proxy_applies_policy_at_every_entry_point(monkeypatch, exchange, assigned_proxy, path):
     monkeypatch.setattr(get_settings(), "allow_direct_egress", True)
     adapter = SimpleNamespace(
         sync_time=AsyncMock(return_value=0), get_instruments=AsyncMock(return_value={}),
@@ -205,10 +259,11 @@ async def test_unhealthy_account_proxy_applies_policy_at_every_entry_point(monke
     async with get_session_factory()() as db:
         node = proxy()
         node.is_healthy = False
+        nodes = [node, proxy(2)] if exchange == "okx" else [node]
         lead = LeadSource(name="synthetic", portfolio_id="synthetic")
-        account = TradingAccount(name="synthetic", exchange=exchange, proxy_id=node.id, api_key_masked="synthetic",
+        account = TradingAccount(name="synthetic", exchange=exchange, proxy_id=node.id if assigned_proxy else None, api_key_masked="synthetic",
                                  encrypted_credentials=CredentialVault().encrypt_dict({}))
-        db.add_all([node, lead, account])
+        db.add_all([*nodes, lead, account])
         await db.flush()
         db.add(CopyBinding(name="synthetic", lead_id=lead.id, account_id=account.id))
         await db.commit()
@@ -229,7 +284,7 @@ async def test_unhealthy_account_proxy_applies_policy_at_every_entry_point(monke
                 "source": "api", "complete": True, "authoritative": True, "positionShow": True,
                 "asOf": int(time.time() * 1000),
             }}
-            await engine.router.process_lead_events(db, lead, [], [], snapshot, [node])
+            await engine.router.process_lead_events(db, lead, [], [], snapshot, nodes)
             assert reconcile.await_count == (1 if exchange == "okx" else 0)
         elif exchange == "binance":
             with pytest.raises(HTTPException):

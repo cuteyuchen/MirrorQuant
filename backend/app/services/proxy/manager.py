@@ -86,6 +86,11 @@ class ProxyManager:
             for n in enabled:
                 if n.id == preferred_proxy_id and n.is_healthy and n.url not in ordered:
                     ordered.append(n.url)
+        settings = get_settings()
+        exchange = exchange.strip().lower() if exchange else None
+        if exchange in settings.direct_egress_exchanges and exchange not in settings.proxy_required_exchanges:
+            # Preserve the account's explicit route; never substitute another pool node.
+            return ordered + [None]
         healthy = sorted(
             [n for n in enabled if n.is_healthy],
             key=lambda n: (n.priority, n.latency_ms if n.latency_ms is not None else 99999.0),
