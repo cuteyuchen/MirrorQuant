@@ -42,3 +42,6 @@ codex_audit_output.txt
 *_AUDIT_REPORT.md
 *_AUDIT_PROMPT.md
 codex_audit_*.txt
+
+# internal workflow docs
+REMEDIATION_*.md
