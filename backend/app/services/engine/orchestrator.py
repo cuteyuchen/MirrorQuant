@@ -77,6 +77,7 @@ class EngineOrchestrator:
         self._running = False
         self._task: Optional[asyncio.Task] = None
         self._risk_task: Optional[asyncio.Task] = None
+        self.last_heartbeat_monotonic: Optional[float] = None
         self._last_lead_poll: Dict[int, float] = {}
         self._last_full_sweep: Dict[int, float] = {}
         self._last_account_poll: Dict[int, float] = {}
@@ -87,18 +88,29 @@ class EngineOrchestrator:
         if self._running:
             return
         self._running = True
+        self.last_heartbeat_monotonic = None
         self._task = asyncio.create_task(self._loop(), name="mirrorquant-orchestrator")
         self._risk_task = asyncio.create_task(self._risk_loop(), name="mirrorquant-risk-monitor")
         logger.info("EngineOrchestrator background loop started")
 
     async def stop(self) -> None:
         self._running = False
+        self.last_heartbeat_monotonic = None
         tasks = [task for task in (self._task, self._risk_task) if task is not None]
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         self._task = self._risk_task = None
         logger.info("EngineOrchestrator stopped")
+
+    @property
+    def is_running(self) -> bool:
+        return self._running and self._task is not None and not self._task.done()
+
+    def heartbeat_age_sec(self) -> Optional[float]:
+        if self.last_heartbeat_monotonic is None:
+            return None
+        return max(0.0, time.monotonic() - self.last_heartbeat_monotonic)
 
     async def _risk_loop(self) -> None:
         while self._running:
@@ -112,6 +124,7 @@ class EngineOrchestrator:
 
     async def _loop(self) -> None:
         while self._running:
+            self.last_heartbeat_monotonic = time.monotonic()
             try:
                 await self.tick()
             except asyncio.CancelledError:

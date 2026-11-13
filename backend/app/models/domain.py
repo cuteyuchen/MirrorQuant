@@ -344,6 +344,10 @@ class ExecutionRecord(Base):
     my_notional: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     slippage_pct: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     order_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    # NULL means not yet reconciled, not a fabricated zero cash flow.
+    fee: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # positive charge, negative rebate
+    funding: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # positive receipt, negative payment
+    exchange_fill_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     details: Mapped[str] = mapped_column(Text, default="", nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False, index=True

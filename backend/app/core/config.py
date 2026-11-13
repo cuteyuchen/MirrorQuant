@@ -87,6 +87,8 @@ class Settings(BaseSettings):
     ]
 
     enable_background_engine: bool = True
+    readiness_heartbeat_max_age_sec: float = Field(default=30.0, gt=0, allow_inf_nan=False)
+    readiness_db_timeout_sec: float = Field(default=2.0, gt=0, le=30, allow_inf_nan=False)
     notification_outbox_max_attempts: int = Field(default=3, ge=1, le=20)
     notification_outbox_poll_sec: float = Field(default=1.0, gt=0, le=60, allow_inf_nan=False)
     default_lead_poll_sec: int = 15

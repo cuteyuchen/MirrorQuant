@@ -1,14 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from app.api import accounts, auth, bindings, dashboard, leads, proxies, settings as settings_api, ws
 from app.core.config import get_settings
@@ -88,7 +89,31 @@ def create_app() -> FastAPI:
 
     @app.get("/api/health")
     async def health():
+        """Process liveness only; dependency health is reported by /api/ready."""
         return {"status": "ok", "app": settings.app_name, "version": "1.0.0"}
+
+    @app.get("/api/ready")
+    async def ready():
+        checks = {}
+        try:
+            async with get_session_factory()() as db:
+                await asyncio.wait_for(db.execute(text("SELECT 1")), timeout=settings.readiness_db_timeout_sec)
+            checks["database"] = {"ok": True}
+        except Exception:
+            # Database exceptions may expose connection credentials.
+            checks["database"] = {"ok": False, "error": "Database unavailable"}
+        age = orchestrator.heartbeat_age_sec()
+        checks["engine"] = {
+            "ok": bool(settings.enable_background_engine and orchestrator.is_running and age is not None
+                       and age <= settings.readiness_heartbeat_max_age_sec),
+            "enabled": settings.enable_background_engine,
+            "heartbeatAgeSec": round(age, 3) if age is not None else None,
+            "maxAgeSec": settings.readiness_heartbeat_max_age_sec,
+        }
+        is_ready = all(check["ok"] for check in checks.values())
+        return JSONResponse(status_code=200 if is_ready else 503, content={
+            "status": "ready" if is_ready else "degraded", "checks": checks,
+        })
 
     static_dir = Path(__file__).resolve().parent.parent / "static"
     if static_dir.exists() and (static_dir / "index.html").exists():

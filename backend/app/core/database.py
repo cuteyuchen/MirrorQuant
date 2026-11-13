@@ -139,6 +139,11 @@ DEFAULT_SYSTEM_CONFIG = {
 
 # Idempotent SQLite column additions for upgrading existing databases without wiping data
 SQLITE_MIGRATIONS: Dict[str, List[Tuple[str, str]]] = {
+    "execution_records": [
+        ("fee", "FLOAT"),
+        ("funding", "FLOAT"),
+        ("exchange_fill_id", "VARCHAR(100)"),
+    ],
     "position_allocations": [
         ("owned_qty_exact", "VARCHAR(100)"),
         ("entry_cost_exact", "VARCHAR(100)"),
