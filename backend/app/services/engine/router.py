@@ -48,6 +48,8 @@ from app.services.lead_collector.binance_bapi import (
     is_open_leg,
     order_dedup_key,
     is_authoritative_snapshot,
+    source_fill_kind,
+    validate_source_fill,
 )
 from app.services.notifier.outbox import enqueue_notification
 from app.services.proxy.manager import ProxyManager
@@ -509,7 +511,7 @@ class CopyRouter:
         self, db: AsyncSession, lead: LeadSource, raw_orders: List[Dict[str, Any]],
         raw_closed: List[Dict[str, Any]], snapshot: Dict[str, Any], proxies: List[ProxyNode],
     ) -> None:
-        """Durably enqueue each follower's cumulative-fill deltas before acknowledging ingestion."""
+        """Enqueue cumulative order deltas or each independent fill once per follower."""
         if not is_authoritative_snapshot(snapshot):
             return
         await db.refresh(lead)
@@ -530,8 +532,8 @@ class CopyRouter:
             baseline = not binding.baseline_seeded
             for order in expanded_orders:
                 key = order_dedup_key(order)
-                cumulative = exact(order.get("executedQty") or 0)
-                notional = cumulative * exact(order.get("avgPrice") or 0)
+                cumulative, price = validate_source_fill(order.get("executedQty"), order.get("avgPrice"))
+                notional = cumulative * price
                 progress = await db.get(BindingSourceProgress, (binding.id, key))
                 if progress is None:
                     for alias in order.get("_legacy_source_keys", []):
@@ -550,7 +552,11 @@ class CopyRouter:
                         progress.cumulative_qty, progress.cumulative_notional = str(cumulative), str(notional)
                         continue
                 previous = exact(progress.cumulative_qty)
-                if cumulative < previous:
+                if source_fill_kind(order) == "individual":
+                    if previous not in (0, cumulative) or (previous > 0 and exact(progress.cumulative_notional) != notional):
+                        logger.error("Conflicting individual source fill %s; suspending source event", key)
+                        continue
+                elif cumulative < previous:
                     logger.error("Regressing source fill %s; suspending source event", key)
                     continue
                 delta = cumulative - previous

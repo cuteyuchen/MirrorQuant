@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_current_user
 from app.core.database import get_db
 from app.core.secret_mask import mask_sensitive_payload, redact_error_urls
+from app.services.lead_collector.freshness import lead_freshness
 from app.models.domain import (
     CopyBinding,
     ExecutionRecord,
@@ -191,6 +192,7 @@ async def public_lead_feed(db: AsyncSession = Depends(get_db)):
                 "portfolioId": lead.portfolio_id,
                 "marginBalance": lead.margin_balance,
                 "aumAmount": lead.aum_amount,
+                **lead_freshness(lead, snap or {}),
                 "snapshot": mask_sensitive_payload(snap),
             }
         )

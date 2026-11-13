@@ -41,19 +41,47 @@ def fnum(val: Any) -> Optional[float]:
 
 
 def order_dedup_key(o: Dict[str, Any]) -> str:
-    """Stable identity excluding mutable timestamps, filled quantity and average price."""
-    raw = json.dumps(
-        [
-            o.get("orderId") or o.get("id"),
-            o.get("orderTime"),
-            o.get("symbol"),
-            o.get("side"),
-            o.get("positionSide"),
-            o.get("type"),
-        ],
-        sort_keys=True,
-    ).encode("utf-8")
+    """Order IDs identify cumulative snapshots; ID-less BAPI rows identify fills.
+
+    Only the confirmed executedQty/avgPrice fields extend an ID-less identity.
+    Update timestamps and unverified IDs must never affect replay identity.
+    """
+    identity = [o.get("orderId"), o.get("orderTime"), o.get("symbol"),
+                o.get("side"), o.get("positionSide"), o.get("type")]
+    if source_fill_kind(o) == "individual":
+        identity[0] = None
+        identity.extend([decimal_identity(o.get("executedQty")), decimal_identity(o.get("avgPrice"))])
+    raw = json.dumps(identity, sort_keys=True).encode("utf-8")
     return hashlib.sha1(raw).hexdigest()[:24]
+
+
+def source_fill_kind(o: Dict[str, Any]) -> str:
+    return "cumulative" if o.get("orderId") not in (None, "") else "individual"
+
+
+def decimal_identity(value: Any) -> str:
+    # Decimal.normalize() can round long values under the active context.
+    value = format(exact(value), "f")
+    return value.rstrip("0").rstrip(".") if "." in value else value
+
+
+def validate_source_fill(q: Any, p: Any) -> Tuple[Decimal, Decimal]:
+    quantity, price = exact(q), exact(p)
+    if not math.isfinite(float(quantity)) or not math.isfinite(float(price)):
+        raise ValueError("Non-finite source fill or price")
+    if quantity <= 0 or price <= 0:
+        raise ValueError("Non-positive source fill or price")
+    return quantity, price
+
+
+def check_source_fill_update(previous: Dict[str, Any], record: Dict[str, Any]) -> None:
+    old_q, old_p = validate_source_fill(previous.get("q"), previous.get("p"))
+    q, p = validate_source_fill(record.get("q"), record.get("p"))
+    if record.get("oid") not in (None, ""):
+        if q < old_q:
+            raise RuntimeError("Regressing cumulative lead fill")
+    elif (q, p) != (old_q, old_p):
+        raise RuntimeError("Conflicting individual lead fill identity")
 
 
 def row_hash(d: Dict[str, Any], keys: Sequence[str]) -> str:
@@ -76,13 +104,11 @@ def direction_label(side: Optional[str], ps: Optional[str], closing: bool) -> st
 def slim_order(o: Dict[str, Any]) -> Dict[str, Any]:
     t = o.get("orderUpdateTime") or o.get("orderTime") or 0
     ot = o.get("orderTime") or t
-    q = exact(o.get("executedQty") or "0")
-    p = exact(o.get("avgPrice") or "0")
-    if q < 0 or p < 0:
-        raise ValueError("Negative source fill or price")
+    q, p = validate_source_fill(o.get("executedQty"), o.get("avgPrice"))
     result = {
         "h": order_dedup_key(o),
-        "oid": o.get("orderId") or o.get("id"),
+        "oid": o.get("orderId"),
+        "fillKind": source_fill_kind(o),
         "t": t,
         "ot": ot,
         "sym": o.get("symbol"),
@@ -93,10 +119,13 @@ def slim_order(o: Dict[str, Any]) -> Dict[str, Any]:
         "p": str(p),
         "pnl": fnum(o.get("totalPnl")) or 0.0,
     }
-    if o.get("_legacy_keys"):
-        result["legacyKeys"] = list(o["_legacy_keys"])
-    if o.get("_legacy_source_keys"):
-        result["legacySourceKeys"] = list(o["_legacy_source_keys"])
+    legacy_hash = hashlib.sha1(json.dumps([
+        ot, o.get("symbol"), o.get("side"), o.get("positionSide"), o.get("type"), float(q), float(p),
+    ], sort_keys=True).encode()).hexdigest()[:24]
+    result["legacyKeys"] = [key for key in dict.fromkeys([
+        *(o.get("_legacy_keys") or []), legacy_hash,
+    ]) if key != result["h"]]
+    result["legacySourceKeys"] = list(o.get("_legacy_source_keys") or [])
     return result
 
 
@@ -157,11 +186,8 @@ def reconstruct_open_positions(
         if not sym or not ps:
             continue
         k = (sym, ps)
-        q = exact(o.get("q") or 0)
-        p = exact(o.get("p") or 0)
+        q, p = validate_source_fill(o.get("q"), o.get("p"))
         t = int(o.get("ot") or o.get("t") or 0)
-        if q <= 0:
-            continue
         if is_open_leg(o.get("side"), ps):
             if net[k] == 0:
                 open_time[k] = t
@@ -760,26 +786,24 @@ class BinanceBapiCollector(BaseLeadCollector):
         store: Dict[str, Dict[str, Any]],
         full_sweep: bool = False,
         proxy_url: Optional[str] = None,
+        history_max_pages: int = 25,
+        require_complete: bool = False,
     ) -> int:
         # Work on a copy: a page gap must not partially advance the durable source cursor.
         pending = {}
         for old in store.values():
             expanded = expand_slim_order(old)
             rec = slim_order(expanded)
-            legacy_hash = hashlib.sha1(json.dumps([
-                expanded.get("orderTime"), expanded.get("symbol"), expanded.get("side"),
-                expanded.get("positionSide"), expanded.get("type"),
-                float(expanded.get("executedQty") or 0), float(expanded.get("avgPrice") or 0),
-            ], sort_keys=True).encode()).hexdigest()[:24]
-            rec["legacyKeys"] = list(dict.fromkeys([*(rec.get("legacyKeys") or []), old.get("h"), legacy_hash]))[:8]
-            rec["legacyKeys"] = [key for key in rec["legacyKeys"] if key]
+            rec["legacyKeys"] = [key for key in dict.fromkeys([
+                *(rec.get("legacyKeys") or []), old.get("h"),
+            ]) if key and key != rec["h"]][:8]
             previous = pending.get(rec["h"])
             if previous is None or exact(rec["q"]) >= exact(previous["q"]):
                 pending[rec["h"]] = rec
         existing_keys = set(pending)
         new_count = 0
         dup_streak = 0
-        max_pages = 25 if full_sweep else 3
+        max_pages = history_max_pages if full_sweep else 3
         complete = False
         for pn in range(1, max_pages + 1):
             lst = await self.fetch_order_history(
@@ -791,21 +815,29 @@ class BinanceBapiCollector(BaseLeadCollector):
                 previous = pending.get(rec["h"])
                 # Older stores discarded orderId. Adopt its newly available identity
                 # without retaining a second copy of the same cumulative execution.
-                legacy_key = order_dedup_key({**raw, "orderId": None, "id": None})
-                if previous is None and rec.get("oid") is not None and legacy_key in pending:
+                legacy_key = None
+                if previous is None and rec.get("oid") not in (None, ""):
+                    candidates = [key for key, old in pending.items() if old.get("oid") in (None, "")
+                                  and all(old.get(k) == rec.get(k) for k in ("ot", "sym", "side", "ps", "ty"))]
+                    if len(candidates) > 1:
+                        raise RuntimeError("Ambiguous legacy cumulative lead identity")
+                    legacy_key = candidates[0] if candidates else None
+                if legacy_key is not None:
                     previous = pending.pop(legacy_key)
                     rec["legacySourceKeys"] = list(dict.fromkeys([*(previous.get("legacySourceKeys") or []), legacy_key]))
                     if legacy_key in existing_keys:
                         existing_keys.add(rec["h"])
                 if previous is not None:
-                    rec["legacyKeys"] = previous.get("legacyKeys") or []
-                    rec.setdefault("legacySourceKeys", previous.get("legacySourceKeys") or [])
-                if previous is not None and exact(rec["q"]) < exact(previous["q"]):
-                    raise RuntimeError("Regressing cumulative lead fill")
+                    rec["legacyKeys"] = list(dict.fromkeys([
+                        *(previous.get("legacyKeys") or []), *(rec.get("legacyKeys") or []),
+                    ]))[:8]
+                    rec["legacySourceKeys"] = rec["legacySourceKeys"] or previous.get("legacySourceKeys") or []
+                if previous is not None:
+                    check_source_fill_update(previous, rec)
                 if previous is None:
                     added += 1
                 pending[rec["h"]] = rec
-                if rec["h"] in existing_keys:
+                if rec["h"] in existing_keys and not require_complete:
                     complete = True
             new_count += added
             if len(lst) < 100:
@@ -815,12 +847,14 @@ class BinanceBapiCollector(BaseLeadCollector):
                 dup_streak += 1
             else:
                 dup_streak = 0
-            if dup_streak >= 2:
+            if dup_streak >= 2 and not require_complete:
                 break
             await asyncio.sleep(0.15)
 
         if not complete:
             raise RuntimeError("Lead order history is truncated without continuity")
+        if require_complete and len(pending) > STORE_MAX:
+            raise RuntimeError("Complete lead history exceeds store capacity")
         trimmed = sorted(pending.values(), key=lambda x: (x.get("ot") or x.get("t") or 0, x["h"]))[-STORE_MAX:]
         store.clear()
         for item in trimmed:
@@ -835,11 +869,14 @@ class BinanceBapiCollector(BaseLeadCollector):
         proxy_url: Optional[str] = None,
         full_sweep: bool = False,
         with_analysis: bool = True,
+        closed_history: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         t0 = time.perf_counter()
         detail = await self.fetch_detail(portfolio_id, proxy_url=proxy_url)
         added = await self.sync_orders_into_store(
-            portfolio_id, orders_store, full_sweep=full_sweep, proxy_url=proxy_url
+            portfolio_id, orders_store, full_sweep=full_sweep, proxy_url=proxy_url,
+            history_max_pages=STORE_MAX // 100 + 1 if closed_history is not None else 25,
+            require_complete=closed_history is not None,
         )
 
         # Fetch closed positions for reconciliation (fallback to closed_cache on failure)
@@ -847,7 +884,7 @@ class BinanceBapiCollector(BaseLeadCollector):
         closed_total = None
         closed_history_complete = False
         try:
-            ph1 = await self.fetch_position_history(
+            ph1 = {"list": closed_history, "total": len(closed_history)} if closed_history is not None else await self.fetch_position_history(
                 portfolio_id, page_number=1, page_size=100, proxy_url=proxy_url
             )
             lst = (ph1 or {}).get("list") or []
@@ -859,7 +896,8 @@ class BinanceBapiCollector(BaseLeadCollector):
                     seen_c[(str(p.get("positionId")), p.get("opened"))] = p
                 closed_rows = [slim_closed_position(p) for p in seen_c.values()]
                 closed_rows.sort(key=lambda x: x.get("closed") or 0, reverse=True)
-                closed_rows = closed_rows[:80]
+                if closed_history is None:
+                    closed_rows = closed_rows[:80]
         except Exception:
             pass
 

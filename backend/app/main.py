@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -15,7 +16,8 @@ from app.api import accounts, auth, bindings, dashboard, leads, proxies, setting
 from app.core.config import get_settings
 from app.core.database import get_session_factory, init_db
 from app.core.security import CredentialVault
-from app.models.domain import TradingAccount, User
+from app.models.domain import LeadSource, TradingAccount, User
+from app.services.lead_collector.freshness import lead_freshness
 from app.services.engine.orchestrator import orchestrator
 from app.services.notifier.outbox import notification_outbox
 
@@ -98,6 +100,15 @@ def create_app() -> FastAPI:
         try:
             async with get_session_factory()() as db:
                 await asyncio.wait_for(db.execute(text("SELECT 1")), timeout=settings.readiness_db_timeout_sec)
+                enabled_leads = list((await asyncio.wait_for(db.scalars(select(LeadSource).where(
+                    LeadSource.is_enabled == True)), timeout=settings.readiness_db_timeout_sec)).all())
+                if enabled_leads:
+                    failed_ids = []
+                    for lead in enabled_leads:
+                        state = lead_freshness(lead, json.loads(lead.snapshot_json or "{}"))
+                        if state["stale"] or state["consecutiveSyncFailures"] >= settings.lead_sync_failure_limit:
+                            failed_ids.append(lead.id)
+                    checks["leadSync"] = {"ok": not failed_ids, "degradedLeadIds": failed_ids}
             checks["database"] = {"ok": True}
         except Exception:
             # Database exceptions may expose connection credentials.

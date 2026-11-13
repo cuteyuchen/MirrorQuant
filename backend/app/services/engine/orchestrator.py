@@ -13,6 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import DEFAULT_SYSTEM_CONFIG, get_session_factory
+from app.core.config import get_settings
 from app.core.security import CredentialVault
 from app.core.secret_mask import mask_sensitive_payload, redact_proxy_userinfo
 from app.models.domain import CopyBinding, LeadSource, ProxyNode, TradingAccount
@@ -22,7 +23,11 @@ from app.services.engine.router import CopyRouter
 from app.services.engine.risk import RiskEngine
 from app.services.engine.serialization import serialized_execution
 from app.services.engine.sizer import exact
-from app.services.lead_collector.binance_bapi import BinanceBapiCollector, STORE_MAX, is_authoritative_snapshot
+from app.services.lead_collector.binance_bapi import (
+    BinanceBapiCollector, STORE_MAX, check_source_fill_update, is_authoritative_snapshot, validate_source_fill,
+)
+from app.services.lead_collector.freshness import lead_freshness
+from app.services.notifier.outbox import enqueue_notification
 from app.services.proxy.manager import ProxyEgressError, ProxyManager
 
 logger = logging.getLogger("mirrorquant.orchestrator")
@@ -327,10 +332,27 @@ class EngineOrchestrator:
         if last_sync_ms > started_ms:
             return False
         current = json.loads(lead.snapshot_json or "{}")
-        meta = current.setdefault("openPositionsMeta", {})
-        if (meta.get("lastFailureStartedAtMs") or 0) > started_ms:
+        if started_ms <= ((current.get("meta") or {}).get("storeRebuiltAtMs") or 0):
             return False
-        meta.update(authoritative=False, complete=False, lastFailureStartedAtMs=started_ms)
+        meta = current.setdefault("openPositionsMeta", {})
+        if (meta.get("lastFailureStartedAtMs") or 0) >= started_ms:
+            return False
+        failures = int(meta.get("consecutiveSyncFailures") or 0) + 1
+        meta.update(authoritative=False, complete=False, lastFailureStartedAtMs=started_ms,
+                    consecutiveSyncFailures=failures)
+        meta.setdefault("firstSyncFailureAtMs", started_ms)
+        freshness = lead_freshness(lead, current, now_ms=int(time.time() * 1000))
+        age = freshness["snapshotAgeSec"]
+        settings = get_settings()
+        overdue = age is None or age > settings.lead_snapshot_stale_sec
+        exhausted = failures >= settings.lead_sync_failure_limit
+        logger.error("Lead %s sync failed; consecutiveFailures=%s snapshotAgeSec=%s", lead.id, failures, age)
+        if (overdue or exhausted) and not meta.get("syncFailureNotified"):
+            config = await self.router._get_config(db, "notifications", DEFAULT_SYSTEM_CONFIG["notifications"])
+            enqueue_notification(db, config, "Lead snapshot stale / sync failure",
+                                 f"Lead {lead.id}: consecutiveFailures={failures}, snapshotAgeSec={age}. "
+                                 "Snapshot is unverified; check lead sync health.", event_type="error")
+            meta["syncFailureNotified"] = True
         lead.snapshot_json = json.dumps(current, separators=(",", ":"))
         lead.status = "error"
         lead.last_error = redact_proxy_userinfo(error)[:480]
@@ -344,6 +366,8 @@ class EngineOrchestrator:
         await db.refresh(lead)
         current = json.loads(lead.snapshot_json or "{}")
         current_meta = current.get("openPositionsMeta") or {}
+        if started_ms <= ((current.get("meta") or {}).get("storeRebuiltAtMs") or 0):
+            return False
         current_observed = max(current_meta.get("asOf") or 0, current_meta.get("lastFailureStartedAtMs") or 0,
                                (current.get("meta") or {}).get("collectionStartedAtMs") or 0)
         incoming_observed = (snapshot.get("openPositionsMeta") or {}).get("asOf") or 0
@@ -355,7 +379,10 @@ class EngineOrchestrator:
         # cumulative fill until per-binding ingestion has durably acknowledged it.
         merged = json.loads(lead.orders_store_json or "{}")
         for key, record in orders_store.items():
+            validate_source_fill(record.get("q"), record.get("p"))
             previous = merged.get(key)
+            if previous is not None and record.get("oid") in (None, ""):
+                check_source_fill_update(previous, record)
             if previous is None or exact(record.get("q") or 0) >= exact(previous.get("q") or 0):
                 merged[key] = record
             for legacy_key in [*(record.get("legacySourceKeys") or []), *(record.get("legacyKeys") or [])]:
@@ -365,6 +392,10 @@ class EngineOrchestrator:
         retained = sorted(merged.values(), key=lambda record: (record.get("ot") or record.get("t") or 0, record.get("h") or ""))[-STORE_MAX:]
         orders_store.update({record["h"]: record for record in retained})
         snapshot.setdefault("meta", {})["collectionStartedAtMs"] = started_ms
+        if (current.get("meta") or {}).get("storeRebuiltAtMs"):
+            snapshot["meta"]["storeRebuiltAtMs"] = current["meta"]["storeRebuiltAtMs"]
+        if (current.get("meta") or {}).get("rebuildDigest"):
+            snapshot["meta"]["rebuildDigest"] = current["meta"]["rebuildDigest"]
         profile = snapshot.get("profile") or {}
         lead.avatar_url = profile.get("avatarUrl") or lead.avatar_url
         lead.description = profile.get("description") or lead.description
