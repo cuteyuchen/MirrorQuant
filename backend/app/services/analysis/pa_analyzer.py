@@ -190,6 +190,8 @@ def analyze_scaling(
 class PAAnalyzer:
     """Async Price-Action & SMC quantitative structure analyzer."""
 
+    exchange = "binance"
+
     def __init__(self):
         self._kline_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
@@ -226,7 +228,9 @@ class PAAnalyzer:
 
         path = f"/fapi/v1/klines?symbol={quote(symbol)}&interval={interval}&limit={limit}"
         urls = [f"{FAPI_PRIMARY}{path}", f"{FAPI_FALLBACK}{path}"]
-        async with ProxyManager.build_client(proxy_url=proxy_url, timeout=12.0) as client:
+        async with ProxyManager.build_client(
+            proxy_url=proxy_url, timeout=12.0, exchange=self.exchange,
+        ) as client:
             for attempt in range(4):
                 target = urls[attempt % len(urls)] if attempt >= 2 else urls[0]
                 try:

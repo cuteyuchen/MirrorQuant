@@ -80,7 +80,7 @@ async def test_lead_sync_reports_unavailable_proxy_without_contacting_upstream(e
 
 @pytest.mark.parametrize("direct_enabled", [False, True])
 @pytest.mark.asyncio
-async def test_lead_failover_only_attempts_direct_when_explicitly_enabled(engine_data, monkeypatch, direct_enabled):
+async def test_binance_lead_failover_never_attempts_direct(engine_data, monkeypatch, direct_enabled):
     data = engine_data
     monkeypatch.setattr(get_settings(), "allow_direct_egress", direct_enabled)
     collect = AsyncMock(side_effect=RuntimeError("Synthetic upstream outage"))
@@ -88,4 +88,4 @@ async def test_lead_failover_only_attempts_direct_when_explicitly_enabled(engine
     result = await data.engine.sync_lead(data.db, data.lead)
     assert result["ok"] is False
     attempted = [call.kwargs["proxy_url"] for call in collect.await_args_list]
-    assert attempted == ([data.proxy.url, None] if direct_enabled else [data.proxy.url])
+    assert attempted == [data.proxy.url]

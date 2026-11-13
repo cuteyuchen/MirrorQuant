@@ -182,7 +182,7 @@ class EngineOrchestrator:
                     proxies = list((await db.scalars(select(ProxyNode).order_by(ProxyNode.priority))).all())
                     resilience_cfg = await self.router._get_config(db, "resilience", DEFAULT_SYSTEM_CONFIG["resilience"])
                     credentials = self.vault.decrypt_dict(account.encrypted_credentials)
-                    proxy_url = ProxyManager.select_proxy_url(proxies, account.proxy_id)
+                    proxy_url = ProxyManager.select_proxy_url(proxies, account.proxy_id, exchange=account.exchange)
                     adapter = create_exchange_adapter(
                         exchange=account.exchange, credentials=credentials,
                         environment=account.environment, proxy_url=proxy_url,
@@ -254,7 +254,9 @@ class EngineOrchestrator:
             proxies = list((await db.scalars(select(ProxyNode).order_by(ProxyNode.priority))).all())
 
         try:
-            proxy_urls = ProxyManager.ordered_proxy_urls(proxies, preferred_proxy_id=lead.proxy_id)
+            proxy_urls = ProxyManager.ordered_proxy_urls(
+                proxies, preferred_proxy_id=lead.proxy_id, exchange=self.collector.exchange,
+            )
         except ProxyEgressError as exc:
             error = str(exc)
             published = await self._record_lead_sync_failure(db, lead, started_ms, error)
@@ -395,7 +397,7 @@ class EngineOrchestrator:
             proxies = list((await db.scalars(select(ProxyNode).order_by(ProxyNode.priority))).all())
         try:
             creds = self.vault.decrypt_dict(account.encrypted_credentials)
-            proxy_url = ProxyManager.select_proxy_url(proxies, account.proxy_id)
+            proxy_url = ProxyManager.select_proxy_url(proxies, account.proxy_id, exchange=account.exchange)
             adapter = create_exchange_adapter(
                 exchange=account.exchange,
                 credentials=creds,

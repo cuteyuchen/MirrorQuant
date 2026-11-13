@@ -453,6 +453,7 @@ class BinanceBapiCollector(BaseLeadCollector):
     """Async collector for Binance Futures public copy-trading bapi endpoints."""
 
     platform = "binance_bapi"
+    exchange = "binance"
 
     def __init__(self, pa_analyzer=None):
         self.pa_analyzer = pa_analyzer
@@ -487,7 +488,9 @@ class BinanceBapiCollector(BaseLeadCollector):
     ) -> Any:
         headers = self._headers(portfolio_id, time_range)
         last_err: Optional[Exception] = None
-        async with ProxyManager.build_client(proxy_url=proxy_url, timeout=timeout, headers=headers) as client:
+        async with ProxyManager.build_client(
+            proxy_url=proxy_url, timeout=timeout, headers=headers, exchange=self.exchange,
+        ) as client:
             for attempt in range(retries):
                 try:
                     if body is not None:
@@ -520,7 +523,9 @@ class BinanceBapiCollector(BaseLeadCollector):
     ) -> Any:
         urls = [f"{FAPI_PRIMARY}{path_and_query}", f"{FAPI_FALLBACK}{path_and_query}"]
         last_err: Optional[Exception] = None
-        async with ProxyManager.build_client(proxy_url=proxy_url, timeout=timeout) as client:
+        async with ProxyManager.build_client(
+            proxy_url=proxy_url, timeout=timeout, exchange=self.exchange,
+        ) as client:
             for attempt in range(retries):
                 target = urls[attempt % len(urls)] if attempt >= 2 else urls[0]
                 try:

@@ -94,7 +94,17 @@ class Settings(BaseSettings):
     default_lead_poll_sec: int = 15
     price_tick_sec: int = 5
     pa_kline_max_staleness_multiplier: float = Field(default=3.0, gt=0, allow_inf_nan=False)
-    allow_direct_egress: bool = False
+    # Explicit exchange policies take precedence over the legacy global fallback.
+    allow_direct_egress: bool = True
+    proxy_required_exchanges: Annotated[List[str], NoDecode] = ["binance"]
+    direct_egress_exchanges: Annotated[List[str], NoDecode] = ["okx", "bybit", "bitget"]
+
+    @field_validator("proxy_required_exchanges", "direct_egress_exchanges", mode="before")
+    @classmethod
+    def _parse_egress_exchanges(cls, value):
+        if isinstance(value, str):
+            value = json.loads(value) if value.lstrip().startswith("[") else value.split(",")
+        return [exchange.strip().lower() for exchange in value if exchange.strip()]
 
     @field_validator("cors_origins", mode="before")
     @classmethod

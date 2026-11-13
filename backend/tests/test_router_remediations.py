@@ -11,7 +11,7 @@ from app.core.database import get_session_factory
 from app.core.security import CredentialVault
 from app.models.domain import (
     BindingDebt, CopyBinding, ExecutionRecord, LeadSource, OrderIntent,
-    PositionAllocation, PositionGuardState, SystemConfig, TradingAccount,
+    PositionAllocation, PositionGuardState, ProxyNode, SystemConfig, TradingAccount,
 )
 from app.services.adapters.base import BalanceInfo, ExchangePosition, InstrumentSpec, OrderBook, OrderResult
 from app.services.engine.risk import RiskEngine
@@ -322,6 +322,8 @@ async def test_closed_cycle_open_cannot_attach_to_current_reopened_position(trad
 
 
 async def prepare_event_router(t, exchange, monkeypatch):
+    t.proxy = ProxyNode(name="offline", url="http://proxy.invalid:8080", is_enabled=True, is_healthy=True)
+    t.db.add(t.proxy)
     t.binding.baseline_seeded = True
     notifications = await t.db.get(SystemConfig, "notifications")
     notifications.value_json = json.dumps({"notify_on_execution": False, "notify_on_risk_block": False})
@@ -353,11 +355,11 @@ async def test_fresh_snapshot_routes_150_second_delayed_fill_once(trading, monke
     await prepare_event_router(t, exchange, monkeypatch)
     orders = [source_order("delayed", "LONG", "BUY", NOW_MS - 150_000)]
     snapshot = current_snapshot("LONG")
-    await t.router.process_lead_events(t.db, t.lead, orders, [], snapshot, [])
+    await t.router.process_lead_events(t.db, t.lead, orders, [], snapshot, [t.proxy])
     assert len(exchange.orders) == 1
     assert (await t.db.scalar(select(ExecutionRecord))).status == "EXECUTED"
     # The age did not suppress ingestion; replay is suppressed by source identity.
-    await t.router.process_lead_events(t.db, t.lead, orders, [], snapshot, [])
+    await t.router.process_lead_events(t.db, t.lead, orders, [], snapshot, [t.proxy])
     assert len(exchange.orders) == 1
     assert len((await t.db.scalars(select(ExecutionRecord))).all()) == 1
 
@@ -376,7 +378,7 @@ async def test_flip_closes_long_before_catchup_short_for_both_legacy_flags(tradi
     # first, without entering the catch-up gate or borrowing the short's book side.
     orders = [source_order("new-short", "SHORT", "SELL", NOW_MS - 150_000),
               source_order("close-long", "LONG", "SELL", NOW_MS - 151_000, price="200")]
-    await t.router.process_lead_events(t.db, t.lead, orders, [], current_snapshot("SHORT"), [])
+    await t.router.process_lead_events(t.db, t.lead, orders, [], current_snapshot("SHORT"), [t.proxy])
     assert [(order["side"], order["pos_side"], order["reduce_only"]) for order in exchange.orders] == [
         ("sell", "long", True), ("sell", "short", False)]
     assert own.owned_qty == 0 and other.owned_qty == 9

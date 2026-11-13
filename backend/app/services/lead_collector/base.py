@@ -8,6 +8,7 @@ class BaseLeadCollector(ABC):
     """Abstract interface for copy-trading lead data collectors."""
 
     platform: str = "unknown"
+    exchange: Optional[str] = None
 
     @abstractmethod
     async def fetch_detail(self, portfolio_id: str, proxy_url: Optional[str] = None) -> Dict[str, Any]:

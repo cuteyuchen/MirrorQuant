@@ -68,7 +68,9 @@ class BinanceAdapter(BaseExchangeAdapter):
         attempts = max(1, retries) if method == "GET" else 1
         base_params = dict(params or {})
 
-        async with ProxyManager.build_client(proxy_url=self.proxy_url, timeout=self.timeout) as client:
+        async with ProxyManager.build_client(
+            proxy_url=self.proxy_url, timeout=self.timeout, exchange=self.exchange,
+        ) as client:
             last_err: Optional[Exception] = None
             for attempt in range(attempts):
                 req_params = dict(base_params)

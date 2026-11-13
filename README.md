@@ -152,7 +152,9 @@ npm run build
 | `MQ_CORS_ORIGINS` | *(local console origins)* | Exact allowed HTTP/WebSocket origins; add the deployed console's HTTPS origin |
 | `MQ_TRUSTED_PROXY_CIDRS` | `127.0.0.0/8,::1/128` | Comma-separated CIDRs allowed to forward client IPs; Compose additionally trusts its fixed Nginx address `172.30.0.3/32` |
 | `MQ_ENABLE_BACKGROUND_ENGINE` | `true` | Enable background lead polling & copy routing loop |
-| `MQ_ALLOW_DIRECT_EGRESS` | `false` | Explicitly permit direct exchange/market-data connections after healthy proxy candidates; otherwise no healthy proxy fails closed, even with an empty proxy pool |
+| `MQ_ALLOW_DIRECT_EGRESS` | `true` | Legacy direct-egress fallback for unknown/unspecified exchanges; explicit exchange lists take precedence |
+| `MQ_PROXY_REQUIRED_EXCHANGES` | `binance` | Comma-separated or JSON exchange list that requires a healthy enabled proxy; overrides both the direct list and global flag |
+| `MQ_DIRECT_EGRESS_EXCHANGES` | `okx,bybit,bitget` | Comma-separated or JSON exchange list permitting direct fallback even when the global flag is false; healthy preferred proxies remain first |
 | `MQ_PA_KLINE_MAX_STALENESS_MULTIPLIER` | `3.0` | Maximum candle age as a multiple of its timeframe before analysis reports `stale: true` |
 | `MQ_READINESS_HEARTBEAT_MAX_AGE_SEC` | `30` | Maximum age of the orchestrator's monotonic heartbeat for readiness |
 | `MQ_READINESS_DB_TIMEOUT_SEC` | `2` | Timeout for the readiness database probe |

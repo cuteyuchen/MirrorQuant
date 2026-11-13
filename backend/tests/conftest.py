@@ -12,7 +12,7 @@ sys.path.insert(0, str(backend_dir))
 # Configure test environment variables BEFORE importing app config
 os.environ["MQ_ENV"] = "test"
 os.environ["MQ_ENABLE_BACKGROUND_ENGINE"] = "false"
-# Synthetic exchange tests intentionally run without configured proxy nodes.
+# Unknown-exchange tests retain the legacy global direct-egress opt-in.
 os.environ["MQ_ALLOW_DIRECT_EGRESS"] = "true"
 os.environ["MQ_DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
 os.environ["MQ_MASTER_KEY"] = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="

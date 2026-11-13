@@ -84,7 +84,9 @@ class BybitAdapter(BaseExchangeAdapter):
         recv_window = "5000"
 
         last_err: Optional[Exception] = None
-        async with ProxyManager.build_client(proxy_url=self.proxy_url, timeout=self.timeout) as client:
+        async with ProxyManager.build_client(
+            proxy_url=self.proxy_url, timeout=self.timeout, exchange=self.exchange,
+        ) as client:
             for attempt in range(attempts):
                 headers: Dict[str, str] = {
                     "Content-Type": "application/json",

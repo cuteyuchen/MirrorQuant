@@ -26,9 +26,9 @@ def disallow_direct_egress(monkeypatch):
     monkeypatch.setattr(get_settings(), "allow_direct_egress", False)
 
 
-def test_direct_egress_defaults_to_disabled(monkeypatch):
+def test_direct_egress_defaults_to_enabled(monkeypatch):
     monkeypatch.delenv("MQ_ALLOW_DIRECT_EGRESS")
-    assert Settings(_env_file=None).allow_direct_egress is False
+    assert Settings(_env_file=None).allow_direct_egress is True
 
 
 def test_healthy_preferred_proxy_is_selected_first():

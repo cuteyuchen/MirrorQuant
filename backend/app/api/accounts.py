@@ -182,7 +182,7 @@ async def test_account_connectivity(
     creds = vault.decrypt_dict(acct.encrypted_credentials)
     proxies = list((await db.scalars(select(ProxyNode).order_by(ProxyNode.priority))).all())
     try:
-        proxy_url = ProxyManager.select_proxy_url(proxies, acct.proxy_id)
+        proxy_url = ProxyManager.select_proxy_url(proxies, acct.proxy_id, exchange=acct.exchange)
     except ProxyEgressError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     adapter = create_exchange_adapter(

@@ -34,13 +34,24 @@ class ProxyManager:
     }
 
     @staticmethod
+    def _direct_egress_allowed(exchange: Optional[str]) -> bool:
+        settings = get_settings()
+        exchange = exchange.strip().lower() if exchange else None
+        if exchange in settings.proxy_required_exchanges:
+            return False
+        if exchange in settings.direct_egress_exchanges:
+            return True
+        return settings.allow_direct_egress
+
+    @staticmethod
     def build_client(
         proxy_url: Optional[str] = None,
         timeout: float = 15.0,
         headers: Optional[dict] = None,
+        exchange: Optional[str] = None,
     ) -> httpx.AsyncClient:
-        if not proxy_url and not get_settings().allow_direct_egress:
-            raise ProxyEgressError("Direct egress is disabled; configure a healthy proxy or enable MQ_ALLOW_DIRECT_EGRESS")
+        if not proxy_url and not ProxyManager._direct_egress_allowed(exchange):
+            raise ProxyEgressError("Direct egress is disabled by egress policy; configure a healthy proxy")
         merged_headers = dict(ProxyManager.DEFAULT_HEADERS)
         if headers:
             merged_headers.update(headers)
@@ -48,6 +59,8 @@ class ProxyManager:
             "timeout": httpx.Timeout(timeout),
             "headers": merged_headers,
             "follow_redirects": True,
+            # Only the selected route may determine egress, including direct routes.
+            "trust_env": False,
         }
         if proxy_url:
             kwargs["proxy"] = proxy_url
@@ -57,13 +70,15 @@ class ProxyManager:
     def select_proxy_url(
         nodes: Sequence[ProxyNode],
         preferred_proxy_id: Optional[int] = None,
+        exchange: Optional[str] = None,
     ) -> Optional[str]:
-        return ProxyManager.ordered_proxy_urls(nodes, preferred_proxy_id)[0]
+        return ProxyManager.ordered_proxy_urls(nodes, preferred_proxy_id, exchange=exchange)[0]
 
     @staticmethod
     def ordered_proxy_urls(
         nodes: Sequence[ProxyNode],
         preferred_proxy_id: Optional[int] = None,
+        exchange: Optional[str] = None,
     ) -> list[Optional[str]]:
         enabled = [n for n in nodes if n.is_enabled]
         ordered: list[Optional[str]] = []
@@ -78,10 +93,10 @@ class ProxyManager:
         for n in healthy:
             if n.url not in ordered:
                 ordered.append(n.url)
-        if get_settings().allow_direct_egress:
+        if ProxyManager._direct_egress_allowed(exchange):
             ordered.append(None)
         if not ordered:
-            raise ProxyEgressError("No healthy enabled proxy is available and direct egress is disabled")
+            raise ProxyEgressError("No healthy enabled proxy is available and direct egress is disabled by egress policy")
         return ordered
 
     @classmethod

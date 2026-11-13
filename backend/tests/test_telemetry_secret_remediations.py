@@ -84,6 +84,9 @@ async def test_account_test_redacts_credentials_before_error_truncation(telemetr
     assert "@" not in error[:480]
     adapter = Mock(test_connection=AsyncMock(side_effect=RuntimeError(error)))
     monkeypatch.setattr("app.api.accounts.create_exchange_adapter", lambda **_: adapter)
+    async with get_session_factory()() as db:
+        db.add(ProxyNode(name="synthetic", url="http://proxy.invalid:8080", is_enabled=True, is_healthy=True))
+        await db.commit()
     response = await client.post(f"/api/accounts/{account_id}/test")
     assert response.status_code == 200
     assert_masked(response.json())

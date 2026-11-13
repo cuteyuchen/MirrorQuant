@@ -187,7 +187,7 @@ async def analyze_lead_symbol(
 
     proxies = list((await db.scalars(select(ProxyNode).order_by(ProxyNode.priority))).all())
     try:
-        proxy_url = ProxyManager.select_proxy_url(proxies, lead.proxy_id)
+        proxy_url = ProxyManager.select_proxy_url(proxies, lead.proxy_id, exchange=orchestrator.pa_analyzer.exchange)
     except ProxyEgressError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 

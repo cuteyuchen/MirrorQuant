@@ -53,7 +53,8 @@ async def management_state(monkeypatch):
     async with factory() as db:
         admin = User(username="role_admin", password_hash="unused", role="admin")
         viewer = User(username="role_viewer", password_hash="unused", role="viewer")
-        proxy = ProxyNode(name="proxy", url="http://proxy.invalid:8080", is_enabled=False)
+        # Offline Binance adapters still require an eligible egress route.
+        proxy = ProxyNode(name="proxy", url="http://proxy.invalid:8080", is_enabled=True, is_healthy=True)
         lead = LeadSource(name="lead", portfolio_id="portfolio", is_enabled=False)
         free_lead = LeadSource(name="free-lead", portfolio_id="free-portfolio", is_enabled=False)
         account = TradingAccount(

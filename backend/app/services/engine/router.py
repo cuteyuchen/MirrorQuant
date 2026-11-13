@@ -612,7 +612,7 @@ class CopyRouter:
                 adapter = create_exchange_adapter(exchange=account.exchange,
                     credentials=self.vault.decrypt_dict(account.encrypted_credentials),
                     environment=account.environment,
-                    proxy_url=ProxyManager.select_proxy_url(proxies, account.proxy_id),
+                    proxy_url=ProxyManager.select_proxy_url(proxies, account.proxy_id, exchange=account.exchange),
                     margin_mode=account.margin_mode, position_mode=account.position_mode)
                 adapter._time_offset_ms = int(account.clock_offset_ms or 0)
                 await db.commit()

@@ -129,7 +129,7 @@ class OrderResult:
 
 
 class BaseExchangeAdapter(ABC):
-    exchange: str = "base"
+    exchange: ClassVar[str] = "base"
     # Shared by all clients/accounts in this worker because public limits can be IP-wide.
     _rate_limit_until: ClassVar[Dict[str, float]] = {}
 
