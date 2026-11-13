@@ -25,10 +25,10 @@ from app.core.security import (
     create_access_token,
     create_captcha_challenge,
     generate_totp_secret,
-    hash_password,
+    hash_password_async,
     totp_qr_svg_data_uri,
     verify_captcha_token,
-    verify_password,
+    verify_password_async,
     verify_totp_code,
 )
 from app.models.domain import LoginAttemptGuard, SystemConfig, User
@@ -247,7 +247,7 @@ async def setup_admin(
         )
     user = User(
         username=payload.username.strip(),
-        password_hash=hash_password(payload.password),
+        password_hash=await hash_password_async(payload.password),
         role="admin",
         is_active=True,
         last_login_at=_utcnow(),
@@ -309,7 +309,7 @@ async def login(
         ip_guard.fail_count if ip_guard else 0,
         user_guard.fail_count if user_guard else 0,
     )
-    if prior_fails >= 3:
+    if prior_fails >= 3 or payload.captcha_token is not None or payload.captcha_answer is not None:
         if not payload.captcha_token or payload.captcha_answer is None or not str(payload.captcha_answer).strip():
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -348,7 +348,7 @@ async def login(
 
     # 3. Verify credentials
     user = await db.scalar(select(User).where(User.username == username))
-    if not user or not verify_password(payload.password, user.password_hash):
+    if not user or not await verify_password_async(payload.password, user.password_hash):
         fails, lock_sec = await _record_login_failure(
             db, request, client_ip, username, "Invalid credentials"
         )
@@ -478,9 +478,9 @@ async def change_password(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    if not verify_password(payload.current_password, current_user.password_hash):
+    if not await verify_password_async(payload.current_password, current_user.password_hash):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Current password incorrect")
-    current_user.password_hash = hash_password(payload.new_password)
+    current_user.password_hash = await hash_password_async(payload.new_password)
     await _revoke_sessions(db, current_user)
     await record_audit(db, "CHANGE_PASSWORD", "user", str(current_user.id), "Password rotated", current_user, request)
     await db.commit()
@@ -496,7 +496,7 @@ async def setup_totp(
 ):
     if current_user.totp_enabled:
         raise HTTPException(status_code=400, detail="Existing 2FA must be disabled with current code before re-enrolling")
-    if not verify_password(payload.current_password, current_user.password_hash):
+    if not await verify_password_async(payload.current_password, current_user.password_hash):
         raise HTTPException(status_code=400, detail="Current password incorrect")
     secret = generate_totp_secret()
     vault = CredentialVault()
@@ -563,7 +563,7 @@ async def disable_totp(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    if not verify_password(payload.current_password, current_user.password_hash):
+    if not await verify_password_async(payload.current_password, current_user.password_hash):
         raise HTTPException(status_code=400, detail="Current password incorrect")
     if current_user.totp_enabled:
         if not current_user.totp_secret_enc or not payload.code or not payload.code.strip():

@@ -120,7 +120,7 @@ pip install -r requirements.txt
 pytest -v tests/
 
 # Start FastAPI server (auto-reload)
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --no-proxy-headers
 ```
 
 ### Frontend (Node 20+ / Vue 3 + Vite)
@@ -150,10 +150,13 @@ npm run build
 | `MQ_JWT_SECRET` | *(auto-generated)* | HS256 secret for HttpOnly JWT cookies |
 | `MQ_BOOTSTRAP_TOKEN` | *(required for initial setup)* | Private random token of at least 32 characters authorizing the first administrator |
 | `MQ_CORS_ORIGINS` | *(local console origins)* | Exact allowed HTTP/WebSocket origins; add the deployed console's HTTPS origin |
+| `MQ_TRUSTED_PROXY_CIDRS` | `127.0.0.0/8,::1/128` | Comma-separated CIDRs allowed to forward client IPs; Compose additionally trusts its fixed Nginx address `172.30.0.3/32` |
 | `MQ_ENABLE_BACKGROUND_ENGINE` | `true` | Enable background lead polling & copy routing loop |
 | `MQ_COOKIE_SECURE` | `false` | Set `true` when serving strictly over HTTPS |
 
 Password changes, logout, and 2FA changes invalidate all existing sessions, including WebSockets. Existing pre-upgrade access tokens also require signing in again. 2FA enrollment requires the current password, expires after ten minutes, and cannot replace an active factor until it has been disabled with its current code. Back up database and vault keys together; startup refuses unreadable credentials. Existing installations using a non-base64 master-key string need a deliberate key migration before upgrading.
+
+Run Uvicorn with `--no-proxy-headers` so the application can validate the actual socket peer against `MQ_TRUSTED_PROXY_CIDRS`. The supplied Nginx configuration replaces incoming forwarded IP headers with its socket peer and strips `CF-Connecting-IP`. Compose reserves `172.30.0.0/24` for its network; deployments using another subnet must update both the Nginx address and its trusted CIDR together. Password hashing and verification run off the event loop. CAPTCHA challenges expire after 120 seconds and are consumed atomically on verification, including incorrect answers. Their bounded cache belongs to the single deployed Uvicorn worker; a restart invalidates pending challenges. Multiple workers require a shared nonce cache or routing each challenge and its verification to the same worker.
 
 ---
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from ipaddress import ip_address, ip_network
 from typing import Optional
 
 from fastapi import Depends, HTTPException, Request, status
@@ -13,23 +14,38 @@ from app.models.domain import AuditLog, User
 
 
 def extract_client_ip(request: Optional[Request]) -> str:
-    """Extract real client IP safely behind Nginx/Cloudflare reverse proxy."""
+    """Honor forwarded addresses only across explicitly trusted proxy hops."""
     if not request:
         return "unknown"
-    cf_ip = (request.headers.get("CF-Connecting-IP") or "").strip()
-    if cf_ip:
-        return cf_ip[:64]
-    real_ip = (request.headers.get("X-Real-IP") or "").strip()
-    if real_ip:
-        return real_ip[:64]
-    fwd = (request.headers.get("X-Forwarded-For") or "").strip()
-    if fwd:
-        first_hop = fwd.split(",")[0].strip()
-        if first_hop:
-            return first_hop[:64]
-    if request.client and request.client.host:
-        return request.client.host[:64]
-    return "unknown"
+    peer = request.client.host if request.client and request.client.host else "unknown"
+    try:
+        address = ip_address(peer)
+    except ValueError:
+        return peer[:64]
+    trusted = [ip_network(cidr) for cidr in get_settings().trusted_proxy_cidrs]
+    if not any(address in network for network in trusted):
+        return str(address)
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        try:
+            hops = [ip_address(hop.strip()) for hop in forwarded.split(",")]
+        except ValueError:
+            return str(address)
+        # Walk from the socket peer toward the client. A client-supplied prefix
+        # must never override the first untrusted hop appended by our proxy.
+        for hop in reversed(hops):
+            if not any(address in network for network in trusted):
+                break
+            address = hop
+        return str(address)
+    for header in ("X-Real-IP", "CF-Connecting-IP"):
+        value = request.headers.get(header)
+        if value:
+            try:
+                return str(ip_address(value.strip()))
+            except ValueError:
+                return str(address)
+    return str(address)
 
 
 def extract_token_from_request(request: Request) -> Optional[str]:

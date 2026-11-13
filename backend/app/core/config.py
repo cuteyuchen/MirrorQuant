@@ -7,6 +7,7 @@ import os
 import secrets
 import stat
 from functools import lru_cache
+from ipaddress import ip_network
 from pathlib import Path
 from typing import Annotated, Callable, List, Optional
 
@@ -74,6 +75,7 @@ class Settings(BaseSettings):
     cookie_name: str = "mq_access_token"
     cookie_secure: bool = False
     access_token_expire_minutes: int = 1440
+    trusted_proxy_cidrs: Annotated[List[str], NoDecode] = ["127.0.0.0/8", "::1/128"]
 
     cors_origins: Annotated[List[str], NoDecode] = [
         "http://localhost:5173",
@@ -97,6 +99,13 @@ class Settings(BaseSettings):
                 return json.loads(v)
             return [x.strip() for x in v.split(",") if x.strip()]
         return v
+
+    @field_validator("trusted_proxy_cidrs", mode="before")
+    @classmethod
+    def _parse_trusted_proxies(cls, value):
+        if isinstance(value, str):
+            value = json.loads(value) if value.lstrip().startswith("[") else value.split(",")
+        return [str(ip_network(cidr.strip(), strict=False)) for cidr in value if cidr.strip()]
 
     @field_validator("bootstrap_token")
     @classmethod

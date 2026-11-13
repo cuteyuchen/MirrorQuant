@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -8,6 +9,7 @@ import json
 import os
 import secrets
 import struct
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
@@ -33,6 +35,14 @@ def verify_password(password: str, password_hash: str) -> bool:
         return _ph.verify(password_hash, password)
     except (VerifyMismatchError, InvalidHashError):
         return False
+
+
+async def hash_password_async(password: str) -> str:
+    return await asyncio.to_thread(hash_password, password)
+
+
+async def verify_password_async(password: str, password_hash: str) -> bool:
+    return await asyncio.to_thread(verify_password, password, password_hash)
 
 
 def _derive_aes_key(master_key: str) -> bytes:
@@ -217,11 +227,44 @@ def verify_totp_code(secret: str, code: str, window: int = 1, now_ts: Optional[i
 
 
 # ---------------------------------------------------------------------------
-# Local SVG Math/Alphanumeric Captcha (signed short-lived JWT)
+# Local SVG Math/Alphanumeric Captcha (signed single-use challenge)
 # ---------------------------------------------------------------------------
 
-def create_captcha_challenge(expires_minutes: int = 5) -> Dict[str, str]:
-    """Generate an SVG math challenge + signed token (no external service needed)."""
+class _CaptchaNonceCache:
+    """Bounded, atomic cache for the deployed single Uvicorn worker.
+
+    Restarting discards outstanding challenges. Multiple workers must share a
+    nonce store or route both challenge and verification to the same worker.
+    """
+
+    def __init__(self, max_entries: int = 4096):
+        self._entries: Dict[str, tuple[float, str]] = {}
+        self._lock = threading.Lock()
+        self._max_entries = max_entries
+
+    def store(self, nonce: str, digest: str, ttl_sec: float) -> None:
+        now = time.monotonic()
+        with self._lock:
+            expired = [key for key, (expiry, _) in self._entries.items() if expiry <= now]
+            for key in expired:
+                del self._entries[key]
+            while len(self._entries) >= self._max_entries:
+                del self._entries[next(iter(self._entries))]
+            self._entries[nonce] = (now + ttl_sec, digest)
+
+    def consume(self, nonce: str) -> Optional[str]:
+        with self._lock:
+            entry = self._entries.pop(nonce, None)
+        if entry is None or entry[0] <= time.monotonic():
+            return None
+        return entry[1]
+
+
+_captcha_nonces = _CaptchaNonceCache()
+
+
+def create_captcha_challenge(expires_minutes: int = 2) -> Dict[str, str]:
+    """Generate an SVG challenge whose server-side nonce is consumed on use."""
     a = secrets.randbelow(18) + 2
     b = secrets.randbelow(9) + 1
     op = "+" if secrets.randbelow(2) == 0 else "-"
@@ -230,7 +273,7 @@ def create_captcha_challenge(expires_minutes: int = 5) -> Dict[str, str]:
     answer = str(a + b if op == "+" else a - b)
     prompt = f"{a} {op} {b} = ?"
 
-    nonce = secrets.token_hex(8)
+    nonce = secrets.token_hex(24)
     settings = get_settings()
     answer_digest = hashlib.sha256(f"{nonce}:{answer}".encode("utf-8")).hexdigest()
     now = datetime.now(timezone.utc)
@@ -238,13 +281,13 @@ def create_captcha_challenge(expires_minutes: int = 5) -> Dict[str, str]:
         {
             "typ": "mq_captcha",
             "nonce": nonce,
-            "digest": answer_digest,
             "iat": int(now.timestamp()),
             "exp": int((now + timedelta(minutes=expires_minutes)).timestamp()),
         },
         settings.resolved_jwt_secret(),
         algorithm="HS256",
     )
+    _captcha_nonces.store(nonce, answer_digest, expires_minutes * 60)
 
     # Render clean SVG with subtle noise lines so bots cannot trivially parse
     x1, y1 = 10 + secrets.randbelow(20), 10 + secrets.randbelow(24)
@@ -270,10 +313,7 @@ def create_captcha_challenge(expires_minutes: int = 5) -> Dict[str, str]:
 
 
 def verify_captcha_token(token: Optional[str], answer: Optional[str]) -> bool:
-    if not token or answer is None:
-        return False
-    clean_answer = str(answer).strip()
-    if not clean_answer:
+    if not token:
         return False
     settings = get_settings()
     try:
@@ -281,12 +321,18 @@ def verify_captcha_token(token: Optional[str], answer: Optional[str]) -> bool:
             token,
             settings.resolved_jwt_secret(),
             algorithms=["HS256"],
+            options={"require": ["exp", "iat", "nonce", "typ"]},
         )
     except jwt.PyJWTError:
         return False
     if payload.get("typ") != "mq_captcha":
         return False
-    nonce = payload.get("nonce") or ""
-    expected_digest = payload.get("digest") or ""
+    nonce = payload.get("nonce")
+    if not isinstance(nonce, str) or not nonce:
+        return False
+    expected_digest = _captcha_nonces.consume(nonce)
+    clean_answer = str(answer).strip() if answer is not None else ""
+    if expected_digest is None or not clean_answer:
+        return False
     actual_digest = hashlib.sha256(f"{nonce}:{clean_answer}".encode("utf-8")).hexdigest()
     return hmac.compare_digest(expected_digest, actual_digest)
