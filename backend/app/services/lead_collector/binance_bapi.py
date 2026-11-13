@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import math
 import time
 from collections import defaultdict
@@ -28,6 +29,43 @@ BUSY_CODE = "11012005"
 BATCH_GAP_MS = 30 * 60 * 1000
 STORE_MAX = 6000
 BRACKET_TTL_S = 6 * 3600
+logger = logging.getLogger("mirrorquant.binance_bapi")
+
+
+def describe_exception(exc: Optional[BaseException], response: Optional[httpx.Response] = None) -> str:
+    """Keep empty transport errors diagnosable without exposing proxy userinfo."""
+    cause = exc
+    seen = set()
+    while response is None and cause is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        response = getattr(cause, "response", None)
+        cause = cause.__cause__
+    status = getattr(response, "status_code", None)
+    request_id = None
+    if response is not None:
+        for header in ("x-mbx-request-id", "x-request-id", "x-amzn-requestid"):
+            value = response.headers.get(header)
+            if isinstance(value, str) and value:
+                request_id = value
+                break
+    message = str(exc).strip() if exc is not None else ""
+    return redact_proxy_userinfo(
+        f"{type(exc).__name__} status={status} reqid={request_id} {message or '(empty message)'}"
+    )
+
+
+class BapiBusyError(RuntimeError):
+    pass
+
+
+def is_retryable_exception(exc: BaseException) -> bool:
+    """Inspect the cause of a wrapped request error, including its HTTP status."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        return status == 429 or 500 <= status < 600
+    if isinstance(exc, (httpx.TransportError, BapiBusyError)):
+        return True
+    return exc.__cause__ is not None and is_retryable_exception(exc.__cause__)
 
 
 def fnum(val: Any) -> Optional[float]:
@@ -286,6 +324,8 @@ def normalize_holdings(holdings: Sequence[Dict[str, Any]]) -> List[Dict[str, Any
 def is_authoritative_snapshot(snapshot: Dict[str, Any], now_ms: Optional[int] = None, max_age_ms: int = 30000) -> bool:
     """UNKNOWN, hidden, derived and stale holdings can never authorize financial actions."""
     meta = snapshot.get("openPositionsMeta") or {}
+    if meta.get("partial") is True or (snapshot.get("meta") or {}).get("detailOk") is False:
+        return False
     if meta.get("source") != "api" or meta.get("complete") is not True or meta.get("authoritative") is not True or meta.get("positionShow") is not True:
         return False
     observed = meta.get("asOf")
@@ -514,31 +554,39 @@ class BinanceBapiCollector(BaseLeadCollector):
     ) -> Any:
         headers = self._headers(portfolio_id, time_range)
         last_err: Optional[Exception] = None
+        last_response = None
         async with ProxyManager.build_client(
             proxy_url=proxy_url, timeout=timeout, headers=headers, exchange=self.exchange,
         ) as client:
             for attempt in range(retries):
+                last_response = None
                 try:
                     if body is not None:
                         resp = await client.post(url, json=body)
                     else:
                         resp = await client.get(url)
+                    last_response = resp
                     if resp.status_code != 200:
-                        raise RuntimeError(f"HTTP {resp.status_code}: {redact_proxy_userinfo(resp.text)[:160]}")
+                        raise httpx.HTTPStatusError(
+                            f"HTTP {resp.status_code}: {redact_proxy_userinfo(resp.text)[:160]}",
+                            request=None, response=resp,
+                        )
                     payload = resp.json()
                     code = payload.get("code")
                     if code == BUSY_CODE:
-                        last_err = RuntimeError(f"bapi busy {BUSY_CODE}")
-                        await asyncio.sleep(min(0.8 * (attempt + 1), 6.0))
-                        continue
+                        raise BapiBusyError(f"bapi busy {BUSY_CODE}")
                     if code not in ("000000", None) or payload.get("data") is None:
                         raise RuntimeError(f"bapi code={code} msg={payload.get('message')}")
                     return payload["data"]
                 except Exception as exc:
                     last_err = exc
+                    if not is_retryable_exception(exc):
+                        break
                     if attempt + 1 < retries:
                         await asyncio.sleep(min(0.8 * (attempt + 1), 5.0))
-        raise RuntimeError(f"Binance bapi failed ({url}): {last_err}")
+        raise RuntimeError(
+            f"Binance bapi failed ({redact_proxy_userinfo(url)}): {describe_exception(last_err, last_response)}"
+        ) from last_err
 
     async def _fapi_get(
         self,
@@ -549,28 +597,43 @@ class BinanceBapiCollector(BaseLeadCollector):
     ) -> Any:
         urls = [f"{FAPI_PRIMARY}{path_and_query}", f"{FAPI_FALLBACK}{path_and_query}"]
         last_err: Optional[Exception] = None
+        last_response = None
         async with ProxyManager.build_client(
             proxy_url=proxy_url, timeout=timeout, exchange=self.exchange,
         ) as client:
             for attempt in range(retries):
+                last_response = None
                 target = urls[attempt % len(urls)] if attempt >= 2 else urls[0]
                 try:
                     resp = await client.get(target)
+                    last_response = resp
                     if resp.status_code != 200:
-                        raise RuntimeError(f"HTTP {resp.status_code}")
+                        raise httpx.HTTPStatusError(f"HTTP {resp.status_code}", request=None, response=resp)
                     return resp.json()
                 except Exception as exc:
                     last_err = exc
+                    if not is_retryable_exception(exc):
+                        break
                     if attempt + 1 < retries:
                         await asyncio.sleep(0.3 * (attempt + 1))
-        raise RuntimeError(f"fapi request failed ({path_and_query}): {last_err}")
+        raise RuntimeError(
+            f"fapi request failed ({redact_proxy_userinfo(path_and_query)}): {describe_exception(last_err, last_response)}"
+        ) from last_err
 
     async def fetch_detail(self, portfolio_id: str, proxy_url: Optional[str] = None) -> Dict[str, Any]:
-        return await self._http_json(
-            f"{FRIENDLY_COPY}/lead-portfolio/detail?portfolioId={quote(portfolio_id)}",
-            portfolio_id=portfolio_id,
-            proxy_url=proxy_url,
-        )
+        # An independent retry budget avoids multiplying the generic HTTP retries.
+        for attempt in range(3):
+            try:
+                return await self._http_json(
+                    f"{FRIENDLY_COPY}/lead-portfolio/detail?portfolioId={quote(portfolio_id)}",
+                    portfolio_id=portfolio_id,
+                    proxy_url=proxy_url,
+                    retries=1,
+                )
+            except Exception as exc:
+                if attempt == 2 or not is_retryable_exception(exc):
+                    raise
+                await asyncio.sleep(min(0.5 * 2 ** attempt, 4.0))
 
     async def fetch_order_history(
         self,
@@ -870,36 +933,45 @@ class BinanceBapiCollector(BaseLeadCollector):
         full_sweep: bool = False,
         with_analysis: bool = True,
         closed_history: Optional[List[Dict[str, Any]]] = None,
+        previous_snapshot: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         t0 = time.perf_counter()
-        detail = await self.fetch_detail(portfolio_id, proxy_url=proxy_url)
+        detail_ok = True
+        detail_error = None
+        previous_profile = dict((previous_snapshot or {}).get("profile") or {})
+        try:
+            detail = await self.fetch_detail(portfolio_id, proxy_url=proxy_url)
+        except Exception as exc:
+            detail_ok = False
+            detail_error = describe_exception(exc)
+            detail = dict(previous_profile)
+            if detail.get("positionShow") is None:
+                detail["positionShow"] = False
+            logger.warning("Lead portfolio %s detail degraded: %s", portfolio_id, detail_error)
         added = await self.sync_orders_into_store(
             portfolio_id, orders_store, full_sweep=full_sweep, proxy_url=proxy_url,
             history_max_pages=STORE_MAX // 100 + 1 if closed_history is not None else 25,
             require_complete=closed_history is not None,
         )
 
-        # Fetch closed positions for reconciliation (fallback to closed_cache on failure)
+        # History failures must reach the orchestrator's failure/alert handling.
         closed_rows = list(closed_cache)
         closed_total = None
         closed_history_complete = False
-        try:
-            ph1 = {"list": closed_history, "total": len(closed_history)} if closed_history is not None else await self.fetch_position_history(
-                portfolio_id, page_number=1, page_size=100, proxy_url=proxy_url
-            )
-            lst = (ph1 or {}).get("list") or []
-            closed_total = (ph1 or {}).get("total")
-            closed_history_complete = closed_total is not None and int(closed_total) <= len(lst)
-            if lst:
-                seen_c: Dict[Tuple[str, Any], Dict[str, Any]] = {}
-                for p in lst:
-                    seen_c[(str(p.get("positionId")), p.get("opened"))] = p
-                closed_rows = [slim_closed_position(p) for p in seen_c.values()]
-                closed_rows.sort(key=lambda x: x.get("closed") or 0, reverse=True)
-                if closed_history is None:
-                    closed_rows = closed_rows[:80]
-        except Exception:
-            pass
+        ph1 = {"list": closed_history, "total": len(closed_history)} if closed_history is not None else await self.fetch_position_history(
+            portfolio_id, page_number=1, page_size=100, proxy_url=proxy_url
+        )
+        lst = (ph1 or {}).get("list") or []
+        closed_total = (ph1 or {}).get("total")
+        closed_history_complete = closed_total is not None and int(closed_total) <= len(lst)
+        if lst:
+            seen_c: Dict[Tuple[str, Any], Dict[str, Any]] = {}
+            for p in lst:
+                seen_c[(str(p.get("positionId")), p.get("opened"))] = p
+            closed_rows = [slim_closed_position(p) for p in seen_c.values()]
+            closed_rows.sort(key=lambda x: x.get("closed") or 0, reverse=True)
+            if closed_history is None:
+                closed_rows = closed_rows[:80]
 
         # Holdings must be freshly observed; a cached/failed response is UNKNOWN,
         # never a fabricated empty position set. Historical reconstruction is display-only.
@@ -914,9 +986,9 @@ class BinanceBapiCollector(BaseLeadCollector):
                 holdings = await self.fetch_holdings(portfolio_id, proxy_url=proxy_url)
                 open_positions = normalize_holdings(holdings)
                 holdings_observed_ms = int(time.time() * 1000)
-                authoritative = True
+                authoritative = detail_ok
             except Exception as exc:
-                holdings_error = redact_proxy_userinfo(str(exc))[:240]
+                holdings_error = describe_exception(exc)[:240]
 
         # Optional dashboard requests cannot delay the execution collector.
         cached_perf = self._perf_cache.get(portfolio_id)
@@ -1084,7 +1156,7 @@ class BinanceBapiCollector(BaseLeadCollector):
         if detail.get("signTradFi") and "TradFi" not in tags:
             tags = ["TradFi", *tags]
 
-        return {
+        snapshot = {
             "meta": {
                 "generatedAt": now_ms,
                 "priceUpdatedAt": max((p.get("priceTime") or 0 for p in open_positions), default=now_ms) or now_ms,
@@ -1095,6 +1167,8 @@ class BinanceBapiCollector(BaseLeadCollector):
                 "ordersAddedThisRound": added,
                 "fullSweep": full_sweep,
                 "closedHistoryComplete": closed_history_complete,
+                "detailOk": detail_ok,
+                "detailError": detail_error,
             },
             "profile": {
                 "nickname": detail.get("nickname"),
@@ -1132,7 +1206,8 @@ class BinanceBapiCollector(BaseLeadCollector):
                 "asOf": holdings_observed_ms,
                 "complete": authoritative,
                 "authoritative": authoritative,
-                "error": holdings_error,
+                "partial": not detail_ok,
+                "error": holdings_error or detail_error,
             },
             "openPositionsSummary": {
                 "positionCount": len(open_positions),
@@ -1165,3 +1240,10 @@ class BinanceBapiCollector(BaseLeadCollector):
             "closed": closed_rows,
             "closedTotal": closed_total,
         }
+        if not detail_ok:
+            snapshot["profile"] = {**previous_profile, "positionShow": detail.get("positionShow")}
+        if margin_balance is None:
+            for field in ("totalNotionalLeverage", "entryLeverage", "maxPositionLeverage",
+                          "estMaintenanceMarginRatioPct", "totalMarginRoePct"):
+                snapshot["openPositionsSummary"][field] = None
+        return snapshot

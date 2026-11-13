@@ -9,14 +9,14 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
 
 from fastapi import WebSocket
-from sqlalchemy import select
+from sqlalchemy import JSON, cast, select, type_coerce
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import DEFAULT_SYSTEM_CONFIG, get_session_factory
 from app.core.config import get_settings
 from app.core.security import CredentialVault
 from app.core.secret_mask import mask_sensitive_payload, redact_proxy_userinfo
-from app.models.domain import CopyBinding, LeadSource, ProxyNode, TradingAccount
+from app.models.domain import CopyBinding, LeadSource, NotificationOutbox, ProxyNode, TradingAccount
 from app.services.adapters.factory import create_exchange_adapter
 from app.services.analysis.pa_analyzer import PAAnalyzer
 from app.services.engine.router import CopyRouter
@@ -24,13 +24,17 @@ from app.services.engine.risk import RiskEngine
 from app.services.engine.serialization import serialized_execution
 from app.services.engine.sizer import exact
 from app.services.lead_collector.binance_bapi import (
-    BinanceBapiCollector, STORE_MAX, check_source_fill_update, is_authoritative_snapshot, validate_source_fill,
+    BinanceBapiCollector, STORE_MAX, check_source_fill_update, describe_exception,
+    is_authoritative_snapshot, validate_source_fill,
 )
 from app.services.lead_collector.freshness import lead_freshness
 from app.services.notifier.outbox import enqueue_notification
 from app.services.proxy.manager import ProxyEgressError, ProxyManager
 
 logger = logging.getLogger("mirrorquant.orchestrator")
+SYNC_FAILURE_FIELDS = (
+    "consecutiveSyncFailures", "firstSyncFailureAtMs", "lastFailureStartedAtMs", "syncFailureNotified",
+)
 
 
 class WebSocketHub:
@@ -88,6 +92,7 @@ class EngineOrchestrator:
         self._last_account_poll: Dict[int, float] = {}
         self._last_clock_sync: Dict[int, float] = {}
         self._last_reconcile: Dict[int, float] = {}
+        self._last_unverified_logged: Dict[int, str] = {}
 
     async def start(self) -> None:
         if self._running:
@@ -263,11 +268,12 @@ class EngineOrchestrator:
                 proxies, preferred_proxy_id=lead.proxy_id, exchange=self.collector.exchange,
             )
         except ProxyEgressError as exc:
-            error = str(exc)
+            error = describe_exception(exc)
             published = await self._record_lead_sync_failure(db, lead, started_ms, error)
             return {"ok": False, "error": error, "superseded": not published}
         orders_store = json.loads(lead.orders_store_json or "{}")
         closed_cache = json.loads(lead.closed_cache_json or "[]")
+        previous_snapshot = json.loads(lead.snapshot_json or "{}")
         full_sweep = (time.time() - self._last_full_sweep.get(lead.id, 0.0)) > 600 or len(orders_store) < 100
 
         snapshot: Optional[Dict[str, Any]] = None
@@ -282,6 +288,7 @@ class EngineOrchestrator:
                         proxy_url=p_url,
                         full_sweep=full_sweep,
                         with_analysis=False,
+                        previous_snapshot=previous_snapshot,
                     ),
                     timeout=30.0,
                 )
@@ -290,7 +297,7 @@ class EngineOrchestrator:
                 last_err = exc
 
         if snapshot is None:
-            error = redact_proxy_userinfo(str(last_err))[:480] if last_err else "Sync failed"
+            error = describe_exception(last_err)[:480]
             published = await self._record_lead_sync_failure(db, lead, started_ms, error)
             return {"ok": False, "error": error, "superseded": not published}
 
@@ -301,6 +308,7 @@ class EngineOrchestrator:
             return {"ok": True, "superseded": True}
 
         if is_authoritative_snapshot(snapshot):
+            self._last_unverified_logged[lead.id] = "verified"
             await self.router.process_lead_events(
                 db=db,
                 lead=lead,
@@ -310,7 +318,9 @@ class EngineOrchestrator:
                 proxies=proxies,
             )
         else:
-            logger.warning("Lead %s snapshot is unverified; financial routing deferred", lead.id)
+            log = logger.debug if self._last_unverified_logged.get(lead.id) == "unverified" else logger.warning
+            log("Lead %s snapshot is unverified; financial routing deferred", lead.id)
+            self._last_unverified_logged[lead.id] = "unverified"
 
         await self.ws_hub.broadcast(
             {
@@ -334,6 +344,8 @@ class EngineOrchestrator:
         current = json.loads(lead.snapshot_json or "{}")
         if started_ms <= ((current.get("meta") or {}).get("storeRebuiltAtMs") or 0):
             return False
+        if started_ms < ((current.get("meta") or {}).get("collectionStartedAtMs") or 0):
+            return False
         meta = current.setdefault("openPositionsMeta", {})
         if (meta.get("lastFailureStartedAtMs") or 0) >= started_ms:
             return False
@@ -346,12 +358,27 @@ class EngineOrchestrator:
         settings = get_settings()
         overdue = age is None or age > settings.lead_snapshot_stale_sec
         exhausted = failures >= settings.lead_sync_failure_limit
-        logger.error("Lead %s sync failed; consecutiveFailures=%s snapshotAgeSec=%s", lead.id, failures, age)
+        error = redact_proxy_userinfo(error).strip() or "Sync failed (empty message)"
+        log = logger.error if failures in (1, settings.lead_sync_failure_limit) else logger.debug
+        log("Lead %s sync failed; consecutiveFailures=%s snapshotAgeSec=%s: %s", lead.id, failures, age, error)
         if (overdue or exhausted) and not meta.get("syncFailureNotified"):
-            config = await self.router._get_config(db, "notifications", DEFAULT_SYSTEM_CONFIG["notifications"])
-            enqueue_notification(db, config, "Lead snapshot stale / sync failure",
-                                 f"Lead {lead.id}: consecutiveFailures={failures}, snapshotAgeSec={age}. "
-                                 "Snapshot is unverified; check lead sync health.", event_type="error")
+            event_key = f"lead-sync-failure:{lead.id}"
+            # SQLite's JSON accessor reads TEXT directly; Postgres needs a cast.
+            payload = (type_coerce(NotificationOutbox.payload, JSON) if db.get_bind().dialect.name == "sqlite"
+                       else cast(NotificationOutbox.payload, JSON))
+            latest = await db.scalar(select(NotificationOutbox).where(
+                payload["event_key"].as_string() == event_key,
+            ).order_by(NotificationOutbox.created_at.desc(), NotificationOutbox.id.desc()).limit(1))
+            recovered = latest is None or (
+                lead.last_sync_at is not None
+                and lead.last_sync_at.replace(tzinfo=timezone.utc) > latest.created_at.replace(tzinfo=timezone.utc)
+            )
+            if recovered:
+                config = await self.router._get_config(db, "notifications", DEFAULT_SYSTEM_CONFIG["notifications"])
+                enqueue_notification(db, config, "Lead snapshot stale / sync failure",
+                                     f"Lead {lead.id}: consecutiveFailures={failures}, snapshotAgeSec={age}. "
+                                     "Snapshot is unverified; check lead sync health.", event_type="error",
+                                     event_key=event_key)
             meta["syncFailureNotified"] = True
         lead.snapshot_json = json.dumps(current, separators=(",", ":"))
         lead.status = "error"
@@ -396,15 +423,32 @@ class EngineOrchestrator:
             snapshot["meta"]["storeRebuiltAtMs"] = current["meta"]["storeRebuiltAtMs"]
         if (current.get("meta") or {}).get("rebuildDigest"):
             snapshot["meta"]["rebuildDigest"] = current["meta"]["rebuildDigest"]
+        # Older callers omit detailOk; only an explicit degradation preserves the
+        # incident. New collector snapshots always carry this success marker.
+        partial = snapshot["meta"].get("detailOk") is False
+        incoming_meta = snapshot.setdefault("openPositionsMeta", {})
+        for field in SYNC_FAILURE_FIELDS:
+            incoming_meta.pop(field, None)
+            if partial and field in current_meta:
+                incoming_meta[field] = current_meta[field]
         profile = snapshot.get("profile") or {}
         lead.avatar_url = profile.get("avatarUrl") or lead.avatar_url
         lead.description = profile.get("description") or lead.description
         lead.position_show = profile.get("positionShow")
-        lead.margin_balance = float(profile.get("marginBalance") or 0.0)
-        lead.aum_amount = float(profile.get("aumAmount") or 0.0)
-        lead.last_trade_time = int(profile.get("lastTradeTime") or 0)
-        lead.last_sync_at = datetime.now(timezone.utc)
-        lead.last_error = None
+        if not partial or profile.get("marginBalance") is not None:
+            lead.margin_balance = float(profile.get("marginBalance") or 0.0)
+        if not partial or profile.get("aumAmount") is not None:
+            lead.aum_amount = float(profile.get("aumAmount") or 0.0)
+        if not partial or profile.get("lastTradeTime") is not None:
+            lead.last_trade_time = int(profile.get("lastTradeTime") or 0)
+        if partial:
+            reason = snapshot["meta"].get("detailError") or incoming_meta.get("error") or "detail unavailable"
+            lead.last_error = "degraded: " + redact_proxy_userinfo(str(reason))[:470]
+        else:
+            # last_sync_at records full recovery, so a partial publication cannot
+            # rearm an already delivered (or failed) outbox incident.
+            lead.last_sync_at = datetime.now(timezone.utc)
+            lead.last_error = None
         lead.status = "running"
 
         lead.orders_store_json = json.dumps(orders_store, separators=(",", ":"))

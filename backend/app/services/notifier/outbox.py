@@ -28,12 +28,14 @@ CLAIM_LEASE_SEC = 60.0
 
 
 def enqueue_notification(db, config: Dict[str, Any], title: str, message: str,
-                         event_type: str = "info", execution_id: Optional[int] = None) -> NotificationOutbox:
+                         event_type: str = "info", execution_id: Optional[int] = None,
+                         event_key: Optional[str] = None) -> NotificationOutbox:
     """Join the caller's transaction; never commit or start external I/O here."""
     row = NotificationOutbox(payload=json.dumps({
         "title": redact_proxy_userinfo(title),
         "message": redact_proxy_userinfo(message),
         "event_type": event_type,
+        "event_key": redact_proxy_userinfo(event_key) if event_key is not None else None,
         "execution_id": execution_id,
         "channels": [channel for channel in CHANNELS if config.get(f"{channel}_enabled")],
         "delivered_channels": [],

@@ -43,5 +43,6 @@ class BaseLeadCollector(ABC):
         proxy_url: Optional[str] = None,
         full_sweep: bool = False,
         with_analysis: bool = True,
+        previous_snapshot: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         raise NotImplementedError
