@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import DEFAULT_SYSTEM_CONFIG
 from app.core.security import CredentialVault
+from app.core.secret_mask import redact_proxy_userinfo
 from app.schemas.api import ResilienceSettings, RiskDefaults
 from app.models.domain import (
     BindingDebt,
@@ -413,6 +414,7 @@ class CopyRouter:
         details: str = "",
         notify_cfg: Optional[Dict[str, Any]] = None,
     ) -> ExecutionRecord:
+        details = redact_proxy_userinfo(details)
         rec = ExecutionRecord(
             binding_id=binding.id,
             lead_id=lead.id,
@@ -610,7 +612,7 @@ class CopyRouter:
                 adapter = create_exchange_adapter(exchange=account.exchange,
                     credentials=self.vault.decrypt_dict(account.encrypted_credentials),
                     environment=account.environment,
-                    proxy_url=ProxyManager.select_proxy_url(proxies, account.proxy_id) if account.proxy_id else None,
+                    proxy_url=ProxyManager.select_proxy_url(proxies, account.proxy_id),
                     margin_mode=account.margin_mode, position_mode=account.position_mode)
                 adapter._time_offset_ms = int(account.clock_offset_ms or 0)
                 await db.commit()
@@ -685,7 +687,7 @@ class CopyRouter:
                     await db.refresh(lead)
                     for stale_binding in bindings:
                         await db.refresh(stale_binding)
-                account.status, account.last_error = "error", str(exc)[:400]
+                account.status, account.last_error = "error", redact_proxy_userinfo(str(exc))[:400]
                 await db.commit()
 
     async def _execute_batch_for_binding(
@@ -1232,7 +1234,7 @@ class CopyRouter:
                 cur_px = book.bids[0][0] if pos.pos_side == "long" else book.asks[0][0]
             except Exception as exc:
                 account.status = "error"
-                account.last_error = f"Protective quote unavailable: {exc}"[:400]
+                account.last_error = redact_proxy_userinfo(f"Protective quote unavailable: {exc}")[:400]
                 binding.circuit_breaker_tripped = True
                 binding.circuit_breaker_reason = "Protective quote unavailable"
                 await db.commit()

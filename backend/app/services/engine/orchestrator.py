@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import DEFAULT_SYSTEM_CONFIG, get_session_factory
 from app.core.security import CredentialVault
-from app.core.secret_mask import mask_sensitive_payload
+from app.core.secret_mask import mask_sensitive_payload, redact_proxy_userinfo
 from app.models.domain import CopyBinding, LeadSource, ProxyNode, TradingAccount
 from app.services.adapters.factory import create_exchange_adapter
 from app.services.analysis.pa_analyzer import PAAnalyzer
@@ -23,7 +23,7 @@ from app.services.engine.risk import RiskEngine
 from app.services.engine.serialization import serialized_execution
 from app.services.engine.sizer import exact
 from app.services.lead_collector.binance_bapi import BinanceBapiCollector, STORE_MAX, is_authoritative_snapshot
-from app.services.proxy.manager import ProxyManager
+from app.services.proxy.manager import ProxyEgressError, ProxyManager
 
 logger = logging.getLogger("mirrorquant.orchestrator")
 
@@ -182,7 +182,7 @@ class EngineOrchestrator:
                     proxies = list((await db.scalars(select(ProxyNode).order_by(ProxyNode.priority))).all())
                     resilience_cfg = await self.router._get_config(db, "resilience", DEFAULT_SYSTEM_CONFIG["resilience"])
                     credentials = self.vault.decrypt_dict(account.encrypted_credentials)
-                    proxy_url = ProxyManager.select_proxy_url(proxies, account.proxy_id) if account.proxy_id is not None else None
+                    proxy_url = ProxyManager.select_proxy_url(proxies, account.proxy_id)
                     adapter = create_exchange_adapter(
                         exchange=account.exchange, credentials=credentials,
                         environment=account.environment, proxy_url=proxy_url,
@@ -253,7 +253,12 @@ class EngineOrchestrator:
         if proxies is None:
             proxies = list((await db.scalars(select(ProxyNode).order_by(ProxyNode.priority))).all())
 
-        proxy_urls = ProxyManager.ordered_proxy_urls(proxies, preferred_proxy_id=lead.proxy_id)
+        try:
+            proxy_urls = ProxyManager.ordered_proxy_urls(proxies, preferred_proxy_id=lead.proxy_id)
+        except ProxyEgressError as exc:
+            error = str(exc)
+            published = await self._record_lead_sync_failure(db, lead, started_ms, error)
+            return {"ok": False, "error": error, "superseded": not published}
         orders_store = json.loads(lead.orders_store_json or "{}")
         closed_cache = json.loads(lead.closed_cache_json or "[]")
         full_sweep = (time.time() - self._last_full_sweep.get(lead.id, 0.0)) > 600 or len(orders_store) < 100
@@ -278,7 +283,7 @@ class EngineOrchestrator:
                 last_err = exc
 
         if snapshot is None:
-            error = str(last_err)[:480] if last_err else "Sync failed"
+            error = redact_proxy_userinfo(str(last_err))[:480] if last_err else "Sync failed"
             published = await self._record_lead_sync_failure(db, lead, started_ms, error)
             return {"ok": False, "error": error, "superseded": not published}
 
@@ -326,7 +331,7 @@ class EngineOrchestrator:
         meta.update(authoritative=False, complete=False, lastFailureStartedAtMs=started_ms)
         lead.snapshot_json = json.dumps(current, separators=(",", ":"))
         lead.status = "error"
-        lead.last_error = error
+        lead.last_error = redact_proxy_userinfo(error)[:480]
         await db.commit()
         return True
 
@@ -390,11 +395,7 @@ class EngineOrchestrator:
             proxies = list((await db.scalars(select(ProxyNode).order_by(ProxyNode.priority))).all())
         try:
             creds = self.vault.decrypt_dict(account.encrypted_credentials)
-            proxy_url = (
-                ProxyManager.select_proxy_url(proxies, account.proxy_id)
-                if account.proxy_id is not None
-                else None
-            )
+            proxy_url = ProxyManager.select_proxy_url(proxies, account.proxy_id)
             adapter = create_exchange_adapter(
                 exchange=account.exchange,
                 credentials=creds,
@@ -442,7 +443,7 @@ class EngineOrchestrator:
             return {"ok": True, "usdtEquity": bal.eq, "positions": [p.to_dict() for p in positions]}
         except Exception as exc:
             account.status = "error"
-            account.last_error = str(exc)[:480]
+            account.last_error = redact_proxy_userinfo(str(exc))[:480]
             await db.commit()
             return {"ok": False, "error": account.last_error}
 
