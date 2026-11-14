@@ -247,10 +247,8 @@ class EngineOrchestrator:
         CopyRouter._refresh_day_start(account, balance.eq)
         account.usdt_equity = balance.eq
         account.avail_equity = balance.avail_eq
-        checks = (
-            RiskEngine.check_drawdown(account.hwm_equity, balance.eq, binding.max_drawdown_pct),
-            RiskEngine.check_daily_loss(account.day_start_equity, balance.eq, binding.daily_max_loss_pct),
-        )
+        RiskEngine.clear_disabled_loss_breaker(binding)
+        checks = RiskEngine.loss_breaker_checks(binding, account.hwm_equity, account.day_start_equity, balance.eq)
         for result in checks:
             if not result.allowed:
                 binding.circuit_breaker_tripped = True

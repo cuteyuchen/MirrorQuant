@@ -17,7 +17,7 @@ import { useSocketStore } from "@/stores/socket";
 import { useDataCacheStore } from "@/stores/dataCache";
 import { useI18n } from "@/i18n";
 import PositionCalculatorCard from "@/components/PositionCalculatorCard.vue";
-import { formatPrice, formatQty, formatUsd, formatPct } from "@/utils/format";
+import { formatDateTime, formatPrice, formatQty, formatUsd, formatPct } from "@/utils/format";
 import { getLeadAlignment } from "@/utils/alignment";
 
 defineOptions({ name: "DashboardView" });
@@ -139,12 +139,7 @@ function syncState(lead: any) {
 }
 
 function syncTime(value?: string) {
-  if (!value) return "—";
-  const date = new Date(value);
-  if (!Number.isFinite(date.getTime())) return "—";
-  return date.toLocaleString(isZh.value ? "zh-CN" : "en-US", {
-    month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
-  });
+  return formatDateTime(value, { short: true });
 }
 
 function statusBadge(status: string) {

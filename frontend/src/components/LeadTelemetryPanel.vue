@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import { useI18n } from "@/i18n";
-import { formatPrice as fmtPrice, formatQty, formatUsd, formatPct as fmtPct } from "@/utils/format";
+import { formatDateTime, formatPrice as fmtPrice, formatQty, formatUsd, formatPct as fmtPct } from "@/utils/format";
 import PositionCalculatorCard from "@/components/PositionCalculatorCard.vue";
 
 const props = defineProps<{
@@ -92,26 +92,11 @@ function fmtLev(v: number | null | undefined) {
 }
 
 function fmtTime(ms: number | null | undefined) {
-  if (!ms) return "—";
-  return new Date(ms).toLocaleString(isZh.value ? "zh-CN" : "en-US", {
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  });
+  return formatDateTime(ms, { short: true });
 }
 
 function fmtShortTime(ms: number | null | undefined) {
-  if (!ms) return "—";
-  return new Date(ms).toLocaleString(isZh.value ? "zh-CN" : "en-US", {
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  });
+  return formatDateTime(ms, { short: true, withSeconds: false });
 }
 
 function fmtAgo(ms: number | null | undefined) {

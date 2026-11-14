@@ -22,6 +22,19 @@ if (typeof document !== "undefined") {
 
 const messages: Record<Locale, Record<string, string>> = {
   "zh-CN": {
+    "app.beijingTime": "北京时间 (UTC+8)",
+    "set.loading": "正在加载设置...",
+    "set.loadError": "设置加载失败，请重试。",
+    "set.retry": "重试",
+    "risk.circuitBreaker": "回撤与日亏熔断保护",
+    "risk.leverageCap": "杠杆上限保护",
+    "risk.circuitDisabledHint": "已关闭熔断保护，订单将完全跟随带单员",
+    "risk.autoLeverageHint": "自动根据带单员比例适配最适杠杆",
+    "risk.zeroSkips": "阈值填 0 可跳过对应限制。",
+    "risk.circuitOn": "熔断保护开启",
+    "risk.circuitOff": "熔断保护关闭",
+    "risk.capOn": "杠杆上限开启",
+    "risk.autoLeverage": "自动杠杆",
     // App & Nav
     "app.brandSub": "v1.0 · 量化跟单终端",
     "nav.dashboard": "总览大盘",
@@ -643,6 +656,19 @@ const messages: Record<Locale, Record<string, string>> = {
   },
 
   "en-US": {
+    "app.beijingTime": "Beijing Time (UTC+8)",
+    "set.loading": "Loading settings...",
+    "set.loadError": "Unable to load settings. Please retry.",
+    "set.retry": "Retry",
+    "risk.circuitBreaker": "Drawdown & Daily Loss Protection",
+    "risk.leverageCap": "Leverage Cap Protection",
+    "risk.circuitDisabledHint": "Loss breakers are off; orders follow the lead trader",
+    "risk.autoLeverageHint": "Automatically adapt leverage to the lead trader’s position ratio",
+    "risk.zeroSkips": "Set a threshold to 0 to skip that limit.",
+    "risk.circuitOn": "Loss breakers on",
+    "risk.circuitOff": "Loss breakers off",
+    "risk.capOn": "Leverage caps on",
+    "risk.autoLeverage": "Automatic leverage",
     "app.brandSub": "v1.0 · QUANT TERMINAL",
     "nav.dashboard": "Dashboard",
     "nav.leads": "Leads & PA",

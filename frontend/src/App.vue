@@ -102,8 +102,9 @@ async function handleLogout() {
         <div class="w-8 h-8 rounded-lg bg-accent/10 border border-accent/30 flex items-center justify-center">
           <Cpu class="w-4 h-4 text-accent" />
         </div>
-        <div class="flex items-center gap-2">
+        <div class="flex flex-wrap items-center gap-2">
           <span class="font-bold tracking-tight text-slate-100 text-sm">MirrorQuant</span>
+          <span class="text-[10px] px-2 py-0.5 rounded-full border border-accent/25 text-accent">{{ t("app.beijingTime") }}</span>
           <span
             class="inline-flex items-center gap-1 text-[10px] font-mono px-2 py-0.5 rounded-full border"
             :class="
@@ -152,6 +153,8 @@ async function handleLogout() {
           </div>
           <LangToggle />
         </div>
+
+        <div class="px-4 pt-3"><span class="text-[10px] px-2 py-0.5 rounded-full border border-accent/25 text-accent">{{ t("app.beijingTime") }}</span></div>
 
         <!-- Navigation -->
         <nav class="p-3 space-y-1 mt-2">

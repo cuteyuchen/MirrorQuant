@@ -168,6 +168,8 @@ class CopyBinding(Base):
     )
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
+    enable_circuit_breaker: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    enable_leverage_cap: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     risk_scale: Mapped[float] = mapped_column(Float, default=1.0, nullable=False)
     max_total_leverage: Mapped[float] = mapped_column(Float, default=8.0, nullable=False)
     max_single_leverage: Mapped[float] = mapped_column(Float, default=4.0, nullable=False)

@@ -21,6 +21,30 @@ class RiskEngine:
     """Risk guards: symbol filters, slippage, spread, drawdown, daily loss, catch-up, margin & TP/SL."""
 
     @staticmethod
+    def clear_disabled_loss_breaker(binding) -> None:
+        """Release a disabled loss latch without clearing execution/protective faults."""
+        if not binding.circuit_breaker_tripped:
+            return
+        reason = binding.circuit_breaker_reason or "Drawdown breaker"
+        enabled = getattr(binding, "enable_circuit_breaker", True)
+        drawdown_disabled = not enabled or not getattr(binding, "max_drawdown_pct", None)
+        daily_disabled = not enabled or not getattr(binding, "daily_max_loss_pct", None)
+        if (drawdown_disabled and reason.startswith("Drawdown")) or (daily_disabled and reason.startswith("Daily loss")):
+            binding.circuit_breaker_tripped = False
+            binding.circuit_breaker_reason = None
+
+    @staticmethod
+    def loss_breaker_checks(binding, hwm_equity: float, day_start_equity: float, equity: float) -> List[RiskCheckResult]:
+        if not getattr(binding, "enable_circuit_breaker", True):
+            return []
+        checks = []
+        if getattr(binding, "max_drawdown_pct", None):
+            checks.append(RiskEngine.check_drawdown(hwm_equity, equity, binding.max_drawdown_pct))
+        if getattr(binding, "daily_max_loss_pct", None):
+            checks.append(RiskEngine.check_daily_loss(day_start_equity, equity, binding.daily_max_loss_pct))
+        return checks
+
+    @staticmethod
     def check_symbol_filter(
         symbol: str,
         whitelist: Sequence[str],
@@ -84,7 +108,7 @@ class RiskEngine:
     ) -> RiskCheckResult:
         if not all(math.isfinite(v) for v in (hwm_equity, current_equity, max_drawdown_pct)):
             return RiskCheckResult(False, "Invalid account equity or drawdown limit", code="BLOCKED_DRAWDOWN")
-        if hwm_equity <= 0:
+        if hwm_equity <= 0 or max_drawdown_pct <= 0:
             return RiskCheckResult(True, value=0.0)
         dd_pct = max(0.0, (hwm_equity - current_equity) / hwm_equity * 100.0)
         if dd_pct > max_drawdown_pct:
@@ -191,7 +215,7 @@ class RiskEngine:
         reason = None
 
         req_notional = qty * one_unit_usd
-        if (cur_sym_notional + req_notional) / equity > single_limit:
+        if single_limit > 0 and (cur_sym_notional + req_notional) / equity > single_limit:
             avail = max(Decimal("0"), single_limit * equity - cur_sym_notional)
             capped = quantize_down(avail / one_unit_usd, spec.lot_sz)
             if capped < spec.min_sz:
@@ -200,7 +224,7 @@ class RiskEngine:
             req_notional = qty * one_unit_usd
             reason = f"Capped by single symbol leverage ({max_single_leverage}x)"
 
-        if (cur_total_notional + req_notional) / equity > total_limit:
+        if total_limit > 0 and (cur_total_notional + req_notional) / equity > total_limit:
             avail = max(Decimal("0"), total_limit * equity - cur_total_notional)
             capped = quantize_down(avail / one_unit_usd, spec.lot_sz)
             if capped < spec.min_sz:

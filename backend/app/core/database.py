@@ -106,6 +106,8 @@ DEFAULT_SYSTEM_CONFIG = {
         "notify_on_security_alert": True,
     },
     "risk_defaults": {
+        "enable_circuit_breaker": True,
+        "enable_leverage_cap": False,
         "max_total_leverage": 8.0,
         "max_single_leverage": 4.0,
         "max_instrument_leverage": 20,
@@ -164,6 +166,8 @@ SQLITE_MIGRATIONS: Dict[str, List[Tuple[str, str]]] = {
         ("clock_offset_ms", "INTEGER NOT NULL DEFAULT 0"),
     ],
     "copy_bindings": [
+        ("enable_circuit_breaker", "BOOLEAN NOT NULL DEFAULT 1"),
+        ("enable_leverage_cap", "BOOLEAN NOT NULL DEFAULT 0"),
         ("daily_max_loss_pct", "FLOAT NOT NULL DEFAULT 10.0"),
         ("max_spread_pct", "FLOAT NOT NULL DEFAULT 0.3"),
         ("tp_sl_mode", "VARCHAR(32) NOT NULL DEFAULT 'follow_lead'"),

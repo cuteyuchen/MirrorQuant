@@ -3,8 +3,10 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_serializer, field_validator
 from pydantic.alias_generators import to_camel
+
+from app.core.time_util import to_utc_iso
 
 
 class CamelModel(BaseModel):
@@ -50,6 +52,10 @@ class UserOut(CamelModel):
     totp_enabled: bool = False
     created_at: datetime
     last_login_at: Optional[datetime] = None
+
+    @field_serializer("created_at", "last_login_at", when_used="json")
+    def serialize_time(self, value: Optional[datetime]) -> Optional[str]:
+        return to_utc_iso(value)
 
 
 class ProxyCreate(CamelModel):
@@ -126,12 +132,14 @@ class BindingCreate(CamelModel):
     lead_id: int
     account_id: int
     is_enabled: bool = True
+    enable_circuit_breaker: bool = True
+    enable_leverage_cap: bool = False
     risk_scale: float = Field(default=1.0, gt=0.0, le=20.0)
-    max_total_leverage: float = Field(default=8.0, gt=0.0, le=100.0)
-    max_single_leverage: float = Field(default=4.0, gt=0.0, le=100.0)
+    max_total_leverage: float = Field(default=8.0, ge=0.0, le=100.0)
+    max_single_leverage: float = Field(default=4.0, ge=0.0, le=100.0)
     max_instrument_leverage: int = Field(default=20, ge=1, le=125)
-    max_drawdown_pct: float = Field(default=30.0, gt=0.0, le=100.0)
-    daily_max_loss_pct: float = Field(default=10.0, gt=0.0, le=100.0)
+    max_drawdown_pct: float = Field(default=30.0, ge=0.0, le=100.0)
+    daily_max_loss_pct: float = Field(default=10.0, ge=0.0, le=100.0)
     max_slippage_pct: float = Field(default=1.0, gt=0.0, le=50.0)
     max_spread_pct: float = Field(default=0.3, ge=0.0, le=20.0)
     ioc_offset_pct: float = Field(default=0.5, ge=0.0, le=10.0)
@@ -152,12 +160,14 @@ class BindingCreate(CamelModel):
 class BindingUpdate(CamelModel):
     name: Optional[str] = None
     is_enabled: Optional[bool] = None
+    enable_circuit_breaker: Optional[bool] = None
+    enable_leverage_cap: Optional[bool] = None
     risk_scale: Optional[float] = Field(default=None, gt=0.0, le=20.0)
-    max_total_leverage: Optional[float] = Field(default=None, gt=0.0, le=100.0)
-    max_single_leverage: Optional[float] = Field(default=None, gt=0.0, le=100.0)
+    max_total_leverage: Optional[float] = Field(default=None, ge=0.0, le=100.0)
+    max_single_leverage: Optional[float] = Field(default=None, ge=0.0, le=100.0)
     max_instrument_leverage: Optional[int] = Field(default=None, ge=1, le=125)
-    max_drawdown_pct: Optional[float] = Field(default=None, gt=0.0, le=100.0)
-    daily_max_loss_pct: Optional[float] = Field(default=None, gt=0.0, le=100.0)
+    max_drawdown_pct: Optional[float] = Field(default=None, ge=0.0, le=100.0)
+    daily_max_loss_pct: Optional[float] = Field(default=None, ge=0.0, le=100.0)
     max_slippage_pct: Optional[float] = Field(default=None, gt=0.0, le=50.0)
     max_spread_pct: Optional[float] = Field(default=None, ge=0.0, le=20.0)
     ioc_offset_pct: Optional[float] = Field(default=None, ge=0.0, le=10.0)
@@ -175,6 +185,14 @@ class BindingUpdate(CamelModel):
     symbol_map: Optional[Dict[str, str]] = None
 
 
+    @field_validator("enable_circuit_breaker", "enable_leverage_cap")
+    @classmethod
+    def reject_null_switch(cls, value):
+        if value is None:
+            raise ValueError("Field cannot be null; omit it to keep the current value")
+        return value
+
+
 class KillSwitchRequest(CamelModel):
     enabled: bool
 
@@ -183,11 +201,13 @@ class RiskDefaults(CamelModel):
     """The same bounds as binding creation, also applied to stored policies."""
 
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
-    max_total_leverage: float = Field(default=8.0, gt=0.0, le=100.0)
-    max_single_leverage: float = Field(default=4.0, gt=0.0, le=100.0)
+    enable_circuit_breaker: StrictBool = True
+    enable_leverage_cap: StrictBool = False
+    max_total_leverage: float = Field(default=8.0, ge=0.0, le=100.0)
+    max_single_leverage: float = Field(default=4.0, ge=0.0, le=100.0)
     max_instrument_leverage: int = Field(default=20, ge=1, le=125)
-    max_drawdown_pct: float = Field(default=30.0, gt=0.0, le=100.0)
-    daily_max_loss_pct: float = Field(default=10.0, gt=0.0, le=100.0)
+    max_drawdown_pct: float = Field(default=30.0, ge=0.0, le=100.0)
+    daily_max_loss_pct: float = Field(default=10.0, ge=0.0, le=100.0)
     max_slippage_pct: float = Field(default=1.0, gt=0.0, le=50.0)
     max_spread_pct: float = Field(default=0.3, ge=0.0, le=20.0)
     ioc_offset_pct: float = Field(default=0.5, ge=0.0, le=10.0)

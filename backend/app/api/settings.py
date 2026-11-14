@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from app.core.time_util import to_utc_iso
+
 import json
 from datetime import datetime, timezone
 
@@ -16,6 +18,7 @@ from app.core.secret_mask import NOTIFICATION_SECRET_FIELDS, mask_sensitive_payl
 from app.models.domain import AuditLog, CopyBinding, LoginAttemptGuard, SystemConfig, User
 from app.schemas.api import RiskDefaults, SettingsUpdate
 from app.services.notifier.service import NotificationService
+from app.services.engine.risk import RiskEngine
 from app.services.engine.serialization import serialized_execution
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
@@ -123,6 +126,7 @@ async def apply_defaults_to_bindings(
             await require_binding_flat(db, b)
         for key, value in defaults.items():
             setattr(b, key, value)
+        RiskEngine.clear_disabled_loss_breaker(b)
 
     await record_audit(
         db,
@@ -174,11 +178,11 @@ async def list_security_guards(
                 "keyType": g.key_type,
                 "keyValue": g.key_value,
                 "failCount": g.fail_count,
-                "lockedUntil": lu.isoformat() if lu else None,
+                "lockedUntil": to_utc_iso(lu),
                 "lockRemainingSec": rem,
                 "lastIp": g.last_ip,
                 "lastUsername": g.last_username,
-                "lastFailAt": g.last_fail_at.isoformat() if g.last_fail_at else None,
+                "lastFailAt": to_utc_iso(g.last_fail_at),
             }
         )
     return {"items": items}
@@ -228,7 +232,7 @@ async def list_audit_logs(
                 "resourceId": r.resource_id,
                 "details": redact_error_urls(r.details),
                 "ipAddress": r.ip_address,
-                "createdAt": r.created_at.isoformat(),
+                "createdAt": to_utc_iso(r.created_at),
             }
             for r in rows
         ]

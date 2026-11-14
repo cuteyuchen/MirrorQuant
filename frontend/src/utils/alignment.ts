@@ -20,8 +20,9 @@ export function getLeadAlignment(lead: any, overview: any, now = Date.now()): Al
   for (const binding of bindings) {
     const account = (overview.accountsStatus || []).find((a: any) => a.id === binding.accountId);
     if (!account?.isEnabled) return "paused";
-    const synced = Date.parse(account.lastSyncAt || "");
-    if (account.status !== "connected" || !Number.isFinite(synced) || synced > now || now - synced > 90000) return "stale";
+    const iso = String(account.lastSyncAt || "").trim();
+    const synced = Date.parse(/(?:Z|[+-]\d{2}:?\d{2})$/i.test(iso) ? iso : `${iso}Z`);
+    if (account.status !== "connected" || !Number.isFinite(synced) || synced - now > 30000 || now - synced > 90000) return "stale";
 
     // An account can follow several leads, so include all of its active sources
     // before treating an additional position as a mismatch.

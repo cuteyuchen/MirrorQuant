@@ -19,6 +19,7 @@ from app.models.domain import (
     User,
 )
 from app.schemas.api import BindingCreate, BindingUpdate, KillSwitchRequest
+from app.services.engine.risk import RiskEngine
 from app.services.engine.serialization import serialized_execution
 
 router = APIRouter(prefix="/api/bindings", tags=["bindings"])
@@ -39,6 +40,8 @@ async def _binding_out(db: AsyncSession, b: CopyBinding) -> dict:
         "accountExchange": acct.exchange if acct else "",
         "accountEnvironment": acct.environment if acct else "",
         "isEnabled": b.is_enabled,
+        "enableCircuitBreaker": b.enable_circuit_breaker,
+        "enableLeverageCap": b.enable_leverage_cap,
         "riskScale": b.risk_scale,
         "maxTotalLeverage": b.max_total_leverage,
         "maxSingleLeverage": b.max_single_leverage,
@@ -110,6 +113,8 @@ async def create_binding(
         lead_id=payload.lead_id,
         account_id=payload.account_id,
         is_enabled=payload.is_enabled,
+        enable_circuit_breaker=payload.enable_circuit_breaker,
+        enable_leverage_cap=payload.enable_leverage_cap,
         risk_scale=payload.risk_scale,
         max_total_leverage=payload.max_total_leverage,
         max_single_leverage=payload.max_single_leverage,
@@ -172,6 +177,7 @@ async def update_binding(
         binding.symbol_map_json = json.dumps(data.pop("symbol_map") or {})
     for k, v in data.items():
         setattr(binding, k, v)
+    RiskEngine.clear_disabled_loss_breaker(binding)
 
     await record_audit(db, "UPDATE_BINDING", "binding", str(binding.id), f"Updated binding {binding.name}", current_user, request)
     await db.commit()

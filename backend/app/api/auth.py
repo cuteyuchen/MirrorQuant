@@ -79,7 +79,7 @@ def _user_dict(u: User) -> dict:
         totp_enabled=bool(getattr(u, "totp_enabled", False)),
         created_at=u.created_at,
         last_login_at=u.last_login_at,
-    ).model_dump()
+    ).model_dump(mode="json")
 
 
 async def _get_or_create_guard(

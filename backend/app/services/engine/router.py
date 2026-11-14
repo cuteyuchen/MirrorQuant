@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from app.core.time_util import BEIJING_TZ, to_utc_iso
+
 import asyncio
 import json
 import logging
@@ -167,7 +169,7 @@ class CopyRouter:
 
     @staticmethod
     def _refresh_day_start(account: TradingAccount, equity: float) -> None:
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d")
         if account.day_start_date != today or (account.day_start_equity or 0.0) <= 0:
             account.day_start_date = today
             account.day_start_equity = equity
@@ -463,7 +465,7 @@ class CopyRouter:
                 "myNotional": my_notional,
                 "slippagePct": slippage_pct,
                 "details": details,
-                "createdAt": rec.created_at.isoformat() if rec.created_at else None,
+                "createdAt": to_utc_iso(rec.created_at),
             },
         }
         if notify_cfg:
@@ -833,31 +835,26 @@ class CopyRouter:
                 details="Exchange inventory is below allocated quantity; reconciliation required", notify_cfg=notify_cfg)
             return
 
-        dd_res = RiskEngine.check_drawdown(account.hwm_equity, my_equity, binding.max_drawdown_pct)
-        if binding.circuit_breaker_tripped or not dd_res.allowed:
-            binding.circuit_breaker_tripped = True
-            binding.circuit_breaker_reason = dd_res.reason or binding.circuit_breaker_reason or "Drawdown breaker"
+        RiskEngine.clear_disabled_loss_breaker(binding)
+        if binding.circuit_breaker_tripped:
             await self._record_execution(
                 db, binding, lead, account, symbol, inst_id, side, ps, action,
                 "BLOCKED_DRAWDOWN", lead_qty, lead_avg_px, lead_notional,
                 details=binding.circuit_breaker_reason, notify_cfg=notify_cfg,
             )
             return
-
-        daily_res = RiskEngine.check_daily_loss(
-            getattr(account, "day_start_equity", 0.0),
-            my_equity,
-            getattr(binding, "daily_max_loss_pct", 10.0),
-        )
-        if not daily_res.allowed:
-            binding.circuit_breaker_tripped = True
-            binding.circuit_breaker_reason = daily_res.reason or "Daily loss breaker"
-            await self._record_execution(
-                db, binding, lead, account, symbol, inst_id, side, ps, action,
-                "BLOCKED_DAILY_LOSS", lead_qty, lead_avg_px, lead_notional,
-                details=binding.circuit_breaker_reason, notify_cfg=notify_cfg,
-            )
-            return
+        for result in RiskEngine.loss_breaker_checks(
+            binding, account.hwm_equity, getattr(account, "day_start_equity", 0.0), my_equity,
+        ):
+            if not result.allowed:
+                binding.circuit_breaker_tripped = True
+                binding.circuit_breaker_reason = result.reason
+                await self._record_execution(
+                    db, binding, lead, account, symbol, inst_id, side, ps, action,
+                    result.code, lead_qty, lead_avg_px, lead_notional,
+                    details=result.reason, notify_cfg=notify_cfg,
+                )
+                return
 
         await db.commit()
         book = await adapter.get_orderbook(inst_id, depth=5)
@@ -930,16 +927,19 @@ class CopyRouter:
             )
             return
 
-        capped_qty, cap_reason = RiskEngine.cap_by_leverage(
-            requested_qty=sized.contracts,
-            ref_price=ref_px,
-            spec=spec,
-            follower_equity=my_equity,
-            positions=positions,
-            inst_id=inst_id,
-            max_single_leverage=binding.max_single_leverage,
-            max_total_leverage=binding.max_total_leverage,
-        )
+        leverage_cap_enabled = getattr(binding, "enable_leverage_cap", False)
+        capped_qty, cap_reason = sized.contracts, None
+        if leverage_cap_enabled:
+            capped_qty, cap_reason = RiskEngine.cap_by_leverage(
+                requested_qty=sized.contracts,
+                ref_price=ref_px,
+                spec=spec,
+                follower_equity=my_equity,
+                positions=positions,
+                inst_id=inst_id,
+                max_single_leverage=binding.max_single_leverage,
+                max_total_leverage=binding.max_total_leverage,
+            )
         if capped_qty <= 0:
             await self._record_execution(
                 db, binding, lead, account, symbol, inst_id, side, ps, action,
@@ -949,11 +949,13 @@ class CopyRouter:
             )
             return
 
-        projected_notional = sum(exact(p.notional_usd) for p in positions if p.inst_id == inst_id) + exact(sized.estimated_notional)
+        projected_notional = sum(abs(exact(p.notional_usd)) for p in positions if p.inst_id == inst_id) + capped_qty * exact(ref_px) * spec.ct_val
         tier_max = await adapter.get_max_leverage(inst_id, projected_notional)
-        max_allowed_lvr = int(min(binding.max_instrument_leverage, spec.max_lvr, tier_max))
+        max_allowed_lvr = int(min(spec.max_lvr, tier_max))
+        if leverage_cap_enabled:
+            max_allowed_lvr = min(max_allowed_lvr, binding.max_instrument_leverage)
         target_lvr = PositionSizer.compute_dynamic_leverage(
-            target_notional=sized.estimated_notional or (exact(sized.contracts) * exact(ref_px) * spec.ct_val),
+            target_notional=capped_qty * exact(ref_px) * spec.ct_val,
             equity=my_equity, max_symbol_leverage=max_allowed_lvr,
         )
         margin_policy = str(resilience_cfg.get("insufficient_margin_policy", "auto_scale_down"))

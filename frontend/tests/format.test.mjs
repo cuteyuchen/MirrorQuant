@@ -36,3 +36,30 @@ test("quantities remove trailing zeros and amounts and percentages keep two deci
   assert.equal(formatPct(.801234, 2, false), "0.80%");
   assert.equal(formatPct(0), "0.00%");
 });
+
+const { formatDateTime } = await loadTs("format");
+
+test("all supported timestamp inputs render Beijing time regardless of browser timezone", () => {
+  const iso = "2026-11-14T14:38:19.655Z";
+  const stamp = Date.parse(iso);
+  const original = process.env.TZ;
+  try {
+    for (const timeZone of ["UTC", "America/Los_Angeles", "Asia/Shanghai"]) {
+      process.env.TZ = timeZone;
+      for (const input of [iso, iso.slice(0, -1), stamp, stamp / 1000, new Date(stamp), "2026-11-14T22:38:19.655+08:00", "2026-11-14T22:38:19.655+0800"]) {
+        assert.equal(formatDateTime(input), "2026-11-14 22:38:19");
+      }
+    }
+  } finally {
+    if (original === undefined) delete process.env.TZ;
+    else process.env.TZ = original;
+  }
+});
+
+test("date formatting handles midnight, short output, seconds and explicit timezone", () => {
+  assert.equal(formatDateTime("2026-11-14T16:00:00"), "2026-11-15 00:00:00");
+  assert.equal(formatDateTime("2026-11-14T14:38:19Z", { short: true }), "11-14 22:38:19");
+  assert.equal(formatDateTime("2026-11-14T14:38:19Z", { withSeconds: false }), "2026-11-14 22:38");
+  assert.equal(formatDateTime("2026-11-14T14:38:19Z", { timeZone: "UTC" }), "2026-11-14 14:38:19");
+  for (const input of [null, undefined, "", " ", "invalid", NaN, Infinity, new Date(NaN)]) assert.equal(formatDateTime(input), "—");
+});

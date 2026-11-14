@@ -1,5 +1,40 @@
 type NumericValue = number | string | null | undefined;
 
+export interface DateTimeOptions {
+  withSeconds?: boolean;
+  short?: boolean;
+  timeZone?: string;
+}
+
+/** API timestamps without an offset are UTC, including legacy SQLite values. */
+export function formatDateTime(value: Date | string | number | null | undefined, options: DateTimeOptions = {}): string {
+  if (value == null || value === "") return "—";
+  let date: Date;
+  if (value instanceof Date) {
+    date = value;
+  } else if (typeof value === "number") {
+    date = new Date(Math.abs(value) < 1e11 ? value * 1000 : value);
+  } else {
+    const iso = value.trim();
+    if (!iso) return "—";
+    date = new Date(/(?:Z|[+-]\d{2}:?\d{2})$/i.test(iso) ? iso : `${iso}Z`);
+  }
+  if (!Number.isFinite(date.getTime())) return "—";
+  try {
+    const parts = new Intl.DateTimeFormat("en-GB", {
+      timeZone: options.timeZone || "Asia/Shanghai",
+      year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23",
+    }).formatToParts(date);
+    const part = (type: Intl.DateTimeFormatPartTypes) => parts.find(p => p.type === type)?.value;
+    const day = `${part("month")}-${part("day")}`;
+    const time = `${part("hour")}:${part("minute")}${options.withSeconds === false ? "" : `:${part("second")}`}`;
+    return `${options.short ? day : `${part("year")}-${day}`} ${time}`;
+  } catch {
+    return "—";
+  }
+}
+
 function finiteNumber(value: NumericValue): number | null {
   if (value == null || (typeof value === "string" && !value.trim())) return null;
   const number = Number(value);

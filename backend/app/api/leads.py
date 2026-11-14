@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from app.core.time_util import to_utc_iso
+
 import json
 from typing import Optional
 
@@ -47,7 +49,7 @@ def _lead_summary(lead: LeadSource) -> dict:
         "marginBalance": lead.margin_balance,
         "aumAmount": lead.aum_amount,
         "lastTradeTime": lead.last_trade_time,
-        "lastSyncAt": lead.last_sync_at.isoformat() if lead.last_sync_at else None,
+        "lastSyncAt": to_utc_iso(lead.last_sync_at),
         "lastError": redact_error_urls(lead.last_error) if lead.last_error else None,
         "status": lead.status,
         "openPositionsCount": open_count,

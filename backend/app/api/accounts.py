@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from app.core.time_util import to_utc_iso
+
 import json
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -49,7 +51,7 @@ def _account_out(a: TradingAccount) -> dict:
         "totalNotional": round(a.total_notional, 2),
         "unrealizedPnl": round(a.unrealized_pnl, 2),
         "positions": mask_sensitive_payload(positions),
-        "lastSyncAt": a.last_sync_at.isoformat() if a.last_sync_at else None,
+        "lastSyncAt": to_utc_iso(a.last_sync_at),
         "lastError": redact_error_urls(a.last_error) if a.last_error else None,
         "status": a.status,
     }

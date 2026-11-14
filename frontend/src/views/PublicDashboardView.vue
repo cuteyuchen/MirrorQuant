@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { formatDateTime } from "@/utils/format";
 import { computed, onActivated, onDeactivated, onMounted, onUnmounted, ref } from "vue";
 import { Cpu, Globe, Lock, RefreshCw, Volume2, VolumeX } from "lucide-vue-next";
 import { api } from "@/api/client";
@@ -59,7 +60,7 @@ async function fetchPublic() {
     const res = await api.get<{ enabled: boolean; leads: any[] }>("/api/dashboard/public");
     enabled.value = res.enabled;
     leads.value = res.leads || [];
-    lastUpdatedAt.value = new Date().toLocaleTimeString(isZh.value ? "zh-CN" : "en-US", { hour12: false });
+    lastUpdatedAt.value = formatDateTime(new Date(), { short: true });
     countdownSec.value = 5;
 
     for (const l of leads.value) {
@@ -127,6 +128,7 @@ onUnmounted(stopPolling);
           </h1>
           <p class="text-sm text-slate-300 leading-relaxed">
             {{ t("pub.subtitle") }}
+            <span class="px-2 py-0.5 rounded-full border border-accent/25 text-accent text-[10px]">{{ t("app.beijingTime") }}</span>
             <span v-if="lastUpdatedAt" class="font-mono text-slate-400"> · {{ lastUpdatedAt }}</span>
           </p>
         </div>

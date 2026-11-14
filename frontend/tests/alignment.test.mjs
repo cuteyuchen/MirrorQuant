@@ -66,3 +66,26 @@ test("other active leads in the same account do not create false mismatches", ()
   overview.leadsStatus[1].stale = true;
   assert.equal(getLeadAlignment(lead, overview, now), "stale");
 });
+
+test("timestamps without Z remain UTC in every browser timezone", () => {
+  const { lead, overview } = fixture();
+  const original = process.env.TZ;
+  overview.accountsStatus[0].lastSyncAt = new Date(now).toISOString().slice(0, -1);
+  try {
+    for (const zone of ["America/Los_Angeles", "Asia/Shanghai", "UTC"]) {
+      process.env.TZ = zone;
+      assert.equal(getLeadAlignment(lead, overview, now), "aligned");
+    }
+  } finally {
+    if (original === undefined) delete process.env.TZ;
+    else process.env.TZ = original;
+  }
+});
+
+test("future clock jitter is tolerated up to 30 seconds with freshness limits intact", () => {
+  const { lead, overview } = fixture();
+  for (const [delta, expected] of [[1, "aligned"], [30000, "aligned"], [30001, "stale"], [-90000, "aligned"], [-90001, "stale"]]) {
+    overview.accountsStatus[0].lastSyncAt = new Date(now + delta).toISOString();
+    assert.equal(getLeadAlignment(lead, overview, now), expected);
+  }
+});

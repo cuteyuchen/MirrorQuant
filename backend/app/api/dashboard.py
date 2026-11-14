@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from app.core.time_util import to_utc_iso
+
 import json
 from typing import Optional
 
@@ -63,7 +65,7 @@ async def dashboard_overview(
             "sourceType": lead.platform,
             "isEnabled": lead.is_enabled,
             "status": lead.status,
-            "lastSyncAt": lead.last_sync_at.isoformat() if lead.last_sync_at else None,
+            "lastSyncAt": to_utc_iso(lead.last_sync_at),
             "lastError": redact_error_urls(lead.last_error) if lead.last_error else None,
             "openPositionsCount": sum(1 for p in lead_positions if p["leadId"] == lead.id),
             "positionsKnown": isinstance(snap.get("openPositions"), list),
@@ -91,7 +93,7 @@ async def dashboard_overview(
                         "exchange": acct.exchange,
                         "environment": acct.environment,
                         "accountStatus": acct.status,
-                        "lastSyncAt": acct.last_sync_at.isoformat() if acct.last_sync_at else None,
+                        "lastSyncAt": to_utc_iso(acct.last_sync_at),
                     }
                 )
         except Exception:
@@ -116,7 +118,7 @@ async def dashboard_overview(
         "leadsStatus": mask_sensitive_payload(leads_status),
         "accountsStatus": [
             {"id": a.id, "isEnabled": a.is_enabled, "status": a.status,
-             "lastSyncAt": a.last_sync_at.isoformat() if a.last_sync_at else None}
+             "lastSyncAt": to_utc_iso(a.last_sync_at)}
             for a in accounts
         ],
         "bindingsStatus": [
@@ -147,7 +149,7 @@ async def dashboard_overview(
                 "slippagePct": r.slippage_pct,
                 "orderId": r.order_id,
                 "details": redact_error_urls(r.details),
-                "createdAt": r.created_at.isoformat(),
+                "createdAt": to_utc_iso(r.created_at),
             }
             for r in recent_execs
         ],
@@ -193,7 +195,7 @@ async def list_executions(
                 "slippagePct": r.slippage_pct,
                 "orderId": r.order_id,
                 "details": redact_error_urls(r.details),
-                "createdAt": r.created_at.isoformat(),
+                "createdAt": to_utc_iso(r.created_at),
             }
             for r in rows
         ]

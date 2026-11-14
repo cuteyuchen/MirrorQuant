@@ -26,6 +26,8 @@ function defaultForm() {
     name: "",
     leadId: null as number | null,
     accountId: null as number | null,
+    enableCircuitBreaker: rd.enable_circuit_breaker ?? true,
+    enableLeverageCap: rd.enable_leverage_cap ?? false,
     riskScale: 1.0,
     maxTotalLeverage: rd.max_total_leverage ?? 8.0,
     maxSingleLeverage: rd.max_single_leverage ?? 4.0,
@@ -82,6 +84,8 @@ function openEdit(b: any) {
     name: b.name,
     leadId: b.leadId,
     accountId: b.accountId,
+    enableCircuitBreaker: b.enableCircuitBreaker ?? true,
+    enableLeverageCap: b.enableLeverageCap ?? false,
     riskScale: b.riskScale,
     maxTotalLeverage: b.maxTotalLeverage,
     maxSingleLeverage: b.maxSingleLeverage,
@@ -114,6 +118,8 @@ async function saveBinding() {
     if (editingId.value) {
       await api.put(`/api/bindings/${editingId.value}`, {
         name: form.value.name,
+        enable_circuit_breaker: form.value.enableCircuitBreaker,
+        enable_leverage_cap: form.value.enableLeverageCap,
         risk_scale: form.value.riskScale,
         max_total_leverage: form.value.maxTotalLeverage,
         max_single_leverage: form.value.maxSingleLeverage,
@@ -232,6 +238,12 @@ onActivated(() => {
               >
                 {{ b.isEnabled ? t("bind.active") : t("bind.paused") }}
               </span>
+              <span class="px-2 py-0.5 rounded-full border text-[10px]" :class="b.enableCircuitBreaker !== false ? 'text-amber-300 border-amber-500/30' : 'text-slate-400 border-slate-700'">
+                {{ b.enableCircuitBreaker !== false ? t("risk.circuitOn") : t("risk.circuitOff") }}
+              </span>
+              <span class="px-2 py-0.5 rounded-full border border-accent/25 text-accent text-[10px]">
+                {{ b.enableLeverageCap ? t("risk.capOn") : t("risk.autoLeverage") }}
+              </span>
               <span v-if="b.baselineSeeded" class="px-2 py-0.5 rounded bg-slate-800 text-slate-400 text-[10px] font-mono">
                 {{ t("bind.baselineSeeded") }}
               </span>
@@ -302,11 +314,11 @@ onActivated(() => {
           </div>
           <div>
             <span class="text-[10px] text-slate-500 block">{{ t("bind.maxLev") }}</span>
-            <span class="text-slate-200">{{ b.maxSingleLeverage }}x / {{ b.maxTotalLeverage }}x</span>
+            <span class="text-slate-200">{{ b.enableLeverageCap ? `${b.maxSingleLeverage}x / ${b.maxTotalLeverage}x` : t("risk.autoLeverage") }}</span>
           </div>
           <div>
             <span class="text-[10px] text-slate-500 block">{{ t("bind.drawdownBreaker") }}</span>
-            <span class="text-slate-200">{{ b.maxDrawdownPct }}% / {{ b.dailyMaxLossPct ?? 10 }}%</span>
+            <span class="text-slate-200">{{ b.enableCircuitBreaker === false ? t("risk.circuitOff") : `${b.maxDrawdownPct}% / ${b.dailyMaxLossPct ?? 10}%` }}</span>
           </div>
           <div>
             <span class="text-[10px] text-slate-500 block">{{ t("bind.slippageGuard") }}</span>
@@ -367,6 +379,19 @@ onActivated(() => {
             </div>
           </div>
 
+          <div class="space-y-3 p-3 rounded-xl bg-background/60 border border-slate-800 text-xs">
+            <label class="flex items-center gap-2 text-slate-200">
+              <input v-model="form.enableCircuitBreaker" type="checkbox" class="w-4 h-4 rounded text-accent" />
+              {{ t("risk.circuitBreaker") }}
+            </label>
+            <p v-if="!form.enableCircuitBreaker" class="text-amber-300">{{ t("risk.circuitDisabledHint") }}</p>
+            <label class="flex items-center gap-2 text-slate-200">
+              <input v-model="form.enableLeverageCap" type="checkbox" class="w-4 h-4 rounded text-accent" />
+              {{ t("risk.leverageCap") }}
+            </label>
+            <p v-if="!form.enableLeverageCap" class="text-accent">{{ t("risk.autoLeverageHint") }}</p>
+            <p class="text-slate-400">{{ t("risk.zeroSkips") }}</p>
+          </div>
           <div class="grid grid-cols-2 sm:grid-cols-3 gap-3">
             <div>
               <label class="block text-xs text-slate-400 mb-1">{{ t("bind.riskScaleInput") }}</label>
@@ -374,19 +399,23 @@ onActivated(() => {
             </div>
             <div>
               <label class="block text-xs text-slate-400 mb-1">{{ t("bind.maxSingleLev") }}</label>
-              <input v-model.number="form.maxSingleLeverage" type="number" step="0.5" min="1" max="100" class="w-full px-3 py-2 rounded-xl bg-background border border-slate-700 text-sm text-white" />
+              <input v-model.number="form.maxSingleLeverage" :disabled="!form.enableLeverageCap" type="number" step="0.5" min="0" max="100" class="disabled:opacity-40 w-full px-3 py-2 rounded-xl bg-background border border-slate-700 text-sm text-white" />
             </div>
             <div>
               <label class="block text-xs text-slate-400 mb-1">{{ t("bind.maxTotalLev") }}</label>
-              <input v-model.number="form.maxTotalLeverage" type="number" step="0.5" min="1" max="100" class="w-full px-3 py-2 rounded-xl bg-background border border-slate-700 text-sm text-white" />
+              <input v-model.number="form.maxTotalLeverage" :disabled="!form.enableLeverageCap" type="number" step="0.5" min="0" max="100" class="disabled:opacity-40 w-full px-3 py-2 rounded-xl bg-background border border-slate-700 text-sm text-white" />
+            </div>
+            <div>
+              <label class="block text-xs text-slate-400 mb-1">{{ t("set.maxInstLev") }}</label>
+              <input v-model.number="form.maxInstrumentLeverage" :disabled="!form.enableLeverageCap" type="number" step="1" min="1" max="125" class="w-full px-3 py-2 rounded-xl bg-background border border-slate-700 text-sm text-white disabled:opacity-40" />
             </div>
             <div>
               <label class="block text-xs text-slate-400 mb-1">{{ t("bind.maxDrawdown") }}</label>
-              <input v-model.number="form.maxDrawdownPct" type="number" step="1" min="1" max="100" class="w-full px-3 py-2 rounded-xl bg-background border border-slate-700 text-sm text-white" />
+              <input v-model.number="form.maxDrawdownPct" :disabled="!form.enableCircuitBreaker" type="number" step="1" min="0" max="100" class="disabled:opacity-40 w-full px-3 py-2 rounded-xl bg-background border border-slate-700 text-sm text-white" />
             </div>
             <div>
               <label class="block text-xs text-slate-400 mb-1">{{ t("bind.dailyMaxLoss") }}</label>
-              <input v-model.number="form.dailyMaxLossPct" type="number" step="0.5" min="1" max="100" class="w-full px-3 py-2 rounded-xl bg-background border border-slate-700 text-sm text-white" />
+              <input v-model.number="form.dailyMaxLossPct" :disabled="!form.enableCircuitBreaker" type="number" step="0.5" min="0" max="100" class="disabled:opacity-40 w-full px-3 py-2 rounded-xl bg-background border border-slate-700 text-sm text-white" />
             </div>
             <div>
               <label class="block text-xs text-slate-400 mb-1">{{ t("bind.maxSlippage") }}</label>

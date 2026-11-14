@@ -27,18 +27,21 @@ import { api } from "@/api/client";
 import { useDataCacheStore } from "@/stores/dataCache";
 import { useAuthStore } from "@/stores/auth";
 import { useI18n } from "@/i18n";
-import { formatUsd } from "@/utils/format";
+import { formatDateTime, formatUsd } from "@/utils/format";
 
 defineOptions({ name: "SettingsView" });
 
 const cache = useDataCacheStore();
 const authStore = useAuthStore();
-const { t, isZh } = useI18n();
+const { t } = useI18n();
 
 type TabKey = "accounts" | "trading" | "resilience" | "network" | "notifications" | "security";
 const activeTab = ref<TabKey>("accounts");
 
-const settingsData = ref<any>(cache.settings?.data ? structuredClone(cache.settings.data) : null);
+const settingsData = ref<any>(cache.settings?.data ? JSON.parse(JSON.stringify(cache.settings.data)) : null);
+const loading = ref(false);
+const loadError = ref("");
+
 const accounts = ref<any[]>(cache.accounts?.data || []);
 const proxies = ref<any[]>(cache.proxies?.data || []);
 const auditLogs = ref<any[]>(cache.auditLogs?.data || []);
@@ -86,18 +89,35 @@ const testingAcctId = ref<number | null>(null);
 const acctTestResult = ref<Record<number, any>>({});
 
 async function loadData(force = false) {
-  const [sRes, aItems, pItems, lItems, gItems] = await Promise.all([
-    cache.fetchSettings(force, 20000),
-    cache.fetchAccounts(force, 15000),
-    cache.fetchProxies(force, 20000),
-    cache.fetchAuditLogs(force, 20000),
-    cache.fetchSecurityGuards(force, 15000),
-  ]);
-  settingsData.value = JSON.parse(JSON.stringify(sRes));
-  accounts.value = aItems;
-  proxies.value = pItems;
-  auditLogs.value = lItems;
-  securityGuards.value = gItems;
+  if (loading.value) return;
+  loading.value = true;
+  loadError.value = "";
+  try {
+    const [settings, ...optional] = await Promise.allSettled([
+      cache.fetchSettings(force, 20000),
+      cache.fetchAccounts(force, 15000),
+      cache.fetchProxies(force, 20000),
+      cache.fetchAuditLogs(force, 20000),
+      cache.fetchSecurityGuards(force, 15000),
+    ]);
+    if (settings.status === "fulfilled" && settings.value) {
+      settingsData.value = JSON.parse(JSON.stringify(settings.value));
+    } else {
+      console.warn("Settings request failed", settings.status === "rejected" ? settings.reason : "Empty response");
+      loadError.value = t("set.loadError");
+    }
+    const targets = [accounts, proxies, auditLogs, securityGuards];
+    const names = ["accounts", "proxies", "auditLogs", "securityGuards"];
+    optional.forEach((result, index) => {
+      targets[index]!.value = result.status === "fulfilled" ? result.value || [] : [];
+      if (result.status === "rejected") console.warn(`Settings: ${names[index]} request failed`, result.reason);
+    });
+  } catch (error) {
+    console.warn("Settings load failed", error);
+    loadError.value = t("set.loadError");
+  } finally {
+    loading.value = false;
+  }
 }
 
 async function saveSettings() {
@@ -273,6 +293,10 @@ onActivated(() => {
 
 <template>
   <div class="space-y-6" v-if="settingsData">
+    <div v-if="loadError" role="alert" class="p-4 rounded-xl bg-amber-500/10 text-amber-300 flex items-center justify-between gap-3">
+      <span>{{ loadError }}</span>
+      <button @click="loadData(true)" :disabled="loading" class="px-3 py-2 rounded-lg bg-surface2 disabled:opacity-40">{{ t("set.retry") }}</button>
+    </div>
     <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
       <div>
         <h2 class="text-xl sm:text-2xl font-bold text-white tracking-tight">{{ t("set.title") }}</h2>
@@ -509,26 +533,39 @@ onActivated(() => {
             <AlertTriangle class="w-4 h-4 text-amber-400" />
             <span>{{ t("set.secRiskCaps") }}</span>
           </h3>
+          <div class="space-y-3 p-3 rounded-xl bg-background/60 border border-slate-800 text-xs">
+            <label class="flex items-center gap-2 text-slate-200">
+              <input v-model="settingsData.risk_defaults.enable_circuit_breaker" type="checkbox" class="w-4 h-4 rounded text-accent" />
+              {{ t("risk.circuitBreaker") }}
+            </label>
+            <p v-if="!settingsData.risk_defaults.enable_circuit_breaker" class="text-amber-300">{{ t("risk.circuitDisabledHint") }}</p>
+            <label class="flex items-center gap-2 text-slate-200">
+              <input v-model="settingsData.risk_defaults.enable_leverage_cap" type="checkbox" class="w-4 h-4 rounded text-accent" />
+              {{ t("risk.leverageCap") }}
+            </label>
+            <p v-if="!settingsData.risk_defaults.enable_leverage_cap" class="text-accent">{{ t("risk.autoLeverageHint") }}</p>
+            <p class="text-slate-400">{{ t("risk.zeroSkips") }}</p>
+          </div>
           <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
             <div>
               <label class="block text-slate-400 mb-1">{{ t("set.maxSingleLev") }}</label>
-              <input v-model.number="settingsData.risk_defaults.max_single_leverage" type="number" step="0.5" min="1" max="100" class="w-full px-3 py-2 rounded-xl bg-background border border-slate-700 text-white font-mono text-sm" />
+              <input v-model.number="settingsData.risk_defaults.max_single_leverage" :disabled="!settingsData.risk_defaults.enable_leverage_cap" type="number" step="0.5" min="0" max="100" class="disabled:opacity-40 w-full px-3 py-2 rounded-xl bg-background border border-slate-700 text-white font-mono text-sm" />
             </div>
             <div>
               <label class="block text-slate-400 mb-1">{{ t("set.maxTotalLev") }}</label>
-              <input v-model.number="settingsData.risk_defaults.max_total_leverage" type="number" step="0.5" min="1" max="100" class="w-full px-3 py-2 rounded-xl bg-background border border-slate-700 text-white font-mono text-sm" />
+              <input v-model.number="settingsData.risk_defaults.max_total_leverage" :disabled="!settingsData.risk_defaults.enable_leverage_cap" type="number" step="0.5" min="0" max="100" class="disabled:opacity-40 w-full px-3 py-2 rounded-xl bg-background border border-slate-700 text-white font-mono text-sm" />
             </div>
             <div>
               <label class="block text-slate-400 mb-1">{{ t("set.maxInstLev") }}</label>
-              <input v-model.number="settingsData.risk_defaults.max_instrument_leverage" type="number" step="1" min="1" max="125" class="w-full px-3 py-2 rounded-xl bg-background border border-slate-700 text-white font-mono text-sm" />
+              <input v-model.number="settingsData.risk_defaults.max_instrument_leverage" :disabled="!settingsData.risk_defaults.enable_leverage_cap" type="number" step="1" min="1" max="125" class="disabled:opacity-40 w-full px-3 py-2 rounded-xl bg-background border border-slate-700 text-white font-mono text-sm" />
             </div>
             <div>
               <label class="block text-slate-400 mb-1">{{ t("set.mddBreaker") }}</label>
-              <input v-model.number="settingsData.risk_defaults.max_drawdown_pct" type="number" step="1" min="1" max="100" class="w-full px-3 py-2 rounded-xl bg-background border border-slate-700 text-white font-mono text-sm" />
+              <input v-model.number="settingsData.risk_defaults.max_drawdown_pct" :disabled="!settingsData.risk_defaults.enable_circuit_breaker" type="number" step="1" min="0" max="100" class="disabled:opacity-40 w-full px-3 py-2 rounded-xl bg-background border border-slate-700 text-white font-mono text-sm" />
             </div>
             <div class="sm:col-span-2">
               <label class="block text-slate-400 mb-1">{{ t("set.dailyLossBreaker") }}</label>
-              <input v-model.number="settingsData.risk_defaults.daily_max_loss_pct" type="number" step="0.5" min="1" max="100" class="w-full px-3 py-2 rounded-xl bg-background border border-slate-700 text-white font-mono text-sm" />
+              <input v-model.number="settingsData.risk_defaults.daily_max_loss_pct" :disabled="!settingsData.risk_defaults.enable_circuit_breaker" type="number" step="0.5" min="0" max="100" class="disabled:opacity-40 w-full px-3 py-2 rounded-xl bg-background border border-slate-700 text-white font-mono text-sm" />
             </div>
           </div>
         </div>
@@ -901,7 +938,7 @@ onActivated(() => {
                   </span>
                   <span v-else class="text-slate-400">{{ t("set.normal") }}</span>
                 </td>
-                <td class="py-2 px-4 text-slate-400">{{ g.lastFailAt ? new Date(g.lastFailAt).toLocaleString(isZh ? "zh-CN" : "en-US") : '-' }}</td>
+                <td class="py-2 px-4 text-slate-400">{{ formatDateTime(g.lastFailAt) }}</td>
                 <td class="py-2 px-4 text-right">
                   <button
                     v-if="g.failCount > 0 || g.lockRemainingSec > 0"
@@ -943,7 +980,7 @@ onActivated(() => {
             </thead>
             <tbody class="divide-y divide-slate-800/60 font-mono">
               <tr v-for="log in auditLogs" :key="log.id" class="hover:bg-slate-800/30">
-                <td class="py-2.5 px-4 text-slate-400 whitespace-nowrap">{{ new Date(log.createdAt).toLocaleString(isZh ? "zh-CN" : "en-US") }}</td>
+                <td class="py-2.5 px-4 text-slate-400 whitespace-nowrap">{{ formatDateTime(log.createdAt) }}</td>
                 <td class="py-2.5 px-4 text-white">{{ log.username }}</td>
                 <td class="py-2.5 px-4 text-accent">{{ log.action }}</td>
                 <td class="py-2.5 px-4 text-slate-300 font-sans">{{ log.details }}</td>
@@ -1090,5 +1127,14 @@ onActivated(() => {
         </form>
       </div>
     </div>
+  </div>
+  <div v-else-if="loading" role="status" aria-live="polite" class="p-8 rounded-2xl bg-surface border border-slate-800 flex items-center justify-center gap-3 text-slate-400">
+    <RefreshCw class="w-5 h-5 animate-spin text-accent" />
+    <span>{{ t("set.loading") }}</span>
+  </div>
+  <div v-else class="p-8 rounded-2xl bg-surface border border-rose-500/30 text-center space-y-4" role="alert">
+    <AlertTriangle class="w-8 h-8 text-rose-400 mx-auto" />
+    <p class="text-slate-300">{{ loadError || t("set.loadError") }}</p>
+    <button @click="loadData(true)" class="px-4 py-2 rounded-xl bg-accent text-slate-950 font-semibold">{{ t("set.retry") }}</button>
   </div>
 </template>

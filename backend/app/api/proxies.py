@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from app.core.time_util import to_utc_iso
+
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -27,7 +29,7 @@ def _proxy_out(p: ProxyNode) -> dict:
         "isEnabled": p.is_enabled,
         "isHealthy": p.is_healthy,
         "latencyMs": p.latency_ms,
-        "lastCheckedAt": p.last_checked_at.isoformat() if p.last_checked_at else None,
+        "lastCheckedAt": to_utc_iso(p.last_checked_at),
         "lastError": redact_error_urls(p.last_error) if p.last_error else None,
     }
 
