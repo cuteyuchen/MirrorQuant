@@ -234,7 +234,8 @@ class BinanceAdapter(BaseExchangeAdapter):
         result: Dict[str, InstrumentSpec] = {}
         for item in info.get("symbols", []):
             if (item.get("status") != "TRADING" or item.get("quoteAsset") != "USDT"
-                    or item.get("marginAsset") != "USDT" or item.get("contractType") != "PERPETUAL"):
+                    or item.get("marginAsset") != "USDT"
+                    or item.get("contractType") not in ("PERPETUAL", "TRADIFI_PERPETUAL")):
                 continue
             try:
                 sym = item["symbol"]

@@ -1,4 +1,8 @@
 from decimal import Decimal
+from unittest.mock import AsyncMock
+
+import pytest
+
 from app.services.adapters.base import InstrumentSpec
 from app.services.adapters.binance import BinanceAdapter
 from app.services.adapters.okx import OKXAdapter
@@ -47,6 +51,79 @@ def test_binance_symbol_resolution():
     inst_id, ok = adapter.resolve_symbol("BTCUSDT", instruments)
     assert inst_id == "BTCUSDT"
     assert ok is True
+
+
+@pytest.fixture
+def binance_symbol_metadata():
+    return {
+        "symbol": "NVDAUSDT",
+        "baseAsset": "NVDA",
+        "status": "TRADING",
+        "quoteAsset": "USDT",
+        "marginAsset": "USDT",
+        "contractType": "TRADIFI_PERPETUAL",
+        "filters": [
+            {"filterType": "LOT_SIZE", "minQty": "0.01", "stepSize": "0.01", "maxQty": "10000"},
+            {"filterType": "MARKET_LOT_SIZE", "minQty": "0.1", "stepSize": "0.1", "maxQty": "1000"},
+            {"filterType": "PRICE_FILTER", "tickSize": "0.001"},
+            {"filterType": "MIN_NOTIONAL", "notional": "5"},
+        ],
+    }
+
+
+async def test_binance_get_instruments_includes_crypto_and_tradfi_perpetuals(binance_symbol_metadata):
+    adapter = BinanceAdapter(credentials={"api_key": "k", "secret_key": "s"})
+    contracts = (
+        ("BTC", "PERPETUAL"),
+        ("NVDA", "TRADIFI_PERPETUAL"),
+        ("TSLA", "TRADIFI_PERPETUAL"),
+        ("XAU", "TRADIFI_PERPETUAL"),
+    )
+    adapter._request = AsyncMock(return_value={
+        "symbols": [
+            {**binance_symbol_metadata, "symbol": f"{base}USDT", "baseAsset": base, "contractType": contract_type}
+            for base, contract_type in contracts
+        ],
+    })
+
+    instruments = await adapter.get_instruments()
+
+    assert instruments == {
+        f"{base}USDT": InstrumentSpec(
+            inst_id=f"{base}USDT",
+            ct_val=Decimal("1"),
+            min_sz=Decimal("0.01"),
+            lot_sz=Decimal("0.01"),
+            max_sz=Decimal("10000"),
+            market_min_sz=Decimal("0.1"),
+            market_lot_sz=Decimal("0.1"),
+            market_max_sz=Decimal("1000"),
+            tick_sz=Decimal("0.001"),
+            max_lvr=125,
+            min_notional=Decimal("5"),
+            settle_ccy="USDT",
+            base_ccy=base,
+        )
+        for base, _ in contracts
+    }
+    adapter._request.assert_awaited_once_with("GET", "/fapi/v1/exchangeInfo", auth=False)
+    assert adapter.resolve_symbol("NVDAUSDT", instruments) == ("NVDAUSDT", True)
+
+
+@pytest.mark.parametrize("overrides", (
+    {"status": "PENDING_TRADING"},
+    {"quoteAsset": "USDC"},
+    {"marginAsset": "USDC"},
+    {"contractType": "CURRENT_QUARTER"},
+    {"contractType": "NEXT_QUARTER"},
+    {"contractType": "UNKNOWN"},
+    {"contractType": None},
+))
+async def test_binance_get_instruments_excludes_ineligible_contracts(binance_symbol_metadata, overrides):
+    adapter = BinanceAdapter(credentials={"api_key": "k", "secret_key": "s"})
+    adapter._request = AsyncMock(return_value={"symbols": [{**binance_symbol_metadata, **overrides}]})
+
+    assert await adapter.get_instruments() == {}
 
 
 def test_bybit_symbol_resolution_and_signature():
