@@ -282,9 +282,9 @@ function statusBadge(status: string) {
           </article>
         </div>
         <div class="hidden md:block overflow-x-auto">
-        <table class="w-full min-w-[1060px] text-sm text-left">
+        <table class="w-full min-w-[760px] text-sm text-left">
           <thead class="bg-background/50 text-slate-300 border-b border-slate-700/70">
-            <tr class="[&>th]:px-5 [&>th]:py-3 [&>th]:font-medium">
+            <tr class="[&>th]:px-3 [&>th]:py-3 [&>th]:font-medium">
               <th>{{ t("dash.colAcctContract") }}</th>
               <th>{{ t("dash.colSideLeverage") }}</th>
               <th class="text-right">{{ t("dash.colQty") }}</th>
@@ -295,7 +295,7 @@ function statusBadge(status: string) {
             </tr>
           </thead>
           <tbody class="divide-y divide-slate-800/70">
-            <tr v-for="pos in data.followerPositions" :key="`${pos.accountId}-${pos.instId}-${pos.posSide}`" class="hover:bg-slate-800/30 [&>td]:px-5 [&>td]:py-4">
+            <tr v-for="pos in data.followerPositions" :key="`${pos.accountId}-${pos.instId}-${pos.posSide}`" class="hover:bg-slate-800/30 [&>td]:px-3 [&>td]:py-4">
               <td>
                 <div class="text-base font-bold text-white">{{ pos.instId || pos.symbol }}</div>
                 <div class="text-sm text-slate-400 mt-1">{{ pos.accountName }} · {{ pos.exchange?.toUpperCase() }} · {{ pos.environment === 'live' ? t('dash.liveEnv') : t('dash.demoEnv') }}</div>
@@ -381,16 +381,16 @@ function statusBadge(status: string) {
       </div>
       <div v-if="!data.leadPositions.length" class="p-8 text-center text-sm text-slate-300">{{ t("dash.noLeadPos") }}</div>
       <div v-else class="overflow-x-auto">
-        <table class="w-full min-w-[900px] text-sm text-left">
+        <table class="w-full min-w-[760px] text-sm text-left">
           <thead class="bg-background/40 text-slate-300 border-b border-slate-800">
-            <tr class="[&>th]:px-5 [&>th]:py-3 [&>th]:font-medium">
+            <tr class="[&>th]:px-3 [&>th]:py-3 [&>th]:font-medium">
               <th>{{ t("dash.colLeadSymbol") }}</th><th>{{ t("dash.colSide") }}</th>
               <th class="text-right">{{ t("dash.colQty") }}</th><th class="text-right">{{ t("dash.colEntryMark") }}</th>
               <th class="text-right">{{ t("dash.colNotional") }}</th><th class="text-right">{{ t("dash.colEstUpnl") }}</th><th>{{ t("dash.colPaBias") }}</th>
             </tr>
           </thead>
           <tbody class="divide-y divide-slate-800/60">
-            <tr v-for="(pos, idx) in data.leadPositions" :key="`${pos.leadId}-${pos.symbol}-${pos.positionSide}-${idx}`" class="hover:bg-slate-800/30 [&>td]:px-5 [&>td]:py-4">
+            <tr v-for="(pos, idx) in data.leadPositions" :key="`${pos.leadId}-${pos.symbol}-${pos.positionSide}-${idx}`" class="hover:bg-slate-800/30 [&>td]:px-3 [&>td]:py-4">
               <td><div class="text-base font-bold text-white">{{ pos.symbol }}</div><div class="text-sm text-slate-400 mt-1">{{ pos.leadName }}</div></td>
               <td><span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg font-semibold" :class="pos.positionSide === 'LONG' ? 'bg-emerald-500/15 text-emerald-400' : 'bg-rose-500/15 text-rose-400'">
                 <ArrowUpRight v-if="pos.positionSide === 'LONG'" class="w-4 h-4" /><ArrowDownRight v-else class="w-4 h-4" />{{ pos.positionSide }}
