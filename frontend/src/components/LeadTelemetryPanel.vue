@@ -158,7 +158,7 @@ function fmtDur(ms: number | null | undefined) {
 
 function pnlColor(v: number | null | undefined) {
   if (v === null || v === undefined) return "text-slate-300";
-  return v >= 0 ? "text-emerald-400" : "text-rose-400";
+  return v > 0 ? "text-emerald-400" : v < 0 ? "text-rose-400" : "text-slate-300";
 }
 
 function dirLabel(dir: string | undefined) {
@@ -319,12 +319,12 @@ const priceAgeSec = computed(() => {
               </h2>
               <span
                 v-if="profile.badgeName"
-                class="px-2 py-0.5 rounded-full text-[10px] font-mono font-bold uppercase tracking-wider bg-amber-500/15 text-amber-300 border border-amber-500/30"
+                class="px-2 py-0.5 rounded-full text-xs font-mono font-bold uppercase tracking-wider bg-amber-500/15 text-amber-300 border border-amber-500/30"
               >
                 {{ profile.badgeName }}
               </span>
               <span
-                class="px-2 py-0.5 rounded-full text-[10px] font-mono border"
+                class="px-2 py-0.5 rounded-full text-xs font-mono border"
                 :class="
                   profile.positionShow
                     ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30'
@@ -335,7 +335,7 @@ const priceAgeSec = computed(() => {
               </span>
               <span
                 v-if="profile.signTradFi"
-                class="px-2 py-0.5 rounded-full text-[10px] font-mono bg-purple-500/15 text-purple-300 border border-purple-500/30"
+                class="px-2 py-0.5 rounded-full text-xs font-mono bg-purple-500/15 text-purple-300 border border-purple-500/30"
               >
                 {{ t("tel.tradFiTag") }}
               </span>
@@ -347,7 +347,7 @@ const priceAgeSec = computed(() => {
                 <span
                   v-for="tag in profile.tags.slice(0, 5)"
                   :key="tag"
-                  class="px-1.5 py-0.5 rounded bg-background border border-slate-800 text-[10px] text-slate-300"
+                  class="px-1.5 py-0.5 rounded bg-background border border-slate-800 text-xs text-slate-300"
                 >
                   {{ tag }}
                 </span>
@@ -363,18 +363,18 @@ const priceAgeSec = computed(() => {
         <!-- Freshness & Timing Badges -->
         <div class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-2 gap-2.5 shrink-0 text-xs">
           <div class="px-3 py-2 rounded-xl bg-background/80 border border-slate-800">
-            <div class="text-[10px] font-mono text-slate-500 uppercase">{{ t("tel.lastTrade") }}</div>
+            <div class="text-xs font-mono text-slate-400 uppercase">{{ t("tel.lastTrade") }}</div>
             <div class="font-mono font-semibold text-slate-100 mt-0.5">
               {{ fmtAgo(profile.lastTradeTime) }}
             </div>
-            <div class="text-[10px] font-mono text-slate-500">{{ fmtTime(profile.lastTradeTime) }}</div>
+            <div class="text-xs font-mono text-slate-400">{{ fmtTime(profile.lastTradeTime) }}</div>
           </div>
           <div class="px-3 py-2 rounded-xl bg-background/80 border border-slate-800">
-            <div class="text-[10px] font-mono text-slate-500 uppercase">{{ t("tel.dataAge") }}</div>
+            <div class="text-xs font-mono text-slate-400 uppercase">{{ t("tel.dataAge") }}</div>
             <div class="font-mono font-semibold text-emerald-400 mt-0.5">
               {{ priceAgeSec != null ? t("tel.priceAge", { s: priceAgeSec }) : "—" }}
             </div>
-            <div class="text-[10px] font-mono text-slate-500">
+            <div class="text-xs font-mono text-slate-400">
               {{ dataAgeSec != null ? t("tel.syncAge", { s: dataAgeSec, ms: meta.fetchMs ?? 0 }) : "—" }}
             </div>
           </div>
@@ -382,10 +382,10 @@ const priceAgeSec = computed(() => {
             v-if="meta.orderStoreSize != null"
             class="px-3 py-2 rounded-xl bg-background/80 border border-slate-800 col-span-2 flex items-center justify-between gap-2"
           >
-            <span class="text-[11px] font-mono text-slate-300">
+            <span class="text-sm font-mono text-slate-300">
               {{ t("tel.storeOrders", { n: meta.orderStoreSize }) }}
             </span>
-            <span v-if="countdownSec != null" class="text-[11px] font-mono text-accent">
+            <span v-if="countdownSec != null" class="text-sm font-mono text-accent">
               {{ t("tel.nextRefresh") }}: {{ countdownSec }}s
             </span>
           </div>
@@ -394,7 +394,7 @@ const priceAgeSec = computed(() => {
 
       <!-- Timeframe Selector -->
       <div class="flex items-center justify-between flex-wrap gap-2 mt-5 mb-2.5">
-        <div class="text-[11px] font-mono uppercase tracking-wider text-slate-400">
+        <div class="text-sm font-mono uppercase tracking-wider text-slate-400">
           {{ t("tel.perfMatrixTitle") }}
         </div>
         <div v-if="availableTfs.length" class="flex items-center gap-1 bg-background p-1 rounded-lg border border-slate-800">
@@ -403,7 +403,7 @@ const priceAgeSec = computed(() => {
             :key="tf"
             type="button"
             @click="activeTf = tf"
-            class="px-2.5 py-1 rounded text-[11px] font-mono font-semibold transition-colors cursor-pointer"
+            class="px-2.5 py-1 rounded text-sm font-mono font-semibold transition-colors cursor-pointer"
             :class="
               selectedTf === tf
                 ? 'bg-accent/20 text-accent border border-accent/30'
@@ -416,64 +416,64 @@ const priceAgeSec = computed(() => {
       </div>
 
       <!-- 6 Headline KPI Cards -->
-      <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
-        <div class="p-3 rounded-xl bg-background/80 border border-slate-800">
-          <div class="text-[10px] font-mono uppercase text-slate-500">{{ selectedTf }} ROI</div>
-          <div class="text-lg font-mono font-bold mt-1" :class="pnlColor(currentPerf.roi)">
+      <div class="grid grid-cols-[repeat(auto-fit,minmax(min(100%,220px),1fr))] gap-4">
+        <div class="min-w-0 p-4 rounded-xl bg-background/80 border border-slate-800">
+          <div class="text-sm font-medium uppercase text-slate-300">{{ selectedTf }} ROI</div>
+          <div class="text-2xl font-mono font-bold tracking-tight mt-1" :class="pnlColor(currentPerf.roi)">
             {{ fmtPct(currentPerf.roi) }}
           </div>
-          <div class="text-[11px] font-mono text-slate-400 mt-0.5">
+          <div class="text-sm font-mono text-slate-300 mt-2">
             PnL {{ fmtUsd(currentPerf.pnl, 0, true) }}
           </div>
         </div>
 
-        <div class="p-3 rounded-xl bg-background/80 border border-slate-800">
-          <div class="text-[10px] font-mono uppercase text-slate-500">{{ t("tel.kpiAum") }}</div>
-          <div class="text-lg font-mono font-bold text-white mt-1">
+        <div class="min-w-0 p-4 rounded-xl bg-background/80 border border-slate-800">
+          <div class="text-sm font-medium uppercase text-slate-300">{{ t("tel.kpiAum") }}</div>
+          <div class="text-2xl font-mono font-bold tracking-tight text-white mt-1">
             {{ fmtUsd(profile.aumAmount, 0) }}
           </div>
-          <div class="text-[11px] font-mono text-slate-400 mt-0.5">
+          <div class="text-sm font-mono text-slate-300 mt-2">
             {{ t("tel.kpiCopyAum", { val: fmtUsd(profile.copyAum, 0) }) }}
           </div>
         </div>
 
-        <div class="p-3 rounded-xl bg-background/80 border border-slate-800">
-          <div class="text-[10px] font-mono uppercase text-slate-500">{{ t("tel.kpiMarginBal") }}</div>
-          <div class="text-lg font-mono font-bold text-accent mt-1">
+        <div class="min-w-0 p-4 rounded-xl bg-background/80 border border-slate-800">
+          <div class="text-sm font-medium uppercase text-slate-300">{{ t("tel.kpiMarginBal") }}</div>
+          <div class="text-2xl font-mono font-bold tracking-tight text-accent mt-1">
             {{ fmtUsd(profile.marginBalance, 2) }}
           </div>
-          <div class="text-[11px] font-mono text-slate-400 mt-0.5">
+          <div class="text-sm font-mono text-slate-300 mt-2">
             {{ t("tel.kpiProfitShare", { rate: profile.profitSharingRate ?? "—" }) }}
           </div>
         </div>
 
-        <div class="p-3 rounded-xl bg-background/80 border border-slate-800">
-          <div class="text-[10px] font-mono uppercase text-slate-500">{{ t("tel.kpiCopierPnl") }}</div>
-          <div class="text-lg font-mono font-bold mt-1" :class="pnlColor(currentPerf.copierPnl ?? profile.copierPnl)">
+        <div class="min-w-0 p-4 rounded-xl bg-background/80 border border-slate-800">
+          <div class="text-sm font-medium uppercase text-slate-300">{{ t("tel.kpiCopierPnl") }}</div>
+          <div class="text-2xl font-mono font-bold tracking-tight mt-1" :class="pnlColor(currentPerf.copierPnl ?? profile.copierPnl)">
             {{ fmtUsd(currentPerf.copierPnl ?? profile.copierPnl, 0, true) }}
           </div>
-          <div class="text-[11px] font-mono text-slate-400 mt-0.5">
+          <div class="text-sm font-mono text-slate-300 mt-2">
             {{ t("tel.kpiCopiers") }}: {{ profile.currentCopyCount ?? "—" }}/{{ profile.maxCopyCount ?? "—" }}
             <span v-if="copyFull" class="text-amber-400">({{ t("tel.kpiFull") }})</span>
           </div>
         </div>
 
-        <div class="p-3 rounded-xl bg-background/80 border border-slate-800">
-          <div class="text-[10px] font-mono uppercase text-slate-500">{{ t("tel.kpiWinRate") }} ({{ selectedTf }})</div>
-          <div class="text-lg font-mono font-bold text-white mt-1">
+        <div class="min-w-0 p-4 rounded-xl bg-background/80 border border-slate-800">
+          <div class="text-sm font-medium uppercase text-slate-300">{{ t("tel.kpiWinRate") }} ({{ selectedTf }})</div>
+          <div class="text-2xl font-mono font-bold tracking-tight text-white mt-1">
             {{ currentPerf.winRate != null ? fmtPct(currentPerf.winRate, 2, false) : "—" }}
           </div>
-          <div class="text-[11px] font-mono text-slate-400 mt-0.5">
+          <div class="text-sm font-mono text-slate-300 mt-2">
             {{ t("tel.kpiWinSub", { win: currentPerf.winOrders ?? 0, total: currentPerf.totalOrder ?? 0 }) }}
           </div>
         </div>
 
-        <div class="p-3 rounded-xl bg-background/80 border border-slate-800">
-          <div class="text-[10px] font-mono uppercase text-slate-500">{{ t("tel.kpiMdd") }} ({{ selectedTf }})</div>
-          <div class="text-lg font-mono font-bold text-amber-400 mt-1">
+        <div class="min-w-0 p-4 rounded-xl bg-background/80 border border-slate-800">
+          <div class="text-sm font-medium uppercase text-slate-300">{{ t("tel.kpiMdd") }} ({{ selectedTf }})</div>
+          <div class="text-2xl font-mono font-bold tracking-tight text-amber-400 mt-1">
             {{ currentPerf.mdd != null ? fmtPct(currentPerf.mdd, 2, false) : "—" }}
           </div>
-          <div class="text-[11px] font-mono text-slate-400 mt-0.5">
+          <div class="text-sm font-mono text-slate-300 mt-2">
             Sharpe: {{ currentPerf.sharpRatio ?? profile.sharpRatio ?? "—" }}
           </div>
         </div>
@@ -482,7 +482,7 @@ const priceAgeSec = computed(() => {
       <!-- Multi-Timeframe Comparison Table -->
       <div v-if="availableTfs.length > 1" class="mt-3 overflow-x-auto rounded-xl border border-slate-800 bg-background/50">
         <table class="w-full text-xs">
-          <thead class="text-[10px] font-mono uppercase text-slate-500 border-b border-slate-800">
+          <thead class="text-xs font-mono uppercase text-slate-400 border-b border-slate-800">
             <tr>
               <th class="px-3 py-2 text-left">{{ t("tel.tfCol") }}</th>
               <th class="px-3 py-2 text-right">{{ t("tel.roiCol") }}</th>
@@ -518,7 +518,7 @@ const priceAgeSec = computed(() => {
               </td>
               <td class="px-3 py-1.5 text-right text-slate-300">
                 {{ perf[tf]?.winRate != null ? fmtPct(perf[tf]?.winRate, 1, false) : "—" }}
-                <span class="text-slate-500 text-[10px]">({{ perf[tf]?.winOrders ?? 0 }}/{{ perf[tf]?.totalOrder ?? 0 }})</span>
+                <span class="text-slate-400 text-xs">({{ perf[tf]?.winOrders ?? 0 }}/{{ perf[tf]?.totalOrder ?? 0 }})</span>
               </td>
               <td class="px-3 py-1.5 text-right text-slate-200">
                 {{ perf[tf]?.sharpRatio ?? "—" }}
@@ -533,11 +533,11 @@ const priceAgeSec = computed(() => {
     <div class="rounded-2xl bg-surface border border-slate-800/90 p-5">
       <div class="flex flex-wrap items-center justify-between gap-2 mb-4">
         <div class="flex items-center gap-2.5">
-          <h3 class="text-sm font-semibold text-white">
+          <h3 class="text-base font-semibold text-white">
             {{ t("tel.openSectionTitle") }}
           </h3>
           <span
-            class="px-2 py-0.5 rounded-full text-[10px] font-mono border"
+            class="px-2 py-0.5 rounded-full text-xs font-mono border"
             :class="
               openMeta.source === 'api'
                 ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30'
@@ -547,57 +547,57 @@ const priceAgeSec = computed(() => {
             {{ openMeta.source === "api" ? t("tel.srcApi") : t("tel.srcDerived") }}
           </span>
         </div>
-        <span class="px-2.5 py-0.5 rounded-full text-[11px] font-mono font-semibold border" :class="riskInfo.cls">
+        <span class="px-2.5 py-0.5 rounded-full text-sm font-mono font-semibold border" :class="riskInfo.cls">
           {{ t(riskInfo.key) }}
         </span>
       </div>
 
       <!-- 6-Tile Account Leverage & Margin Risk Summary -->
-      <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5 mb-4">
-        <div class="p-3 rounded-xl bg-background/80 border border-slate-800">
-          <div class="text-[10px] font-mono uppercase text-slate-500">{{ t("tel.posStatus") }}</div>
+      <div class="grid grid-cols-[repeat(auto-fit,minmax(min(100%,220px),1fr))] gap-4 mb-5">
+        <div class="min-w-0 p-4 rounded-xl bg-background/80 border border-slate-800">
+          <div class="text-sm font-medium uppercase text-slate-300">{{ t("tel.posStatus") }}</div>
           <div class="text-sm font-semibold mt-1" :class="summary.positionCount ? 'text-white' : 'text-slate-400'">
             {{ holdingStatusText }}
           </div>
-          <div class="text-[10px] text-slate-500 mt-0.5">{{ holdingExposureNote }}</div>
+          <div class="text-sm text-slate-300 mt-0.5">{{ holdingExposureNote }}</div>
         </div>
 
-        <div class="p-3 rounded-xl bg-background/80 border border-slate-800">
-          <div class="text-[10px] font-mono uppercase text-slate-500">{{ t("tel.tileMarginBal") }}</div>
-          <div class="text-sm font-mono font-bold text-white mt-1">
+        <div class="min-w-0 p-4 rounded-xl bg-background/80 border border-slate-800">
+          <div class="text-sm font-medium uppercase text-slate-300">{{ t("tel.tileMarginBal") }}</div>
+          <div class="text-xl font-mono font-bold text-white mt-1">
             {{ fmtUsd(summary.marginBalance ?? profile.marginBalance, 2) }}
           </div>
-          <div class="text-[10px] font-mono text-slate-500 mt-0.5">
+          <div class="text-sm font-mono text-slate-400 mt-0.5">
             {{ t("tel.tileAvail", { val: fmtUsd(summary.availableMargin, 2) }) }}
           </div>
         </div>
 
-        <div class="p-3 rounded-xl bg-background/80 border border-slate-800">
-          <div class="text-[10px] font-mono uppercase text-slate-500">{{ t("tel.tileTotalMark") }}</div>
-          <div class="text-sm font-mono font-bold text-white mt-1">
+        <div class="min-w-0 p-4 rounded-xl bg-background/80 border border-slate-800">
+          <div class="text-sm font-medium uppercase text-slate-300">{{ t("tel.tileTotalMark") }}</div>
+          <div class="text-xl font-mono font-bold text-white mt-1">
             {{ fmtUsd(summary.totalMarkNotional, 2) }}
           </div>
-          <div class="text-[10px] font-mono text-slate-500 mt-0.5">
+          <div class="text-sm font-mono text-slate-400 mt-0.5">
             {{ t("tel.tileEntryNotional", { val: fmtUsd(summary.totalEntryNotional, 2) }) }}
           </div>
         </div>
 
-        <div class="p-3 rounded-xl bg-background/80 border border-slate-800">
-          <div class="text-[10px] font-mono uppercase text-slate-500">{{ t("tel.tileNotionalLev") }}</div>
-          <div class="text-sm font-mono font-bold text-accent mt-1">
+        <div class="min-w-0 p-4 rounded-xl bg-background/80 border border-slate-800">
+          <div class="text-sm font-medium uppercase text-slate-300">{{ t("tel.tileNotionalLev") }}</div>
+          <div class="text-xl font-mono font-bold text-accent mt-1">
             {{ fmtLev(summary.totalNotionalLeverage) }}
           </div>
-          <div class="text-[10px] font-mono text-slate-500 mt-0.5">
+          <div class="text-sm font-mono text-slate-400 mt-0.5">
             {{ t("tel.tileMaxSingle", { val: fmtLev(summary.maxPositionLeverage) }) }}
           </div>
         </div>
 
-        <div class="p-3 rounded-xl bg-background/80 border border-slate-800">
-          <div class="text-[10px] font-mono uppercase text-slate-500">{{ t("tel.tileMmrBuffer") }}</div>
-          <div class="text-sm font-mono font-bold text-white mt-1">
+        <div class="min-w-0 p-4 rounded-xl bg-background/80 border border-slate-800">
+          <div class="text-sm font-medium uppercase text-slate-300">{{ t("tel.tileMmrBuffer") }}</div>
+          <div class="text-xl font-mono font-bold text-white mt-1">
             {{ summary.estMaintenanceMarginRatioPct != null ? fmtPct(summary.estMaintenanceMarginRatioPct, 2, false) : "—" }}
           </div>
-          <div class="text-[10px] font-mono text-slate-500 mt-0.5">
+          <div class="text-sm font-mono text-slate-400 mt-0.5">
             {{
               t("tel.tileCovBuf", {
                 cov: fmtPct(summary.marginCoveragePct, 1, false),
@@ -607,18 +607,18 @@ const priceAgeSec = computed(() => {
           </div>
         </div>
 
-        <div class="p-3 rounded-xl bg-background/80 border border-slate-800">
-          <div class="text-[10px] font-mono uppercase text-slate-500">{{ t("tel.tileLiveUpnl") }}</div>
-          <div class="text-sm font-mono font-bold mt-1" :class="pnlColor(summary.totalUnrealizedPnl)">
+        <div class="min-w-0 p-4 rounded-xl bg-background/80 border border-slate-800">
+          <div class="text-sm font-medium uppercase text-slate-300">{{ t("tel.tileLiveUpnl") }}</div>
+          <div class="text-xl font-mono font-bold mt-1" :class="pnlColor(summary.totalUnrealizedPnl)">
             {{ fmtUsd(summary.totalUnrealizedPnl, 2, true) }}
           </div>
-          <div class="text-[10px] font-mono mt-0.5" :class="pnlColor(summary.totalMarginRoePct)">
+          <div class="text-sm font-mono mt-0.5" :class="pnlColor(summary.totalMarginRoePct)">
             {{ t("tel.tileMarginRoe", { val: fmtPct(summary.totalMarginRoePct, 2, true) }) }}
           </div>
         </div>
       </div>
 
-      <div class="text-[11px] font-mono text-slate-400 mb-4 px-3 py-2 rounded-lg bg-background/60 border border-slate-800">
+      <div class="text-sm font-mono text-slate-400 mb-4 px-3 py-2 rounded-lg bg-background/60 border border-slate-800">
         {{
           t("tel.formulaNote", {
             mb: fmtUsd(summary.marginBalance ?? profile.marginBalance, 2),
@@ -627,7 +627,7 @@ const priceAgeSec = computed(() => {
         }}
       </div>
 
-      <div v-if="!openPositions.length" class="py-10 text-center text-sm text-slate-500">
+      <div v-if="!openPositions.length" class="py-10 text-center text-sm text-slate-400">
         {{ t("tel.noOpenPositions") }}
       </div>
 
@@ -636,13 +636,13 @@ const priceAgeSec = computed(() => {
         <div
           v-for="p in openPositions"
           :key="posKey(p)"
-          class="rounded-xl border border-slate-800 bg-background/70 p-4 space-y-3"
+          class="rounded-xl border border-slate-800 bg-background/70 p-4 sm:p-5 space-y-5"
         >
-          <div class="flex flex-wrap items-center justify-between gap-2">
-            <div class="flex flex-wrap items-center gap-2">
-              <span class="text-base font-mono font-bold text-white">{{ p.symbol }}</span>
+          <div class="flex flex-wrap items-center justify-between gap-3">
+            <div class="flex flex-wrap items-center gap-3">
+              <span class="text-lg font-mono font-bold text-white">{{ p.symbol }}</span>
               <span
-                class="px-2 py-0.5 rounded text-[11px] font-mono font-bold"
+                class="px-3 py-1 rounded text-base font-mono font-bold"
                 :class="
                   p.positionSide === 'SHORT'
                     ? 'bg-rose-500/20 text-rose-400 border border-rose-500/30'
@@ -654,15 +654,15 @@ const priceAgeSec = computed(() => {
               <span class="text-xs font-mono text-slate-300">
                 {{ Number(p.qty || 0).toLocaleString("en-US", { maximumFractionDigits: 4 }) }}
               </span>
-              <span class="px-1.5 py-0.5 rounded bg-surface border border-slate-800 text-[10px] font-mono text-slate-400">
+              <span class="px-1.5 py-0.5 rounded bg-surface border border-slate-800 text-sm font-medium text-slate-300">
                 {{ t("pos.openedAt", { time: fmtShortTime(p.openTime) }) }}
               </span>
-              <span class="px-1.5 py-0.5 rounded bg-surface border border-slate-800 text-[10px] font-mono text-slate-400">
+              <span class="px-1.5 py-0.5 rounded bg-surface border border-slate-800 text-sm font-medium text-slate-300">
                 {{ t("pos.entryOrdersCount", { n: p.entryOrdersCount ?? (p.entryOrders?.length || 1) }) }}
               </span>
               <span
                 v-if="p.fundingRate != null"
-                class="px-1.5 py-0.5 rounded bg-surface border border-slate-800 text-[10px] font-mono text-slate-400"
+                class="px-1.5 py-0.5 rounded bg-surface border border-slate-800 text-sm font-medium text-slate-300"
               >
                 {{ t("pos.fundingRate", { rate: (Number(p.fundingRate) * 100).toFixed(4) + "%" }) }}
               </span>
@@ -679,74 +679,74 @@ const priceAgeSec = computed(() => {
           </div>
 
           <!-- 8 Telemetry Metrics Grid -->
-          <div class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-2 text-xs">
-            <div class="p-2.5 rounded-lg bg-surface/90 border border-slate-800">
-              <div class="text-[10px] font-mono text-slate-500 flex items-center gap-1">
+          <div class="grid grid-cols-[repeat(auto-fit,minmax(min(100%,240px),1fr))] gap-3 text-sm">
+            <div class="min-w-0 p-3.5 rounded-xl bg-surface/90 border border-slate-800">
+              <div class="text-sm font-medium text-slate-300 flex items-center gap-1">
                 <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
                 {{ t("pos.curPrice") }}
               </div>
-              <div class="font-mono font-bold text-white mt-0.5">{{ fmtPrice(p.currentPrice ?? p.markPrice) }}</div>
-              <div class="text-[10px] font-mono mt-0.5" :class="pnlColor(p.priceEdgePct)">
+              <div class="text-lg font-mono font-bold text-white mt-2">{{ fmtPrice(p.currentPrice ?? p.markPrice) }}</div>
+              <div class="text-sm font-mono font-semibold mt-2" :class="pnlColor(p.priceEdgePct)">
                 {{ t("pos.vsAvg") }} {{ fmtPct(p.priceDiffPct) }}
               </div>
             </div>
 
-            <div class="p-2.5 rounded-lg bg-surface/90 border border-slate-800">
-              <div class="text-[10px] font-mono text-slate-500">{{ t("pos.avgEntry") }}</div>
-              <div class="font-mono font-bold text-white mt-0.5">{{ fmtPrice(p.avgEntry) }}</div>
-              <div class="text-[10px] font-mono text-slate-400 mt-0.5">
+            <div class="min-w-0 p-3.5 rounded-xl bg-surface/90 border border-slate-800">
+              <div class="text-sm font-medium text-slate-300">{{ t("pos.avgEntry") }}</div>
+              <div class="text-lg font-mono font-bold text-white mt-2">{{ fmtPrice(p.avgEntry) }}</div>
+              <div class="text-sm font-medium text-slate-300 mt-2">
                 {{ t("pos.entryVal", { val: fmtUsd(p.entryValue, 0) }) }}
               </div>
             </div>
 
-            <div class="p-2.5 rounded-lg bg-surface/90 border border-slate-800">
-              <div class="text-[10px] font-mono text-slate-500">{{ t("pos.markVal") }}</div>
-              <div class="font-mono font-bold text-white mt-0.5">{{ fmtUsd(p.markValue, 2) }}</div>
-              <div class="text-[10px] font-mono text-slate-400 mt-0.5">
+            <div class="min-w-0 p-3.5 rounded-xl bg-surface/90 border border-slate-800">
+              <div class="text-sm font-medium text-slate-300">{{ t("pos.markVal") }}</div>
+              <div class="text-lg font-mono font-bold text-white mt-2">{{ fmtUsd(p.markValue, 2) }}</div>
+              <div class="text-sm font-medium text-slate-300 mt-2">
                 {{ t("pos.share", { pct: fmtPct(p.sharePct, 1, false) }) }}
               </div>
             </div>
 
-            <div class="p-2.5 rounded-lg bg-surface/90 border border-slate-800">
-              <div class="text-[10px] font-mono text-slate-500">{{ t("pos.notionalLev") }}</div>
-              <div class="font-mono font-bold text-accent mt-0.5">{{ fmtLev(p.notionalLeverage) }}</div>
-              <div class="text-[10px] font-mono text-slate-400 mt-0.5">
+            <div class="min-w-0 p-3.5 rounded-xl bg-surface/90 border border-slate-800">
+              <div class="text-sm font-medium text-slate-300">{{ t("pos.notionalLev") }}</div>
+              <div class="text-lg font-mono font-bold text-accent mt-2">{{ fmtLev(p.notionalLeverage) }}</div>
+              <div class="text-sm font-medium text-slate-300 mt-2">
                 {{ t("pos.entryLev", { val: fmtLev(p.entryLeverage) }) }}
               </div>
             </div>
 
-            <div class="p-2.5 rounded-lg bg-surface/90 border border-slate-800">
-              <div class="text-[10px] font-mono text-slate-500">{{ t("pos.mmrRate") }}</div>
-              <div class="font-mono font-bold text-white mt-0.5">
+            <div class="min-w-0 p-3.5 rounded-xl bg-surface/90 border border-slate-800">
+              <div class="text-sm font-medium text-slate-300">{{ t("pos.mmrRate") }}</div>
+              <div class="text-lg font-mono font-bold text-white mt-2">
                 {{ p.maintMarginPct != null ? fmtPct(p.maintMarginPct, 2, false) : "—" }}
               </div>
-              <div class="text-[10px] font-mono text-slate-400 mt-0.5">
-                {{ p.mmr?.tier ? t("pos.tier", { tier: p.mmr.tier }) : "—" }}
+              <div class="text-sm font-medium text-slate-300 mt-2">
+                {{ p.mmr?.tier ? t("pos.tier", { tier: p.mmr.tier }) : p.mmr?.exact === false ? t("tel.mmrFallback") : "—" }}
               </div>
             </div>
 
-            <div class="p-2.5 rounded-lg bg-surface/90 border border-slate-800">
-              <div class="text-[10px] font-mono text-slate-500">{{ t("pos.maintMargin") }}</div>
-              <div class="font-mono font-bold text-white mt-0.5">{{ fmtUsd(p.maintMargin, 2) }}</div>
-              <div class="text-[10px] font-mono text-slate-400 mt-0.5">
+            <div class="min-w-0 p-3.5 rounded-xl bg-surface/90 border border-slate-800">
+              <div class="text-sm font-medium text-slate-300">{{ t("pos.maintMargin") }}</div>
+              <div class="text-lg font-mono font-bold text-white mt-2">{{ fmtUsd(p.maintMargin, 2) }}</div>
+              <div class="text-sm font-medium text-slate-300 mt-2">
                 {{ t("pos.pctOfMb", { pct: fmtPct(p.maintMarginRoePct, 2, false) }) }}
               </div>
             </div>
 
-            <div class="p-2.5 rounded-lg bg-surface/90 border border-slate-800">
-              <div class="text-[10px] font-mono text-slate-500">{{ t("pos.floatPnl") }}</div>
-              <div class="font-mono font-bold mt-0.5" :class="pnlColor(p.uPnL)">
+            <div class="min-w-0 p-3.5 rounded-xl border" :class="p.uPnL > 0 ? 'bg-emerald-500/10 border-emerald-500/30' : p.uPnL < 0 ? 'bg-rose-500/10 border-rose-500/30' : 'bg-surface/90 border-slate-800'">
+              <div class="text-sm font-medium text-slate-300">{{ t("pos.floatPnl") }}</div>
+              <div class="text-2xl font-mono font-bold mt-2" :class="pnlColor(p.uPnL)">
                 {{ fmtUsd(p.uPnL, 2, true) }}
               </div>
-              <div class="text-[10px] font-mono mt-0.5" :class="pnlColor(p.uPnLRoePct)">
+              <div class="text-sm font-mono font-semibold mt-2" :class="pnlColor(p.uPnLRoePct)">
                 ROE {{ fmtPct(p.uPnLRoePct, 2) }}
               </div>
             </div>
 
-            <div class="p-2.5 rounded-lg bg-surface/90 border border-slate-800">
-              <div class="text-[10px] font-mono text-slate-500">{{ t("pos.heldDur") }}</div>
-              <div class="font-mono font-bold text-white mt-0.5">{{ fmtDur(p.heldMs) }}</div>
-              <div class="text-[10px] font-mono text-slate-400 mt-0.5">
+            <div class="min-w-0 p-3.5 rounded-xl bg-surface/90 border border-slate-800">
+              <div class="text-sm font-medium text-slate-300">{{ t("pos.heldDur") }}</div>
+              <div class="text-lg font-mono font-bold text-white mt-2">{{ fmtDur(p.heldMs) }}</div>
+              <div class="text-sm font-medium text-slate-300 mt-2">
                 {{ t("pos.lastAdd", { ago: fmtAgo(p.lastAddTime) }) }}
               </div>
             </div>
@@ -762,7 +762,7 @@ const priceAgeSec = computed(() => {
               :key="idx"
               class="flex flex-wrap items-center justify-between gap-2 text-xs font-mono text-slate-300 py-1 border-b border-slate-800/60 last:border-b-0"
             >
-              <span class="text-slate-500">{{ fmtTime(eo.t) }}</span>
+              <span class="text-slate-400">{{ fmtTime(eo.t) }}</span>
               <span>{{ eo.dir ? dirLabel(eo.dir) : p.positionSide === "SHORT" ? t("dir.OPEN_SHORT") : t("dir.OPEN_LONG") }}</span>
               <span class="text-white font-semibold">{{ Number(eo.q || 0).toLocaleString("en-US", { maximumFractionDigits: 4 }) }}</span>
               <span class="text-accent">@ {{ fmtPrice(eo.p) }}</span>
@@ -774,7 +774,7 @@ const priceAgeSec = computed(() => {
           <div v-if="p.analysis && p.analysis.ok" class="rounded-xl bg-surface/80 border border-slate-800 p-3.5 space-y-3">
             <div class="flex flex-wrap items-center justify-between gap-2">
               <span class="text-xs font-semibold text-white">{{ t("pa.title") }}</span>
-              <div class="flex flex-wrap items-center gap-1.5 text-[11px] font-mono">
+              <div class="flex flex-wrap items-center gap-1.5 text-sm font-mono">
                 <span class="px-2 py-0.5 rounded-full border font-semibold" :class="verdictBadgeClass(p.analysis.verdictLevel)">
                   {{ paVerdict(p.analysis) }}
                 </span>
@@ -811,7 +811,7 @@ const priceAgeSec = computed(() => {
                   :title="t('pa.curMark', { pct: p.analysis.curRangePct })"
                 ></div>
               </div>
-              <div class="flex flex-wrap items-center justify-between gap-2 text-[10px] font-mono text-slate-400">
+              <div class="flex flex-wrap items-center justify-between gap-2 text-xs font-mono text-slate-400">
                 <span>{{ t("pa.low72") }} {{ fmtPrice(p.analysis.low72h) }}</span>
                 <span class="text-amber-400">● {{ t("pa.entryMark", { pct: p.analysis.entryRangePct }) }}</span>
                 <span>{{ t("pa.eq50") }} {{ fmtPrice(p.analysis.eq72h) }}</span>
@@ -823,40 +823,40 @@ const priceAgeSec = computed(() => {
             <!-- PA Key Levels & Indicators Grid -->
             <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2 text-xs font-mono">
               <div class="p-2 rounded bg-background/80 border border-slate-800/80">
-                <div class="text-[10px] text-slate-500">{{ t("pa.keyRes") }}</div>
+                <div class="text-xs text-slate-400">{{ t("pa.keyRes") }}</div>
                 <div class="text-rose-400 font-semibold mt-0.5">{{ fmtPrice(p.analysis.keyResistance) }}</div>
               </div>
               <div class="p-2 rounded bg-background/80 border border-slate-800/80">
-                <div class="text-[10px] text-slate-500">{{ t("pa.keySup") }}</div>
+                <div class="text-xs text-slate-400">{{ t("pa.keySup") }}</div>
                 <div class="text-emerald-400 font-semibold mt-0.5">{{ fmtPrice(p.analysis.keySupport) }}</div>
               </div>
               <div class="p-2 rounded bg-background/80 border border-slate-800/80">
-                <div class="text-[10px] text-slate-500">{{ t("pa.invalidation") }}</div>
+                <div class="text-xs text-slate-400">{{ t("pa.invalidation") }}</div>
                 <div class="text-amber-300 font-semibold mt-0.5">{{ fmtPrice(p.analysis.invalidationLevel) }}</div>
               </div>
               <div class="p-2 rounded bg-background/80 border border-slate-800/80">
-                <div class="text-[10px] text-slate-500">{{ t("pa.targets") }}</div>
+                <div class="text-xs text-slate-400">{{ t("pa.targets") }}</div>
                 <div class="text-white font-semibold mt-0.5">
                   {{ fmtPrice(p.analysis.target1) }} / {{ fmtPrice(p.analysis.target2) }}
-                  <span class="text-accent text-[10px]">({{ p.analysis.rrFromEntry }}R)</span>
+                  <span class="text-accent text-xs">({{ p.analysis.rrFromEntry }}R)</span>
                 </div>
               </div>
               <div class="p-2 rounded bg-background/80 border border-slate-800/80">
-                <div class="text-[10px] text-slate-500">RSI14 (1H/4H) · ATR</div>
+                <div class="text-xs text-slate-400">RSI14 (1H/4H) · ATR</div>
                 <div class="text-white font-semibold mt-0.5">
                   {{ p.analysis.rsi1h ?? "—" }} / {{ p.analysis.rsi4h ?? "—" }}
-                  <span class="text-slate-400 text-[10px]">({{ p.analysis.atr1hPct }}%)</span>
+                  <span class="text-slate-400 text-xs">({{ p.analysis.atr1hPct }}%)</span>
                 </div>
               </div>
               <div class="p-2 rounded bg-background/80 border border-slate-800/80">
-                <div class="text-[10px] text-slate-500">{{ t("pa.emaDist") }}</div>
+                <div class="text-xs text-slate-400">{{ t("pa.emaDist") }}</div>
                 <div class="text-white font-semibold mt-0.5">
                   {{ p.analysis.entryVsEma21Atr >= 0 ? "+" : "" }}{{ p.analysis.entryVsEma21Atr }} ATR
                 </div>
               </div>
             </div>
 
-            <div class="flex flex-wrap gap-2 text-[11px] font-mono">
+            <div class="flex flex-wrap gap-2 text-sm font-mono">
               <span v-if="p.analysis.nearestBearFvg" class="px-2 py-0.5 rounded bg-rose-500/10 text-rose-400 border border-rose-500/20">
                 {{ t("pa.bearFvg") }}: {{ fmtPrice(p.analysis.nearestBearFvg[0]) }} ~ {{ fmtPrice(p.analysis.nearestBearFvg[1]) }}
               </span>
@@ -869,7 +869,7 @@ const priceAgeSec = computed(() => {
               {{ paSummary(p.analysis) }}
             </p>
           </div>
-          <div v-else class="text-xs text-slate-500 italic px-2">
+          <div v-else class="text-xs text-slate-400 italic px-2">
             {{ t("pa.pending") }}
           </div>
         </div>
@@ -889,7 +889,7 @@ const priceAgeSec = computed(() => {
     <div class="grid grid-cols-1 lg:grid-cols-3 gap-5">
       <div class="lg:col-span-2 rounded-2xl bg-surface border border-slate-800/90 p-5">
         <div class="flex items-center justify-between mb-3">
-          <h3 class="text-sm font-semibold text-white">{{ t("chart.title") }}</h3>
+          <h3 class="text-base font-semibold text-white">{{ t("chart.title") }}</h3>
           <div v-if="chartSvg" class="flex items-center gap-3 text-xs font-mono">
             <span class="text-slate-400">{{ t("chart.peak", { val: fmtPct(chartSvg.peak) }) }}</span>
             <span :class="chartSvg.positive ? 'text-emerald-400 font-semibold' : 'text-rose-400 font-semibold'">
@@ -950,13 +950,13 @@ const priceAgeSec = computed(() => {
             </text>
           </svg>
         </div>
-        <div v-else class="py-12 text-center text-xs text-slate-500">{{ t("chart.noData") }}</div>
+        <div v-else class="py-12 text-center text-xs text-slate-400">{{ t("chart.noData") }}</div>
       </div>
 
       <div class="rounded-2xl bg-surface border border-slate-800/90 p-5">
         <div class="flex items-center justify-between mb-3">
-          <h3 class="text-sm font-semibold text-white">{{ t("alloc.title") }}</h3>
-          <span v-if="snapshot?.allocation?.updateTime" class="text-[10px] font-mono text-slate-500">
+          <h3 class="text-base font-semibold text-white">{{ t("alloc.title") }}</h3>
+          <span v-if="snapshot?.allocation?.updateTime" class="text-xs font-mono text-slate-400">
             {{ t("alloc.updated", { time: fmtShortTime(snapshot.allocation.updateTime) }) }}
           </span>
         </div>
@@ -979,7 +979,7 @@ const priceAgeSec = computed(() => {
             </div>
           </div>
         </div>
-        <div v-else class="py-12 text-center text-xs text-slate-500">{{ t("alloc.noData") }}</div>
+        <div v-else class="py-12 text-center text-xs text-slate-400">{{ t("alloc.noData") }}</div>
       </div>
     </div>
 
@@ -1000,7 +1000,7 @@ const priceAgeSec = computed(() => {
             "
           >
             {{ t(`tab.${tabId}`) }}
-            <span class="ml-1 font-mono text-[10px] opacity-80">
+            <span class="ml-1 font-mono text-xs opacity-80">
               ({{
                 tabId === "batches"
                   ? orderBatches.length
@@ -1018,15 +1018,15 @@ const priceAgeSec = computed(() => {
 
       <!-- TAB 1: 30m Order Batches -->
       <div v-if="activeTab === 'batches'">
-        <div class="px-5 py-2 text-[11px] text-slate-400 bg-background/40 border-b border-slate-800/70">
+        <div class="px-5 py-2 text-sm text-slate-400 bg-background/40 border-b border-slate-800/70">
           {{ t("feed.batchNote") }}
         </div>
-        <div v-if="!orderBatches.length" class="p-8 text-center text-sm text-slate-500">
+        <div v-if="!orderBatches.length" class="p-8 text-center text-sm text-slate-400">
           {{ t("feed.noBatches") }}
         </div>
         <div v-else class="overflow-x-auto">
           <table class="w-full text-xs">
-            <thead class="text-[10px] font-mono uppercase text-slate-500 border-b border-slate-800 bg-background/30">
+            <thead class="text-xs font-mono uppercase text-slate-400 border-b border-slate-800 bg-background/30">
               <tr>
                 <th class="px-4 py-2.5 text-left">{{ t("feed.colTime") }}</th>
                 <th class="px-4 py-2.5 text-left">{{ t("feed.colDirSym") }}</th>
@@ -1042,7 +1042,7 @@ const priceAgeSec = computed(() => {
                 <tr @click="toggleBatch(idx)" class="hover:bg-slate-800/30 cursor-pointer transition-colors">
                   <td class="px-4 py-2.5 text-slate-400 whitespace-nowrap">{{ fmtTime(b.endTime || b.startTime || b.time) }}</td>
                   <td class="px-4 py-2.5">
-                    <span class="px-1.5 py-0.5 rounded text-[10px] font-semibold mr-1.5" :class="dirBadgeClass(b.dir)">
+                    <span class="px-1.5 py-0.5 rounded text-xs font-semibold mr-1.5" :class="dirBadgeClass(b.dir)">
                       {{ dirLabel(b.dir) }}
                     </span>
                     <span class="font-bold text-white">{{ b.symbol }}</span>
@@ -1061,13 +1061,13 @@ const priceAgeSec = computed(() => {
                 </tr>
                 <tr v-if="expandedBatches[idx] && (b.items?.length || (Array.isArray(b.orders) && b.orders.length))" class="bg-background/80">
                   <td colspan="7" class="px-6 py-2">
-                    <div class="space-y-1 text-[11px]">
+                    <div class="space-y-1 text-sm">
                       <div
                         v-for="(co, cidx) in (b.items || b.orders)"
                         :key="cidx"
                         class="flex items-center justify-between text-slate-300 py-0.5 border-b border-slate-800/40 last:border-b-0"
                       >
-                        <span class="text-slate-500">{{ fmtTime(co.time ?? co.t) }}</span>
+                        <span class="text-slate-400">{{ fmtTime(co.time ?? co.t) }}</span>
                         <span>{{ co.ty || b.type || "MARKET" }}</span>
                         <span>{{ Number(co.qty ?? co.q ?? 0).toLocaleString("en-US", { maximumFractionDigits: 4 }) }} @ {{ fmtPrice(co.price ?? co.p) }}</span>
                         <span :class="pnlColor(co.pnl)">{{ co.pnl ? fmtUsd(co.pnl, 2, true) : "—" }}</span>
@@ -1083,12 +1083,12 @@ const priceAgeSec = computed(() => {
 
       <!-- TAB 2: Historical Trade Cycles -->
       <div v-if="activeTab === 'cycles'">
-        <div v-if="!tradeCycles.length" class="p-8 text-center text-sm text-slate-500">
+        <div v-if="!tradeCycles.length" class="p-8 text-center text-sm text-slate-400">
           {{ t("feed.noCycles") }}
         </div>
         <div v-else class="overflow-x-auto">
           <table class="w-full text-xs">
-            <thead class="text-[10px] font-mono uppercase text-slate-500 border-b border-slate-800 bg-background/30">
+            <thead class="text-xs font-mono uppercase text-slate-400 border-b border-slate-800 bg-background/30">
               <tr>
                 <th class="px-4 py-2.5 text-left">{{ t("feed.cycleId") }}</th>
                 <th class="px-4 py-2.5 text-left">{{ t("feed.colDirSym") }}</th>
@@ -1101,10 +1101,10 @@ const priceAgeSec = computed(() => {
             </thead>
             <tbody class="divide-y divide-slate-800/60 font-mono">
               <tr v-for="c in tradeCycles.slice(0, cyclesLimit)" :key="c.cycleId" class="hover:bg-slate-800/30">
-                <td class="px-4 py-2.5 text-slate-500">{{ c.cycleId }}</td>
+                <td class="px-4 py-2.5 text-slate-400">{{ c.cycleId }}</td>
                 <td class="px-4 py-2.5">
                   <span
-                    class="px-1.5 py-0.5 rounded text-[10px] font-bold mr-1.5"
+                    class="px-1.5 py-0.5 rounded text-xs font-bold mr-1.5"
                     :class="c.positionSide === 'SHORT' ? 'bg-rose-500/20 text-rose-400' : 'bg-emerald-500/20 text-emerald-400'"
                   >
                     {{ c.positionSide }}
@@ -1113,7 +1113,7 @@ const priceAgeSec = computed(() => {
                 </td>
                 <td class="px-4 py-2.5">
                   <span
-                    class="px-2 py-0.5 rounded-full text-[10px]"
+                    class="px-2 py-0.5 rounded-full text-xs"
                     :class="c.status === 'OPEN' ? 'bg-accent/15 text-accent' : 'bg-slate-800 text-slate-300'"
                   >
                     {{ c.status === "OPEN" ? t("feed.openStatus") : t("feed.closedStatus") }}
@@ -1150,12 +1150,12 @@ const priceAgeSec = computed(() => {
 
       <!-- TAB 3: Official Closed Positions -->
       <div v-if="activeTab === 'closed'">
-        <div v-if="!closedList.length" class="p-8 text-center text-sm text-slate-500">
+        <div v-if="!closedList.length" class="p-8 text-center text-sm text-slate-400">
           {{ t("feed.noClosed") }}
         </div>
         <div v-else class="overflow-x-auto">
           <table class="w-full text-xs">
-            <thead class="text-[10px] font-mono uppercase text-slate-500 border-b border-slate-800 bg-background/30">
+            <thead class="text-xs font-mono uppercase text-slate-400 border-b border-slate-800 bg-background/30">
               <tr>
                 <th class="px-4 py-2.5 text-left">{{ t("feed.closedTime") }}</th>
                 <th class="px-4 py-2.5 text-left">{{ t("feed.colDirSym") }}</th>
@@ -1172,7 +1172,7 @@ const priceAgeSec = computed(() => {
                 <td class="px-4 py-2.5 text-slate-400 whitespace-nowrap">{{ fmtTime(c.closed) }}</td>
                 <td class="px-4 py-2.5">
                   <span
-                    class="px-1.5 py-0.5 rounded text-[10px] font-bold mr-1.5"
+                    class="px-1.5 py-0.5 rounded text-xs font-bold mr-1.5"
                     :class="c.side === 'Short' ? 'bg-rose-500/20 text-rose-400' : 'bg-emerald-500/20 text-emerald-400'"
                   >
                     {{ c.side?.toUpperCase() }}
@@ -1214,12 +1214,12 @@ const priceAgeSec = computed(() => {
 
       <!-- TAB 4: Raw Order Feed -->
       <div v-if="activeTab === 'orders'">
-        <div v-if="!ordersList.length" class="p-8 text-center text-sm text-slate-500">
+        <div v-if="!ordersList.length" class="p-8 text-center text-sm text-slate-400">
           {{ t("feed.noOrders") }}
         </div>
         <div v-else class="overflow-x-auto max-h-96 overflow-y-auto">
           <table class="w-full text-xs">
-            <thead class="text-[10px] font-mono uppercase text-slate-500 border-b border-slate-800 bg-background/80 sticky top-0">
+            <thead class="text-xs font-mono uppercase text-slate-400 border-b border-slate-800 bg-background/80 sticky top-0">
               <tr>
                 <th class="px-4 py-2.5 text-left">{{ t("feed.colTime") }}</th>
                 <th class="px-4 py-2.5 text-left">{{ t("feed.colDirSym") }}</th>
@@ -1233,7 +1233,7 @@ const priceAgeSec = computed(() => {
               <tr v-for="(o, idx) in ordersList.slice(0, 80)" :key="idx" class="hover:bg-slate-800/30">
                 <td class="px-4 py-2 text-slate-400 whitespace-nowrap">{{ fmtTime(o.time) }}</td>
                 <td class="px-4 py-2">
-                  <span class="px-1.5 py-0.5 rounded text-[10px] font-semibold mr-1.5" :class="dirBadgeClass(o.dir)">
+                  <span class="px-1.5 py-0.5 rounded text-xs font-semibold mr-1.5" :class="dirBadgeClass(o.dir)">
                     {{ dirLabel(o.dir) }}
                   </span>
                   <span class="font-bold text-white">{{ o.symbol }}</span>

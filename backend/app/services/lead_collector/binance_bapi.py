@@ -1130,37 +1130,63 @@ class BinanceBapiCollector(BaseLeadCollector):
                     holdings_source = "stale-fallback"
                     holdings_observed_ms = previous_observed_ms
 
-        # Optional dashboard requests cannot delay the execution collector.
+        # Seed durable analysis data with an expired timestamp so this round
+        # still attempts a refresh while retaining a fallback after a restart.
         cached_perf = self._perf_cache.get(portfolio_id)
+        if (not cached_perf or not cached_perf[1]) and (previous_snapshot or {}).get("performance"):
+            cached_perf = (0.0, dict(previous_snapshot["performance"]))
+            self._perf_cache[portfolio_id] = cached_perf
         perf = dict(cached_perf[1]) if cached_perf else {}
         cached_chart = self._chart_cache.get(portfolio_id)
+        if (not cached_chart or not cached_chart[1]) and (previous_snapshot or {}).get("roiChart365D"):
+            cached_chart = (0.0, list(previous_snapshot["roiChart365D"]))
+            self._chart_cache[portfolio_id] = cached_chart
         roi_chart = list(cached_chart[1]) if cached_chart else []
         cached_alloc = self._alloc_cache.get(portfolio_id)
+        if (not cached_alloc or not cached_alloc[1].get("items")) and (previous_snapshot or {}).get("allocation"):
+            cached_alloc = (0.0, dict(previous_snapshot["allocation"]))
+            self._alloc_cache[portfolio_id] = cached_alloc
         allocation = dict(cached_alloc[1]) if cached_alloc else {}
         if with_analysis:
-            if not cached_perf or now_s - cached_perf[0] >= 180.0:
+            if not cached_perf or not cached_perf[1] or now_s - cached_perf[0] >= 180.0:
                 async def _get_perf(tr: str):
                     try:
                         return tr, await self.fetch_performance(portfolio_id, time_range=tr, proxy_url=proxy_url)
                     except Exception:
                         return tr, None
                 perf_items = await asyncio.gather(*(_get_perf(tr) for tr in ("7D", "30D", "90D", "180D", "365D")))
-                perf = {tr: val for tr, val in perf_items if val is not None}
-                if perf:
-                    self._perf_cache[portfolio_id] = (now_s, perf)
-            if not cached_chart or now_s - cached_chart[0] >= 300.0:
-                roi_chart = await self.fetch_roi_chart(portfolio_id, time_range="365D", proxy_url=proxy_url)
-                if roi_chart:
-                    self._chart_cache[portfolio_id] = (now_s, roi_chart)
-            if not cached_alloc or now_s - cached_alloc[0] >= 300.0:
-                allocation = await self.fetch_allocation(portfolio_id, time_range="90D", proxy_url=proxy_url)
-                if allocation.get("items"):
-                    self._alloc_cache[portfolio_id] = (now_s, allocation)
+                new_perf = {tr: val for tr, val in perf_items if val}
+                if new_perf:
+                    perf.update(new_perf)
+                    self._perf_cache[portfolio_id] = (now_s, dict(perf))
+            if not cached_chart or not cached_chart[1] or now_s - cached_chart[0] >= 300.0:
+                try:
+                    new_chart = await self.fetch_roi_chart(portfolio_id, time_range="365D", proxy_url=proxy_url)
+                except Exception:
+                    new_chart = None
+                if new_chart:
+                    roi_chart = list(new_chart)
+                    self._chart_cache[portfolio_id] = (now_s, list(roi_chart))
+            if not cached_alloc or not cached_alloc[1].get("items") or now_s - cached_alloc[0] >= 300.0:
+                try:
+                    new_alloc = await self.fetch_allocation(portfolio_id, time_range="90D", proxy_url=proxy_url)
+                except Exception:
+                    new_alloc = None
+                if new_alloc and new_alloc.get("items"):
+                    allocation = dict(new_alloc)
+                    self._alloc_cache[portfolio_id] = (now_s, dict(allocation))
 
         margin_balance = fnum(detail.get("marginBalance"))
         if with_analysis:
-            marks = await self.fetch_marks([p["symbol"] for p in open_positions], proxy_url=proxy_url)
-            brackets = await self.fetch_brackets(proxy_url=proxy_url)
+            marks = {symbol: dict(quote, source="cache") for symbol, quote in self._marks_cache.items()}
+            try:
+                marks.update(await self.fetch_marks([p["symbol"] for p in open_positions], proxy_url=proxy_url) or {})
+            except Exception:
+                pass
+            try:
+                brackets = await self.fetch_brackets(proxy_url=proxy_url) or self._brackets_map
+            except Exception:
+                brackets = self._brackets_map
         else:
             marks = {
                 row["symbol"]: {
@@ -1174,19 +1200,38 @@ class BinanceBapiCollector(BaseLeadCollector):
             brackets = self._brackets_map
 
         now_ms = int(time.time() * 1000)
+        previous_prices = {p["symbol"]: p for p in (previous_snapshot or {}).get("openPositions") or [] if p.get("symbol")}
+
+        def valid_price(*values: Any) -> Optional[float]:
+            for value in values:
+                price = fnum(value)
+                if price is not None and price > 0:
+                    return price
+            return None
+
         for p in open_positions:
             m = marks.get(p["symbol"]) or {}
-            mark = m.get("markPrice")
-            last_px = m.get("lastPrice") or mark
-            cur_px = m.get("currentPrice") or last_px or mark
+            previous_price = previous_prices.get(p["symbol"]) or {}
+            mark = valid_price(m.get("markPrice"))
+            last_px = valid_price(m.get("lastPrice"))
+            cur_px = valid_price(m.get("currentPrice"), last_px, mark)
+            inherited_price = False
+            if mark is None:
+                mark = valid_price(previous_price.get("markPrice"), previous_price.get("lastPrice"), previous_price.get("currentPrice"))
+                inherited_price = mark is not None
+                mark = mark or valid_price(last_px, cur_px)
+            if cur_px is None:
+                cur_px = valid_price(previous_price.get("currentPrice"), previous_price.get("lastPrice"), previous_price.get("markPrice"))
+                inherited_price = inherited_price or cur_px is not None
+            last_px = last_px or valid_price(previous_price.get("lastPrice"), cur_px, mark)
             p["lastPrice"] = last_px
             p["markPrice"] = mark
             p["currentPrice"] = cur_px
             p["indexPrice"] = m.get("indexPrice")
             p["fundingRate"] = m.get("fundingRate")
             p["nextFundingTime"] = m.get("nextFundingTime")
-            p["priceTime"] = m.get("priceTime")
-            p["priceSource"] = m.get("source")
+            p["priceTime"] = previous_price.get("priceTime") if inherited_price else m.get("priceTime")
+            p["priceSource"] = "previous-snapshot" if inherited_price else m.get("source")
 
             qty = p.get("qty") or 0.0
             entry = p.get("avgEntry")
@@ -1244,10 +1289,14 @@ class BinanceBapiCollector(BaseLeadCollector):
         entry_lev = round(tot_entry / margin_balance, 4) if (margin_balance and tot_entry) else 0.0
         short_cnt = sum(1 for p in open_positions if p.get("positionSide") == "SHORT")
         long_cnt = sum(1 for p in open_positions if p.get("positionSide") == "LONG")
-        exact_mmr = all(((p.get("mmr") or {}).get("exact", True)) for p in open_positions) if open_positions else True
+        prices_complete = all(p.get("markValue") is not None for p in open_positions)
+        pnl_complete = all(p.get("uPnL") is not None for p in open_positions)
+        exact_mmr = all(((p.get("mmr") or {}).get("exact", False)) for p in open_positions) if open_positions else True
         max_pos_lev = max((p.get("notionalLeverage") or 0.0 for p in open_positions), default=0.0)
         for p in open_positions:
-            p["sharePct"] = round((p["markValue"] / tot_mark * 100.0), 2) if (tot_mark and p.get("markValue")) else None
+            p["sharePct"] = round((p["markValue"] / tot_mark * 100.0), 2) if (prices_complete and tot_mark and p.get("markValue")) else None
+
+        price_as_of = max((p.get("priceTime") or 0 for p in open_positions), default=now_ms) or None
 
         if with_analysis and self.pa_analyzer is not None and open_positions:
             analyzer = self.pa_analyzer
@@ -1299,7 +1348,7 @@ class BinanceBapiCollector(BaseLeadCollector):
         snapshot = {
             "meta": {
                 "generatedAt": now_ms,
-                "priceUpdatedAt": max((p.get("priceTime") or 0 for p in open_positions), default=now_ms) or now_ms,
+                "priceUpdatedAt": price_as_of,
                 "fetchMs": int((time.perf_counter() - t0) * 1000),
                 "portfolioId": portfolio_id,
                 "nickname": detail.get("nickname") or portfolio_id,
@@ -1380,7 +1429,7 @@ class BinanceBapiCollector(BaseLeadCollector):
                 "adverseMoveBufferPct": round((margin_balance - tot_mm) / tot_mark * 100, 2) if (margin_balance and tot_mark) else (100.0 if margin_balance else None),
                 "availableMargin": round(margin_balance - tot_mm, 2) if margin_balance is not None else None,
                 "marginBalance": margin_balance,
-                "priceAsOf": now_ms,
+                "priceAsOf": price_as_of,
             },
             "orderBatches": batches,
             "tradeCycles": trade_cycles,
@@ -1393,5 +1442,14 @@ class BinanceBapiCollector(BaseLeadCollector):
         if margin_balance is None:
             for field in ("totalNotionalLeverage", "entryLeverage", "maxPositionLeverage",
                           "estMaintenanceMarginRatioPct", "totalMarginRoePct"):
+                snapshot["openPositionsSummary"][field] = None
+        # A missing quote is unknown, never a zero-valued position or account.
+        if not prices_complete:
+            for field in ("totalMarkNotional", "totalNotionalLeverage", "maxPositionLeverage",
+                          "marginCoveragePct", "estMaintenanceMargin", "estMaintenanceMarginRatioPct",
+                          "avgMmrPct", "adverseMoveBufferPct", "availableMargin", "mmrSource"):
+                snapshot["openPositionsSummary"][field] = None
+        if not pnl_complete:
+            for field in ("totalUnrealizedPnl", "totalUnrealizedPnlPctOfEntry", "totalMarginRoePct"):
                 snapshot["openPositionsSummary"][field] = None
         return snapshot

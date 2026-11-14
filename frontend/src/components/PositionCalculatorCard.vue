@@ -13,6 +13,7 @@ import {
   ArrowDownRight,
   Sparkles,
   Info,
+  SlidersHorizontal,
 } from "lucide-vue-next";
 import { useI18n } from "@/i18n";
 
@@ -268,7 +269,7 @@ async function copyPlan() {
 <template>
   <div
     class="relative rounded-2xl bg-surface/90 border border-cyan-500/30 shadow-xl shadow-cyan-950/20 backdrop-blur-md overflow-hidden transition-all duration-300"
-    :class="compact ? 'p-3' : 'p-4 sm:p-5'"
+    :class="compact ? 'p-3 sm:p-4' : 'p-4 sm:p-5'"
   >
     <!-- Top Cyberpunk Accent Border Glow -->
     <div
@@ -276,8 +277,8 @@ async function copyPlan() {
     ></div>
 
     <!-- Header & Toggle Bar -->
-    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-800/80">
-      <div class="flex items-center gap-2.5 min-w-0">
+    <div class="flex flex-wrap items-center justify-between gap-3 pb-4 border-b border-slate-800/80">
+      <div class="flex items-center gap-2.5 min-w-0 flex-1 basis-64">
         <div
           class="w-9 h-9 rounded-xl bg-gradient-to-br from-cyan-500/20 to-blue-500/10 border border-cyan-500/40 flex items-center justify-center shrink-0 shadow-inner shadow-cyan-500/20"
         >
@@ -285,28 +286,28 @@ async function copyPlan() {
         </div>
         <div class="min-w-0">
           <div class="flex items-center flex-wrap gap-2">
-            <h3 class="text-sm sm:text-base font-bold text-white tracking-tight flex items-center gap-1.5">
+            <h3 class="text-base font-bold text-white tracking-tight flex items-center gap-1.5">
               <span>{{ t("calc.title") }}</span>
             </h3>
             <span
-              class="px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 flex items-center gap-1"
+              class="px-2.5 py-1 rounded-full text-xs font-mono font-semibold bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 flex items-center gap-1.5"
             >
-              <Sparkles class="w-2.5 h-2.5" />
+              <Sparkles class="w-3 h-3" />
               {{ t("calc.badge") }}
             </span>
           </div>
-          <p class="text-[11px] text-slate-400 truncate mt-0.5">
+          <p class="text-sm text-slate-300 leading-relaxed mt-1">
             {{ t("calc.desc") }}
           </p>
         </div>
       </div>
 
-      <div class="flex items-center gap-2 shrink-0 self-end sm:self-auto">
+      <div class="flex items-center gap-2 shrink-0 ml-auto">
         <button
           v-if="calculatedRows.length > 0"
           type="button"
           @click="copyPlan"
-          class="px-2.5 py-1.5 rounded-lg text-xs font-mono font-medium transition-all duration-200 flex items-center gap-1.5 border cursor-pointer"
+          class="min-h-10 px-3 py-2 rounded-lg text-xs font-mono font-semibold transition-all duration-200 flex items-center gap-1.5 border cursor-pointer"
           :class="
             copied
               ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40 shadow-sm shadow-emerald-500/20'
@@ -322,7 +323,7 @@ async function copyPlan() {
         <button
           type="button"
           @click="isExpanded = !isExpanded"
-          class="p-1.5 rounded-lg bg-slate-800/80 hover:bg-slate-700/80 border border-slate-700/80 text-slate-400 hover:text-white transition-colors"
+          class="p-2.5 rounded-lg bg-slate-800/80 hover:bg-slate-700/80 border border-slate-700/80 text-slate-300 hover:text-white transition-colors"
           :title="isExpanded ? t('calc.collapse') : t('calc.expand')"
         >
           <ChevronUp v-if="isExpanded" class="w-4 h-4" />
@@ -335,42 +336,42 @@ async function copyPlan() {
     <div v-show="isExpanded" class="mt-4 space-y-4">
       <!-- Controls Row: Capital Input, Quick Presets & Multiplier -->
       <div
-        class="p-3.5 sm:p-4 rounded-xl bg-background/80 border border-slate-800/90 flex flex-col md:flex-row md:items-center justify-between gap-4"
+        class="p-3.5 sm:p-4 rounded-xl bg-background/80 border border-slate-800/90 flex flex-wrap items-start justify-between gap-5"
       >
         <!-- Capital Input -->
-        <div class="space-y-1.5 flex-1 max-w-md">
-          <label class="text-xs font-mono font-semibold text-slate-300 flex items-center gap-1.5">
+        <div class="space-y-2 min-w-0 flex-1 basis-64 max-w-md">
+          <label class="text-sm font-mono font-semibold text-slate-300 flex items-center flex-wrap gap-1.5">
             <Wallet class="w-3.5 h-3.5 text-cyan-400" />
             <span>{{ t("calc.capitalLabel") }}</span>
-            <span v-if="leadMarginBal > 0" class="text-[10px] text-slate-500 font-normal">
+            <span v-if="leadMarginBal > 0" class="text-xs text-slate-300 font-normal">
               ({{ t("calc.leadMarginBal") }}: {{ formatUsd(leadMarginBal, 0) }})
             </span>
           </label>
           <div class="relative flex items-center">
-            <span class="absolute left-3 text-cyan-400/70 font-mono font-bold text-sm">$</span>
+            <span class="absolute left-3 text-cyan-300 font-mono font-bold text-base">$</span>
             <input
               v-model="capitalInput"
               type="number"
               min="0"
               step="100"
               :placeholder="t('calc.capitalPlaceholder')"
-              class="w-full pl-7 pr-3 py-2 rounded-xl bg-surface/90 border border-slate-700 focus:border-cyan-400 focus:ring-1 focus:ring-cyan-400/40 text-sm font-mono font-bold text-white transition-all outline-none"
+              class="w-full pl-7 pr-3 py-2.5 rounded-xl bg-surface/90 border border-slate-700 focus:border-cyan-400 focus:ring-1 focus:ring-cyan-400/40 text-base font-mono font-bold text-white transition-all outline-none"
             />
           </div>
 
           <!-- Quick Select Buttons -->
-          <div class="flex items-center flex-wrap gap-1.5 pt-0.5">
-            <span class="text-[10px] font-mono text-slate-500 mr-1">{{ t("calc.quickPreset") }}:</span>
+          <div class="flex items-center flex-wrap gap-2 pt-1">
+            <span class="text-xs font-mono text-slate-300 mr-1">{{ t("calc.quickPreset") }}:</span>
             <button
               v-for="preset in quickPresets"
               :key="preset"
               type="button"
               @click="selectPreset(preset)"
-              class="px-2 py-0.5 rounded-md text-[11px] font-mono transition-colors border"
+              class="min-h-10 px-3 py-2 rounded-lg text-xs font-mono font-semibold transition-colors border"
               :class="
                 Number(capitalInput) === preset
-                  ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/50 font-bold'
-                  : 'bg-surface/80 hover:bg-surface2 text-slate-400 border-slate-800 hover:text-slate-200'
+                  ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/50'
+                  : 'bg-surface/80 hover:bg-surface2 text-slate-300 border-slate-800 hover:text-white'
               "
             >
               {{ preset.toLocaleString() }}
@@ -379,20 +380,20 @@ async function copyPlan() {
         </div>
 
         <!-- Scale Mode Toggle -->
-        <div class="space-y-1.5">
-          <label class="text-xs font-mono font-semibold text-slate-300 flex items-center gap-1.5">
+        <div class="space-y-2 min-w-0 flex-1 basis-64 max-w-md">
+          <label class="text-sm font-mono font-semibold text-slate-300 flex items-center gap-1.5">
             <SlidersHorizontal class="w-3.5 h-3.5 text-cyan-400" />
             <span>{{ t("calc.multiplierLabel") }}</span>
           </label>
-          <div class="grid grid-cols-3 gap-1.5">
+          <div class="grid grid-cols-[repeat(auto-fit,minmax(min(100%,6rem),1fr))] gap-2">
             <button
               type="button"
               @click="multiplier = 0.5"
-              class="px-2.5 py-1.5 rounded-xl text-xs font-mono transition-colors border"
+              class="min-h-10 px-3 py-2 rounded-xl text-xs font-mono font-semibold transition-colors border"
               :class="
                 multiplier === 0.5
-                  ? 'bg-amber-500/20 text-amber-300 border-amber-500/50 font-bold'
-                  : 'bg-surface/80 hover:bg-surface2 text-slate-400 border-slate-800'
+                  ? 'bg-amber-500/20 text-amber-300 border-amber-500/50'
+                  : 'bg-surface/80 hover:bg-surface2 text-slate-300 border-slate-800'
               "
             >
               {{ t("calc.multDefensive") }}
@@ -400,11 +401,11 @@ async function copyPlan() {
             <button
               type="button"
               @click="multiplier = 1.0"
-              class="px-2.5 py-1.5 rounded-xl text-xs font-mono transition-colors border"
+              class="min-h-10 px-3 py-2 rounded-xl text-xs font-mono font-semibold transition-colors border"
               :class="
                 multiplier === 1.0
-                  ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/50 font-bold'
-                  : 'bg-surface/80 hover:bg-surface2 text-slate-400 border-slate-800'
+                  ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/50'
+                  : 'bg-surface/80 hover:bg-surface2 text-slate-300 border-slate-800'
               "
             >
               {{ t("calc.multProportional") }}
@@ -412,11 +413,11 @@ async function copyPlan() {
             <button
               type="button"
               @click="multiplier = 1.2"
-              class="px-2.5 py-1.5 rounded-xl text-xs font-mono transition-colors border"
+              class="min-h-10 px-3 py-2 rounded-xl text-xs font-mono font-semibold transition-colors border"
               :class="
                 multiplier === 1.2
-                  ? 'bg-rose-500/20 text-rose-300 border-rose-500/50 font-bold'
-                  : 'bg-surface/80 hover:bg-surface2 text-slate-400 border-slate-800'
+                  ? 'bg-rose-500/20 text-rose-300 border-rose-500/50'
+                  : 'bg-surface/80 hover:bg-surface2 text-slate-300 border-slate-800'
               "
             >
               {{ t("calc.multAggressive") }}
@@ -430,21 +431,21 @@ async function copyPlan() {
         v-if="calculatedRows.length === 0"
         class="p-6 rounded-xl bg-background/50 border border-dashed border-slate-800 text-center space-y-2"
       >
-        <ShieldCheck class="w-8 h-8 text-slate-600 mx-auto" />
+        <ShieldCheck class="w-8 h-8 text-slate-400 mx-auto" />
         <div class="text-sm font-semibold text-slate-300">{{ t("tel.flatStatus") }}</div>
-        <p class="text-xs text-slate-500 max-w-md mx-auto">
+        <p class="text-sm text-slate-300 leading-relaxed max-w-md mx-auto">
           {{ t("calc.flatNotice") }}
         </p>
       </div>
 
       <!-- Active Positions Calculation Table & Cards -->
       <div v-else class="space-y-3">
-        <!-- Desktop Table View (sm and up) -->
+        <!-- Desktop Table View (md and up) -->
         <div class="hidden md:block rounded-xl bg-background/70 border border-slate-800/90 overflow-hidden">
           <div class="overflow-x-auto">
-            <table class="w-full text-left text-xs border-collapse">
+            <table class="w-full min-w-[1100px] text-left text-sm border-collapse">
               <thead>
-                <tr class="border-b border-slate-800 bg-surface/60 text-slate-400 font-mono text-[11px] uppercase">
+                <tr class="border-b border-slate-800 bg-surface/60 text-xs font-mono font-semibold uppercase text-slate-300 [&>th]:font-semibold">
                   <th class="py-2.5 px-3.5">{{ t("calc.colSymbol") }}</th>
                   <th class="py-2.5 px-3.5">{{ t("calc.colPrice") }}</th>
                   <th class="py-2.5 px-3.5 text-center">{{ t("calc.colRatio") }}</th>
@@ -464,17 +465,17 @@ async function copyPlan() {
                   <!-- Symbol & Side -->
                   <td class="py-3 px-3.5">
                     <div class="flex items-center gap-2">
-                      <span class="font-bold text-white text-sm tracking-tight">{{ row.symbol }}</span>
+                      <span class="text-base font-bold text-white tracking-tight">{{ row.symbol }}</span>
                       <span
-                        class="px-2 py-0.5 rounded text-[10px] font-bold inline-flex items-center gap-0.5"
+                        class="px-2.5 py-1 rounded text-xs font-bold inline-flex items-center gap-1 whitespace-nowrap"
                         :class="
                           row.isShort
                             ? 'bg-rose-500/20 text-rose-400 border border-rose-500/30'
                             : 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
                         "
                       >
-                        <ArrowDownRight v-if="row.isShort" class="w-2.5 h-2.5" />
-                        <ArrowUpRight v-else class="w-2.5 h-2.5" />
+                        <ArrowDownRight v-if="row.isShort" class="w-3 h-3" />
+                        <ArrowUpRight v-else class="w-3 h-3" />
                         {{ row.isShort ? t("pos.short") : t("pos.long") }}
                       </span>
                     </div>
@@ -482,51 +483,51 @@ async function copyPlan() {
 
                   <!-- Entry / Current Price -->
                   <td class="py-3 px-3.5">
-                    <div class="text-white font-semibold">{{ formatPrice(row.entryPrice) }}</div>
-                    <div class="text-[10px] text-slate-500 mt-0.5">现 {{ formatPrice(row.currentPrice) }}</div>
+                    <div class="text-sm font-bold text-slate-100 whitespace-nowrap">{{ formatPrice(row.entryPrice) }}</div>
+                    <div class="text-sm text-slate-300 whitespace-nowrap mt-1">现 {{ formatPrice(row.currentPrice) }}</div>
                   </td>
 
                   <!-- Position Ratio r -->
                   <td class="py-3 px-3.5 text-center">
                     <span
-                      class="px-2 py-1 rounded-md bg-surface border border-slate-800 text-slate-300 font-bold text-xs"
+                      class="px-2.5 py-1.5 rounded-md bg-surface border border-slate-800 text-slate-100 font-bold text-sm"
                       :title="t('calc.ratioFormula')"
                     >
                       {{ (row.scaledR * 100).toFixed(1) }}%
                     </span>
-                    <div class="text-[10px] text-slate-500 mt-0.5">r={{ row.scaledR.toFixed(4) }}</div>
+                    <div class="text-xs text-slate-300 mt-0.5">r={{ row.scaledR.toFixed(4) }}</div>
                   </td>
 
                   <!-- Follower Target Notional -->
-                  <td class="py-3 px-3.5 text-right font-bold text-white text-sm">
+                  <td class="py-3 px-3.5 text-right text-base font-bold font-mono text-white whitespace-nowrap">
                     {{ formatUsd(row.targetNotional, 2) }}
                   </td>
 
                   <!-- Target Follower Quantity -->
                   <td class="py-3 px-3.5 text-right">
-                    <div class="text-cyan-300 font-bold text-sm">
+                    <div class="text-base font-bold font-mono text-cyan-300 whitespace-nowrap">
                       {{ row.targetQtyFormatted }}
                     </div>
-                    <div class="text-[10px] text-slate-500">{{ row.symbol.replace(/USDT$/, "") }}</div>
+                    <div class="text-xs text-slate-300">{{ row.symbol.replace(/USDT$/, "") }}</div>
                   </td>
 
                   <!-- Dynamic Optimal Leverage L_opt -->
                   <td class="py-3 px-3.5 text-center">
                     <div class="inline-flex flex-col items-center">
                       <span
-                        class="px-2.5 py-0.5 rounded-full text-xs font-bold bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 shadow-sm shadow-cyan-500/10"
+                        class="px-3 py-1 rounded-full text-base font-bold font-mono bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 shadow-sm shadow-cyan-500/10"
                         :title="t('calc.dynLevFormula')"
                       >
                         {{ row.optLev }}x
                       </span>
-                      <span class="text-[9px] text-slate-500 mt-0.5">L_opt</span>
+                      <span class="text-xs text-slate-300 mt-0.5">L_opt</span>
                     </div>
                   </td>
 
                   <!-- Initial Margin Required -->
                   <td class="py-3 px-3.5 text-right">
-                    <div class="text-slate-200 font-semibold">{{ formatUsd(row.initialMargin, 2) }}</div>
-                    <div class="text-[10px] text-slate-500">
+                    <div class="text-sm font-bold text-slate-100 whitespace-nowrap">{{ formatUsd(row.initialMargin, 2) }}</div>
+                    <div class="text-xs text-slate-300">
                       {{ capital > 0 ? ((row.initialMargin / capital) * 100).toFixed(1) + "%" : "0%" }}
                     </div>
                   </td>
@@ -534,13 +535,13 @@ async function copyPlan() {
                   <!-- Liquidation Safety Buffer -->
                   <td class="py-3 px-3.5 text-right">
                     <div
-                      class="inline-flex items-center gap-1 font-bold text-xs"
+                      class="inline-flex items-center gap-1.5 text-base font-bold font-mono whitespace-nowrap"
                       :class="row.isShort ? 'text-rose-400' : 'text-emerald-400'"
                     >
-                      <ShieldCheck class="w-3 h-3" />
+                      <ShieldCheck class="w-4 h-4 shrink-0" />
                       <span>{{ row.bufferDisplay }}</span>
                     </div>
-                    <div class="text-[10px] text-slate-400 mt-0.5">强平 {{ formatPrice(row.estLiqPrice) }}</div>
+                    <div class="text-xs text-slate-400 mt-0.5">强平 {{ formatPrice(row.estLiqPrice) }}</div>
                   </td>
                 </tr>
               </tbody>
@@ -553,67 +554,72 @@ async function copyPlan() {
           <div
             v-for="row in calculatedRows"
             :key="row.symbol + '_' + row.positionSide"
-            class="p-3.5 rounded-xl bg-background/80 border border-slate-800/90 space-y-2.5"
+            class="p-3.5 rounded-xl bg-background/80 border border-slate-800/90 space-y-3"
           >
             <!-- Card Header -->
-            <div class="flex items-center justify-between gap-2 pb-2 border-b border-slate-800/60">
-              <div class="flex items-center gap-1.5">
-                <span class="font-bold text-white text-base">{{ row.symbol }}</span>
+            <div class="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-slate-800/60">
+              <div class="flex flex-wrap items-center gap-2 min-w-0">
+                <span class="text-base font-bold text-white break-all">{{ row.symbol }}</span>
                 <span
-                  class="px-2 py-0.5 rounded text-[10px] font-bold inline-flex items-center gap-0.5"
+                  class="px-2.5 py-1 rounded text-xs font-bold inline-flex items-center gap-1 whitespace-nowrap"
                   :class="
                     row.isShort
                       ? 'bg-rose-500/20 text-rose-400 border border-rose-500/30'
                       : 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
                   "
                 >
-                  <ArrowDownRight v-if="row.isShort" class="w-2.5 h-2.5" />
-                  <ArrowUpRight v-else class="w-2.5 h-2.5" />
+                  <ArrowDownRight v-if="row.isShort" class="w-3 h-3" />
+                  <ArrowUpRight v-else class="w-3 h-3" />
                   {{ row.isShort ? t("pos.short") : t("pos.long") }}
                 </span>
               </div>
               <div class="flex items-center gap-1.5">
-                <span class="text-[10px] text-slate-500">建议杠杆:</span>
+                <span class="text-xs text-slate-300">建议杠杆:</span>
                 <span
-                  class="px-2 py-0.5 rounded-full text-xs font-bold bg-cyan-500/20 text-cyan-300 border border-cyan-500/40"
+                  class="px-3 py-1 rounded-full text-base font-bold font-mono bg-cyan-500/20 text-cyan-300 border border-cyan-500/40"
                 >
                   {{ row.optLev }}x
                 </span>
               </div>
             </div>
 
-            <!-- Card Metric Grid (2x2) -->
-            <div class="grid grid-cols-2 gap-2 text-xs font-mono">
-              <div class="p-2 rounded-lg bg-surface/70 border border-slate-800">
-                <div class="text-[10px] text-slate-500">{{ t("calc.colTargetNotional") }}</div>
-                <div class="text-sm font-bold text-white mt-0.5">{{ formatUsd(row.targetNotional, 2) }}</div>
-                <div class="text-[10px] text-slate-400">r = {{(row.scaledR * 100).toFixed(1)}}%</div>
+            <div class="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-sm font-mono">
+              <span class="font-bold text-slate-100">均价 {{ formatPrice(row.entryPrice) }}</span>
+              <span class="text-slate-300">现价 {{ formatPrice(row.currentPrice) }}</span>
+            </div>
+
+            <!-- Card Metric Grid adapts to the available width -->
+            <div class="grid grid-cols-[repeat(auto-fit,minmax(min(100%,10rem),1fr))] gap-2.5 text-xs font-mono">
+              <div class="min-w-0 p-3 rounded-lg bg-surface/70 border border-slate-800">
+                <div class="text-xs text-slate-300">{{ t("calc.colTargetNotional") }}</div>
+                <div class="text-lg font-bold font-mono text-white break-words mt-1">{{ formatUsd(row.targetNotional, 2) }}</div>
+                <div class="text-xs text-slate-300 mt-1">r = {{ (row.scaledR * 100).toFixed(1) }}%</div>
               </div>
 
-              <div class="p-2 rounded-lg bg-surface/70 border border-slate-800">
-                <div class="text-[10px] text-slate-500">{{ t("calc.colTargetQty") }}</div>
-                <div class="text-sm font-bold text-cyan-300 mt-0.5">{{ row.targetQtyFormatted }}</div>
-                <div class="text-[10px] text-slate-400">@ {{ formatPrice(row.entryPrice) }}</div>
+              <div class="min-w-0 p-3 rounded-lg bg-surface/70 border border-slate-800">
+                <div class="text-xs text-slate-300">{{ t("calc.colTargetQty") }}</div>
+                <div class="text-lg font-bold font-mono text-cyan-300 break-words mt-1">{{ row.targetQtyFormatted }}</div>
+                <div class="text-xs text-slate-300 mt-1">{{ row.symbol.replace(/USDT$/, "") }}</div>
               </div>
 
-              <div class="p-2 rounded-lg bg-surface/70 border border-slate-800">
-                <div class="text-[10px] text-slate-500">{{ t("calc.colMarginReq") }}</div>
-                <div class="text-xs font-semibold text-slate-200 mt-0.5">{{ formatUsd(row.initialMargin, 2) }}</div>
-                <div class="text-[10px] text-slate-500">
+              <div class="min-w-0 p-3 rounded-lg bg-surface/70 border border-slate-800">
+                <div class="text-xs text-slate-300">{{ t("calc.colMarginReq") }}</div>
+                <div class="text-base font-bold font-mono text-slate-100 break-words mt-1">{{ formatUsd(row.initialMargin, 2) }}</div>
+                <div class="text-xs text-slate-300 mt-1">
                   {{ capital > 0 ? ((row.initialMargin / capital) * 100).toFixed(1) + "% 本金" : "—" }}
                 </div>
               </div>
 
-              <div class="p-2 rounded-lg bg-surface/70 border border-slate-800">
-                <div class="text-[10px] text-slate-500">{{ t("calc.colLiqBuffer") }}</div>
+              <div class="min-w-0 p-3 rounded-lg bg-surface/70 border border-slate-800">
+                <div class="text-xs text-slate-300">{{ t("calc.colLiqBuffer") }}</div>
                 <div
-                  class="text-xs font-bold mt-0.5 flex items-center gap-1"
+                  class="text-lg font-bold font-mono mt-1 flex items-center gap-1.5"
                   :class="row.isShort ? 'text-rose-400' : 'text-emerald-400'"
                 >
-                  <ShieldCheck class="w-3 h-3" />
+                  <ShieldCheck class="w-4 h-4 shrink-0" />
                   <span>{{ row.bufferDisplay }}</span>
                 </div>
-                <div class="text-[10px] text-slate-400 truncate">强平 {{ formatPrice(row.estLiqPrice) }}</div>
+                <div class="text-xs text-slate-300 break-words mt-1">强平 {{ formatPrice(row.estLiqPrice) }}</div>
               </div>
             </div>
           </div>
@@ -621,58 +627,58 @@ async function copyPlan() {
 
         <!-- 4. Follower Portfolio Summary Row -->
         <div class="rounded-xl bg-gradient-to-br from-surface via-surface2/60 to-surface border border-slate-800/90 p-4">
-          <div class="flex items-center justify-between gap-2 mb-3">
+          <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
             <span class="text-xs font-mono font-bold uppercase tracking-wider text-slate-300 flex items-center gap-1.5">
               <Sparkles class="w-3.5 h-3.5 text-cyan-400" />
               <span>{{ t("calc.summaryTitle") }}</span>
             </span>
-            <span class="text-[11px] font-mono text-cyan-300">
+            <span class="text-sm font-mono text-cyan-300">
               跟单本金: {{ formatUsd(capital, 0) }}
             </span>
           </div>
 
           <!-- 4-KPI Grid -->
-          <div class="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+          <div class="grid grid-cols-[repeat(auto-fit,minmax(min(100%,14rem),1fr))] gap-3">
             <!-- 1. Total Notional -->
-            <div class="p-3 rounded-xl bg-background/80 border border-slate-800/90">
-              <div class="text-[10px] font-mono text-slate-500 uppercase">{{ t("calc.totalNotional") }}</div>
-              <div class="text-base sm:text-lg font-mono font-bold text-white mt-0.5">
+            <div class="min-w-0 p-4 rounded-xl bg-background/80 border border-slate-800/90">
+              <div class="text-xs font-medium text-slate-300">{{ t("calc.totalNotional") }}</div>
+              <div class="text-xl sm:text-2xl font-bold font-mono text-white tracking-tight break-words mt-1.5">
                 {{ formatUsd(portfolio.totalNotional, 2) }}
               </div>
-              <div class="text-[10px] font-mono text-slate-400 mt-0.5">
+              <div class="text-xs font-mono text-slate-300 mt-1.5">
                 {{ calculatedRows.length }} 个开仓品种
               </div>
             </div>
 
             <!-- 2. Portfolio Leverage -->
-            <div class="p-3 rounded-xl bg-background/80 border border-slate-800/90">
-              <div class="text-[10px] font-mono text-slate-500 uppercase">{{ t("calc.portfolioLev") }}</div>
-              <div class="text-base sm:text-lg font-mono font-bold text-cyan-400 mt-0.5">
+            <div class="min-w-0 p-4 rounded-xl bg-background/80 border border-slate-800/90">
+              <div class="text-xs font-medium text-slate-300">{{ t("calc.portfolioLev") }}</div>
+              <div class="text-xl sm:text-2xl font-bold font-mono text-cyan-300 tracking-tight break-words mt-1.5">
                 {{ portfolio.portfolioLeverage.toFixed(2) }}x
               </div>
-              <div class="text-[10px] font-mono text-slate-400 mt-0.5">
+              <div class="text-xs font-mono text-slate-300 mt-1.5">
                 带单净杠杆 {{ summary.totalNotionalLeverage ? Number(summary.totalNotionalLeverage).toFixed(2) + "x" : "—" }}
               </div>
             </div>
 
             <!-- 3. Margin Occupied -->
-            <div class="p-3 rounded-xl bg-background/80 border border-slate-800/90">
-              <div class="text-[10px] font-mono text-slate-500 uppercase">{{ t("calc.marginOccupied") }}</div>
-              <div class="text-base sm:text-lg font-mono font-bold text-amber-400 mt-0.5">
-                {{ portfolio.marginOccupiedPct.toFixed(2) }}%
+            <div class="min-w-0 p-4 rounded-xl bg-background/80 border border-slate-800/90">
+              <div class="text-xs font-medium text-slate-300">{{ t("calc.marginOccupied") }}</div>
+              <div class="text-xl sm:text-2xl font-bold font-mono text-white tracking-tight break-words mt-1.5">
+                {{ formatUsd(portfolio.totalInitialMargin, 2) }}
               </div>
-              <div class="text-[10px] font-mono text-slate-400 mt-0.5">
-                占用 {{ formatUsd(portfolio.totalInitialMargin, 2) }}
+              <div class="text-xs font-mono text-slate-300 mt-1.5">
+                占本金 {{ portfolio.marginOccupiedPct.toFixed(2) }}%
               </div>
             </div>
 
             <!-- 4. Free Cash Cushion -->
-            <div class="p-3 rounded-xl bg-background/80 border border-slate-800/90">
-              <div class="text-[10px] font-mono text-slate-500 uppercase">{{ t("calc.freeCashCushion") }}</div>
-              <div class="text-base sm:text-lg font-mono font-bold text-emerald-400 mt-0.5">
+            <div class="min-w-0 p-4 rounded-xl bg-background/80 border border-slate-800/90">
+              <div class="text-xs font-medium text-slate-300">{{ t("calc.freeCashCushion") }}</div>
+              <div class="text-xl sm:text-2xl font-bold font-mono text-emerald-300 tracking-tight break-words mt-1.5">
                 {{ formatUsd(portfolio.freeCashCushion, 2) }}
               </div>
-              <div class="text-[10px] font-mono text-slate-400 mt-0.5">
+              <div class="text-xs font-mono text-slate-300 mt-1.5">
                 防爆安全垫 ±{{ portfolio.crossBufferPct.toFixed(1) }}%
               </div>
             </div>
@@ -680,9 +686,9 @@ async function copyPlan() {
 
           <!-- Cushion Visual Bar -->
           <div class="mt-3.5 space-y-1.5">
-            <div class="flex items-center justify-between text-[10px] font-mono text-slate-400">
+            <div class="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-xs font-mono text-slate-300">
               <span>保证金占用 {{ portfolio.marginOccupiedPct.toFixed(1) }}%</span>
-              <span class="text-emerald-400">空闲现金防爆缓冲 {{ portfolio.freeCashPct.toFixed(1) }}%</span>
+              <span class="text-emerald-300">空闲现金防爆缓冲 {{ portfolio.freeCashPct.toFixed(1) }}%</span>
             </div>
             <div class="h-2 rounded-full bg-slate-800 overflow-hidden flex">
               <div
@@ -697,7 +703,7 @@ async function copyPlan() {
           </div>
 
           <!-- Bottom Operational Note -->
-          <div class="mt-3 text-[11px] font-mono text-slate-400 flex items-start gap-1.5 leading-relaxed">
+          <div class="mt-3 text-sm text-slate-300 flex items-start gap-2 leading-relaxed">
             <Info class="w-3.5 h-3.5 text-cyan-400 shrink-0 mt-0.5" />
             <span>{{ t("calc.crossMarginNotice") }}</span>
           </div>

@@ -136,7 +136,7 @@ function statusBadge(status: string) {
           {{ t("dash.subtitle") }}
         </p>
       </div>
-      <div class="flex items-center gap-2.5">
+      <div class="flex flex-wrap items-center gap-2.5">
         <button
           @click="fetchOverview(true)"
           class="px-3 py-2 rounded-xl bg-surface border border-slate-700 hover:border-slate-500 text-xs font-medium text-slate-300 flex items-center gap-1.5 transition-colors"
@@ -239,17 +239,17 @@ function statusBadge(status: string) {
 
     <!-- Main Grid: Positions + Executions -->
     <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
-      <div class="lg:col-span-7 space-y-6">
+      <div class="lg:col-span-7 min-w-0 space-y-6">
         <div class="rounded-2xl bg-surface border border-slate-800/80 overflow-hidden">
-          <div class="px-5 py-4 border-b border-slate-800/80 flex items-center justify-between">
-            <h3 class="text-sm font-semibold text-white">{{ t("dash.monitoredLeadPos") }}</h3>
-            <div class="flex items-center gap-2">
-              <span class="text-xs font-mono text-slate-400">{{ t("dash.activeCount", { n: data.leadPositions.length }) }}</span>
+          <div class="px-5 py-4 border-b border-slate-800/80 flex flex-wrap items-center justify-between gap-3">
+            <h3 class="text-base font-semibold text-white">{{ t("dash.monitoredLeadPos") }}</h3>
+            <div class="flex flex-wrap items-center gap-2">
+              <span class="text-xs font-mono text-slate-300">{{ t("dash.activeCount", { n: data.leadPositions.length }) }}</span>
               <button
                 v-if="data.leadPositions.length > 0"
                 type="button"
                 @click="showLeadCalculator = !showLeadCalculator"
-                class="px-2.5 py-1 rounded-lg text-xs font-mono font-medium flex items-center gap-1.5 border transition-all cursor-pointer"
+                class="min-h-10 px-3 py-2 rounded-lg text-xs font-mono font-semibold flex items-center gap-1.5 border transition-all cursor-pointer"
                 :class="
                   showLeadCalculator
                     ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/50'
@@ -267,13 +267,13 @@ function statusBadge(status: string) {
               :compact="true"
             />
           </div>
-          <div v-if="data.leadPositions.length === 0" class="p-8 text-center text-xs text-slate-500">
+          <div v-if="data.leadPositions.length === 0" class="p-8 text-center text-sm text-slate-300">
             {{ t("dash.noLeadPos") }}
           </div>
           <div v-else class="overflow-x-auto">
-            <table class="w-full text-left border-collapse text-xs">
+            <table class="w-full min-w-[800px] text-left border-collapse text-sm">
               <thead>
-                <tr class="border-b border-slate-800 text-slate-400 uppercase font-mono">
+                <tr class="border-b border-slate-800 text-xs font-mono font-semibold uppercase text-slate-300 [&>th]:font-semibold">
                   <th class="py-3 px-4">{{ t("dash.colLeadSymbol") }}</th>
                   <th class="py-3 px-4">{{ t("dash.colSide") }}</th>
                   <th class="py-3 px-4 text-right">{{ t("dash.colEntryMark") }}</th>
@@ -285,12 +285,12 @@ function statusBadge(status: string) {
               <tbody class="divide-y divide-slate-800/60">
                 <tr v-for="(pos, idx) in data.leadPositions" :key="idx" class="hover:bg-slate-800/30">
                   <td class="py-3 px-4">
-                    <div class="font-semibold text-white">{{ pos.symbol }}</div>
-                    <div class="text-[11px] text-slate-400">{{ pos.leadName }}</div>
+                    <div class="text-base font-bold text-white">{{ pos.symbol }}</div>
+                    <div class="text-xs text-slate-300 mt-1">{{ pos.leadName }}</div>
                   </td>
                   <td class="py-3 px-4">
                     <span
-                      class="inline-flex items-center gap-1 px-2 py-0.5 rounded-md font-mono font-semibold text-[11px]"
+                      class="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-bold font-mono whitespace-nowrap"
                       :class="pos.positionSide === 'LONG' ? 'bg-emerald-500/15 text-emerald-400' : 'bg-rose-500/15 text-rose-400'"
                     >
                       <ArrowUpRight v-if="pos.positionSide === 'LONG'" class="w-3 h-3" />
@@ -298,26 +298,26 @@ function statusBadge(status: string) {
                       {{ pos.positionSide }}
                     </span>
                   </td>
-                  <td class="py-3 px-4 text-right font-mono">
-                    <div class="text-slate-200">{{ pos.avgEntry }}</div>
-                    <div class="text-[11px] text-slate-400">{{ pos.currentPrice }}</div>
+                  <td class="py-3 px-4 text-right text-sm font-bold font-mono whitespace-nowrap">
+                    <div class="text-slate-100">{{ pos.avgEntry }}</div>
+                    <div class="text-sm text-slate-300 mt-1">{{ pos.currentPrice }}</div>
                   </td>
-                  <td class="py-3 px-4 text-right font-mono text-slate-200">
+                  <td class="py-3 px-4 text-right text-sm font-bold font-mono text-slate-100 whitespace-nowrap">
                     {{ formatUsd(pos.markValue) }}
                   </td>
                   <td
-                    class="py-3 px-4 text-right font-mono font-semibold"
+                    class="py-3 px-4 text-right text-sm font-bold font-mono whitespace-nowrap"
                     :class="pos.uPnL >= 0 ? 'text-emerald-400' : 'text-rose-400'"
                   >
                     {{ pos.uPnL >= 0 ? "+" : "" }}{{ formatUsd(pos.uPnL) }}
-                    <div class="text-[10px] font-normal opacity-80">{{ (pos.uPnLRoePct ?? pos.uPnLPct ?? 0).toFixed(2) }}%</div>
+                    <div class="text-xs font-mono font-normal mt-1">{{ (pos.uPnLRoePct ?? pos.uPnLPct ?? 0).toFixed(2) }}%</div>
                   </td>
                   <td class="py-3 px-4">
-                    <span v-if="pos.analysis?.ok" class="text-[11px] font-mono text-accent">
+                    <span v-if="pos.analysis?.ok" class="text-xs font-mono text-accent">
                       {{ isZh && pos.analysis.verdictZh ? pos.analysis.verdictZh : pos.analysis.verdict }} ·
                       {{ isZh && pos.analysis.trend1hZh ? pos.analysis.trend1hZh : pos.analysis.trend1h }}
                     </span>
-                    <span v-else class="text-[11px] text-slate-500">—</span>
+                    <span v-else class="text-xs text-slate-300">—</span>
                   </td>
                 </tr>
               </tbody>
@@ -326,17 +326,17 @@ function statusBadge(status: string) {
         </div>
 
         <div class="rounded-2xl bg-surface border border-slate-800/80 overflow-hidden">
-          <div class="px-5 py-4 border-b border-slate-800/80 flex items-center justify-between">
-            <h3 class="text-sm font-semibold text-white">{{ t("dash.followerPosTitle") }}</h3>
-            <span class="text-xs font-mono text-slate-400">{{ t("dash.openCount", { n: data.followerPositions.length }) }}</span>
+          <div class="px-5 py-4 border-b border-slate-800/80 flex flex-wrap items-center justify-between gap-3">
+            <h3 class="text-base font-semibold text-white">{{ t("dash.followerPosTitle") }}</h3>
+            <span class="text-xs font-mono text-slate-300">{{ t("dash.openCount", { n: data.followerPositions.length }) }}</span>
           </div>
-          <div v-if="data.followerPositions.length === 0" class="p-8 text-center text-xs text-slate-500">
+          <div v-if="data.followerPositions.length === 0" class="p-8 text-center text-sm text-slate-300">
             {{ t("dash.noFollowerPos") }}
           </div>
           <div v-else class="overflow-x-auto">
-            <table class="w-full text-left border-collapse text-xs">
+            <table class="w-full min-w-[700px] text-left border-collapse text-sm">
               <thead>
-                <tr class="border-b border-slate-800 text-slate-400 uppercase font-mono">
+                <tr class="border-b border-slate-800 text-xs font-mono font-semibold uppercase text-slate-300 [&>th]:font-semibold">
                   <th class="py-3 px-4">{{ t("dash.colAcctContract") }}</th>
                   <th class="py-3 px-4">{{ t("dash.colSide") }}</th>
                   <th class="py-3 px-4 text-right">{{ t("dash.colSizeAvgPx") }}</th>
@@ -347,26 +347,26 @@ function statusBadge(status: string) {
               <tbody class="divide-y divide-slate-800/60">
                 <tr v-for="(pos, idx) in data.followerPositions" :key="idx" class="hover:bg-slate-800/30">
                   <td class="py-3 px-4">
-                    <div class="font-semibold text-white">{{ pos.instId }}</div>
-                    <div class="text-[11px] text-slate-400 uppercase">
+                    <div class="text-base font-bold text-white">{{ pos.instId }}</div>
+                    <div class="text-xs text-slate-300 uppercase mt-1">
                       {{ pos.accountName }} · {{ pos.exchange }} ({{ pos.environment }})
                     </div>
                   </td>
                   <td class="py-3 px-4">
                     <span
-                      class="px-2 py-0.5 rounded-md font-mono font-semibold text-[11px] uppercase"
+                      class="inline-flex px-2.5 py-1 rounded-md text-xs font-bold font-mono uppercase whitespace-nowrap"
                       :class="pos.posSide === 'long' ? 'bg-emerald-500/15 text-emerald-400' : 'bg-rose-500/15 text-rose-400'"
                     >
                       {{ pos.posSide }} {{ pos.lever }}x
                     </span>
                   </td>
-                  <td class="py-3 px-4 text-right font-mono">
-                    <div class="text-slate-200">{{ pos.pos }}</div>
-                    <div class="text-[11px] text-slate-400">{{ pos.avgPx }}</div>
+                  <td class="py-3 px-4 text-right text-sm font-bold font-mono whitespace-nowrap">
+                    <div class="text-slate-100">{{ pos.pos }}</div>
+                    <div class="text-sm text-slate-300 mt-1">{{ pos.avgPx }}</div>
                   </td>
-                  <td class="py-3 px-4 text-right font-mono text-slate-200">{{ formatUsd(pos.notionalUsd) }}</td>
+                  <td class="py-3 px-4 text-right text-sm font-bold font-mono text-slate-100 whitespace-nowrap">{{ formatUsd(pos.notionalUsd) }}</td>
                   <td
-                    class="py-3 px-4 text-right font-mono font-semibold"
+                    class="py-3 px-4 text-right text-sm font-bold font-mono whitespace-nowrap"
                     :class="pos.upl >= 0 ? 'text-emerald-400' : 'text-rose-400'"
                   >
                     {{ pos.upl >= 0 ? "+" : "" }}{{ formatUsd(pos.upl) }}
@@ -378,33 +378,33 @@ function statusBadge(status: string) {
         </div>
       </div>
 
-      <div class="lg:col-span-5">
+      <div class="lg:col-span-5 min-w-0">
         <div class="rounded-2xl bg-surface border border-slate-800/80 overflow-hidden h-full flex flex-col">
-          <div class="px-5 py-4 border-b border-slate-800/80 flex items-center justify-between">
-            <h3 class="text-sm font-semibold text-white">{{ t("dash.execFeedTitle") }}</h3>
+          <div class="px-5 py-4 border-b border-slate-800/80 flex flex-wrap items-center justify-between gap-3">
+            <h3 class="text-base font-semibold text-white">{{ t("dash.execFeedTitle") }}</h3>
             <span class="text-xs font-mono text-accent">{{ t("dash.liveStream") }}</span>
           </div>
-          <div v-if="data.recentExecutions.length === 0" class="p-8 text-center text-xs text-slate-500 flex-1">
+          <div v-if="data.recentExecutions.length === 0" class="p-8 text-center text-sm text-slate-300 flex-1">
             {{ t("dash.waitingEvents") }}
           </div>
           <div v-else class="divide-y divide-slate-800/60 max-h-[640px] overflow-y-auto">
             <div v-for="ex in data.recentExecutions" :key="ex.id" class="p-4 hover:bg-slate-800/30 transition-colors">
-              <div class="flex items-center justify-between gap-2 mb-1.5">
-                <div class="flex items-center gap-2 min-w-0">
-                  <span class="font-bold text-xs text-white truncate">{{ ex.symbol }}</span>
-                  <span class="text-[11px] font-mono text-slate-400">{{ ex.action }}</span>
+              <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
+                <div class="flex flex-wrap items-center gap-2 min-w-0">
+                  <span class="text-sm font-bold text-white break-all">{{ ex.symbol }}</span>
+                  <span class="text-xs font-mono text-slate-300">{{ ex.action }}</span>
                 </div>
-                <span class="px-2 py-0.5 rounded-full text-[10px] font-mono border shrink-0" :class="statusBadge(ex.status)">
+                <span class="max-w-full px-2.5 py-1 rounded-full text-xs font-mono font-semibold border break-all" :class="statusBadge(ex.status)">
                   {{ ex.status }}
                 </span>
               </div>
-              <div class="flex items-center justify-between text-[11px] text-slate-400 font-mono">
-                <span>{{ ex.leadName }} → {{ ex.accountName }}</span>
-                <span v-if="ex.myNotional > 0" class="text-slate-200">
+              <div class="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-xs text-slate-300 font-mono">
+                <span class="min-w-0 break-words">{{ ex.leadName }} → {{ ex.accountName }}</span>
+                <span v-if="ex.myNotional > 0" class="text-sm font-bold text-slate-100 break-words">
                   ${{ ex.myNotional }} @ {{ ex.myPrice }}
                 </span>
               </div>
-              <p v-if="ex.details" class="text-[11px] text-slate-500 mt-1.5 break-words">{{ ex.details }}</p>
+              <p v-if="ex.details" class="text-sm text-slate-300 mt-2 break-words leading-relaxed">{{ ex.details }}</p>
             </div>
           </div>
         </div>

@@ -139,7 +139,7 @@ onActivated(() => {
 
     <div v-else-if="leads.length === 0" class="p-10 rounded-2xl bg-surface border border-slate-800 text-center">
       <p class="text-slate-300 font-medium mb-1">{{ t("leads.emptyTitle") }}</p>
-      <p class="text-xs text-slate-500 mb-4">{{ t("leads.emptyDesc") }}</p>
+      <p class="text-xs text-slate-400 mb-4">{{ t("leads.emptyDesc") }}</p>
       <button @click="showModal = true" class="px-4 py-2 rounded-xl bg-accent/15 text-accent border border-accent/30 text-xs font-semibold">
         {{ t("leads.addFirst") }}
       </button>
@@ -155,9 +155,9 @@ onActivated(() => {
           <div class="flex items-start justify-between gap-3">
             <div>
               <div class="flex items-center gap-2">
-                <h3 class="font-bold text-base text-white">{{ lead.name }}</h3>
+                <h3 class="font-bold text-lg text-white">{{ lead.name }}</h3>
                 <span
-                  class="px-2 py-0.5 rounded-full text-[10px] font-mono border"
+                  class="px-2 py-0.5 rounded-full text-xs font-mono border"
                   :class="
                     lead.status === 'running'
                       ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
@@ -173,37 +173,37 @@ onActivated(() => {
             </div>
             <span
               v-if="lead.isPublicDashboard"
-              class="px-2 py-0.5 rounded-md bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 text-[10px] font-mono"
+              class="px-2 py-0.5 rounded-md bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 text-xs font-mono"
             >
               {{ t("leads.publicTag") }}
             </span>
           </div>
 
-          <div class="grid grid-cols-2 gap-3 mt-4 p-3 rounded-xl bg-background/60 border border-slate-800/80 text-xs">
+          <div class="grid grid-cols-2 gap-4 mt-4 p-4 rounded-xl bg-background/60 border border-slate-800/80 text-xs">
             <div>
-              <span class="text-slate-500 block text-[11px]">{{ t("leads.marginBalance") }}</span>
-              <span class="font-mono font-semibold text-slate-100">{{ formatUsd(lead.marginBalance) }}</span>
+              <span class="text-slate-300 block text-sm mb-1">{{ t("leads.marginBalance") }}</span>
+              <span class="text-lg font-mono font-bold text-slate-100">{{ formatUsd(lead.marginBalance) }}</span>
             </div>
             <div>
-              <span class="text-slate-500 block text-[11px]">{{ t("leads.openPositions") }}</span>
-              <span class="font-mono font-semibold text-accent">{{ lead.openPositionsCount }} {{ t("leads.activeSuffix") }}</span>
+              <span class="text-slate-300 block text-sm mb-1">{{ t("leads.openPositions") }}</span>
+              <span class="text-lg font-mono font-bold text-accent">{{ lead.openPositionsCount }} {{ t("leads.activeSuffix") }}</span>
             </div>
             <div>
-              <span class="text-slate-500 block text-[11px]">{{ t("leads.estUpnl") }}</span>
+              <span class="text-slate-300 block text-sm mb-1">{{ t("leads.estUpnl") }}</span>
               <span
-                class="font-mono font-semibold"
+                class="text-lg font-mono font-bold"
                 :class="lead.openUnrealizedPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'"
               >
                 {{ lead.openUnrealizedPnl >= 0 ? "+" : "" }}{{ formatUsd(lead.openUnrealizedPnl) }}
               </span>
             </div>
             <div>
-              <span class="text-slate-500 block text-[11px]">{{ t("leads.pollInterval") }}</span>
+              <span class="text-slate-300 block text-sm mb-1">{{ t("leads.pollInterval") }}</span>
               <span class="font-mono text-slate-300">{{ lead.pollIntervalSec }}s</span>
             </div>
           </div>
 
-          <p v-if="lead.lastError" class="mt-3 text-[11px] text-rose-400 bg-rose-500/10 p-2 rounded-lg border border-rose-500/20 break-words">
+          <p v-if="lead.lastError" class="mt-3 text-sm text-rose-400 bg-rose-500/10 p-2 rounded-lg border border-rose-500/20 break-words">
             {{ lead.lastError }}
           </p>
         </div>
@@ -228,7 +228,7 @@ onActivated(() => {
           </div>
           <button
             @click="deleteLead(lead.id)"
-            class="p-1.5 rounded-lg text-slate-500 hover:text-rose-400 hover:bg-rose-500/10 transition-colors"
+            class="p-1.5 rounded-lg text-slate-400 hover:text-rose-400 hover:bg-rose-500/10 transition-colors"
           >
             <Trash2 class="w-4 h-4" />
           </button>
@@ -280,7 +280,7 @@ onActivated(() => {
 
     <!-- Rich Inspect / Telemetry Modal -->
     <div v-if="detailLead" class="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-2 sm:p-5">
-      <div class="w-full max-w-7xl max-h-[92vh] bg-background border border-slate-800 rounded-2xl flex flex-col shadow-2xl overflow-hidden">
+      <div class="w-full max-w-screen-2xl max-h-[92vh] bg-background border border-slate-800 rounded-2xl flex flex-col shadow-2xl overflow-hidden">
         <div class="px-5 py-3.5 bg-surface border-b border-slate-800 flex flex-wrap items-center justify-between gap-3">
           <div>
             <h3 class="text-base sm:text-lg font-bold text-white">{{ detailLead.name }}</h3>
@@ -321,7 +321,7 @@ onActivated(() => {
         </div>
 
         <div class="p-4 sm:p-6 overflow-y-auto flex-1">
-          <div v-if="!detailSnapshot" class="text-center py-12 text-slate-500 text-sm">
+          <div v-if="!detailSnapshot" class="text-center py-12 text-slate-400 text-sm">
             {{ t("leads.noSnapshot") }}
           </div>
           <LeadTelemetryPanel

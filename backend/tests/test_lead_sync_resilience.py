@@ -54,6 +54,18 @@ def monitor(monkeypatch):
         "symbol": "BTCUSDT", "positionSide": "LONG", "positionAmt": "2",
         "entryPrice": "100", "markPrice": "110",
     }])
+    engine.collector.fetch_performance = AsyncMock(return_value={
+        "roi": 10, "pnl": 20, "winRate": 60, "mdd": 5, "winOrders": 3, "totalOrder": 5,
+    })
+    engine.collector.fetch_roi_chart = AsyncMock(return_value=[{"t": 1000, "v": 10}])
+    engine.collector.fetch_allocation = AsyncMock(return_value={
+        "timeRange": "90D", "items": [{"symbol": "BTCUSDT", "ratio": 100}],
+    })
+    engine.collector.fetch_marks = AsyncMock(return_value={
+        "BTCUSDT": {"markPrice": 110, "lastPrice": 111, "currentPrice": 111, "priceTime": 1000},
+    })
+    engine.collector.fetch_brackets = AsyncMock(return_value={})
+    engine.pa_analyzer.analyze_position = AsyncMock(return_value={"ok": True})
     engine.router.process_lead_events = AsyncMock()
     engine.ws_hub.broadcast = AsyncMock()
     monkeypatch.setattr(ProxyManager, "ordered_proxy_urls", lambda *args, **kwargs: [None])

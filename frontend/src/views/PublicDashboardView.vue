@@ -94,7 +94,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="min-h-screen bg-background text-slate-100 p-4 md:p-8 max-w-[1440px] mx-auto space-y-6 overflow-x-hidden">
+  <div class="min-h-screen bg-background text-slate-100 p-4 md:p-8 max-w-[1600px] mx-auto space-y-6 overflow-x-hidden">
     <!-- Top Bar -->
     <header class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-5 border-b border-slate-800">
       <div class="flex items-center gap-3 min-w-0">
@@ -102,15 +102,15 @@ onUnmounted(() => {
           <Cpu class="w-5 h-5 text-accent" />
         </div>
         <div class="min-w-0">
-          <h1 class="text-lg sm:text-xl font-bold text-white flex flex-wrap items-center gap-2">
+          <h1 class="text-xl sm:text-2xl font-bold text-white flex flex-wrap items-center gap-2">
             <span>{{ t("pub.title") }}</span>
-            <span class="px-2 py-0.5 rounded-full text-[10px] font-mono border" :class="beaconStatus.cls">
+            <span class="px-2 py-0.5 rounded-full text-xs font-mono border" :class="beaconStatus.cls">
               {{ t(beaconStatus.key) }}
             </span>
           </h1>
-          <p class="text-xs text-slate-400 truncate">
+          <p class="text-sm text-slate-300 leading-relaxed">
             {{ t("pub.subtitle") }}
-            <span v-if="lastUpdatedAt" class="font-mono text-slate-500"> · {{ lastUpdatedAt }}</span>
+            <span v-if="lastUpdatedAt" class="font-mono text-slate-400"> · {{ lastUpdatedAt }}</span>
           </p>
         </div>
       </div>
@@ -124,18 +124,18 @@ onUnmounted(() => {
           :title="soundEnabled ? t('sound.onTitle') : t('sound.offTitle')"
         >
           <Volume2 v-if="soundEnabled" class="w-4 h-4 text-accent" />
-          <VolumeX v-else class="w-4 h-4 text-slate-500" />
+          <VolumeX v-else class="w-4 h-4 text-slate-400" />
         </button>
         <button
           @click="fetchPublic"
-          class="px-3 py-2 rounded-xl bg-surface border border-slate-700 hover:border-slate-500 text-xs text-slate-300 flex items-center gap-1.5 transition-colors"
+          class="px-3 py-2 rounded-xl bg-surface border border-slate-700 hover:border-slate-500 text-sm text-slate-300 flex items-center gap-1.5 transition-colors"
         >
           <RefreshCw class="w-3.5 h-3.5" :class="{ 'animate-spin': loading }" />
           <span>{{ t("pub.refresh") }}</span>
         </button>
         <router-link
           to="/login"
-          class="px-3 py-2 rounded-xl bg-surface border border-slate-800 hover:border-accent/40 text-slate-400 hover:text-accent text-xs font-medium flex items-center gap-1.5 transition-colors"
+          class="px-3 py-2 rounded-xl bg-surface border border-slate-800 hover:border-accent/40 text-slate-400 hover:text-accent text-sm font-medium flex items-center gap-1.5 transition-colors"
         >
           <Lock class="w-3.5 h-3.5" />
           <span>{{ t("pub.console") }}</span>
@@ -144,7 +144,7 @@ onUnmounted(() => {
     </header>
 
     <div v-if="!enabled" class="p-10 rounded-2xl bg-surface border border-slate-800 text-center">
-      <Globe class="w-8 h-8 text-slate-500 mx-auto mb-3" />
+      <Globe class="w-8 h-8 text-slate-400 mx-auto mb-3" />
       <h2 class="text-base font-bold text-white">{{ t("pub.disabledTitle") }}</h2>
       <p class="text-xs text-slate-400 mt-1">{{ t("pub.disabledDesc") }}</p>
     </div>
