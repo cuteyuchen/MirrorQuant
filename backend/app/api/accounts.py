@@ -14,6 +14,7 @@ from app.core.secret_mask import mask_sensitive_payload, redact_error_urls, reda
 from app.models.domain import ProxyNode, TradingAccount, User
 from app.schemas.api import AccountCreate, AccountUpdate
 from app.services.adapters.factory import create_exchange_adapter
+from app.services.positions import with_current_price
 from app.services.engine.orchestrator import orchestrator
 from app.services.engine.serialization import serialized_execution
 from app.services.proxy.manager import ProxyEgressError, ProxyManager
@@ -25,7 +26,8 @@ def _account_out(a: TradingAccount) -> dict:
     positions = []
     if a.positions_json:
         try:
-            positions = json.loads(a.positions_json)
+            positions = [with_current_price(p, a.exchange) for p in json.loads(a.positions_json)
+                         if isinstance(p, dict)]
         except Exception:
             pass
     return {

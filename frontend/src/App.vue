@@ -26,6 +26,7 @@ const { t } = useI18n();
 
 const cachedViews = [
   "DashboardView",
+  "PublicDashboardView",
   "LeadsView",
   "AccountsView",
   "BindingsView",
@@ -34,12 +35,14 @@ const cachedViews = [
 ];
 
 const isPublicOrAuthLayout = computed(() => {
-  return ["/login", "/setup", "/public"].includes(route.path);
+  if (route.path === "/public") return !authStore.authenticated;
+  return ["/login", "/setup"].includes(route.path);
 });
 
 // Desktop Navigation Items
 const navItems = computed(() => [
   { name: t("nav.dashboard"), path: "/dashboard", icon: LayoutDashboard },
+  { name: t("nav.publicFeed"), path: "/public", icon: Globe },
   { name: t("nav.leads"), path: "/leads", icon: Users },
   { name: t("nav.accounts"), path: "/accounts", icon: Wallet },
   { name: t("nav.bindings"), path: "/bindings", icon: GitFork },
@@ -47,9 +50,10 @@ const navItems = computed(() => [
   { name: t("nav.settings"), path: "/settings", icon: Settings },
 ]);
 
-// Mobile Bottom Navigation Bar (5 core tabs)
+// Six compact tabs keep the radar accessible on mobile.
 const mobileNavItems = computed(() => [
   { name: t("nav.mobile.dashboard"), path: "/dashboard", icon: LayoutDashboard },
+  { name: t("nav.mobile.publicFeed"), path: "/public", icon: Globe },
   { name: t("nav.mobile.leads"), path: "/leads", icon: Users },
   { name: t("nav.mobile.accounts"), path: "/accounts", icon: Wallet },
   { name: t("nav.mobile.bindings"), path: "/bindings", icon: GitFork },
@@ -166,15 +170,6 @@ async function handleLogout() {
             <span>{{ item.name }}</span>
           </router-link>
 
-          <div class="pt-4 mt-4 border-t border-slate-800/80">
-            <router-link
-              to="/public"
-              class="flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium text-slate-400 hover:text-cyan-300 hover:bg-slate-800/50 transition-all"
-            >
-              <Globe class="w-4 h-4" />
-              <span>{{ t("nav.publicFeed") }}</span>
-            </router-link>
-          </div>
         </nav>
       </div>
 
@@ -233,7 +228,7 @@ async function handleLogout() {
     <nav
       class="md:hidden fixed bottom-0 left-0 right-0 z-40 bg-[#0d121c]/95 backdrop-blur border-t border-[#1e293b] pb-safe shadow-[0_-8px_24px_rgba(0,0,0,0.5)]"
     >
-      <div class="grid grid-cols-5 items-center justify-around h-14 max-w-md mx-auto px-1">
+      <div class="grid grid-cols-6 items-center justify-around h-14 max-w-md mx-auto px-1">
         <router-link
           v-for="item in mobileNavItems"
           :key="item.path"

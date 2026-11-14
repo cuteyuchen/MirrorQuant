@@ -4,6 +4,7 @@ import { AlertTriangle, ArrowRight, Layers, Plus, Power, RotateCcw, Settings2, T
 import { api } from "@/api/client";
 import { useDataCacheStore } from "@/stores/dataCache";
 import { useI18n } from "@/i18n";
+import { formatUsd } from "@/utils/format";
 
 defineOptions({ name: "BindingsView" });
 
@@ -276,7 +277,7 @@ onActivated(() => {
               class="px-3 py-1.5 rounded-lg bg-surface2 hover:bg-slate-700 text-xs text-amber-300 flex items-center gap-1.5"
             >
               <RotateCcw class="w-3.5 h-3.5" />
-              <span>{{ t("bind.clearDebt", { amt: b.pendingDebtUsd }) }}</span>
+              <span>{{ t("bind.clearDebt", { amt: formatUsd(b.pendingDebtUsd) }) }}</span>
             </button>
 
             <button
@@ -325,7 +326,7 @@ onActivated(() => {
           </div>
           <div>
             <span class="text-[10px] text-slate-500 block">{{ t("bind.pendingDebt") }}</span>
-            <span :class="b.pendingDebtUsd > 0 ? 'text-amber-400' : 'text-slate-400'">${{ b.pendingDebtUsd }}</span>
+            <span :class="b.pendingDebtUsd > 0 ? 'text-amber-400' : 'text-slate-400'">{{ formatUsd(b.pendingDebtUsd) }}</span>
           </div>
         </div>
 

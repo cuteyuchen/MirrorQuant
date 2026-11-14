@@ -4,6 +4,7 @@ import { CheckCircle2, KeyRound, Plus, RefreshCw, Shield, Trash2, Wifi, X } from
 import { api } from "@/api/client";
 import { useDataCacheStore } from "@/stores/dataCache";
 import { useI18n } from "@/i18n";
+import { formatUsd } from "@/utils/format";
 
 defineOptions({ name: "AccountsView" });
 
@@ -96,13 +97,6 @@ async function deleteAccount(id: number) {
   await loadData(true);
 }
 
-function formatUsd(val: number) {
-  return new Intl.NumberFormat("en-US", {
-    style: "currency",
-    currency: "USD",
-    minimumFractionDigits: 2,
-  }).format(val || 0);
-}
 
 onMounted(() => loadData(false));
 onActivated(() => {

@@ -11,6 +11,7 @@ from app.api.deps import get_current_user
 from app.core.database import get_db
 from app.core.secret_mask import mask_sensitive_payload, redact_error_urls
 from app.services.lead_collector.freshness import lead_freshness
+from app.services.positions import with_current_price
 from app.models.domain import (
     CopyBinding,
     ExecutionRecord,
@@ -44,15 +45,35 @@ async def dashboard_overview(
     total_hwm = sum(a.hwm_equity for a in accounts if a.is_enabled)
 
     lead_positions = []
+    leads_status = []
     for lead in leads:
-        if not lead.snapshot_json:
-            continue
+        snap = {}
         try:
-            snap = json.loads(lead.snapshot_json)
+            snap = json.loads(lead.snapshot_json) if lead.snapshot_json else {}
+            if not isinstance(snap, dict):
+                snap = {}
             for p in snap.get("openPositions", []):
-                lead_positions.append({"leadId": lead.id, "leadName": lead.name, **p})
+                if isinstance(p, dict):
+                    lead_positions.append({**p, "leadId": lead.id, "leadName": lead.name})
         except Exception:
-            pass
+            snap = {}
+        leads_status.append({
+            "id": lead.id,
+            "name": lead.name,
+            "sourceType": lead.platform,
+            "isEnabled": lead.is_enabled,
+            "status": lead.status,
+            "lastSyncAt": lead.last_sync_at.isoformat() if lead.last_sync_at else None,
+            "lastError": redact_error_urls(lead.last_error) if lead.last_error else None,
+            "openPositionsCount": sum(1 for p in lead_positions if p["leadId"] == lead.id),
+            "positionsKnown": isinstance(snap.get("openPositions"), list),
+            "snapshotIncomplete": bool((snap.get("openPositionsMeta") or {}).get("partial")
+                                       or (snap.get("openPositionsMeta") or {}).get("error")
+                                       or (snap.get("meta") or {}).get("detailOk") is False),
+            "marginBalance": lead.margin_balance,
+            "boundAccountIds": [b.account_id for b in bindings if b.lead_id == lead.id and b.is_enabled],
+            **lead_freshness(lead, snap),
+        })
 
     follower_positions = []
     for acct in accounts:
@@ -60,13 +81,17 @@ async def dashboard_overview(
             continue
         try:
             for p in json.loads(acct.positions_json):
+                if not isinstance(p, dict):
+                    continue
                 follower_positions.append(
                     {
+                        **with_current_price(p, acct.exchange),
                         "accountId": acct.id,
                         "accountName": acct.name,
                         "exchange": acct.exchange,
                         "environment": acct.environment,
-                        **p,
+                        "accountStatus": acct.status,
+                        "lastSyncAt": acct.last_sync_at.isoformat() if acct.last_sync_at else None,
                     }
                 )
         except Exception:
@@ -88,6 +113,18 @@ async def dashboard_overview(
             "globalKillSwitch": bool(global_kill),
         },
         "leadPositions": mask_sensitive_payload(lead_positions),
+        "leadsStatus": mask_sensitive_payload(leads_status),
+        "accountsStatus": [
+            {"id": a.id, "isEnabled": a.is_enabled, "status": a.status,
+             "lastSyncAt": a.last_sync_at.isoformat() if a.last_sync_at else None}
+            for a in accounts
+        ],
+        "bindingsStatus": [
+            {"leadId": b.lead_id, "accountId": b.account_id, "isEnabled": b.is_enabled,
+             "circuitBreakerTripped": b.circuit_breaker_tripped,
+             "symbolMap": json.loads(b.symbol_map_json or "{}")}
+            for b in bindings
+        ],
         "followerPositions": mask_sensitive_payload(follower_positions),
         "recentExecutions": [
             {

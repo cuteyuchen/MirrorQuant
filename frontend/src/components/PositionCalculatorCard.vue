@@ -16,6 +16,7 @@ import {
   SlidersHorizontal,
 } from "lucide-vue-next";
 import { useI18n } from "@/i18n";
+import { formatPrice, formatQty, formatUsd } from "@/utils/format";
 
 export interface Props {
   snapshot?: any;
@@ -61,44 +62,6 @@ const positions = computed<any[]>(() => {
   if (props.snapshot?.openPositions && Array.isArray(props.snapshot.openPositions)) return props.snapshot.openPositions;
   return [];
 });
-
-function formatPrice(v: number | null | undefined): string {
-  if (v == null || Number.isNaN(Number(v))) return "—";
-  const n = Number(v);
-  const a = Math.abs(n);
-  const d = a >= 1000 ? 2 : a >= 10 ? 3 : a >= 1 ? 4 : 5;
-  return "$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: d });
-}
-
-function formatUsd(v: number | null | undefined, digits = 2): string {
-  if (v == null || Number.isNaN(Number(v))) return "$0.00";
-  return "$" + Number(v).toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits });
-}
-
-function formatQty(qty: number, price: number, sampleQty?: number): string {
-  if (!qty || Number.isNaN(qty) || !Number.isFinite(qty)) return "0";
-  let maxDec = 3;
-  if (sampleQty != null) {
-    const parts = String(sampleQty).split(".");
-    if (parts.length > 1) {
-      maxDec = Math.min(parts[1].length, 4);
-    }
-  } else if (price >= 10000) {
-    maxDec = 4;
-  } else if (price >= 1000) {
-    maxDec = 3;
-  } else if (price >= 10) {
-    maxDec = 2;
-  } else if (price >= 1) {
-    maxDec = 2;
-  } else {
-    maxDec = 1;
-  }
-  return qty.toLocaleString("en-US", {
-    minimumFractionDigits: Math.min(2, maxDec),
-    maximumFractionDigits: maxDec,
-  });
-}
 
 // 1. First pass calculation of raw rows & MMR
 const rawRows = computed(() => {
@@ -211,7 +174,7 @@ const calculatedRows = computed(() => {
 
     return {
       ...r,
-      targetQtyFormatted: formatQty(r.targetQty, r.entryPrice, r.raw?.qty),
+      targetQtyFormatted: formatQty(r.targetQty),
       crossBufferPct: bufPct,
       bufferDisplay: (r.isShort ? "+" : "-") + bufPct.toFixed(2) + "%",
       estLiqPrice,
@@ -231,7 +194,7 @@ async function copyPlan() {
 
   const lines = [
     `=== ⚡ MirrorQuant 跟单开仓测算 [${leadName}] ===`,
-    `💰 跟单资金: ${formatUsd(cap, 0)} | 测算倍率: ${multiplier.value}x`,
+    `💰 跟单资金: ${formatUsd(cap)} | 测算倍率: ${multiplier.value}x`,
     `📊 组合总名义: ${formatUsd(p.totalNotional, 2)} | 组合整体杠杆: ${p.portfolioLeverage.toFixed(2)}x`,
     `🔒 占用保证金: ${formatUsd(p.totalInitialMargin, 2)} (${p.marginOccupiedPct.toFixed(2)}%)`,
     `🛡️ 剩余现金安全垫: ${formatUsd(p.freeCashCushion, 2)} (${p.freeCashPct.toFixed(2)}%)`,
@@ -344,7 +307,7 @@ async function copyPlan() {
             <Wallet class="w-3.5 h-3.5 text-cyan-400" />
             <span>{{ t("calc.capitalLabel") }}</span>
             <span v-if="leadMarginBal > 0" class="text-xs text-slate-300 font-normal">
-              ({{ t("calc.leadMarginBal") }}: {{ formatUsd(leadMarginBal, 0) }})
+              ({{ t("calc.leadMarginBal") }}: {{ formatUsd(leadMarginBal) }})
             </span>
           </label>
           <div class="relative flex items-center">
@@ -633,7 +596,7 @@ async function copyPlan() {
               <span>{{ t("calc.summaryTitle") }}</span>
             </span>
             <span class="text-sm font-mono text-cyan-300">
-              跟单本金: {{ formatUsd(capital, 0) }}
+              跟单本金: {{ formatUsd(capital) }}
             </span>
           </div>
 

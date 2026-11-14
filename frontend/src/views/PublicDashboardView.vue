@@ -1,10 +1,14 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onActivated, onDeactivated, onMounted, onUnmounted, ref } from "vue";
 import { Cpu, Globe, Lock, RefreshCw, Volume2, VolumeX } from "lucide-vue-next";
 import { api } from "@/api/client";
 import { useI18n } from "@/i18n";
 import LangToggle from "@/components/LangToggle.vue";
 import LeadTelemetryPanel from "@/components/LeadTelemetryPanel.vue";
+import { useAuthStore } from "@/stores/auth";
+
+defineOptions({ name: "PublicDashboardView" });
+const authStore = useAuthStore();
 
 const { t, isZh } = useI18n();
 
@@ -65,6 +69,8 @@ async function fetchPublic() {
       }
       if (latest) lastOrderTimestamps[l.id] = latest;
     }
+  } catch (error) {
+    console.error("Failed to load public radar", error);
   } finally {
     loading.value = false;
   }
@@ -79,22 +85,33 @@ const beaconStatus = computed(() => {
   return { key: "pub.beaconLive", cls: "bg-emerald-500/15 text-emerald-400 border-emerald-500/30" };
 });
 
-onMounted(() => {
+function startPolling() {
+  if (pollTimer) return;
   fetchPublic();
   pollTimer = setInterval(fetchPublic, 5000);
   tickTimer = setInterval(() => {
     countdownSec.value = countdownSec.value > 1 ? countdownSec.value - 1 : 5;
   }, 1000);
-});
+}
 
-onUnmounted(() => {
+function stopPolling() {
   if (pollTimer) clearInterval(pollTimer);
   if (tickTimer) clearInterval(tickTimer);
-});
+  pollTimer = null;
+  tickTimer = null;
+}
+
+onMounted(startPolling);
+onActivated(startPolling);
+onDeactivated(stopPolling);
+onUnmounted(stopPolling);
 </script>
 
 <template>
-  <div class="min-h-screen bg-background text-slate-100 p-4 md:p-8 max-w-[1600px] mx-auto space-y-6 overflow-x-hidden">
+  <div
+    class="bg-background text-slate-100 space-y-6 overflow-x-hidden"
+    :class="authStore.authenticated ? '' : 'min-h-screen p-4 md:p-8 max-w-[1600px] mx-auto'"
+  >
     <!-- Top Bar -->
     <header class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-5 border-b border-slate-800">
       <div class="flex items-center gap-3 min-w-0">
@@ -116,7 +133,7 @@ onUnmounted(() => {
       </div>
 
       <div class="flex items-center flex-wrap gap-2 shrink-0">
-        <LangToggle />
+        <LangToggle v-if="!authStore.authenticated" />
         <button
           type="button"
           @click="toggleSound"
@@ -134,6 +151,7 @@ onUnmounted(() => {
           <span>{{ t("pub.refresh") }}</span>
         </button>
         <router-link
+          v-if="!authStore.authenticated"
           to="/login"
           class="px-3 py-2 rounded-xl bg-surface border border-slate-800 hover:border-accent/40 text-slate-400 hover:text-accent text-sm font-medium flex items-center gap-1.5 transition-colors"
         >

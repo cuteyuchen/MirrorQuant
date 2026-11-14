@@ -4,6 +4,7 @@ import { Download, Eye, Plus, RefreshCw, Trash2, X } from "lucide-vue-next";
 import { api } from "@/api/client";
 import { useDataCacheStore } from "@/stores/dataCache";
 import { useI18n } from "@/i18n";
+import { formatUsd } from "@/utils/format";
 import LeadTelemetryPanel from "@/components/LeadTelemetryPanel.vue";
 
 defineOptions({ name: "LeadsView" });
@@ -101,13 +102,6 @@ function downloadCsv(leadId: number, type: "orders" | "cycles") {
   window.open(api.resolveUrl(`/api/leads/${leadId}/export-csv?export_type=${type}`), "_blank");
 }
 
-function formatUsd(val: number) {
-  return new Intl.NumberFormat("en-US", {
-    style: "currency",
-    currency: "USD",
-    maximumFractionDigits: 2,
-  }).format(val || 0);
-}
 
 onMounted(() => loadData(false));
 onActivated(() => {

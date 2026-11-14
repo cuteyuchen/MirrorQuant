@@ -205,6 +205,7 @@ class BitgetAdapter(BaseExchangeAdapter):
                     pos=abs(sz),
                     avail_pos=abs(float(p["available"])) if p.get("available") not in (None, "") else 0.0,
                     avg_px=avg_px,
+                    cur_px=mark_px,
                     upl=upl,
                     upl_ratio=(upl / notional) if notional > 0 else 0.0,
                     notional_usd=notional,

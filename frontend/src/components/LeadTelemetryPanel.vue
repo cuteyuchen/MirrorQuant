@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import { useI18n } from "@/i18n";
+import { formatPrice as fmtPrice, formatQty, formatUsd, formatPct as fmtPct } from "@/utils/format";
 import PositionCalculatorCard from "@/components/PositionCalculatorCard.vue";
 
 const props = defineProps<{
@@ -81,30 +82,8 @@ const holdingExposureNote = computed(() => {
   return t("tel.hedged");
 });
 
-function fmtUsd(v: number | null | undefined, digits = 2, signed = false) {
-  if (v === null || v === undefined || Number.isNaN(Number(v))) return "—";
-  const n = Number(v);
-  const abs = Math.abs(n).toLocaleString("en-US", {
-    minimumFractionDigits: digits,
-    maximumFractionDigits: digits,
-  });
-  if (signed) return (n > 0 ? "+$" : n < 0 ? "-$" : "$") + abs;
-  return (n < 0 ? "-$" : "$") + abs;
-}
-
-function fmtPrice(v: number | null | undefined) {
-  if (v === null || v === undefined || Number.isNaN(Number(v))) return "—";
-  const n = Number(v);
-  const a = Math.abs(n);
-  const d = a >= 1000 ? 2 : a >= 10 ? 3 : a >= 1 ? 4 : 5;
-  return "$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: d });
-}
-
-function fmtPct(v: number | null | undefined, digits = 2, signed = true) {
-  if (v === null || v === undefined || Number.isNaN(Number(v))) return "—";
-  const n = Number(v);
-  const s = signed && n > 0 ? "+" : "";
-  return `${s}${n.toFixed(digits)}%`;
+function fmtUsd(v: number | string | null | undefined, digits = 2, signed = false) {
+  return (signed && Number(v) > 0 ? "+" : "") + formatUsd(v, digits);
 }
 
 function fmtLev(v: number | null | undefined) {
@@ -423,17 +402,17 @@ const priceAgeSec = computed(() => {
             {{ fmtPct(currentPerf.roi) }}
           </div>
           <div class="text-sm font-mono text-slate-300 mt-2">
-            PnL {{ fmtUsd(currentPerf.pnl, 0, true) }}
+            PnL {{ fmtUsd(currentPerf.pnl, 2, true) }}
           </div>
         </div>
 
         <div class="min-w-0 p-4 rounded-xl bg-background/80 border border-slate-800">
           <div class="text-sm font-medium uppercase text-slate-300">{{ t("tel.kpiAum") }}</div>
           <div class="text-2xl font-mono font-bold tracking-tight text-white mt-1">
-            {{ fmtUsd(profile.aumAmount, 0) }}
+            {{ fmtUsd(profile.aumAmount, 2) }}
           </div>
           <div class="text-sm font-mono text-slate-300 mt-2">
-            {{ t("tel.kpiCopyAum", { val: fmtUsd(profile.copyAum, 0) }) }}
+            {{ t("tel.kpiCopyAum", { val: fmtUsd(profile.copyAum, 2) }) }}
           </div>
         </div>
 
@@ -450,7 +429,7 @@ const priceAgeSec = computed(() => {
         <div class="min-w-0 p-4 rounded-xl bg-background/80 border border-slate-800">
           <div class="text-sm font-medium uppercase text-slate-300">{{ t("tel.kpiCopierPnl") }}</div>
           <div class="text-2xl font-mono font-bold tracking-tight mt-1" :class="pnlColor(currentPerf.copierPnl ?? profile.copierPnl)">
-            {{ fmtUsd(currentPerf.copierPnl ?? profile.copierPnl, 0, true) }}
+            {{ fmtUsd(currentPerf.copierPnl ?? profile.copierPnl, 2, true) }}
           </div>
           <div class="text-sm font-mono text-slate-300 mt-2">
             {{ t("tel.kpiCopiers") }}: {{ profile.currentCopyCount ?? "—" }}/{{ profile.maxCopyCount ?? "—" }}
@@ -508,10 +487,10 @@ const priceAgeSec = computed(() => {
                 {{ fmtPct(perf[tf]?.roi) }}
               </td>
               <td class="px-3 py-1.5 text-right" :class="pnlColor(perf[tf]?.pnl)">
-                {{ fmtUsd(perf[tf]?.pnl, 0, true) }}
+                {{ fmtUsd(perf[tf]?.pnl, 2, true) }}
               </td>
               <td class="px-3 py-1.5 text-right" :class="pnlColor(perf[tf]?.copierPnl)">
-                {{ fmtUsd(perf[tf]?.copierPnl, 0, true) }}
+                {{ fmtUsd(perf[tf]?.copierPnl, 2, true) }}
               </td>
               <td class="px-3 py-1.5 text-right text-amber-400">
                 {{ perf[tf]?.mdd != null ? fmtPct(perf[tf]?.mdd, 2, false) : "—" }}
@@ -652,7 +631,7 @@ const priceAgeSec = computed(() => {
                 {{ p.positionSide === "SHORT" ? t("pos.short") : t("pos.long") }}
               </span>
               <span class="text-xs font-mono text-slate-300">
-                {{ Number(p.qty || 0).toLocaleString("en-US", { maximumFractionDigits: 4 }) }}
+                {{ formatQty(p.qty || 0) }}
               </span>
               <span class="px-1.5 py-0.5 rounded bg-surface border border-slate-800 text-sm font-medium text-slate-300">
                 {{ t("pos.openedAt", { time: fmtShortTime(p.openTime) }) }}
@@ -695,7 +674,7 @@ const priceAgeSec = computed(() => {
               <div class="text-sm font-medium text-slate-300">{{ t("pos.avgEntry") }}</div>
               <div class="text-lg font-mono font-bold text-white mt-2">{{ fmtPrice(p.avgEntry) }}</div>
               <div class="text-sm font-medium text-slate-300 mt-2">
-                {{ t("pos.entryVal", { val: fmtUsd(p.entryValue, 0) }) }}
+                {{ t("pos.entryVal", { val: fmtUsd(p.entryValue, 2) }) }}
               </div>
             </div>
 
@@ -764,7 +743,7 @@ const priceAgeSec = computed(() => {
             >
               <span class="text-slate-400">{{ fmtTime(eo.t) }}</span>
               <span>{{ eo.dir ? dirLabel(eo.dir) : p.positionSide === "SHORT" ? t("dir.OPEN_SHORT") : t("dir.OPEN_LONG") }}</span>
-              <span class="text-white font-semibold">{{ Number(eo.q || 0).toLocaleString("en-US", { maximumFractionDigits: 4 }) }}</span>
+              <span class="text-white font-semibold">{{ formatQty(eo.q || 0) }}</span>
               <span class="text-accent">@ {{ fmtPrice(eo.p) }}</span>
               <span class="text-slate-400">{{ fmtUsd((eo.q || 0) * (eo.p || 0), 2) }}</span>
             </div>
@@ -1049,7 +1028,7 @@ const priceAgeSec = computed(() => {
                   </td>
                   <td class="px-4 py-2.5 text-right text-slate-200">{{ fmtPrice(b.avgPrice) }}</td>
                   <td class="px-4 py-2.5 text-right text-slate-300">
-                    {{ Number(b.qty ?? b.totalQty ?? 0).toLocaleString("en-US", { maximumFractionDigits: 4 }) }}
+                    {{ formatQty(b.qty ?? b.totalQty ?? 0) }}
                   </td>
                   <td class="px-4 py-2.5 text-right text-slate-200">{{ fmtUsd(b.notional ?? b.totalValue, 2) }}</td>
                   <td class="px-4 py-2.5 text-right text-accent">
@@ -1069,7 +1048,7 @@ const priceAgeSec = computed(() => {
                       >
                         <span class="text-slate-400">{{ fmtTime(co.time ?? co.t) }}</span>
                         <span>{{ co.ty || b.type || "MARKET" }}</span>
-                        <span>{{ Number(co.qty ?? co.q ?? 0).toLocaleString("en-US", { maximumFractionDigits: 4 }) }} @ {{ fmtPrice(co.price ?? co.p) }}</span>
+                        <span>{{ formatQty(co.qty ?? co.q ?? 0) }} @ {{ fmtPrice(co.price ?? co.p) }}</span>
                         <span :class="pnlColor(co.pnl)">{{ co.pnl ? fmtUsd(co.pnl, 2, true) : "—" }}</span>
                       </div>
                     </div>
@@ -1185,7 +1164,7 @@ const priceAgeSec = computed(() => {
                 <td class="px-4 py-2.5 text-right text-slate-300">{{ fmtPrice(c.avgCost) }}</td>
                 <td class="px-4 py-2.5 text-right text-white">{{ fmtPrice(c.avgClosePrice ?? c.avgClose) }}</td>
                 <td class="px-4 py-2.5 text-right text-slate-300">
-                  {{ Number(c.maxQty ?? c.closedVol ?? c.maxOpen ?? 0).toLocaleString("en-US", { maximumFractionDigits: 4 }) }}
+                  {{ formatQty(c.maxQty ?? c.closedVol ?? c.maxOpen ?? 0) }}
                 </td>
                 <td class="px-4 py-2.5 text-right font-semibold" :class="pnlColor(c.pnl)">
                   {{ fmtUsd(c.pnl, 2, true) }}
@@ -1240,7 +1219,7 @@ const priceAgeSec = computed(() => {
                 </td>
                 <td class="px-4 py-2 text-right text-slate-200">{{ fmtPrice(o.avgPrice) }}</td>
                 <td class="px-4 py-2 text-right text-slate-300">
-                  {{ Number(o.qty || 0).toLocaleString("en-US", { maximumFractionDigits: 4 }) }}
+                  {{ formatQty(o.qty || 0) }}
                 </td>
                 <td class="px-4 py-2 text-right text-slate-200">{{ fmtUsd((o.qty || 0) * (o.avgPrice || 0), 2) }}</td>
                 <td class="px-4 py-2 text-right font-semibold" :class="pnlColor(o.pnl)">

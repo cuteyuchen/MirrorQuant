@@ -221,7 +221,8 @@ class BybitAdapter(BaseExchangeAdapter):
             else:
                 pos_side = "long" if raw_side == "buy" else "short"
             avg_px = float(p.get("avgPrice") or 0.0)
-            notional = abs(float(p.get("positionValue") or (sz * avg_px)))
+            cur_px = float(p.get("markPrice") or p.get("lastPrice") or avg_px or 0.0)
+            notional = abs(float(p.get("positionValue") or (sz * cur_px)))
             upl = float(p.get("unrealisedPnl") or 0.0)
             positions.append(
                 ExchangePosition(
@@ -232,6 +233,7 @@ class BybitAdapter(BaseExchangeAdapter):
                     pos=abs(sz),
                     avail_pos=abs(sz),
                     avg_px=avg_px,
+                    cur_px=cur_px,
                     upl=upl,
                     upl_ratio=(upl / notional) if notional > 0 else 0.0,
                     notional_usd=notional,

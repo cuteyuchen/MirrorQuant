@@ -216,6 +216,7 @@ class BinanceAdapter(BaseExchangeAdapter):
                     pos=abs(amt),
                     avail_pos=abs(amt),
                     avg_px=entry,
+                    cur_px=mark,
                     upl=upl,
                     upl_ratio=(upl / notional) if notional > 0 else 0.0,
                     notional_usd=notional,

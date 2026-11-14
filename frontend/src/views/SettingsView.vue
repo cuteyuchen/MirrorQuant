@@ -27,6 +27,7 @@ import { api } from "@/api/client";
 import { useDataCacheStore } from "@/stores/dataCache";
 import { useAuthStore } from "@/stores/auth";
 import { useI18n } from "@/i18n";
+import { formatUsd } from "@/utils/format";
 
 defineOptions({ name: "SettingsView" });
 
@@ -256,13 +257,6 @@ async function quickCreateAccount() {
   }
 }
 
-function formatUsd(val: number) {
-  return new Intl.NumberFormat("en-US", {
-    style: "currency",
-    currency: "USD",
-    minimumFractionDigits: 2,
-  }).format(val || 0);
-}
 
 onMounted(() => loadData(false));
 onActivated(() => {

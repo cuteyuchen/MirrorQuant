@@ -45,6 +45,7 @@ class ExchangePosition:
     upl_ratio: float
     notional_usd: float
     lever: float
+    cur_px: float = 0.0
     c_time: int = 0
     u_time: int = 0
 
@@ -57,6 +58,10 @@ class ExchangePosition:
             "pos": self.pos,
             "availPos": self.avail_pos,
             "avgPx": self.avg_px,
+            "curPx": self.cur_px,
+            "markPx": self.cur_px,
+            "currentPrice": self.cur_px,
+            "markPrice": self.cur_px,
             "upl": self.upl,
             "uplRatio": self.upl_ratio,
             "notionalUsd": self.notional_usd,

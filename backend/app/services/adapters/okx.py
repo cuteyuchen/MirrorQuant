@@ -196,6 +196,7 @@ class OKXAdapter(BaseExchangeAdapter):
                     pos=abs(pos_sz),
                     avail_pos=abs(float(p.get("availPos") or 0.0)),
                     avg_px=float(p.get("avgPx") or 0.0),
+                    cur_px=float(p.get("markPx") or p.get("last") or p.get("idxPx") or p.get("avgPx") or 0.0),
                     upl=float(p.get("upl") or 0.0),
                     upl_ratio=float(p.get("uplRatio") or 0.0),
                     notional_usd=abs(float(p.get("notionalUsd") or 0.0)),
