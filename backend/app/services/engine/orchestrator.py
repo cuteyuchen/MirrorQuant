@@ -25,7 +25,7 @@ from app.services.engine.serialization import serialized_execution
 from app.services.engine.sizer import exact
 from app.services.lead_collector.binance_bapi import (
     BinanceBapiCollector, STORE_MAX, check_source_fill_update, describe_exception,
-    is_authoritative_snapshot, validate_source_fill,
+    is_authoritative_snapshot, is_routable_snapshot, validate_source_fill,
 )
 from app.services.lead_collector.freshness import lead_freshness
 from app.services.notifier.outbox import enqueue_notification
@@ -312,7 +312,7 @@ class EngineOrchestrator:
         if not await self._publish_lead_snapshot(db, lead, snapshot, orders_store, started_ms):
             return {"ok": True, "superseded": True}
 
-        if is_authoritative_snapshot(snapshot):
+        if is_routable_snapshot(snapshot):
             self._last_unverified_logged[lead.id] = "verified"
             await self.router.process_lead_events(
                 db=db,

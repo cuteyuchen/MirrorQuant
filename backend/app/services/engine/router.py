@@ -48,6 +48,7 @@ from app.services.lead_collector.binance_bapi import (
     is_open_leg,
     order_dedup_key,
     is_authoritative_snapshot,
+    is_routable_snapshot,
     positions_have_close_evidence,
     source_fill_kind,
     validate_source_fill,
@@ -513,15 +514,16 @@ class CopyRouter:
         raw_closed: List[Dict[str, Any]], snapshot: Dict[str, Any], proxies: List[ProxyNode],
     ) -> None:
         """Enqueue cumulative order deltas or each independent fill once per follower."""
-        if not is_authoritative_snapshot(snapshot):
+        if not is_routable_snapshot(snapshot):
             return
         await db.refresh(lead)
         latest = json.loads(lead.snapshot_json or "{}")
-        latest_observed = (latest.get("openPositionsMeta") or {}).get("asOf") or 0
+        latest_observed = (latest.get("openPositionsMeta") or {}).get("asOf") or (latest.get("meta") or {}).get("generatedAt") or 0
         failed_at = (latest.get("openPositionsMeta") or {}).get("lastFailureStartedAtMs") or 0
-        if (latest_observed > snapshot["openPositionsMeta"]["asOf"]
-                or failed_at >= snapshot["openPositionsMeta"]["asOf"]):
-            return
+        snapshot_as_of = (snapshot.get("openPositionsMeta") or {}).get("asOf") or (snapshot.get("meta") or {}).get("generatedAt") or 0
+        if snapshot_as_of:
+            if latest_observed > snapshot_as_of or (failed_at and failed_at >= snapshot_as_of):
+                return
         seen_keys = list(json.loads(lead.seen_order_keys_json or "[]"))
         seen_closed = list(json.loads(lead.seen_closed_ids_json or "[]"))
         old_seen = set(seen_keys)
@@ -646,7 +648,7 @@ class CopyRouter:
                     else:
                         inventory[leg] = inventory.get(leg, Decimal("0")) + quantity
                 for delivery in deliveries:
-                    if not is_authoritative_snapshot(snapshot):
+                    if not is_routable_snapshot(snapshot):
                         break
                     await db.commit()
                     bal = await adapter.get_usdt_balance()
@@ -658,7 +660,7 @@ class CopyRouter:
                     account.positions_json = json.dumps([p.to_dict() for p in positions])
                     account.status, account.last_error = "connected", None
                     batch = json.loads(delivery.payload_json)
-                    batch["_observed_at_ms"] = snapshot["openPositionsMeta"]["asOf"]
+                    batch["_observed_at_ms"] = (snapshot.get("openPositionsMeta") or {}).get("asOf") or (snapshot.get("meta") or {}).get("generatedAt") or int(time.time() * 1000)
                     batch["_lead_remaining_qty"] = remaining_by_event.get(delivery.source_event_id, 0)
                     # Historical openings inside a known completed lead cycle must not
                     # attach to the same symbol's currently reopened position.

@@ -404,7 +404,7 @@ def positions_have_close_evidence(
 
 
 def is_authoritative_snapshot(snapshot: Dict[str, Any], now_ms: Optional[int] = None, max_age_ms: int = 30000) -> bool:
-    """UNKNOWN, hidden, derived and stale holdings can never authorize financial actions."""
+    """Only fresh, complete public holdings can authorize orphan cleanup."""
     meta = snapshot.get("openPositionsMeta") or {}
     if meta.get("partial") is True or (snapshot.get("meta") or {}).get("detailOk") is False:
         return False
@@ -417,6 +417,30 @@ def is_authoritative_snapshot(snapshot: Dict[str, Any], now_ms: Optional[int] = 
         return False
     age = (int(time.time() * 1000) if now_ms is None else now_ms) - observed
     return 0 <= age <= max_age_ms and isinstance(snapshot.get("openPositions"), list)
+
+
+def is_routable_snapshot(snapshot: Dict[str, Any], now_ms: Optional[int] = None, max_age_ms: int = 30000) -> bool:
+    """Allow order following from healthy reconstructed holdings, including hidden positions."""
+    if is_authoritative_snapshot(snapshot, now_ms=now_ms, max_age_ms=max_age_ms):
+        return True
+    meta = snapshot.get("openPositionsMeta") or {}
+    snapshot_meta = snapshot.get("meta") or {}
+    if meta.get("partial") is True or snapshot_meta.get("detailOk") is False:
+        return False
+    if meta.get("error"):
+        return False
+    if not (meta.get("derived") is True or meta.get("reconstructed") is True
+            or meta.get("source") in ("derived-from-order-history", "derived")
+            or meta.get("positionShow") is False):
+        return False
+    if not isinstance(snapshot.get("openPositions"), list):
+        return False
+    observed = meta.get("asOf") or snapshot_meta.get("generatedAt") or snapshot_meta.get("collectionStartedAtMs")
+    if isinstance(observed, (int, float)) and math.isfinite(observed):
+        age = (int(time.time() * 1000) if now_ms is None else now_ms) - observed
+        if not 0 <= age <= max_age_ms:
+            return False
+    return True
 
 
 def group_orders_into_batches(orders: Sequence[Dict[str, Any]], gap_ms: int = BATCH_GAP_MS) -> List[Dict[str, Any]]:
@@ -1200,6 +1224,8 @@ class BinanceBapiCollector(BaseLeadCollector):
             brackets = self._brackets_map
 
         now_ms = int(time.time() * 1000)
+        if detail.get("positionShow") is False and holdings_error is None and holdings_observed_ms is None:
+            holdings_observed_ms = now_ms
         previous_prices = {p["symbol"]: p for p in (previous_snapshot or {}).get("openPositions") or [] if p.get("symbol")}
 
         def valid_price(*values: Any) -> Optional[float]:
@@ -1391,6 +1417,8 @@ class BinanceBapiCollector(BaseLeadCollector):
             "openPositions": open_positions,
             "openPositionsMeta": {
                 "source": holdings_source,
+                "reconstructed": holdings_source == "derived-from-order-history",
+                "derived": holdings_source == "derived-from-order-history",
                 "positionShow": detail.get("positionShow"),
                 "asOf": holdings_observed_ms,
                 "complete": authoritative,

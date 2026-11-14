@@ -585,11 +585,15 @@ async def test_unverified_warning_rearms_only_after_verified_state(monitor, cloc
     caplog.set_level(logging.WARNING, logger="mirrorquant.orchestrator")
     async with get_session_factory()() as db:
         lead = await make_lead(db, clock)
+        # Healthy hidden holdings are routable; detail degradation remains unverified.
+        monitor.collector.fetch_detail.side_effect = httpx.ReadTimeout("detail unavailable")
         await run_syncs(db, monitor, lead, clock, 10, ok=True)
+        monitor.collector.fetch_detail.side_effect = None
         monitor.collector.fetch_detail.return_value = {**PROFILE, "positionShow": True}
         await run_syncs(db, monitor, lead, clock, 1, ok=True)
         monitor.router.process_lead_events.assert_awaited_once()
         monitor.collector.fetch_detail.return_value = PROFILE
+        monitor.collector.fetch_detail.side_effect = httpx.ReadTimeout("detail unavailable")
         await run_syncs(db, monitor, lead, clock, 10, ok=True)
     assert len([record for record in caplog.records if record.levelno == logging.WARNING
                 and "snapshot is unverified" in record.message]) == 2
