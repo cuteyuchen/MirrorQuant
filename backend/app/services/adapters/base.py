@@ -27,6 +27,9 @@ class BalanceInfo:
     upl: float
     currency: str = "USDT"
     raw: Dict[str, Any] = field(default_factory=dict)
+    usdt_eq: float = 0.0
+    usdc_eq: float = 0.0
+    asset_balances: Dict[str, Dict[str, float]] = field(default_factory=dict)
 
 
 @dataclass

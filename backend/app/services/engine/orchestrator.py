@@ -292,10 +292,10 @@ class EngineOrchestrator:
                         closed_cache=closed_cache,
                         proxy_url=p_url,
                         full_sweep=full_sweep,
-                        with_analysis=False,
+                        with_analysis=True,
                         previous_snapshot=previous_snapshot,
                     ),
-                    timeout=30.0,
+                    timeout=45.0,
                 )
                 break
             except Exception as exc:
@@ -547,12 +547,21 @@ class EngineOrchestrator:
                     "type": "account_update",
                     "accountId": account.id,
                     "name": account.name,
-                    "usdtEquity": account.usdt_equity,
+                    "totalEquity": account.usdt_equity,
+                    "usdtEquity": getattr(bal, "usdt_eq", account.usdt_equity),
+                    "usdcEquity": getattr(bal, "usdc_eq", 0.0),
                     "unrealizedPnl": account.unrealized_pnl,
                     "positions": [p.to_dict() for p in positions],
                 }
             )
-            return {"ok": True, "usdtEquity": bal.eq, "positions": [p.to_dict() for p in positions]}
+            return {
+                "ok": True,
+                "totalEquity": bal.eq,
+                "usdtEquity": getattr(bal, "usdt_eq", bal.eq),
+                "usdcEquity": getattr(bal, "usdc_eq", 0.0),
+                "positions": [p.to_dict() for p in positions],
+                "assetBalances": getattr(bal, "asset_balances", {}),
+            }
         except Exception as exc:
             account.status = "error"
             account.last_error = redact_proxy_userinfo(str(exc))[:480]

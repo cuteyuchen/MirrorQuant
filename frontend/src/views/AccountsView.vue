@@ -190,8 +190,8 @@ onActivated(() => {
 
           <div class="grid grid-cols-3 gap-3 mt-4 p-3 rounded-xl bg-background/60 border border-slate-800/80 text-xs font-mono">
             <div>
-              <span class="text-[10px] text-slate-500 block">{{ t("accts.usdtEquity") }}</span>
-              <span class="font-bold text-white">{{ formatUsd(acct.usdtEquity) }}</span>
+              <span class="text-[10px] text-slate-500 block">{{ t("accts.totalEquity") }}</span>
+              <span class="font-bold text-white">{{ formatUsd(acct.totalEquity ?? acct.usdtEquity) }}</span>
             </div>
             <div>
               <span class="text-[10px] text-slate-500 block">{{ t("accts.available") }}</span>
@@ -208,9 +208,10 @@ onActivated(() => {
           <div v-if="testResult[acct.id]" class="mt-3 p-2.5 rounded-lg text-xs font-mono border"
             :class="testResult[acct.id].ok ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300' : 'bg-rose-500/10 border-rose-500/30 text-rose-300'"
           >
-            <div v-if="testResult[acct.id].ok" class="flex items-center gap-1.5">
+            <div v-if="testResult[acct.id].ok" class="flex flex-wrap items-center gap-1.5">
               <CheckCircle2 class="w-3.5 h-3.5" />
-              <span>{{ t("accts.connectedMsg", { mode: testResult[acct.id].posMode, eq: formatUsd(testResult[acct.id].usdtEquity) }) }}</span>
+              <span>{{ t("accts.connectedMsg", { mode: testResult[acct.id].posMode, eq: formatUsd(testResult[acct.id].totalEquity ?? testResult[acct.id].usdtEquity) }) }}</span>
+              <span v-if="testResult[acct.id].usdcEquity > 0" class="text-[11px] text-emerald-400/80 ml-2">(USDT: {{ formatUsd(testResult[acct.id].usdtEquity) }} · USDC: {{ formatUsd(testResult[acct.id].usdcEquity) }})</span>
             </div>
             <div v-else>Error: {{ testResult[acct.id].error }}</div>
           </div>

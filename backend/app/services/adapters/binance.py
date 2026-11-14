@@ -138,21 +138,57 @@ class BinanceAdapter(BaseExchangeAdapter):
             "environment": self.environment,
             "posMode": "hedge" if dual.get("dualSidePosition") else "one_way",
             "canTrade": acct.get("canTrade", True),
-            "usdtEquity": bal.eq,
+            "totalEquity": bal.eq,
+            "usdtEquity": bal.usdt_eq if hasattr(bal, "usdt_eq") and bal.usdt_eq > 0 else bal.eq,
+            "usdcEquity": getattr(bal, "usdc_eq", 0.0),
             "availEquity": bal.avail_eq,
             "openPositions": len(positions),
+            "assetBalances": getattr(bal, "asset_balances", {}),
         }
 
     async def get_usdt_balance(self) -> BalanceInfo:
         data = await self._request("GET", "/fapi/v2/account")
-        for item in data.get("assets") or []:
-            if item.get("asset") == "USDT":
-                # marginBalance includes both cross and isolated unrealized PnL.
-                return BalanceInfo(
-                    eq=float(item["marginBalance"]), avail_eq=float(item.get("availableBalance") or 0),
-                    cash_bal=float(item["walletBalance"]), upl=float(item["unrealizedProfit"]), raw=item,
-                )
-        return BalanceInfo(eq=0, avail_eq=0, cash_bal=0, upl=0)
+        assets = {str(item.get("asset") or "").upper(): item for item in data.get("assets") or []}
+        usdt = assets.get("USDT", {})
+        usdc = assets.get("USDC", {})
+        # Per-asset marginBalance includes cross and isolated unrealized PnL.
+        usdt_mb = float(usdt.get("marginBalance") or 0.0)
+        usdt_avail = float(usdt.get("availableBalance") or 0.0)
+        usdt_wallet = float(usdt.get("walletBalance") or 0.0)
+        usdt_upl = float(usdt.get("unrealizedProfit") or 0.0)
+        usdc_mb = float(usdc.get("marginBalance") or 0.0)
+        usdc_avail = float(usdc.get("availableBalance") or 0.0)
+        usdc_wallet = float(usdc.get("walletBalance") or 0.0)
+        usdc_upl = float(usdc.get("unrealizedProfit") or 0.0)
+
+        asset_balances = {}
+        for asset_name, item in assets.items():
+            mb = float(item.get("marginBalance") or 0.0)
+            avail = float(item.get("availableBalance") or 0.0)
+            wb = float(item.get("walletBalance") or 0.0)
+            asset_upl = float(item.get("unrealizedProfit") or 0.0)
+            if mb > 0 or wb > 0:
+                asset_balances[asset_name] = {"equity": mb, "available": avail, "wallet": wb, "upl": asset_upl}
+
+        is_multi_assets = bool(data.get("multiAssetsMargin", False))
+        if is_multi_assets and float(data.get("totalMarginBalance") or 0.0) > 0:
+            eq = float(data.get("totalMarginBalance"))
+            avail_eq = float(data.get("availableBalance") or 0.0)
+            cash_bal = float(data.get("totalWalletBalance") or 0.0)
+            upl = float(data.get("totalUnrealizedProfit") or 0.0)
+        else:
+            # Single-asset account totals omit USDC; combine stablecoin balances 1:1.
+            eq = usdt_mb + usdc_mb
+            avail_eq = usdt_avail + usdc_avail
+            cash_bal = usdt_wallet + usdc_wallet
+            upl = usdt_upl + usdc_upl
+
+        if eq == 0.0 and avail_eq == 0.0 and cash_bal == 0.0 and not asset_balances:
+            return BalanceInfo(eq=0.0, avail_eq=0.0, cash_bal=0.0, upl=0.0, raw=data)
+        return BalanceInfo(
+            eq=eq, avail_eq=avail_eq, cash_bal=cash_bal, upl=upl, currency="USDT", raw=data,
+            usdt_eq=usdt_mb, usdc_eq=usdc_mb, asset_balances=asset_balances,
+        )
 
     async def get_positions(self) -> List[ExchangePosition]:
         data = await self._request("GET", "/fapi/v2/positionRisk")

@@ -38,6 +38,7 @@ def _account_out(a: TradingAccount) -> dict:
         "isEnabled": a.is_enabled,
         "marginMode": a.margin_mode,
         "positionMode": a.position_mode,
+        "totalEquity": round(a.usdt_equity, 2),
         "usdtEquity": round(a.usdt_equity, 2),
         "availEquity": round(a.avail_equity, 2),
         "hwmEquity": round(a.hwm_equity, 2),
@@ -197,7 +198,7 @@ async def test_account_connectivity(
         res = await adapter.test_connection()
         acct.status = "connected"
         acct.last_error = None
-        acct.usdt_equity = float(res.get("usdtEquity") or 0.0)
+        acct.usdt_equity = float(res.get("totalEquity") or res.get("usdtEquity") or 0.0)
         acct.avail_equity = float(res.get("availEquity") or 0.0)
         if acct.usdt_equity > acct.hwm_equity:
             acct.hwm_equity = acct.usdt_equity
