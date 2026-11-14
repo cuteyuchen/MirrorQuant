@@ -48,6 +48,7 @@ from app.services.lead_collector.binance_bapi import (
     is_open_leg,
     order_dedup_key,
     is_authoritative_snapshot,
+    positions_have_close_evidence,
     source_fill_kind,
     validate_source_fill,
 )
@@ -1132,8 +1133,20 @@ class CopyRouter:
         instruments: Dict[str, Any],
         resilience_cfg: Optional[Dict[str, Any]] = None,
         notify_cfg: Optional[Dict[str, Any]] = None,
+        snapshot: Optional[Dict[str, Any]] = None,
     ) -> List[str]:
         """Detect follower positions whose lead leg no longer exists (e.g. closed during outage)."""
+        if snapshot is None:
+            await db.refresh(lead)
+            try:
+                snapshot = json.loads(lead.snapshot_json or "{}")
+            except (TypeError, ValueError):
+                snapshot = {}
+        if (not is_authoritative_snapshot(snapshot)
+                or snapshot.get("openPositions") != lead_open_positions
+                or (not lead_open_positions and (snapshot.get("openPositionsMeta") or {}).get("emptyVerified") is not True)):
+            logger.warning("Skipping orphan auto-close: lead open positions empty but unverified or abrupt drop without close events")
+            return []
         await db.refresh(binding)
         if not await self.reconcile_pending_orders(db, account, adapter, instruments):
             return []
@@ -1167,6 +1180,23 @@ class CopyRouter:
 
             raw_ps = "LONG" if pos.pos_side == "long" else "SHORT"
             if mode == "auto_close":
+                if not is_authoritative_snapshot(snapshot):
+                    return actions_taken
+                if not lead_open_positions:
+                    # Even a verified flat lead cannot explain this allocation's
+                    # disappearance without a close in its own position cycle.
+                    reference = {
+                        "symbol": next((sym for sym, inst in symbol_map.items() if inst == pos.inst_id), pos.symbol),
+                        "positionSide": raw_ps,
+                        "qty": allocation.owned_qty,
+                        "openTime": allocation.opened_at_ms or None,
+                    }
+                    orders = list(json.loads(lead.orders_store_json or "{}").values())
+                    if not positions_have_close_evidence(
+                        [reference], orders or snapshot.get("orders") or [], snapshot.get("closed") or [],
+                    ):
+                        logger.warning("Skipping orphan auto-close: lead open positions empty but unverified or abrupt drop without close events")
+                        continue
                 spec = instruments.get(pos.inst_id)
                 if not spec:
                     continue

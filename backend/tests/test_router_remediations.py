@@ -463,6 +463,13 @@ async def test_closed_history_reconciliation_is_binding_scoped(trading):
 async def test_orphan_close_is_binding_scoped(trading):
     t = trading
     own, other, _, _ = await seed_allocation(t)
+    t.lead.snapshot_json = json.dumps({
+        "meta": {"detailOk": True}, "openPositions": [],
+        "openPositionsMeta": {"source": "api", "authoritative": True, "complete": True,
+                              "positionShow": True, "partial": False, "emptyVerified": True, "asOf": NOW_MS},
+        "closed": [{"symbol": "BTCUSDT", "side": "LONG", "opened": 100, "closed": 200}],
+    })
+    await t.db.commit()
     exchange = OfflineExchange()
     actions = await t.router.reconcile_orphan_positions(t.db, t.lead, t.account, t.binding, exchange, [], [t.pos],
         {"BTCUSDT": t.spec}, resilience_cfg={"auto_close_orphan_positions": "auto_close"},

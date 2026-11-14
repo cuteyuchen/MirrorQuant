@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
 import math
+import random
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -26,6 +28,8 @@ FAPI_PRIMARY = "https://www.binance.com"
 FAPI_FALLBACK = "https://fapi.binance.com"
 
 BUSY_CODE = "11012005"
+RATE_LIMIT_CODE = "90801003"
+MAX_STALE_SNAPSHOT_SEC = 60
 DETAIL_DEGRADED_WARN_INTERVAL = 300.0
 HISTORY_RETRY_BUDGET = 10.0
 BATCH_GAP_MS = 30 * 60 * 1000
@@ -60,14 +64,24 @@ class BapiBusyError(RuntimeError):
     pass
 
 
+class BapiRateLimitError(RuntimeError):
+    pass
+
+
 def is_retryable_exception(exc: BaseException) -> bool:
     """Inspect the cause of a wrapped request error, including its HTTP status."""
-    if isinstance(exc, httpx.HTTPStatusError):
-        status = exc.response.status_code
-        return status == 429 or 500 <= status < 600
-    if isinstance(exc, (httpx.TransportError, BapiBusyError)):
-        return True
-    return exc.__cause__ is not None and is_retryable_exception(exc.__cause__)
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, httpx.HTTPStatusError):
+            status = exc.response.status_code
+            if status == 429 or 500 <= status < 600:
+                return True
+        if isinstance(exc, (httpx.TimeoutException, httpx.TransportError, httpx.NetworkError,
+                            BapiBusyError, BapiRateLimitError)):
+            return True
+        exc = exc.__cause__
+    return False
 
 
 def fnum(val: Any) -> Optional[float]:
@@ -323,10 +337,78 @@ def normalize_holdings(holdings: Sequence[Dict[str, Any]]) -> List[Dict[str, Any
     return positions
 
 
+def snapshot_positions_observed_ms(snapshot: Dict[str, Any]) -> Optional[float]:
+    """Never renew a fallback's holdings age using its publication time."""
+    meta = snapshot.get("openPositionsMeta") or {}
+    observed = meta.get("asOf")
+    if observed is None:
+        if "lastNonEmptyAsOf" in meta:
+            observed = meta["lastNonEmptyAsOf"]
+        elif meta.get("source") != "stale-fallback":
+            observed = (snapshot.get("meta") or {}).get("generatedAt")
+    return fnum(observed)
+
+
+def positions_have_close_evidence(
+    positions: Sequence[Dict[str, Any]],
+    orders: Sequence[Dict[str, Any]],
+    closed_rows: Sequence[Dict[str, Any]],
+    observed_ms: Optional[float] = None,
+) -> bool:
+    """Require a complete closure for every leg, after its last known exposure.
+
+    Old cycles, partial reductions and another symbol's close cannot explain an
+    empty account. Use order creation time so a cumulative partial close updated
+    after the snapshot cannot count its previously executed quantity again.
+    """
+    if not positions:
+        return False
+    for position in positions:
+        symbol = position.get("symbol")
+        side = str(position.get("positionSide") or "").upper()
+        opened = fnum(position.get("openTime"))
+        cutoff = observed_ms if observed_ms is not None else opened
+        qty = exact(position.get("qtyExact", position.get("qty")) or 0)
+        if not symbol or side not in ("LONG", "SHORT") or qty <= 0 or cutoff is None:
+            return False
+        if any(
+            row.get("symbol") == symbol
+            and str(row.get("side") or row.get("positionSide") or "").upper() == side
+            and (fnum(row.get("closed")) or 0) > cutoff
+            and (opened is None or (fnum(row.get("opened")) or 0) <= opened)
+            for row in closed_rows
+        ):
+            continue
+        closed_qty = Decimal("0")
+        added_qty = Decimal("0")
+        for order in orders:
+            if (order.get("symbol", order.get("sym")) != symbol
+                    or str(order.get("positionSide", order.get("ps")) or "").upper() != side):
+                continue
+            timestamp = fnum(order.get("orderTime") or order.get("ot") or order.get("time") or order.get("t"))
+            if timestamp is None or timestamp <= cutoff:
+                continue
+            order_side = str(order.get("side") or "").upper()
+            if order_side not in ("BUY", "SELL"):
+                continue
+            amount = exact(order.get("executedQty", order.get("q", order.get("qty"))) or 0)
+            if amount <= 0:
+                continue
+            if is_open_leg(order_side, side):
+                added_qty += amount
+            else:
+                closed_qty += amount
+        if closed_qty < qty + added_qty:
+            return False
+    return True
+
+
 def is_authoritative_snapshot(snapshot: Dict[str, Any], now_ms: Optional[int] = None, max_age_ms: int = 30000) -> bool:
     """UNKNOWN, hidden, derived and stale holdings can never authorize financial actions."""
     meta = snapshot.get("openPositionsMeta") or {}
     if meta.get("partial") is True or (snapshot.get("meta") or {}).get("detailOk") is False:
+        return False
+    if meta.get("error") or meta.get("emptyVerified") is False:
         return False
     if meta.get("source") != "api" or meta.get("complete") is not True or meta.get("authoritative") is not True or meta.get("positionShow") is not True:
         return False
@@ -552,9 +634,11 @@ class BinanceBapiCollector(BaseLeadCollector):
         body: Optional[Dict[str, Any]] = None,
         proxy_url: Optional[str] = None,
         time_range: str = "7D",
-        retries: int = 2,
+        retries: int = 3,
         timeout: float = 8.0,
         retry_budget: Optional[float] = None,
+        retry_backoff_cap: float = 2.4,
+        retry_jitter: float = 0.0,
     ) -> Any:
         headers = self._headers(portfolio_id, time_range)
         last_err: Optional[Exception] = None
@@ -580,6 +664,8 @@ class BinanceBapiCollector(BaseLeadCollector):
                         code = payload.get("code")
                         if str(code) == BUSY_CODE:
                             raise BapiBusyError(f"bapi busy {BUSY_CODE}")
+                        if str(code) == RATE_LIMIT_CODE:
+                            raise BapiRateLimitError(f"bapi rate limit {RATE_LIMIT_CODE}: {payload.get('message')}")
                         if code not in ("000000", None) or payload.get("data") is None:
                             raise RuntimeError(f"bapi code={code} msg={payload.get('message')}")
                         return payload["data"]
@@ -588,7 +674,10 @@ class BinanceBapiCollector(BaseLeadCollector):
                         if not is_retryable_exception(exc):
                             break
                         if attempt + 1 < retries:
-                            await asyncio.sleep(min(0.8 * 2 ** attempt, 2.4))
+                            delay = 0.8 * 2 ** attempt
+                            if retry_jitter:
+                                delay += random.uniform(0, retry_jitter)
+                            await asyncio.sleep(min(delay, retry_backoff_cap))
         except TimeoutError as exc:
             last_err = exc
             last_response = None
@@ -694,7 +783,9 @@ class BinanceBapiCollector(BaseLeadCollector):
             f"{PUBLIC_COPY}/lead-data/positions?portfolioId={quote(portfolio_id)}",
             portfolio_id=portfolio_id,
             proxy_url=proxy_url,
-            retries=2,
+            retries=3,
+            retry_backoff_cap=4.0,
+            retry_jitter=0.2,
         )
         if not isinstance(data, list):
             raise RuntimeError("Malformed direct holdings response")
@@ -709,7 +800,7 @@ class BinanceBapiCollector(BaseLeadCollector):
                 portfolio_id=portfolio_id,
                 proxy_url=proxy_url,
                 time_range=time_range,
-                retries=2,
+                retries=3,
             )
             if isinstance(data, list):
                 return [
@@ -730,7 +821,7 @@ class BinanceBapiCollector(BaseLeadCollector):
                 portfolio_id=portfolio_id,
                 proxy_url=proxy_url,
                 time_range=time_range,
-                retries=2,
+                retries=3,
             )
             if isinstance(data, dict):
                 return {
@@ -802,7 +893,7 @@ class BinanceBapiCollector(BaseLeadCollector):
             j = await self._http_json(
                 f"{FRIENDLY_ROOT}/common/brackets",
                 proxy_url=proxy_url,
-                retries=2,
+                retries=3,
                 timeout=25.0,
             )
             rows = (j or {}).get("brackets") or []
@@ -992,22 +1083,52 @@ class BinanceBapiCollector(BaseLeadCollector):
             if closed_history is None:
                 closed_rows = closed_rows[:80]
 
-        # Holdings must be freshly observed; a cached/failed response is UNKNOWN,
-        # never a fabricated empty position set. Historical reconstruction is display-only.
+        # Failed or unexplained empty holdings are UNKNOWN. A previous position
+        # remains useful for display for at most 60 seconds, never for execution.
         now_s = time.time()
         holdings: List[Dict[str, Any]] = []
         holdings_observed_ms = None
         holdings_error = None
         authoritative = False
+        holdings_source = "derived-from-order-history"
+        empty_verified = False
+        previous_meta = (previous_snapshot or {}).get("openPositionsMeta") or {}
+        previous_positions = (previous_snapshot or {}).get("openPositions") or previous_meta.get("lastNonEmptyPositions") or []
+        previous_observed_ms = snapshot_positions_observed_ms(previous_snapshot or {})
+        close_evidence = False
         open_positions = reconstruct_open_positions(orders_store, closed_rows=closed_rows)
         if detail.get("positionShow") is True:
             try:
                 holdings = await self.fetch_holdings(portfolio_id, proxy_url=proxy_url)
-                open_positions = normalize_holdings(holdings)
-                holdings_observed_ms = int(time.time() * 1000)
-                authoritative = detail_ok
+                candidate_positions = normalize_holdings(holdings)
+                if not candidate_positions and previous_positions:
+                    close_evidence = positions_have_close_evidence(
+                        previous_positions, list(orders_store.values()), closed_rows, previous_observed_ms,
+                    )
+                    if not close_evidence:
+                        await asyncio.sleep(1.0)
+                        holdings = await self.fetch_holdings(portfolio_id, proxy_url=proxy_url)
+                        candidate_positions = normalize_holdings(holdings)
+                        if not candidate_positions:
+                            holdings_error = (
+                                "Anomalous empty holdings response without close evidence; fallback to previous snapshot"
+                            )
+                if holdings_error is None:
+                    open_positions = candidate_positions
+                    holdings_observed_ms = int(time.time() * 1000)
+                    holdings_source = "api"
+                    authoritative = detail_ok
+                    empty_verified = not candidate_positions
             except Exception as exc:
                 holdings_error = describe_exception(exc)[:240]
+                holdings = []
+            if holdings_error:
+                logger.warning("Lead portfolio %s holdings degraded: %s", portfolio_id, holdings_error)
+                if (previous_positions and previous_observed_ms is not None
+                        and 0 <= time.time() * 1000 - previous_observed_ms <= MAX_STALE_SNAPSHOT_SEC * 1000):
+                    open_positions = copy.deepcopy(previous_positions)
+                    holdings_source = "stale-fallback"
+                    holdings_observed_ms = previous_observed_ms
 
         # Optional dashboard requests cannot delay the execution collector.
         cached_perf = self._perf_cache.get(portfolio_id)
@@ -1220,13 +1341,21 @@ class BinanceBapiCollector(BaseLeadCollector):
             "holdings": holdings,
             "openPositions": open_positions,
             "openPositionsMeta": {
-                "source": "api" if authoritative else "derived-from-order-history",
+                "source": holdings_source,
                 "positionShow": detail.get("positionShow"),
                 "asOf": holdings_observed_ms,
                 "complete": authoritative,
                 "authoritative": authoritative,
-                "partial": not detail_ok,
+                "partial": not detail_ok or holdings_error is not None,
                 "error": holdings_error or detail_error,
+                "emptyVerified": empty_verified if not open_positions else None,
+                "closeEvidence": close_evidence,
+                **({
+                    # Preserve the suspicion after display fallback expires. An
+                    # expired derived empty set must not verify the next empty poll.
+                    "lastNonEmptyPositions": copy.deepcopy(previous_positions),
+                    "lastNonEmptyAsOf": previous_observed_ms,
+                } if holdings_error and previous_positions else {}),
             },
             "openPositionsSummary": {
                 "positionCount": len(open_positions),

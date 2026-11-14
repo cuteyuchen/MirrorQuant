@@ -420,6 +420,10 @@ class EngineOrchestrator:
         current_observed = max(current_meta.get("asOf") or 0, current_meta.get("lastFailureStartedAtMs") or 0,
                                (current.get("meta") or {}).get("collectionStartedAtMs") or 0)
         incoming_observed = (snapshot.get("openPositionsMeta") or {}).get("asOf") or 0
+        if (snapshot.get("openPositionsMeta") or {}).get("partial") is True:
+            # A stale fallback retains the original holdings timestamp. Order
+            # concurrent publications by collection time, not that old timestamp.
+            incoming_observed = max(incoming_observed, started_ms)
         if (incoming_observed and current_observed > incoming_observed) or (
             not incoming_observed and current_observed > started_ms
         ):
@@ -447,7 +451,8 @@ class EngineOrchestrator:
             snapshot["meta"]["rebuildDigest"] = current["meta"]["rebuildDigest"]
         # Older callers omit detailOk; only an explicit degradation preserves the
         # incident. New collector snapshots always carry this success marker.
-        partial = snapshot["meta"].get("detailOk") is False
+        partial = (snapshot["meta"].get("detailOk") is False
+                   or (snapshot.get("openPositionsMeta") or {}).get("partial") is True)
         incoming_meta = snapshot.setdefault("openPositionsMeta", {})
         for field in SYNC_FAILURE_FIELDS:
             incoming_meta.pop(field, None)
@@ -464,7 +469,7 @@ class EngineOrchestrator:
         if not partial or profile.get("lastTradeTime") is not None:
             lead.last_trade_time = int(profile.get("lastTradeTime") or 0)
         if partial:
-            reason = snapshot["meta"].get("detailError") or incoming_meta.get("error") or "detail unavailable"
+            reason = snapshot["meta"].get("detailError") or incoming_meta.get("error") or "snapshot unavailable"
             lead.last_error = "degraded: " + redact_proxy_userinfo(str(reason))[:470]
         else:
             # last_sync_at records full recovery, so a partial publication cannot
