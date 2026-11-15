@@ -326,14 +326,18 @@ async def test_authoritative_empty_without_matching_close_events_never_closes(cl
     router = CopyRouter(None)
     router._close_owned = AsyncMock()
     router.reconcile_pending_orders = AsyncMock(return_value=True)
-    router._get_allocation = AsyncMock(return_value=SimpleNamespace(owned_qty=2, opened_at_ms=POSITION["openTime"]))
+    allocation = SimpleNamespace(owned_qty=2, owned_qty_exact="2", opened_at_ms=POSITION["openTime"],
+                                 inst_id="BTCUSDT", pos_side="long")
+    router._get_allocation = AsyncMock(return_value=allocation)
+    db = AsyncMock()
+    db.scalars.return_value = SimpleNamespace(all=lambda: [allocation])
     snapshot = previous_snapshot(positions=[])
     snapshot["openPositionsMeta"]["emptyVerified"] = True
     lead = SimpleNamespace(snapshot_json=json.dumps(snapshot), orders_store_json="{}")
     position = SimpleNamespace(pos=2, pos_side="long", inst_id="BTCUSDT", symbol="BTCUSDT")
     adapter = SimpleNamespace(get_positions=AsyncMock(return_value=[position]))
     actions = await router.reconcile_orphan_positions(
-        AsyncMock(), lead, SimpleNamespace(id=1), SimpleNamespace(id=1, symbol_map_json="{}"), adapter,
+        db, lead, SimpleNamespace(id=1), SimpleNamespace(id=1, symbol_map_json="{}"), adapter,
         [], [position], {"BTCUSDT": SimpleNamespace()},
         resilience_cfg={"auto_close_orphan_positions": "auto_close"}, notify_cfg={"notify_on_execution": False},
     )

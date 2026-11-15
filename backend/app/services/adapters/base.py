@@ -32,6 +32,27 @@ class BalanceInfo:
     asset_balances: Dict[str, Dict[str, float]] = field(default_factory=dict)
 
 
+async def get_collateral_balance(adapter: Any, spec: Optional[InstrumentSpec] = None) -> BalanceInfo:
+    """Use contract collateral when supported; legacy balances are USDT-only."""
+    currency = spec.settle_ccy if spec is not None else "USDT"
+    reader = getattr(adapter, "get_contract_balance", None)
+    if callable(reader):
+        balance = await reader(spec)
+    else:
+        if currency != "USDT":
+            raise ValueError("Legacy adapter cannot confirm non-USDT collateral")
+        balance = await adapter.get_usdt_balance()
+    if balance.currency != currency:
+        raise ValueError("Collateral balance currency does not match contract settlement")
+    for name in ("eq", "avail_eq", "cash_bal", "upl"):
+        value = getattr(balance, name)
+        if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)) or not math.isfinite(value):
+            raise ValueError(f"Invalid collateral {name}")
+        if name != "upl" and value < 0:
+            raise ValueError(f"Negative collateral {name}")
+    return balance
+
+
 @dataclass
 class ExchangePosition:
     inst_id: str
@@ -272,6 +293,12 @@ class BaseExchangeAdapter(ABC):
     @abstractmethod
     async def get_usdt_balance(self) -> BalanceInfo:
         raise NotImplementedError
+
+    async def get_contract_balance(self, spec: Optional[InstrumentSpec] = None) -> BalanceInfo:
+        """Backward-compatible collateral reader for USDT-only adapters."""
+        if spec is not None and spec.settle_ccy != "USDT":
+            raise ValueError("Adapter cannot confirm non-USDT collateral")
+        return await self.get_usdt_balance()
 
     @abstractmethod
     async def get_positions(self) -> List[ExchangePosition]:

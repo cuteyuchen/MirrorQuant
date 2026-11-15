@@ -183,7 +183,7 @@ async def test_empty_account_returns_zero_balance_with_raw_response(adapter, dat
 
 
 @pytest.mark.parametrize("dual,mode", [(True, "hedge"), (False, "one_way")])
-async def test_connection_reports_combined_equity_and_breakdown(adapter, dual, mode):
+async def test_connection_reports_usdt_total_equity_and_separate_usdc(adapter, dual, mode):
     data = single_asset_account()
     data["canTrade"] = False
     adapter._request = AsyncMock(side_effect=[data, {"dualSidePosition": dual}, data])
@@ -193,8 +193,8 @@ async def test_connection_reports_combined_equity_and_breakdown(adapter, dual, m
 
     assert result == {
         "ok": True, "exchange": "binance", "environment": "demo", "posMode": mode,
-        "canTrade": False, "totalEquity": 9602.64, "usdtEquity": 4602.64, "usdcEquity": 5000,
-        "availEquity": 9602.64, "openPositions": 1,
+        "canTrade": False, "totalEquity": 4602.64, "usdtEquity": 4602.64, "usdcEquity": 5000,
+        "availEquity": 4602.64, "openPositions": 1,
         "assetBalances": {
             "USDT": {"equity": 4602.64, "available": 4602.64, "wallet": 4602.64, "upl": 0},
             "USDC": {"equity": 5000, "available": 5000, "wallet": 5000, "upl": 0},
@@ -203,7 +203,7 @@ async def test_connection_reports_combined_equity_and_breakdown(adapter, dual, m
 
 
 @pytest.mark.parametrize("total", [None, 0, 9602.64])
-async def test_connectivity_persists_total_equity_with_legacy_fallback(persisted_account, monkeypatch, total):
+async def test_connectivity_never_persists_combined_total_into_usdt_risk(persisted_account, monkeypatch, total):
     db, account = persisted_account
     result = {"ok": True, "usdtEquity": 4602.64, "availEquity": 4000}
     if total is not None:
@@ -211,11 +211,11 @@ async def test_connectivity_persists_total_equity_with_legacy_fallback(persisted
     adapter = Mock(test_connection=AsyncMock(return_value=result))
     monkeypatch.setattr("app.api.accounts.create_exchange_adapter", Mock(return_value=adapter))
 
-    assert await account_connectivity(account.id, db=db, _user=None) == result
+    assert await account_connectivity(account.id, db=db, _user=None) == {**result, "totalEquity": 4602.64}
     await db.refresh(account)
 
-    expected = total or 4602.64
-    assert (account.usdt_equity, account.avail_equity, account.hwm_equity) == (expected, 4000, expected)
+    expected = 4602.64
+    assert (account.usdt_equity, account.avail_equity, account.hwm_equity) == (expected, 4000, 0)
     assert account.status == "connected"
     assert _account_out(account)["totalEquity"] == round(expected, 2)
 
@@ -237,18 +237,30 @@ async def test_connectivity_http_endpoint_and_account_listing(async_client, pers
     assert response.status_code == 200
     result = response.json()
     assert result["ok"] is True
-    assert (result["totalEquity"], result["usdtEquity"], result["usdcEquity"]) == (9602.64, 4602.64, 5000)
+    assert (result["totalEquity"], result["usdtEquity"], result["usdcEquity"]) == (4602.64, 4602.64, 5000)
     assert result["assetBalances"]["USDC"]["equity"] == 5000
     await db.refresh(account)
-    assert account.usdt_equity == 9602.64
+    assert account.usdt_equity == 4602.64
+    assert account.hwm_equity == 0
     listing = await async_client.get("/api/accounts", headers=headers)
     assert listing.status_code == 200
-    assert listing.json()["items"][0]["totalEquity"] == 9602.64
+    assert listing.json()["items"][0]["totalEquity"] == 4602.64
 
 
-async def test_sync_account_persists_and_broadcasts_combined_equity(persisted_account, adapter, monkeypatch):
+@pytest.mark.parametrize("available", [0, 4000])
+async def test_sync_account_persists_usdt_collateral_and_displays_usdc_separately(
+    persisted_account, adapter, monkeypatch, available,
+):
     db, account = persisted_account
-    adapter._request = AsyncMock(return_value=single_asset_account())
+    monkeypatch.setattr("app.services.adapters.binance.time.time", lambda: 1_700_000_000)
+    data = single_asset_account()
+    data["updateTime"] = 1_700_000_000_000
+    data["assets"][0]["availableBalance"] = str(available)
+    adapter._request = AsyncMock(return_value=data)
+    portfolio = await adapter.get_usdt_balance()
+    assert (portfolio.eq, portfolio.avail_eq) == (9602.64, available + 5000)
+    adapter.get_usdt_balance = AsyncMock(return_value=portfolio)
+    adapter._request = AsyncMock(side_effect=[{"multiAssetsMargin": False}, data])
     adapter.sync_time = AsyncMock(return_value=12)
     position = Mock(notional_usd=1200, upl=-25)
     position.to_dict.return_value = {"instId": "BTCUSDT", "pos": 0.02, "upl": -25}
@@ -261,17 +273,18 @@ async def test_sync_account_persists_and_broadcasts_combined_equity(persisted_ac
     await db.refresh(account)
 
     assert result["ok"] is True
-    assert (result["totalEquity"], result["usdtEquity"], result["usdcEquity"]) == (9602.64, 4602.64, 5000)
+    assert (result["totalEquity"], result["usdtEquity"], result["usdcEquity"]) == (4602.64, 4602.64, 5000)
     assert result["assetBalances"]["USDC"]["equity"] == 5000
     assert result["positions"] == [position.to_dict.return_value]
     assert (account.usdt_equity, account.avail_equity, account.hwm_equity, account.day_start_equity) == (
-        9602.64, 9602.64, 9602.64, 9602.64,
+        4602.64, available, 4602.64, 4602.64,
     )
     assert (account.total_notional, account.unrealized_pnl, account.clock_offset_ms) == (1200, -25, 12)
     assert json.loads(account.positions_json) == result["positions"]
     assert account.status == "connected" and account.last_sync_at is not None
     engine.ws_hub.broadcast.assert_awaited_once_with({
         "type": "account_update", "accountId": account.id, "name": account.name,
-        "totalEquity": 9602.64, "usdtEquity": 4602.64, "usdcEquity": 5000,
+        "totalEquity": 4602.64, "usdtEquity": 4602.64, "usdcEquity": 5000,
         "unrealizedPnl": -25, "positions": result["positions"],
     })
+    adapter.get_usdt_balance.assert_not_awaited()

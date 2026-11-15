@@ -14,6 +14,7 @@ from app.core.database import get_db
 from app.core.secret_mask import mask_sensitive_payload, redact_error_urls
 from app.services.lead_collector.freshness import lead_freshness
 from app.services.positions import with_current_price
+from app.services.engine.equity import account_equity_display, account_usdt_hwm
 from app.models.domain import (
     CopyBinding,
     ExecutionRecord,
@@ -40,11 +41,11 @@ async def dashboard_overview(
     ks_row = await db.scalar(select(SystemConfig).where(SystemConfig.key == "global_kill_switch"))
     global_kill = json.loads(ks_row.value_json) if ks_row else False
 
-    total_equity = sum(a.usdt_equity for a in accounts if a.is_enabled)
-    total_avail = sum(a.avail_equity for a in accounts if a.is_enabled)
+    total_equity = sum(account_equity_display(a)["usdtEquity"] for a in accounts if a.is_enabled)
+    total_avail = sum(account_equity_display(a)["availEquity"] for a in accounts if a.is_enabled)
     total_notional = sum(a.total_notional for a in accounts if a.is_enabled)
     total_upl = sum(a.unrealized_pnl for a in accounts if a.is_enabled)
-    total_hwm = sum(a.hwm_equity for a in accounts if a.is_enabled)
+    total_hwm = sum(account_usdt_hwm(a) for a in accounts if a.is_enabled)
 
     lead_positions = []
     leads_status = []

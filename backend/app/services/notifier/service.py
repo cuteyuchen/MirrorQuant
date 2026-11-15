@@ -6,12 +6,46 @@ import json
 import logging
 import os
 import time
+import re
+from contextvars import ContextVar
+from functools import wraps
 from pathlib import Path
 from typing import Any, Dict
 
 import httpx
 
 logger = logging.getLogger("mirrorquant.notifier")
+_notification_http = ContextVar("notification_http", default=False)
+
+
+class _NotificationHTTPFilter(logging.Filter):
+    def filter(self, record):
+        if _notification_http.get():
+            event = record.getMessage().split(" ", 1)[0]
+            record.msg = event if re.fullmatch(r"[a-z_]+\.(started|complete|failed)", event) else "Notification HTTP transport activity"
+            record.args = ()
+            record.stack_info = None
+            record.exc_text = None
+            if record.exc_info:
+                record.msg += f" ({record.exc_info[0].__name__})"
+                record.exc_info = None
+        return True
+
+
+for transport_logger in ("httpx", "httpcore.connection", "httpcore.http11", "httpcore.http2",
+                         "httpcore.proxy", "httpcore.socks"):
+    logging.getLogger(transport_logger).addFilter(_NotificationHTTPFilter())
+
+
+def _private_http_logs(function):
+    @wraps(function)
+    async def wrapped(*args, **kwargs):
+        token = _notification_http.set(True)
+        try:
+            return await function(*args, **kwargs)
+        finally:
+            _notification_http.reset(token)
+    return wrapped
 
 
 class NotificationService:
@@ -30,6 +64,7 @@ class NotificationService:
                 fcntl.flock(f, fcntl.LOCK_UN)
 
     @staticmethod
+    @_private_http_logs
     async def dispatch(config: Dict[str, Any], title: str, message: str, event_type: str = "info") -> Dict[str, Any]:
         results: Dict[str, Any] = {}
         clean_msg = message.strip()
@@ -48,6 +83,16 @@ class NotificationService:
             except Exception as exc:
                 results["outbox"] = {"ok": False, "error": type(exc).__name__}
 
+        try:
+            await NotificationService._dispatch_http(config, title, message, full_text, event_type, results)
+        except Exception as exc:
+            for channel in ("webhook", "telegram", "wecom", "dingtalk"):
+                if config.get(f"{channel}_enabled"):
+                    results[channel] = {"ok": False, "error": type(exc).__name__}
+        return results
+
+    @staticmethod
+    async def _dispatch_http(config, title, message, full_text, event_type, results):
         async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
             if config.get("webhook_enabled") and config.get("webhook_url"):
                 try:
@@ -87,7 +132,17 @@ class NotificationService:
                         config["dingtalk_webhook_url"],
                         json={"msgtype": "text", "text": {"content": full_text}},
                     )
-                    results["dingtalk"] = {"ok": resp.status_code < 400, "status": resp.status_code}
+                    body = resp.json()
+                    code = body.get("errcode") if isinstance(body, dict) else None
+                    valid_code = type(code) is int
+                    results["dingtalk"] = {
+                        "ok": 200 <= resp.status_code < 300 and valid_code and code == 0,
+                        "status": resp.status_code,
+                    }
+                    if valid_code:
+                        results["dingtalk"]["errcode"] = code
+                    else:
+                        results["dingtalk"]["error"] = "InvalidDingTalkResponse"
                 except Exception as exc:
                     results["dingtalk"] = {"ok": False, "error": type(exc).__name__}
 

@@ -154,6 +154,8 @@ class OKXAdapter(BaseExchangeAdapter):
             "posMode": cfg.get("posMode", "unknown"),
             "acctLv": cfg.get("acctLv", "unknown"),
             "usdtEquity": bal.eq,
+            "totalEquity": bal.eq,
+            "usdcEquity": 0.0,
             "availEquity": bal.avail_eq,
             "openPositions": len(positions),
         }
@@ -346,8 +348,8 @@ class OKXAdapter(BaseExchangeAdapter):
         return {
             "ordId": row.get("ordId"),
             "clOrdId": row.get("clOrdId"),
-            "accFillSz": float(row.get("accFillSz") or 0.0),
-            "avgPx": float(row.get("avgPx") or row.get("fillPx") or 0.0),
+            "accFillSz": float(row["accFillSz"]) if row.get("accFillSz") not in (None, "") else None,
+            "avgPx": float(row.get("avgPx") or 0.0),
             "state": row.get("state"),
             "raw": row,
         }

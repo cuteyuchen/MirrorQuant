@@ -10,7 +10,7 @@ from sqlalchemy import select
 from app.core.database import get_session_factory
 from app.core.security import CredentialVault
 from app.models.domain import (
-    BindingDebt, CopyBinding, ExecutionRecord, LeadSource, OrderIntent,
+    BindingDebt, BindingDelivery, CopyBinding, ExecutionRecord, LeadSource, OrderIntent,
     PositionAllocation, PositionGuardState, ProxyNode, SystemConfig, TradingAccount,
 )
 from app.services.adapters.base import BalanceInfo, ExchangePosition, InstrumentSpec, OrderBook, OrderResult
@@ -79,6 +79,8 @@ async def seed_allocation(t, qty=1, debt=25):
                                     pos_side="long", owned_qty=qty, entry_cost=qty * 100, opened_at_ms=100)
     other = PositionAllocation(binding_id=t.other.id, account_id=t.account.id, inst_id="BTCUSDT",
                               pos_side="long", owned_qty=9, entry_cost=900)
+    t.pos.pos = t.pos.avail_pos = qty + other.owned_qty
+    t.pos.notional_usd = t.pos.pos * t.pos.avg_px
     pending = BindingDebt(binding_id=t.binding.id, symbol="BTCUSDT", position_side="LONG", pending_usd=debt)
     guard = PositionGuardState(binding_id=t.binding.id, inst_id="BTCUSDT", pos_side="long", entry_px=100, peak_px=100, trough_px=100)
     t.db.add_all([allocation, other, pending, guard])
@@ -362,6 +364,94 @@ async def test_fresh_snapshot_routes_150_second_delayed_fill_once(trading, monke
     await t.router.process_lead_events(t.db, t.lead, orders, [], snapshot, [t.proxy])
     assert len(exchange.orders) == 1
     assert len((await t.db.scalars(select(ExecutionRecord))).all()) == 1
+
+
+@pytest.mark.parametrize("remaining,expected_qty", [(0, "1.0"), (1, "0.5")])
+async def test_collateral_failure_then_recovery_retries_exit_once(trading, monkeypatch, remaining, expected_qty):
+    t = trading
+    allocation, other, debt, guard = await seed_allocation(t)
+    exchange = OfflineExchange()
+    await prepare_event_router(t, exchange, monkeypatch)
+    exchange.get_usdt_balance.side_effect = [RuntimeError("synthetic balance unavailable"),
+        BalanceInfo(1000, 1000, 1000, 0)]
+    snapshot = current_snapshot("LONG")
+    snapshot["openPositions"][0].update(qty=remaining, qtyExact=str(remaining))
+    orders = [source_order("recover-exit", "LONG", "SELL", NOW_MS - 150_000)]
+    await t.router.process_lead_events(t.db, t.lead, orders, [], snapshot, [t.proxy])
+    delivery = await t.db.scalar(select(BindingDelivery))
+    assert delivery.state != "APPLIED"
+    assert exchange.orders == []
+    assert allocation.owned_qty == 1 and other.owned_qty == 9
+    assert (await t.db.scalar(select(ExecutionRecord))).status == "BLOCKED_COLLATERAL_BALANCE"
+    await t.router.process_lead_events(t.db, t.lead, orders, [], snapshot, [t.proxy])
+    assert len(exchange.orders) == 1
+    assert Decimal(exchange.orders[0]["sz"]) == Decimal(expected_qty)
+    assert exchange.orders[0]["reduce_only"] is True
+    assert delivery.state == "APPLIED"
+    assert Decimal(str(allocation.owned_qty)) == 1 - Decimal(expected_qty)
+    assert other.owned_qty == 9
+    await t.router.process_lead_events(t.db, t.lead, orders, [], snapshot, [t.proxy])
+    assert len(exchange.orders) == 1
+    assert len((await t.db.scalars(select(OrderIntent))).all()) == 1
+    assert len((await t.db.scalars(select(ExecutionRecord).where(ExecutionRecord.my_qty > 0))).all()) == 1
+
+
+@pytest.mark.parametrize("ambiguous", [False, True])
+async def test_recovered_exit_partial_or_unknown_submission_never_resubmits(trading, monkeypatch, ambiguous):
+    t = trading
+    allocation, other, debt, guard = await seed_allocation(t)
+    exchange = OfflineExchange(fill=0.2, state="partially_filled")
+    await prepare_event_router(t, exchange, monkeypatch)
+    exchange.get_usdt_balance.side_effect = RuntimeError("synthetic balance unavailable")
+    orders = [source_order("recover-unresolved-exit", "LONG", "SELL", NOW_MS - 150_000)]
+    snapshot = current_snapshot("LONG")
+    snapshot["openPositions"] = []
+    await t.router.process_lead_events(t.db, t.lead, orders, [], snapshot, [t.proxy])
+    assert exchange.orders == []
+    exchange.get_usdt_balance.side_effect = None
+    if ambiguous:
+        async def submit(**order):
+            exchange.orders.append(order)
+            raise TimeoutError("synthetic acceptance response lost")
+        exchange.place_order = submit
+        exchange.get_order = AsyncMock(return_value=None)
+    await t.router.process_lead_events(t.db, t.lead, orders, [], snapshot, [t.proxy])
+    assert len(exchange.orders) == 1
+    delivery = await t.db.scalar(select(BindingDelivery))
+    assert delivery.state != "APPLIED"
+    assert allocation.owned_qty == (1 if ambiguous else 0.8)
+    await t.router.process_lead_events(t.db, t.lead, orders, [], snapshot, [t.proxy])
+    assert len(exchange.orders) == 1
+    exchange.get_order = AsyncMock(return_value={"ordId": "exchange-id", "accFillSz": "1",
+                                               "avgPx": "100", "state": "filled"})
+    await t.router.process_lead_events(t.db, t.lead, orders, [], snapshot, [t.proxy])
+    assert allocation.owned_qty == 0 and other.owned_qty == 9
+    assert delivery.state == "APPLIED"
+    assert len(exchange.orders) == 1
+    records = (await t.db.scalars(select(ExecutionRecord).where(ExecutionRecord.my_qty > 0))).all()
+    assert sum(Decimal(str(record.my_qty)) for record in records) == 1
+    await t.router.process_lead_events(t.db, t.lead, orders, [], snapshot, [t.proxy])
+    assert len(exchange.orders) == 1
+
+
+async def test_collateral_failure_defers_mixed_exit_and_entry_in_order(trading, monkeypatch):
+    t = trading
+    await seed_allocation(t)
+    exchange = OfflineExchange()
+    await prepare_event_router(t, exchange, monkeypatch)
+    exchange.get_usdt_balance.side_effect = RuntimeError("synthetic balance unavailable")
+    orders = [source_order("first-close", "LONG", "SELL", NOW_MS - 150_000),
+              source_order("then-open", "LONG", "BUY", NOW_MS - 149_000)]
+    snapshot = current_snapshot("LONG")
+    await t.router.process_lead_events(t.db, t.lead, orders, [], snapshot, [t.proxy])
+    assert exchange.orders == []
+    assert len((await t.db.scalars(select(BindingDelivery).where(BindingDelivery.state != "APPLIED"))).all()) == 2
+    exchange.get_usdt_balance.side_effect = None
+    await t.router.process_lead_events(t.db, t.lead, orders, [], snapshot, [t.proxy])
+    assert [order["side"] for order in exchange.orders] == ["sell", "buy"]
+    assert [order["reduce_only"] for order in exchange.orders] == [True, False]
+    await t.router.process_lead_events(t.db, t.lead, orders, [], snapshot, [t.proxy])
+    assert len(exchange.orders) == 2
 
 
 @pytest.mark.parametrize("flip_close_first", (False, True))

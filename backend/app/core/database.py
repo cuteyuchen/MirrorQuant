@@ -141,10 +141,29 @@ DEFAULT_SYSTEM_CONFIG = {
 
 # Idempotent SQLite column additions for upgrading existing databases without wiping data
 SQLITE_MIGRATIONS: Dict[str, List[Tuple[str, str]]] = {
+    "binding_position_progress": [("cycle_tracked", "BOOLEAN NOT NULL DEFAULT 0"),
+                                  ("source_remaining_qty", "VARCHAR(100)")],
     "execution_records": [
+        ("notification_state", "VARCHAR(32) NOT NULL DEFAULT 'unknown'"),
         ("fee", "FLOAT"),
         ("funding", "FLOAT"),
         ("exchange_fill_id", "VARCHAR(100)"),
+        ("my_qty_exact", "VARCHAR(100)"),
+        ("my_price_exact", "VARCHAR(100)"),
+        ("delivery_event_id", "VARCHAR(100)"),
+    ],
+    "binding_deliveries": [
+        ("exit_superseded_by", "VARCHAR(100)"),
+        ("exit_account_id", "INTEGER"),
+        ("exit_inst_id", "VARCHAR(64)"),
+        ("exit_pos_side", "VARCHAR(16)"),
+        ("exit_allocation_id", "INTEGER"),
+        ("exit_generation", "INTEGER"),
+        ("exit_initial_owned_qty", "VARCHAR(100)"),
+        ("exit_target_qty", "VARCHAR(100)"),
+        ("exit_filled_qty", "VARCHAR(100)"),
+        ("exit_remaining_qty", "VARCHAR(100)"),
+        ("exit_progress", "VARCHAR(32)"),
     ],
     "position_allocations": [
         ("owned_qty_exact", "VARCHAR(100)"),
@@ -152,7 +171,8 @@ SQLITE_MIGRATIONS: Dict[str, List[Tuple[str, str]]] = {
         ("generation", "INTEGER NOT NULL DEFAULT 0"),
         ("opened_at_ms", "BIGINT NOT NULL DEFAULT 0"),
     ],
-    "order_intents": [("source_time_ms", "BIGINT NOT NULL DEFAULT 0")],
+    "order_intents": [("source_time_ms", "BIGINT NOT NULL DEFAULT 0"),
+                      ("delivery_event_id", "VARCHAR(100)")],
     "binding_debts": [("pending_usd_exact", "VARCHAR(100)")],
     "users": [
         ("session_version", "INTEGER NOT NULL DEFAULT 0"),
@@ -161,6 +181,7 @@ SQLITE_MIGRATIONS: Dict[str, List[Tuple[str, str]]] = {
         ("totp_pending_secret_enc", "TEXT"),
     ],
     "trading_accounts": [
+        ("risk_equity_json", "TEXT"),
         ("day_start_equity", "FLOAT NOT NULL DEFAULT 0.0"),
         ("day_start_date", "VARCHAR(16)"),
         ("clock_offset_ms", "INTEGER NOT NULL DEFAULT 0"),
@@ -196,6 +217,22 @@ def _apply_sqlite_migrations(sync_conn) -> None:
             if col_name not in existing_cols:
                 logger.info("Auto-migrating SQLite column %s.%s", table, col_name)
                 sync_conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_def}"))
+        if table == "binding_deliveries" and "exit_target_qty" not in existing_cols:
+            deliveries = sync_conn.execute(text(
+                "SELECT binding_id, source_event_id, payload_json FROM binding_deliveries"
+            )).fetchall()
+            for binding_id, event_id, payload_json in deliveries:
+                try:
+                    payload = json.loads(payload_json)
+                    is_exit = "_closed" in payload or (payload.get("side"), payload.get("positionSide")) in (
+                        ("SELL", "LONG"), ("BUY", "SHORT"))
+                except (ValueError, TypeError, AttributeError):
+                    is_exit = True
+                if is_exit:
+                    sync_conn.execute(text(
+                        "UPDATE binding_deliveries SET state='PENDING', exit_progress='REVIEW_REQUIRED' "
+                        "WHERE binding_id=:binding_id AND source_event_id=:event_id"
+                    ), {"binding_id": binding_id, "event_id": event_id})
 
 
 async def init_db() -> None:

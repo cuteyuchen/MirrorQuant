@@ -254,6 +254,16 @@ async def test_hidden_open_persists_delivery_and_filled_intent(workflow, timesta
 
     t.adapter.place_order.side_effect = submit
     await t.router.process_lead_events(t.db, t.lead, [opening_order()], [], snapshot, [t.proxy])
+    if timestamp_field is None:
+        # An undated reconstruction must not consume the source event or submit.
+        t.adapter.place_order.assert_not_awaited()
+        assert not (await t.db.scalars(select(BindingDelivery))).all()
+        assert not (await t.db.scalars(select(OrderIntent))).all()
+        assert not (await t.db.scalars(select(ExecutionRecord))).all()
+        snapshot["openPositionsMeta"]["asOf"] = NOW_MS
+        t.lead.snapshot_json = json.dumps(snapshot)
+        await t.db.commit()
+        await t.router.process_lead_events(t.db, t.lead, [opening_order()], [], snapshot, [t.proxy])
     t.adapter.place_order.assert_awaited_once()
     order = t.adapter.place_order.await_args.kwargs
     assert order["side"] == "buy" and order["pos_side"] == "long"
@@ -273,6 +283,33 @@ async def test_hidden_open_persists_delivery_and_filled_intent(workflow, timesta
     # Repeated polling must not submit the same hidden-position event twice.
     await t.router.process_lead_events(t.db, t.lead, [opening_order()], [], snapshot, [t.proxy])
     t.adapter.place_order.assert_awaited_once()
+
+
+@pytest.mark.parametrize("field", ["asOf", "generatedAt", "collectionStartedAtMs"])
+@pytest.mark.parametrize("value", [None, "1800000000000", "", True, False, float("nan"),
+                                   float("inf"), float("-inf"), 0, -1, NOW_MS + 1, NOW_MS - 30_001])
+def test_reconstructed_snapshot_requires_valid_fresh_timestamp(fixed_clock, field, value):
+    snapshot = hidden_snapshot()
+    snapshot["openPositionsMeta"]["asOf"] = None
+    snapshot["meta"].pop("generatedAt")
+    target = snapshot["openPositionsMeta"] if field == "asOf" else snapshot["meta"]
+    target[field] = value
+    assert not is_routable_snapshot(snapshot)
+
+
+@pytest.mark.parametrize("value", [0, False, "", "invalid", float("nan"), NOW_MS - 30_001])
+def test_invalid_observation_cannot_be_renewed_by_fresh_publication(fixed_clock, value):
+    snapshot = hidden_snapshot()
+    snapshot["openPositionsMeta"]["asOf"] = value
+    assert not is_routable_snapshot(snapshot)
+
+
+def test_boolean_timestamp_is_never_authoritative():
+    snapshot = hidden_snapshot()
+    snapshot["openPositionsMeta"].update(source="api", authoritative=True, complete=True,
+                                         positionShow=True, asOf=True)
+    assert not is_authoritative_snapshot(snapshot, now_ms=1)
+    assert not is_routable_snapshot(snapshot, now_ms=1)
 
 
 @pytest.mark.parametrize("reason", ["newer_observation", "newer_failure"])

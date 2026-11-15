@@ -1,5 +1,7 @@
 import os
 import sys
+import asyncio
+import selectors
 from pathlib import Path
 
 import pytest
@@ -21,6 +23,25 @@ os.environ["MQ_BOOTSTRAP_TOKEN"] = "TestBootstrapAuthorizationSecretForSetupOnly
 
 from app.core.database import get_db, init_db, reset_db_engine
 from app.main import app
+
+
+class _OfflineSelector(selectors.DefaultSelector):
+    """Poll thread completions when the offline shell blocks socket wakeup writes."""
+
+    def select(self, timeout=None):
+        return super().select(0.001 if timeout is None else min(timeout, 0.001))
+
+
+class _OfflineEventLoopPolicy(asyncio.DefaultEventLoopPolicy):
+    def new_event_loop(self):
+        return asyncio.SelectorEventLoop(selector=_OfflineSelector())
+
+
+@pytest.fixture(scope="session")
+def event_loop_policy():
+    if os.environ.get("CODEX_SANDBOX_OFFLINE") == "1":
+        return _OfflineEventLoopPolicy()
+    return asyncio.DefaultEventLoopPolicy()
 
 
 @pytest.fixture(autouse=True)

@@ -18,9 +18,11 @@ from app.core.security import CredentialVault
 from app.core.secret_mask import mask_sensitive_payload, redact_proxy_userinfo
 from app.models.domain import CopyBinding, LeadSource, NotificationOutbox, ProxyNode, TradingAccount
 from app.services.adapters.factory import create_exchange_adapter
+from app.services.adapters.base import get_collateral_balance
 from app.services.analysis.pa_analyzer import PAAnalyzer
 from app.services.engine.router import CopyRouter
 from app.services.engine.risk import RiskEngine
+from app.services.engine.equity import display_equity, equity_baseline, persist_equity, risk_state
 from app.services.engine.serialization import serialized_execution
 from app.services.engine.sizer import exact
 from app.services.lead_collector.binance_bapi import (
@@ -233,28 +235,38 @@ class EngineOrchestrator:
         await asyncio.gather(*(check_binding(binding_id) for binding_id in binding_ids))
 
     @serialized_execution
-    async def _check_account_equity(self, db: AsyncSession, binding: CopyBinding, account: TradingAccount, adapter: Any) -> None:
+    async def _check_account_equity(self, db: AsyncSession, binding: CopyBinding, account: TradingAccount, adapter: Any) -> bool:
         """Continuously latch configured loss breakers; protection remains active."""
-        balance = await asyncio.wait_for(adapter.get_usdt_balance(), timeout=15.0)
         await db.refresh(binding)
         await db.refresh(account)
-        if not math.isfinite(balance.eq) or not math.isfinite(balance.avail_eq):
+        try:
+            balance = await asyncio.wait_for(get_collateral_balance(adapter), timeout=15.0)
+            observations = await persist_equity(db, account, balance, all_assets=True)
+            if not set(risk_state(account)["assets"]).issubset(observations):
+                raise ValueError("Previously observed collateral currency is missing")
+            checks = []
+            for currency, observation in observations.items():
+                hwm, day_start = equity_baseline(account, currency)
+                for check in RiskEngine.loss_breaker_checks(binding, hwm, day_start, observation.eq):
+                    if check.reason:
+                        check.reason += f" [{currency}]"
+                    checks.append(check)
+        except Exception as exc:
             binding.circuit_breaker_tripped = True
-            binding.circuit_breaker_reason = "Invalid exchange account equity; entries suspended"
+            binding.circuit_breaker_reason = "Invalid exchange collateral balance; entries suspended"
+            account.status = "error"
+            account.last_error = redact_proxy_userinfo(str(exc))[:400]
             await db.commit()
-            return
-        account.hwm_equity = max(account.hwm_equity, balance.eq)
-        CopyRouter._refresh_day_start(account, balance.eq)
-        account.usdt_equity = balance.eq
-        account.avail_equity = balance.avail_eq
+            return False
         RiskEngine.clear_disabled_loss_breaker(binding)
-        checks = RiskEngine.loss_breaker_checks(binding, account.hwm_equity, account.day_start_equity, balance.eq)
         for result in checks:
             if not result.allowed:
                 binding.circuit_breaker_tripped = True
                 binding.circuit_breaker_reason = result.reason
                 break
         await db.commit()
+
+        return True
 
     async def sync_lead(
         self,
@@ -525,13 +537,10 @@ class EngineOrchestrator:
                 except Exception:
                     logger.warning("Clock calibration failed for account %s; retaining prior offset", account.id)
 
-            bal = await adapter.get_usdt_balance()
+            bal = await get_collateral_balance(adapter)
             positions = await adapter.get_positions()
-            if bal.eq > account.hwm_equity:
-                account.hwm_equity = bal.eq
-            CopyRouter._refresh_day_start(account, bal.eq)
-            account.usdt_equity = bal.eq
-            account.avail_equity = bal.avail_eq
+            await persist_equity(db, account, bal, all_assets=True)
+            equity_display = display_equity(bal)
             account.total_notional = sum(p.notional_usd for p in positions)
             account.unrealized_pnl = sum(p.upl for p in positions)
             account.positions_json = json.dumps([p.to_dict() for p in positions])
@@ -545,18 +554,16 @@ class EngineOrchestrator:
                     "type": "account_update",
                     "accountId": account.id,
                     "name": account.name,
-                    "totalEquity": account.usdt_equity,
-                    "usdtEquity": getattr(bal, "usdt_eq", account.usdt_equity),
-                    "usdcEquity": getattr(bal, "usdc_eq", 0.0),
+                    "totalEquity": equity_display["totalEquity"],
+                    "usdtEquity": equity_display["usdtEquity"],
+                    "usdcEquity": equity_display["usdcEquity"],
                     "unrealizedPnl": account.unrealized_pnl,
                     "positions": [p.to_dict() for p in positions],
                 }
             )
             return {
                 "ok": True,
-                "totalEquity": bal.eq,
-                "usdtEquity": getattr(bal, "usdt_eq", bal.eq),
-                "usdcEquity": getattr(bal, "usdc_eq", 0.0),
+                **equity_display,
                 "positions": [p.to_dict() for p in positions],
                 "assetBalances": getattr(bal, "asset_balances", {}),
             }

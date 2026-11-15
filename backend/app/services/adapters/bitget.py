@@ -354,7 +354,7 @@ class BitgetAdapter(BaseExchangeAdapter):
         return {
             "ordId": row.get("orderId"),
             "clOrdId": row.get("clientOid"),
-            "accFillSz": float(row.get("baseVolume") or 0.0),
+            "accFillSz": float(row["baseVolume"]) if row.get("baseVolume") not in (None, "") else None,
             "avgPx": float(row.get("priceAvg") or 0.0),
             "state": row.get("state"),
             "raw": row,

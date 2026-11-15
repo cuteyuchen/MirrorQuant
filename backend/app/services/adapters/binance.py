@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import math
+import re
 import time
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode
 
@@ -138,15 +140,16 @@ class BinanceAdapter(BaseExchangeAdapter):
             "environment": self.environment,
             "posMode": "hedge" if dual.get("dualSidePosition") else "one_way",
             "canTrade": acct.get("canTrade", True),
-            "totalEquity": bal.eq,
-            "usdtEquity": bal.usdt_eq if hasattr(bal, "usdt_eq") and bal.usdt_eq > 0 else bal.eq,
+            "totalEquity": bal.usdt_eq,
+            "usdtEquity": bal.usdt_eq,
             "usdcEquity": getattr(bal, "usdc_eq", 0.0),
-            "availEquity": bal.avail_eq,
+            "availEquity": bal.asset_balances.get("USDT", {}).get("available", 0.0),
             "openPositions": len(positions),
             "assetBalances": getattr(bal, "asset_balances", {}),
         }
 
     async def get_usdt_balance(self) -> BalanceInfo:
+        """Legacy portfolio display, not a contract's usable collateral."""
         data = await self._request("GET", "/fapi/v2/account")
         assets = {str(item.get("asset") or "").upper(): item for item in data.get("assets") or []}
         usdt = assets.get("USDT", {})
@@ -188,6 +191,73 @@ class BinanceAdapter(BaseExchangeAdapter):
         return BalanceInfo(
             eq=eq, avail_eq=avail_eq, cash_bal=cash_bal, upl=upl, currency="USDT", raw=data,
             usdt_eq=usdt_mb, usdc_eq=usdc_mb, asset_balances=asset_balances,
+        )
+
+    async def get_contract_balance(self, spec: Optional[InstrumentSpec] = None) -> BalanceInfo:
+        currency = spec.settle_ccy if spec is not None else "USDT"
+        if currency not in ("USDT", "USDC"):
+            raise ValueError("Unsupported Binance settlement currency")
+        mode = await self._request("GET", "/fapi/v1/multiAssetsMargin")
+        if not isinstance(mode, dict) or mode.get("multiAssetsMargin") is not False:
+            raise ValueError("Binance single-asset collateral mode is not confirmed")
+        data = await self._request("GET", "/fapi/v2/account")
+        if not isinstance(data, dict) or data.get("multiAssetsMargin") is not False:
+            raise ValueError("Binance account collateral mode is missing or contradictory")
+        now_ms = int(time.time() * 1000) + self._time_offset_ms
+
+        def validate_timestamp(value: Any) -> None:
+            if type(value) is not int and not (isinstance(value, str) and value.isascii() and value.isdecimal()):
+                raise ValueError("Invalid Binance collateral timestamp")
+            timestamp = int(value)
+            if timestamp <= 0 or timestamp > now_ms or now_ms - timestamp > 30_000:
+                raise ValueError("Binance collateral timestamp is future or stale")
+
+        def number(item: Dict[str, Any], field: str, signed: bool = False) -> float:
+            value = item.get(field)
+            if isinstance(value, bool) or not isinstance(value, (str, int, float, Decimal)):
+                raise ValueError(f"Invalid Binance collateral {field}")
+            if isinstance(value, str) and re.fullmatch(r"[+-]?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?", value) is None:
+                raise ValueError(f"Invalid Binance collateral {field}")
+            try:
+                decimal_value = Decimal(str(value))
+                parsed = float(decimal_value)
+            except (ValueError, OverflowError, InvalidOperation) as exc:
+                raise ValueError(f"Invalid Binance collateral {field}") from exc
+            if (not decimal_value.is_finite() or not math.isfinite(parsed)
+                    or (not signed and decimal_value < 0) or (decimal_value != 0 and parsed == 0)):
+                raise ValueError(f"Invalid Binance collateral {field}")
+            return parsed
+
+        validate_timestamp(data.get("updateTime"))
+        assets = data.get("assets")
+        if not isinstance(assets, list):
+            raise ValueError("Missing Binance collateral assets")
+        balances = {}
+        for item in assets:
+            if not isinstance(item, dict):
+                raise ValueError("Invalid Binance collateral asset")
+            name = item.get("asset")
+            if not isinstance(name, str) or not name or name != name.strip():
+                raise ValueError("Invalid Binance collateral asset name")
+            name = name.upper()
+            if name in balances:
+                raise ValueError("Duplicate Binance collateral asset")
+            if "updateTime" in item:
+                validate_timestamp(item["updateTime"])
+            balances[name] = {
+                "equity": number(item, "marginBalance"),
+                "available": number(item, "availableBalance"),
+                "wallet": number(item, "walletBalance"),
+                "upl": number(item, "unrealizedProfit", signed=True),
+            }
+        if currency not in balances:
+            raise ValueError(f"Missing Binance {currency} collateral asset")
+        selected = balances[currency]
+        return BalanceInfo(
+            eq=selected["equity"], avail_eq=selected["available"],
+            cash_bal=selected["wallet"], upl=selected["upl"], currency=currency, raw=data,
+            usdt_eq=balances.get("USDT", {}).get("equity", 0.0),
+            usdc_eq=balances.get("USDC", {}).get("equity", 0.0), asset_balances=balances,
         )
 
     async def get_positions(self) -> List[ExchangePosition]:
@@ -367,7 +437,7 @@ class BinanceAdapter(BaseExchangeAdapter):
         return {
             "ordId": str(row.get("orderId") or ""),
             "clOrdId": row.get("clientOrderId"),
-            "accFillSz": float(row.get("executedQty") or 0.0),
+            "accFillSz": float(row["executedQty"]) if row.get("executedQty") not in (None, "") else None,
             "avgPx": float(row.get("avgPrice") or 0.0),
             "state": row.get("status"),
             "raw": row,

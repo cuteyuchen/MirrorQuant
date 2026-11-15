@@ -135,6 +135,7 @@ class TradingAccount(Base):
     hwm_equity: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     day_start_equity: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     day_start_date: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    risk_equity_json: Mapped[Optional[str]] = mapped_column(Text, default="{}", nullable=True)
     clock_offset_ms: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     total_notional: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     unrealized_pnl: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
@@ -253,6 +254,29 @@ class BindingDelivery(Base):
     source_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
     payload_json: Mapped[str] = mapped_column(Text, nullable=False)
     state: Mapped[str] = mapped_column(String(32), default="PENDING", nullable=False)
+    exit_account_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    exit_inst_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    exit_pos_side: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    exit_allocation_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    exit_generation: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    exit_initial_owned_qty: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    exit_target_qty: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    exit_filled_qty: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    exit_remaining_qty: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    exit_progress: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    exit_superseded_by: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+
+
+class BindingPositionProgress(Base):
+    __tablename__ = "binding_position_progress"
+    binding_id: Mapped[int] = mapped_column(Integer, ForeignKey("copy_bindings.id", ondelete="CASCADE"), primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(64), primary_key=True)
+    position_side: Mapped[str] = mapped_column(String(16), primary_key=True)
+    source_time_ms: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    source_event_id: Mapped[str] = mapped_column(String(100), default="", nullable=False)
+    cycle_tracked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    source_remaining_qty: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    review_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
 
 class OrderIntent(Base):
@@ -264,6 +288,7 @@ class OrderIntent(Base):
     inst_id: Mapped[str] = mapped_column(String(64), nullable=False)
     pos_side: Mapped[str] = mapped_column(String(16), nullable=False)
     source_event_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    delivery_event_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     state: Mapped[str] = mapped_column(String(32), nullable=False)
     requested_qty: Mapped[str] = mapped_column(String(100), nullable=False)
     filled_qty: Mapped[str] = mapped_column(String(100), default="0", nullable=False)
@@ -336,6 +361,7 @@ class ExecutionRecord(Base):
     position_side: Mapped[str] = mapped_column(String(16), nullable=False)
     action: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    notification_state: Mapped[str] = mapped_column(String(32), default="unknown", nullable=False)
 
     lead_qty: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     lead_price: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
@@ -343,9 +369,12 @@ class ExecutionRecord(Base):
 
     my_qty: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     my_price: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    my_qty_exact: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    my_price_exact: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     my_notional: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     slippage_pct: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     order_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    delivery_event_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     # NULL means not yet reconciled, not a fabricated zero cash flow.
     fee: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # positive charge, negative rebate
     funding: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # positive receipt, negative payment

@@ -19,6 +19,7 @@ import httpx
 from app.core.secret_mask import redact_proxy_userinfo
 from app.services.lead_collector.base import BaseLeadCollector
 from app.services.engine.sizer import exact
+from app.services.lead_collector.snapshot_clock import closed_interval, event_interval, event_timestamp
 from app.services.proxy.manager import ProxyManager
 
 FRIENDLY_ROOT = "https://www.binance.com/bapi/futures/v1/friendly/future"
@@ -219,7 +220,7 @@ def slim_closed_position(p: Dict[str, Any]) -> Dict[str, Any]:
         "roi": fnum(p.get("roi")),
         "opened": opened,
         "closed": closed,
-        "heldMs": (closed - opened) if (opened and closed) else None,
+        "heldMs": (interval[1] - interval[0]) if (interval := closed_interval(p)) is not None else None,
     }
 
 
@@ -269,10 +270,11 @@ def reconstruct_open_positions(
         stale = False
         if ot:
             for c in closed_rows:
+                interval = closed_interval(c)
                 if (
                     c.get("symbol") == sym
                     and str(c.get("side") or "").upper() == ps
-                    and (c.get("opened") or 0) <= ot <= (c.get("closed") or 0)
+                    and interval is not None and interval[0] <= ot <= interval[1]
                 ):
                     stale = True
                     break
@@ -346,7 +348,7 @@ def snapshot_positions_observed_ms(snapshot: Dict[str, Any]) -> Optional[float]:
             observed = meta["lastNonEmptyAsOf"]
         elif meta.get("source") != "stale-fallback":
             observed = (snapshot.get("meta") or {}).get("generatedAt")
-    return fnum(observed)
+    return event_timestamp(observed) if type(observed) in (int, float) else None
 
 
 def positions_have_close_evidence(
@@ -366,28 +368,38 @@ def positions_have_close_evidence(
     for position in positions:
         symbol = position.get("symbol")
         side = str(position.get("positionSide") or "").upper()
-        opened = fnum(position.get("openTime"))
-        cutoff = observed_ms if observed_ms is not None else opened
+        opened = event_timestamp(position.get("openTime"))
+        cutoff = event_timestamp(observed_ms) if observed_ms is not None else opened
         qty = exact(position.get("qtyExact", position.get("qty")) or 0)
-        if not symbol or side not in ("LONG", "SHORT") or qty <= 0 or cutoff is None:
+        if (not symbol or side not in ("LONG", "SHORT") or qty <= 0 or cutoff is None or
+                (position.get("openTime") is not None and opened is None) or
+                (opened is not None and opened > cutoff)):
             return False
         if any(
             row.get("symbol") == symbol
             and str(row.get("side") or row.get("positionSide") or "").upper() == side
-            and (fnum(row.get("closed")) or 0) > cutoff
-            and (opened is None or (fnum(row.get("opened")) or 0) <= opened)
+            and (interval := closed_interval(row)) is not None and interval[1] > cutoff
+            and (opened is None or interval[0] <= opened)
             for row in closed_rows
         ):
             continue
         closed_qty = Decimal("0")
         added_qty = Decimal("0")
+        intervals = []
         for order in orders:
             if (order.get("symbol", order.get("sym")) != symbol
                     or str(order.get("positionSide", order.get("ps")) or "").upper() != side):
                 continue
-            timestamp = fnum(order.get("orderTime") or order.get("ot") or order.get("time") or order.get("t"))
-            if timestamp is None or timestamp <= cutoff:
+            interval = event_interval(order.get("orderTime", order.get("ot", order.get("time", order.get("t")))),
+                                      order.get("orderUpdateTime", order.get("t")))
+            if interval is None:
+                return False
+            timestamp = interval[0]
+            if timestamp <= cutoff:
                 continue
+            if any(max(timestamp, previous[0]) <= min(interval[1], previous[1]) for previous in intervals):
+                return False
+            intervals.append(interval)
             order_side = str(order.get("side") or "").upper()
             if order_side not in ("BUY", "SELL"):
                 continue
@@ -405,6 +417,9 @@ def positions_have_close_evidence(
 
 def is_authoritative_snapshot(snapshot: Dict[str, Any], now_ms: Optional[int] = None, max_age_ms: int = 30000) -> bool:
     """Only fresh, complete public holdings can authorize orphan cleanup."""
+    from app.services.lead_collector.snapshot_clock import snapshot_times
+    if snapshot_times(snapshot, now_ms, max_age_ms) is None:
+        return False
     meta = snapshot.get("openPositionsMeta") or {}
     if meta.get("partial") is True or (snapshot.get("meta") or {}).get("detailOk") is False:
         return False
@@ -413,7 +428,7 @@ def is_authoritative_snapshot(snapshot: Dict[str, Any], now_ms: Optional[int] = 
     if meta.get("source") != "api" or meta.get("complete") is not True or meta.get("authoritative") is not True or meta.get("positionShow") is not True:
         return False
     observed = meta.get("asOf")
-    if not isinstance(observed, (int, float)) or not math.isfinite(observed):
+    if type(observed) not in (int, float) or not math.isfinite(observed):
         return False
     age = (int(time.time() * 1000) if now_ms is None else now_ms) - observed
     return 0 <= age <= max_age_ms and isinstance(snapshot.get("openPositions"), list)
@@ -421,6 +436,9 @@ def is_authoritative_snapshot(snapshot: Dict[str, Any], now_ms: Optional[int] = 
 
 def is_routable_snapshot(snapshot: Dict[str, Any], now_ms: Optional[int] = None, max_age_ms: int = 30000) -> bool:
     """Allow order following from healthy reconstructed holdings, including hidden positions."""
+    from app.services.lead_collector.snapshot_clock import snapshot_times
+    if snapshot_times(snapshot, now_ms, max_age_ms) is None:
+        return False
     if is_authoritative_snapshot(snapshot, now_ms=now_ms, max_age_ms=max_age_ms):
         return True
     meta = snapshot.get("openPositionsMeta") or {}
@@ -435,12 +453,15 @@ def is_routable_snapshot(snapshot: Dict[str, Any], now_ms: Optional[int] = None,
         return False
     if not isinstance(snapshot.get("openPositions"), list):
         return False
-    observed = meta.get("asOf") or snapshot_meta.get("generatedAt") or snapshot_meta.get("collectionStartedAtMs")
-    if isinstance(observed, (int, float)) and math.isfinite(observed):
-        age = (int(time.time() * 1000) if now_ms is None else now_ms) - observed
-        if not 0 <= age <= max_age_ms:
-            return False
-    return True
+    observed = meta.get("asOf")
+    if observed is None:
+        observed = snapshot_meta.get("generatedAt")
+    if observed is None:
+        observed = snapshot_meta.get("collectionStartedAtMs")
+    if type(observed) not in (int, float) or not math.isfinite(observed):
+        return False
+    age = (int(time.time() * 1000) if now_ms is None else now_ms) - observed
+    return 0 <= age <= max_age_ms
 
 
 def group_orders_into_batches(orders: Sequence[Dict[str, Any]], gap_ms: int = BATCH_GAP_MS) -> List[Dict[str, Any]]:
@@ -1126,7 +1147,7 @@ class BinanceBapiCollector(BaseLeadCollector):
                 holdings = await self.fetch_holdings(portfolio_id, proxy_url=proxy_url)
                 candidate_positions = normalize_holdings(holdings)
                 if not candidate_positions and previous_positions:
-                    close_evidence = positions_have_close_evidence(
+                    close_evidence = previous_observed_ms is not None and positions_have_close_evidence(
                         previous_positions, list(orders_store.values()), closed_rows, previous_observed_ms,
                     )
                     if not close_evidence:

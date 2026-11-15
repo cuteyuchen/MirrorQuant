@@ -381,7 +381,7 @@ class BybitAdapter(BaseExchangeAdapter):
         return {
             "ordId": row.get("orderId"),
             "clOrdId": row.get("orderLinkId"),
-            "accFillSz": float(row.get("cumExecQty") or 0.0),
+            "accFillSz": float(row["cumExecQty"]) if row.get("cumExecQty") not in (None, "") else None,
             "avgPx": float(row.get("avgPrice") or 0.0),
             "state": row.get("orderStatus"),
             "raw": row,
