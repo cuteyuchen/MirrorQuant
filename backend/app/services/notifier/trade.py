@@ -1,11 +1,14 @@
-"""Trade notifications use source fills and allowlisted fields, never free-text names/errors."""
+"""Trade notifications use source fills and allowlisted fields; lead names are
+single-line sanitized, never raw free text or error output."""
 from __future__ import annotations
 
 import math
 import re
-from datetime import timezone
+from datetime import datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, Optional
+
+from app.core.time_util import BEIJING_TZ
 
 # 折算基准本金；与前端仓位测算器的口径一致。
 REFERENCE_CAPITAL = Decimal("1000")
@@ -92,8 +95,74 @@ def _limit_lines(status: str, record, limit: dict) -> tuple[str, list[str]]:
     return ("✅ 限价单已成交" if complete else "⚠️ 限价单部分成交，剩余已撤单"), [f"📌 限价 {px} ｜ {progress}"]
 
 
+_LEAD_PLATFORMS = {"binance_bapi": "币安"}
+
+
+def _lead_header(lead: Any, record) -> str:
+    """带单员身份行：名字只取单行截断后的文本，自由文本不得伪造换行或多行内容。"""
+    name = getattr(lead, "name", None) or getattr(record, "lead_name", None)
+    if not isinstance(name, str):
+        name = "未知带单员"
+    else:
+        name = re.sub(r"[\x00-\x1f\x7f]+", " ", name)
+        name = re.sub(r"\s+", " ", name).strip()[:24] or "未知带单员"
+    platform = getattr(lead, "platform", None)
+    label = _LEAD_PLATFORMS.get(platform) if isinstance(platform, str) else None
+    return f"【{name} · {label}】" if label else f"【{name}】"
+
+
+def _precise_action(side: Any, direction: Any, position: Optional[dict]) -> Optional[str]:
+    """用仓位变化区分新开/加仓与减仓/平仓；缺仓位上下文时返回 None 走模糊口径。"""
+    if not isinstance(position, dict):
+        return None
+    previous = _decimal(position.get("previous_qty"), allow_zero=True)
+    current = _decimal(position.get("current_qty"), allow_zero=True)
+    if previous is None or current is None:
+        return None
+    if _is_opening(side, direction):
+        return "新开仓" if previous <= 0 else "加仓"
+    return "平仓" if current <= 0 else "减仓"
+
+
+def _position_line(position: Optional[dict]) -> Optional[str]:
+    if not isinstance(position, dict):
+        return None
+    previous = _decimal(position.get("previous_qty"), allow_zero=True)
+    current = _decimal(position.get("current_qty"), allow_zero=True)
+    if previous is None or current is None:
+        return None
+    return f"【原仓位】 {format(previous, 'f')} → 【现仓位】 {format(current, 'f')}"
+
+
+def _event_time_line(source: dict) -> Optional[str]:
+    """带单成交的北京时间；事件本身过旧时也如实显示，供判断消息时效。"""
+    try:
+        event_ms = int(source.get("endTime") or source.get("time") or 0)
+        if event_ms <= 0:
+            return None
+        moment = datetime.fromtimestamp(event_ms / 1000, tz=BEIJING_TZ)
+    except (TypeError, ValueError, AttributeError, OverflowError, OSError):
+        return None
+    if not 2020 <= moment.year <= 2100:
+        return None
+    return f"🕐 带单时间 {moment.strftime('%Y/%m/%d %H:%M:%S')}（北京时间）"
+
+
+def _snapshot_line(position: Optional[dict], lead_margin: Any) -> Optional[str]:
+    if not isinstance(position, dict):
+        return None
+    count = position.get("open_count")
+    if type(count) is not int or count < 0:
+        return None
+    line = f"【持仓快照】 当前持仓 {count} 个"
+    if _decimal(lead_margin) is not None:
+        line += f" ｜ 账户保证金 {_money(lead_margin)}"
+    return line
+
+
 def trade_message(record, account, source: Optional[dict] = None, lead_margin: Any = None,
-                  limit: Optional[dict] = None) -> str:
+                  limit: Optional[dict] = None, lead: Any = None,
+                  position: Optional[dict] = None) -> str:
     """One durable message per account outcome, with the independent lead leg first.
 
     Follower close/guard actions cannot establish the lead's action. A source
@@ -110,7 +179,8 @@ def trade_message(record, account, source: Optional[dict] = None, lead_margin: A
         # maxQty is peak inventory, not a confirmed independent closing fill.
     elif source:
         symbol, direction, side = source.get("symbol"), source.get("positionSide"), source.get("side")
-        action = _lead_action(side, direction)
+        precise = _precise_action(side, direction, position)
+        action = precise if precise is not None else _lead_action(side, direction)
         opening = _is_opening(side, direction)
         price = source.get("avgPrice")
         qty = source.get("qtyExact", source.get("qty"))
@@ -123,12 +193,20 @@ def trade_message(record, account, source: Optional[dict] = None, lead_margin: A
         opening = action != "未知" and _is_opening(record.side, direction)
         if action == "未知":
             symbol, direction, price, qty, notional = None, None, None, None, None
-    # 第一行就是结论：图标 + 动作 + 币种 + 多空。
+        elif position is not None:
+            precise = _precise_action(record.side, direction, position)
+            if precise is not None:
+                action = precise
+    # 第一行是带单员身份，第二行就是结论：图标 + 动作 + 币种 + 多空。
     icon, direction_text = {"LONG": ("🟢", "做多"), "SHORT": ("🔴", "做空")}.get(direction, ("❔", "方向未知"))
     lines = [
-        f"{icon} 带单 {action} ｜ {_symbol(symbol)} ｜ {direction_text}",
-        f"💰 均价 {_number(price)} ｜ 数量 {_number(qty)} ｜ 金额 {_money(notional)}",
+        _lead_header(lead, record),
+        f"{icon} {action} ｜ {_symbol(symbol)} 永续 ｜ {direction_text}",
+        f"💰 本次均价 {_number(price)} ｜ 数量 {_number(qty)} ｜ 金额 {_money(notional)}",
     ]
+    position_line = _position_line(position)
+    if position_line:
+        lines.append(position_line)
     # 折算仓位只对开仓/加仓有意义，平仓不给“建议杠杆”。
     reference = _reference_line(notional, lead_margin) if opening else None
     if reference:
@@ -136,6 +214,12 @@ def trade_message(record, account, source: Optional[dict] = None, lead_margin: A
     latency = _latency_line(source, record)
     if latency:
         lines.append(latency)
+    event_time = _event_time_line(source)
+    if event_time:
+        lines.append(event_time)
+    snapshot = _snapshot_line(position, lead_margin)
+    if snapshot:
+        lines.append(snapshot)
     lead = "\n".join(lines)
 
     exchange = {"okx": "欧易", "binance": "Binance", "bybit": "Bybit", "bitget": "Bitget"}.get(

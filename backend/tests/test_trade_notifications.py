@@ -1,5 +1,6 @@
 """Source-first messages and DingTalk receipts, entirely synthetic and offline."""
 import json
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -12,6 +13,7 @@ from app.models.domain import BindingDelivery, ExecutionRecord, NotificationOutb
 from app.services.notifier.outbox import NotificationOutboxDrainer
 from app.services.notifier.service import NotificationService
 from app.services.notifier.trade import trade_message
+from app.services.engine.router import lead_position_context
 from test_notification_outbox import configure_sink, record_execution
 from test_routing_deliveries import make_workflow, order, route
 from test_auto_follow_hidden_positions import fixed_clock, hidden_snapshot, opening_order, workflow
@@ -26,8 +28,8 @@ def message_record():
 
 
 @pytest.mark.parametrize("side,direction,label", [
-    ("BUY", "LONG", "🟢 带单 开多/加多"), ("SELL", "SHORT", "🔴 带单 开空/加空"),
-    ("SELL", "LONG", "🟢 带单 平多/减多"), ("BUY", "SHORT", "🔴 带单 平空/减空"),
+    ("BUY", "LONG", "🟢 开多/加多"), ("SELL", "SHORT", "🔴 开空/加空"),
+    ("SELL", "LONG", "🟢 平多/减多"), ("BUY", "SHORT", "🔴 平空/减空"),
 ])
 def test_independent_lead_leg_precedes_different_follower_fill(side, direction, label):
     rec = message_record()
@@ -84,7 +86,7 @@ def test_unknown_lead_values_and_autonomous_follower_exit_are_not_fabricated():
     rec = message_record()
     rec.action, rec.lead_qty, rec.lead_price, rec.lead_notional = "TP_CLOSE", 0, 0, 0
     msg = trade_message(rec, SimpleNamespace(exchange="okx", environment="live"))
-    assert "带单 未知" in msg
+    assert "❔ 未知 ｜ 未知 永续 ｜ 方向未知" in msg
     assert "均价 未知 ｜ 数量 未知 ｜ 金额 未知" in msg
     header, follower = msg.split("\n\n")
     assert "BTCUSDT" not in header and "方向未知" in header and "1000U" not in header
@@ -152,7 +154,8 @@ async def test_fanout_keeps_source_identity_and_does_not_duplicate_messages(monk
         assert len((await db.scalars(select(ExecutionRecord))).all()) == 3 * independent_fills
         assert all(d.state == "APPLIED" for d in (await db.scalars(select(BindingDelivery))).all())
         headers = [json.loads(r.payload)["message"].split("\n\n")[0] for r in rows]
-        assert len(set(headers)) == 1 and "开多/加多" in headers[0] and "BTCUSDT" in headers[0]
+        assert len(set(headers)) == 1 and "加仓" in headers[0] and "BTCUSDT" in headers[0]
+        assert "【原仓位】 9.9 → 【现仓位】 10" in headers[0]
         assert "数量 0.1 ｜ 金额 10.00 U" in headers[0]
         assert [json.loads(r.payload)["event_type"] for r in rows] == [o for o in outcomes for _ in range(independent_fills)]
 
@@ -180,7 +183,7 @@ async def test_actual_filled_unfilled_and_risk_paths_keep_terminal_states(workfl
     rows = (await t.db.scalars(select(NotificationOutbox))).all()
     assert len(rows) == 1
     msg = json.loads(rows[0].payload)["message"]
-    assert "开多/加多" in msg and "均价 100 ｜ 数量 1 ｜ 金额 100.00 U" in msg
+    assert "新开仓" in msg and "均价 100 ｜ 数量 1 ｜ 金额 100.00 U" in msg
     assert ("✅" in msg) is (outcome == "EXECUTED")
     assert all(d.state == "APPLIED" for d in (await t.db.scalars(select(BindingDelivery))).all())
     if outcome.startswith(("BLOCKED", "SKIPPED")):
@@ -314,3 +317,78 @@ async def test_wecom_reports_the_platform_receipt_code(monkeypatch):
         "wecom_webhook_url": "https://example.test/wecom"}, "MirrorQuant", "synthetic")
     assert result["wecom"] == {"ok": False, "status": 200, "errcode": 93000}
     assert "synthetic-sensitive-marker" not in json.dumps(result)
+
+
+
+def test_lead_header_and_precise_action_use_position_context():
+    rec = message_record()
+    rec.lead_name = "熬鹰资本"
+    source = dict(symbol="NVDAUSDT", side="BUY", positionSide="LONG", qtyExact="604.12",
+                  avgPrice="160.51", notionalExact="96967.00", endTime=1794843319000)
+    lead = SimpleNamespace(name="熬鹰资本", platform="binance_bapi")
+    position = {"previous_qty": Decimal("3803.17"), "current_qty": Decimal("4407.29"), "open_count": 1}
+    msg = trade_message(rec, SimpleNamespace(exchange="binance", environment="live"), source,
+                        355911.79, lead=lead, position=position)
+    assert msg.split("\n")[0] == "【熬鹰资本 · 币安】"
+    assert "🟢 加仓 ｜ NVDAUSDT 永续 ｜ 做多" in msg
+    assert "【原仓位】 3803.17 → 【现仓位】 4407.29" in msg
+    assert "🕐 带单时间 2026/11/16 23:35:19（北京时间）" in msg
+    assert "【持仓快照】 当前持仓 1 个 ｜ 账户保证金 355,911.79 U" in msg
+
+
+@pytest.mark.parametrize("previous,current,side,direction,expected", [
+    (0, 604.12, "BUY", "LONG", "新开仓"),
+    (3803.17, 4407.29, "BUY", "LONG", "加仓"),
+    (4407.29, 3803.17, "SELL", "LONG", "减仓"),
+    (604.12, 0, "SELL", "LONG", "平仓"),
+    (0, 10, "SELL", "SHORT", "新开仓"),
+    (10, 0, "BUY", "SHORT", "平仓"),
+])
+def test_precise_action_labels(previous, current, side, direction, expected):
+    source = dict(symbol="NVDAUSDT", side=side, positionSide=direction, qtyExact="1",
+                  avgPrice="100", notionalExact="100")
+    position = {"previous_qty": previous, "current_qty": current, "open_count": 1}
+    msg = trade_message(message_record(), SimpleNamespace(exchange="binance", environment="live"),
+                        source, position=position)
+    assert expected in msg.split("\n")[1]
+
+
+def test_lead_name_is_sanitized_to_a_single_line():
+    lead = SimpleNamespace(name="evil\n【伪造】\x00lead-name-that-is-way-too-long-to-show", platform="unknown_platform")
+    msg = trade_message(message_record(), SimpleNamespace(exchange="binance", environment="live"),
+                        dict(symbol="BTCUSDT", side="BUY", positionSide="LONG", qtyExact="1",
+                             avgPrice="100", notionalExact="100"), lead=lead)
+    header = msg.split("\n")[0]
+    assert "\n" not in header and "\x00" not in header
+    assert header.startswith("【") and header.endswith("】")
+    assert "币安" not in header
+    assert len(header) <= 26
+
+
+def test_lead_position_context_recovers_inventory_from_snapshot():
+    payload = {"symbol": "NVDAUSDT", "positionSide": "LONG", "side": "BUY", "qtyExact": "604.12"}
+    snapshot = {"openPositions": [
+        {"symbol": "NVDAUSDT", "positionSide": "LONG", "qtyExact": "4407.29"},
+        {"symbol": "BTCUSDT", "positionSide": "SHORT", "qtyExact": "0.5"},
+    ]}
+    db = SimpleNamespace(info={"delivery": SimpleNamespace(payload_json=json.dumps(payload)),
+                               "snapshot_admission": (None, snapshot)})
+    context = lead_position_context(db)
+    assert context == {"previous_qty": Decimal("3803.17"), "current_qty": Decimal("4407.29"), "open_count": 2}
+
+
+def test_lead_position_context_close_and_guards():
+    payload = {"symbol": "NVDAUSDT", "positionSide": "LONG", "side": "SELL", "qtyExact": "604.12"}
+    snapshot = {"openPositions": [{"symbol": "NVDAUSDT", "positionSide": "LONG", "qtyExact": "3803.17"}]}
+    db = SimpleNamespace(info={"delivery": SimpleNamespace(payload_json=json.dumps(payload)),
+                               "snapshot_admission": (None, snapshot)})
+    context = lead_position_context(db)
+    assert context["previous_qty"] == Decimal("4407.29") and context["current_qty"] == Decimal("3803.17")
+    closed = SimpleNamespace(info={"delivery": SimpleNamespace(payload_json=json.dumps({"_closed": payload})),
+                                   "snapshot_admission": (None, snapshot)})
+    assert lead_position_context(closed) is None
+    assert lead_position_context(SimpleNamespace(info={})) is None
+    open_payload = {"symbol": "NVDAUSDT", "positionSide": "LONG", "side": "BUY", "qtyExact": "604.12"}
+    empty = SimpleNamespace(info={"delivery": SimpleNamespace(payload_json=json.dumps(open_payload)),
+                                  "snapshot_admission": (None, {"openPositions": []})})
+    assert lead_position_context(empty) is None

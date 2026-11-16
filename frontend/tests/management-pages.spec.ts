@@ -108,6 +108,14 @@ describe("通知渠道", () => {
     expect(summary().text()).toContain(useI18n().t("common.enable"));
     expect(summary().text()).not.toContain(useI18n().t("state.UNKNOWN"));
   });
+  it("明确停用的渠道不展示配置项与测试按钮", () => {
+    const notification = { ...structuredClone(mockSettings.notifications!), webhook_enabled: false };
+    wrapper = mount(NotificationSettingsPanel, { props: { modelValue: notification, errors: {}, dirty: false } });
+    const first = wrapper.findAll("details")[0];
+    expect(first.find('input[name="notifications.webhook_url"]').exists()).toBe(false);
+    expect(first.find("button").exists()).toBe(false);
+    expect(first.find('input[type="checkbox"]').exists()).toBe(true);
+  });
 });
 
 describe("代理列表", () => {

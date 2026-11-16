@@ -4,6 +4,8 @@ Failed rows are retained as the dead-letter queue (status='failed'). Payloads
 contain no sink credentials: destinations are resolved from current notification
 settings at delivery time. Successfully delivered channels are not retried.
 A crash after delivery but before acknowledgement can still duplicate a message.
+Rows older than the configured TTL are expired without delivery, so a restart
+never flushes stale notifications that accumulated while delivery was down.
 """
 from __future__ import annotations
 
@@ -55,10 +57,12 @@ async def _acknowledge_execution(db, payload, status: str) -> None:
 
 
 class NotificationOutboxDrainer:
-    def __init__(self, max_attempts: Optional[int] = None, poll_interval: Optional[float] = None):
+    def __init__(self, max_attempts: Optional[int] = None, poll_interval: Optional[float] = None,
+                 ttl_sec: Optional[float] = None):
         settings = get_settings()
         self.max_attempts = max_attempts if max_attempts is not None else settings.notification_outbox_max_attempts
         self.poll_interval = poll_interval if poll_interval is not None else settings.notification_outbox_poll_sec
+        self.ttl_sec = ttl_sec if ttl_sec is not None else settings.notification_ttl_sec
         self._task: Optional[asyncio.Task] = None
         self._stopping = asyncio.Event()
         self._lock = asyncio.Lock()
@@ -101,6 +105,18 @@ class NotificationOutboxDrainer:
             if not ignore_backoff:
                 conditions.append(or_(NotificationOutbox.next_attempt_at.is_(None), NotificationOutbox.next_attempt_at <= now))
             async with get_session_factory()() as db:
+                # 过期消息直接作废：先于耗尽判断，让旧行的终态原因说清是过期而非投递失败。
+                expired = await db.execute(update(NotificationOutbox).where(
+                    NotificationOutbox.status == "pending", available,
+                    NotificationOutbox.created_at < now - timedelta(seconds=self.ttl_sec),
+                ).values(status="failed", last_error="Notification expired before delivery", claimed_until=None)
+                    .returning(NotificationOutbox.payload))
+                for payload_text in expired.scalars().all():
+                    try:
+                        payload = json.loads(payload_text)
+                    except (ValueError, TypeError):
+                        continue
+                    await _acknowledge_execution(db, payload, "failed")
                 exhausted = await db.execute(update(NotificationOutbox).where(
                     NotificationOutbox.status == "pending", available,
                     NotificationOutbox.attempts >= self.max_attempts,

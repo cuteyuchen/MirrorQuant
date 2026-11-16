@@ -1,0 +1,27 @@
+# 交易服务器生产部署：系统 nginx 终止 TLS 并把根路径代理到 127.0.0.1:8120。
+# host 网络保留客户端真实 IP，与 systemd 时代的网络行为一致；不启用 compose 自带的 nginx。
+# 数据目录与环境文件沿用 systemd 时代的路径；容器以数据目录属主的 UID:GID 运行
+# （交易服务器上 ubuntu 用户为 1000:1001；换机器部署时按数据目录属主调整）。
+services:
+  mirrorquant:
+    image: ghcr.io/cuteyuchen/mirrorquant:1.1.0
+    container_name: mirrorquant-app
+    restart: unless-stopped
+    network_mode: host
+    user: "1000:1001"
+    env_file:
+      - /etc/mirrorquant/mirrorquant.env
+    volumes:
+      - /srv/apps/mirrorquant/data:/srv/apps/mirrorquant/data
+    command: ["uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8120", "--proxy-headers", "--forwarded-allow-ips=127.0.0.1"]
+    stop_grace_period: 70s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8120/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

@@ -9,7 +9,7 @@ import math
 import time
 import hashlib
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_UP
+from decimal import Decimal, InvalidOperation, ROUND_UP
 from typing import Any, Callable, Coroutine, Dict, List, Optional
 
 from sqlalchemy import func, or_, select
@@ -83,6 +83,57 @@ class SourceExitUnproven(UnknownOrderOutcome):
 
 
 TERMINAL_STATES = {"filled", "canceled", "rejected", "expired"}
+
+
+def lead_position_context(db) -> Optional[Dict[str, Any]]:
+    """Recover pre/post lead inventory for a notification from the current delivery scope.
+
+    Everything comes from the delivery payload (the independent source fill),
+    never from the follower-mapped record fields: a mapped follower close must
+    not rewrite the lead's opening action. The admitted snapshot holds
+    post-event holdings; pre-event inventory is recovered arithmetically from
+    the source fill quantity. Returns None outside a delivery scope, for
+    historical closes, for fills without a positive quantity, or on any
+    inconsistent input, so callers always fall back to the leg-only labels.
+    """
+    delivery = db.info.get("delivery")
+    admission = db.info.get("snapshot_admission")
+    if delivery is None or admission is None:
+        return None
+    try:
+        payload = json.loads(delivery.payload_json)
+        if not isinstance(payload, dict) or "_closed" in payload:
+            return None
+        symbol = payload.get("symbol")
+        position_side = payload.get("positionSide")
+        side = payload.get("side")
+        if side not in ("BUY", "SELL") or position_side not in ("LONG", "SHORT"):
+            return None
+        qty = exact(payload.get("qtyExact", payload.get("qty")) or 0)
+        if qty <= 0:
+            return None
+        snapshot = admission[1]
+        if not isinstance(snapshot, dict):
+            return None
+        leg = f"{symbol}_{position_side}"
+        current = None
+        open_count = 0
+        for position in snapshot.get("openPositions") or []:
+            if not isinstance(position, dict):
+                continue
+            amount = exact(position.get("qtyExact", position.get("qty")) or 0)
+            if amount > 0:
+                open_count += 1
+            if f"{position.get('symbol')}_{position.get('positionSide')}" == leg:
+                current = amount
+        if current is None:
+            current = Decimal("0")
+        previous = current - qty if is_open_leg(side, position_side) else current + qty
+        if previous < 0 or current < 0:
+            return None
+        return {"previous_qty": previous, "current_qty": current, "open_count": open_count}
+    except (ValueError, TypeError, KeyError, AttributeError, InvalidOperation):
+        return None
 
 
 class CopyRouter:
@@ -866,7 +917,8 @@ class CopyRouter:
                     # 带单员保证金余额用于把本笔折算到 1000U 本金。
                     source_lead = await db.get(LeadSource, record.lead_id)
                     outbox = enqueue_notification(db, config, "MirrorQuant",
-                        trade_message(record, account, source, getattr(source_lead, "margin_balance", None)),
+                        trade_message(record, account, source, getattr(source_lead, "margin_balance", None),
+                                      lead=source_lead),
                         event_type=record.status, execution_id=record.id, event_key=f"execution:{record.id}")
                     outboxes.append(outbox)
                     record.notification_state = "pending"
@@ -993,7 +1045,8 @@ class CopyRouter:
             )
             if should_notify:
                 source = json.loads(delivery.payload_json) if delivery is not None else None
-                msg = trade_message(rec, account, source, getattr(lead, "margin_balance", None), limit=limit)
+                msg = trade_message(rec, account, source, getattr(lead, "margin_balance", None), limit=limit,
+                                    lead=lead, position=lead_position_context(db))
                 event_key = f"execution:{rec.id}"
                 enqueue_notification(db, notify_cfg, "MirrorQuant", msg, event_type=status,
                                      execution_id=rec.id, event_key=event_key)

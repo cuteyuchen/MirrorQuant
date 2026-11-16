@@ -29,6 +29,11 @@ function update<K extends keyof NotificationSettings>(key: K, value: Notificatio
 function configured(channel: typeof channels[number]) {
   return channel.fields.every(field => field.optional || !!props.modelValue[field.key] || props.modelValue[`${field.key}_configured` as keyof NotificationSettings] === true);
 }
+function showFields(channel: typeof channels[number]) {
+  // 明确停用时不展示配置项；状态未知时照常展示，有字段报错时强制展示，避免报错无处可看。
+  return props.modelValue[channel.enabled] !== false
+    || channel.fields.some(field => !!props.errors[`notifications.${field.key}`]);
+}
 async function test() {
   // 后端当前会测试所有已保存且启用的渠道，各卡片展示各自的真实结果。
   const response = await run(() => api.post<NotificationTestResponse>("/api/settings/test-notify"), { success: false });
@@ -49,6 +54,7 @@ async function test() {
       <div class="mt-4 space-y-4">
         <label class="flex min-h-11 items-center gap-3"><input type="checkbox" :checked="modelValue[channel.enabled] === true" @change="update(channel.enabled, ($event.target as HTMLInputElement).checked as never)" />{{ t("set.enableChannel") }}</label>
         <p v-if="errors[`notifications.${channel.enabled}`]" class="field-error">{{ errors[`notifications.${channel.enabled}`] }}</p>
+        <div v-if="showFields(channel)" class="space-y-4">
         <p class="text-xs leading-relaxed text-muted">{{ t(channel.hint) }}</p>
         <label v-for="field in channel.fields" :key="field.key" class="field-label">{{ t(field.label) }} <span v-if="modelValue[channel.enabled] && !field.optional" aria-hidden="true">*</span>
           <input :value="(modelValue[field.key] as string | null | undefined) ?? ''" :name="`notifications.${field.key}`" :type="field.key.includes('url') || field.key.includes('token') || field.key.includes('secret') ? 'password' : 'text'" class="form-input mt-1" autocomplete="off" :aria-invalid="!!errors[`notifications.${field.key}`]" @input="update(field.key, ($event.target as HTMLInputElement).value as never)" />
@@ -63,6 +69,7 @@ async function test() {
           <!-- 平台回执码（钉钉 310000 多为关键词/加签不匹配）直接显示，便于对照排查。 -->
           <span v-if="results[channel.id]?.errcode"> · {{ t("set.errcode", { n: results[channel.id]!.errcode! }) }}</span>
         </p>
+        </div>
       </div>
     </details>
   </section>

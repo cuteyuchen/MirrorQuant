@@ -113,6 +113,14 @@ docker compose up -d --build
 
 ---
 
+## Release / 发布流程
+
+- The version number lives in the repo-root `VERSION` file; `backend/pyproject.toml` and `frontend/package.json` must carry the same number (CI checks this). 版本号以仓库根目录的 `VERSION` 文件为准，`backend/pyproject.toml` 与 `frontend/package.json` 须与之保持一致（CI 会校验）。
+- Release: bump all three version numbers, push to `main` (or tag `vX.Y.Z`); GitHub Actions builds the image with `VITE_BASE_PATH=/` and pushes it to `ghcr.io/cuteyuchen/mirrorquant:<version>`.
+- Production server update: change the image tag in `docker-compose.prod.yml`, then `docker compose -f docker-compose.prod.yml pull && docker compose -f docker-compose.prod.yml up -d`. The systemd unit is kept as the rollback path.
+
+---
+
 ## Local Development / 本地开发运行
 
 ### Backend (Linux, Python 3.12+)

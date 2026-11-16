@@ -1,6 +1,10 @@
 # Stage 1: Build Vue 3 Frontend
 FROM node:22-alpine AS frontend-builder
 WORKDIR /build/frontend
+# 根路径部署的构建产物：VITE_BASE_PATH 由 CI 传入 /；本地 compose 默认 /mq/。
+ARG VITE_BASE_PATH=/mq/
+ENV VITE_BASE_PATH=$VITE_BASE_PATH
+COPY VERSION /build/VERSION
 COPY frontend/package*.json ./
 RUN npm ci --no-audit --no-fund
 COPY frontend/ ./
@@ -24,6 +28,7 @@ COPY backend/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY backend/ ./
+COPY VERSION /app/VERSION
 COPY --from=frontend-builder /build/frontend/dist ./static
 
 # 固定低权限 UID，宿主机绑定目录需授予该 UID 写权限。

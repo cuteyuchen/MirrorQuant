@@ -15,10 +15,26 @@ const switches = computed(() => (Object.keys(RISK_SWITCHES) as (keyof typeof RIS
   .filter(key => props.section === "all" || (props.section === "risk" ? ["enable_circuit_breaker", "enable_leverage_cap"].includes(key) :
     props.section === "protection" && ["enable_stop_loss", "enable_take_profit", "enable_trailing_stop"].includes(key))));
 const numbers = computed(() => props.section === "all" ? Object.keys(RISK_RULES) as (keyof typeof RISK_RULES)[] : RISK_FIELD_GROUPS[props.section]);
+// 明确停用的功能不展示其参数；状态未知时照常展示，有报错的字段强制展示，避免报错无处可看。
+const GATED_NUMBERS: Partial<Record<keyof typeof RISK_RULES, (value: RiskSettings) => boolean>> = {
+  max_total_leverage: value => value.enable_leverage_cap !== false,
+  max_single_leverage: value => value.enable_leverage_cap !== false,
+  max_instrument_leverage: value => value.enable_leverage_cap !== false,
+  max_drawdown_pct: value => value.enable_circuit_breaker !== false,
+  daily_max_loss_pct: value => value.enable_circuit_breaker !== false,
+  stop_loss_pct: value => value.enable_stop_loss !== false,
+  take_profit_pct: value => value.enable_take_profit !== false,
+  trailing_callback_pct: value => value.enable_trailing_stop !== false,
+  limit_order_ttl_sec: value => value.slippage_action !== "block",
+};
+const visibleNumbers = computed(() => numbers.value.filter(key => {
+  const gate = GATED_NUMBERS[key];
+  if (!gate) return true;
+  if (gate(props.modelValue)) return true;
+  return !!props.errors?.[`${props.prefix}${key}`];
+}));
 function changed(key: keyof RiskSettings) { return !!props.defaults && props.modelValue[key] !== props.defaults[key]; }
 function locked(key: keyof RiskSettings) {
-  // 限价单有效期只在“改挂限价单”时生效，拦截模式下置灰避免误解。
-  if (key === "limit_order_ttl_sec" && props.modelValue.slippage_action !== "limit") return true;
   return props.disabledFields?.includes(key) === true;
 }
 // 此处仅编辑草稿；调用方保存前统一确认所有保护项的减弱。
@@ -61,7 +77,7 @@ function update<K extends keyof RiskSettings>(key: K, value: RiskSettings[K]) {
           </select>
         </label><p class="mt-1 text-xs text-muted">{{ t("riskHelp.tp_sl_mode") }}</p><p v-if="errors?.[`${prefix}tp_sl_mode`]" class="field-error" role="alert">{{ errors[`${prefix}tp_sl_mode`] }}</p>
       </div>
-      <NumberField v-for="key in numbers" :key="key" :name="`${prefix}${key}`" :model-value="modelValue[key]" :rule="RISK_RULES[key]" :error="errors?.[`${prefix}${key}`]" :changed="changed(key)" :disabled="locked(key)" @update:model-value="update(key, $event)" />
+      <NumberField v-for="key in visibleNumbers" :key="key" :name="`${prefix}${key}`" :model-value="modelValue[key]" :rule="RISK_RULES[key]" :error="errors?.[`${prefix}${key}`]" :changed="changed(key)" :disabled="locked(key)" @update:model-value="update(key, $event)" />
     </div>
   </div>
 </template>

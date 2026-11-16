@@ -99,11 +99,23 @@ describe("绑定状态与页面摘要", () => {
     page.unmount();
   });
   it("仅有敞口限制的保护项锁定，倍率和普通风控仍可编辑", () => {
-    const fields = mount(RiskPolicyFields, { props: { modelValue: DEFAULT_RISK, defaults: DEFAULT_RISK, disabledFields: FLAT_REQUIRED_RISK_FIELDS } });
+    const enabled = { ...DEFAULT_RISK, enable_stop_loss: true, enable_take_profit: true, enable_trailing_stop: true };
+    const fields = mount(RiskPolicyFields, { props: { modelValue: enabled, defaults: DEFAULT_RISK, disabledFields: FLAT_REQUIRED_RISK_FIELDS } });
     expect(fields.get('select[name="tp_sl_mode"]').attributes("disabled")).toBeDefined();
     expect(fields.get('input[name="stop_loss_pct"]').attributes("disabled")).toBeDefined();
     expect(fields.get('input[name="max_drawdown_pct"]').attributes("disabled")).toBeUndefined();
     expect(fields.get('select[name="order_mode"]').attributes("disabled")).toBeUndefined();
+    fields.unmount();
+  });
+  it("明确停用的功能不展示其参数，熔断与硬止损等无开关项照常展示", () => {
+    const fields = mount(RiskPolicyFields, { props: { modelValue: DEFAULT_RISK, defaults: DEFAULT_RISK } });
+    expect(fields.find('input[name="stop_loss_pct"]').exists()).toBe(false);
+    expect(fields.find('input[name="take_profit_pct"]').exists()).toBe(false);
+    expect(fields.find('input[name="trailing_callback_pct"]').exists()).toBe(false);
+    expect(fields.find('input[name="max_total_leverage"]').exists()).toBe(false);
+    expect(fields.find('input[name="limit_order_ttl_sec"]').exists()).toBe(false);
+    expect(fields.find('input[name="max_drawdown_pct"]').exists()).toBe(true);
+    expect(fields.find('input[name="hard_stop_loss_pct"]').exists()).toBe(true);
     fields.unmount();
   });
 });

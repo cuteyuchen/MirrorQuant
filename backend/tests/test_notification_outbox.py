@@ -304,3 +304,40 @@ async def test_jsonl_sink_runs_file_io_off_event_loop(tmp_path, monkeypatch):
     assert result["outbox"]["ok"] is True
     assert worker_threads and worker_threads[0] != loop_thread
     assert json.loads(path.read_text())["text"] == "body"
+
+
+@pytest.mark.asyncio
+async def test_expired_pending_rows_are_failed_without_delivery(monkeypatch):
+    dispatch = AsyncMock(return_value={"webhook": {"ok": True}})
+    monkeypatch.setattr(NotificationService, "dispatch", dispatch)
+    async with get_session_factory()() as db:
+        await configure_sink(db)
+        row = enqueue_notification(db, {"webhook_enabled": True}, "stale", "body")
+        row.created_at = datetime.now(timezone.utc) - timedelta(seconds=3700)
+        await db.commit()
+        row_id = row.id
+    assert await NotificationOutboxDrainer().drain_once() == 0
+    async with get_session_factory()() as db:
+        row = await db.get(NotificationOutbox, row_id)
+        assert row.status == "failed" and row.last_error == "Notification expired before delivery"
+    dispatch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_expired_execution_notification_updates_receipt(monkeypatch):
+    dispatch = AsyncMock()
+    monkeypatch.setattr(NotificationService, "dispatch", dispatch)
+    async with get_session_factory()() as db:
+        router, binding, lead, account = await record_execution(db)
+        execution = await router._record_execution(db, binding, lead, account,
+            "BTCUSDT", "BTC-USDT-SWAP", "BUY", "LONG", "OPEN_LONG", "EXECUTED",
+            1, 100, 100, notify_cfg={"webhook_enabled": True})
+        row = await db.scalar(select(NotificationOutbox))
+        row.created_at = datetime.now(timezone.utc) - timedelta(seconds=3700)
+        await db.commit()
+        execution_id, row_id = execution.id, row.id
+    assert await NotificationOutboxDrainer().drain_once() == 0
+    async with get_session_factory()() as db:
+        assert (await db.get(NotificationOutbox, row_id)).status == "failed"
+        assert (await db.get(ExecutionRecord, execution_id)).notification_state == "failed"
+    dispatch.assert_not_awaited()

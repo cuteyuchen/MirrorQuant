@@ -21,6 +21,7 @@ const cache = useDataCacheStore();
 const route = useRoute();
 const router = useRouter();
 const { t } = useI18n();
+const appVersion = __APP_VERSION__;
 const moreOpen = ref(false);
 const loggingOut = ref(false);
 const intentsError = ref(false);
@@ -86,7 +87,7 @@ async function logout() {
           <span class="brand-mark"><Activity :size="19" aria-hidden="true" /></span>
           <span class="min-w-0">
             <span class="block text-base font-bold leading-tight tracking-tight">{{ t("app.name") }}</span>
-            <span class="block text-xs text-faint">{{ t("app.brandSub") }}</span>
+            <span class="block text-xs text-faint">{{ t("app.brandSub") }} · v{{ appVersion }}</span>
           </span>
         </RouterLink>
         <nav :aria-label="t('nav.main')" class="flex-1 space-y-5 overflow-y-auto px-3 py-2">
@@ -120,7 +121,7 @@ async function logout() {
         <header v-if="showShell" class="flex items-center justify-between gap-2 border-b border-border/60 bg-surface/80 px-3 py-1.5 md:hidden">
           <RouterLink to="/dashboard" class="flex min-w-0 items-center gap-2.5">
             <span class="brand-mark"><Activity :size="18" aria-hidden="true" /></span>
-            <span class="truncate text-base font-bold tracking-tight">{{ t("app.name") }}</span>
+            <span class="truncate text-base font-bold tracking-tight">{{ t("app.name") }} <span class="text-xs font-normal text-faint">v{{ appVersion }}</span></span>
           </RouterLink>
           <div class="flex shrink-0 items-center">
             <ThemeToggle /><LangToggle />

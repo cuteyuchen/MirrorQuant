@@ -95,6 +95,7 @@ class Settings(BaseSettings):
     readiness_db_timeout_sec: float = Field(default=2.0, gt=0, le=30, allow_inf_nan=False)
     notification_outbox_max_attempts: int = Field(default=8, ge=1, le=20)  # 默认退避覆盖十五分钟以上。
     notification_outbox_poll_sec: float = Field(default=1.0, gt=0, le=60, allow_inf_nan=False)
+    notification_ttl_sec: int = Field(default=1800, ge=60, le=86400)  # 超过此时长仍未投递的通知直接作废，不再补发。
     default_lead_poll_sec: int = 15
     lead_snapshot_stale_sec: float = Field(default=300.0, gt=0, allow_inf_nan=False)
     lead_sync_failure_limit: int = Field(default=3, ge=1)

@@ -15,6 +15,7 @@ from sqlalchemy import select, text
 from app.api import accounts, auth, bindings, dashboard, leads, proxies, settings as settings_api, ws
 from app.core.config import get_settings
 from app.core.database import get_session_factory, init_db
+from app.core.version import get_app_version
 from app.core.security import CredentialVault
 from app.models.domain import LeadSource, TradingAccount, User
 from app.services.lead_collector.freshness import lead_freshness
@@ -71,7 +72,7 @@ async def lifespan(_app: FastAPI):
 def create_app() -> FastAPI:
     app = FastAPI(
         title="MirrorQuant",
-        version="1.0.0",
+        version=get_app_version(),
         description="Open-source multi-lead copy-trading & quantitative monitoring platform",
         lifespan=lifespan,
     )
@@ -86,8 +87,12 @@ def create_app() -> FastAPI:
 
     @app.middleware("http")
     async def strip_mq_prefix(request, call_next):
-        if request.url.path.startswith("/mq/api/"):
-            request.scope["path"] = request.url.path[3:]  # strip /mq
+        # 兼容 /mq 前缀部署：API、静态资源、WebSocket 与深链接统一去掉前缀后路由。
+        path = request.url.path
+        if path == "/mq":
+            request.scope["path"] = "/"
+        elif path.startswith("/mq/"):
+            request.scope["path"] = path[3:]  # strip /mq
         return await call_next(request)
 
     app.include_router(auth.router)
@@ -102,7 +107,7 @@ def create_app() -> FastAPI:
     @app.get("/api/health")
     async def health():
         """Process liveness only; dependency health is reported by /api/ready."""
-        return {"status": "ok", "app": settings.app_name, "version": "1.0.0"}
+        return {"status": "ok", "app": settings.app_name, "version": get_app_version()}
 
     @app.get("/api/ready")
     async def ready():
@@ -150,7 +155,8 @@ def create_app() -> FastAPI:
                 raise HTTPException(status_code=404, detail="Not found")
             if full_path and candidate.is_file():
                 return FileResponse(str(candidate))
-            return FileResponse(str(root / "index.html"))
+            # 首页不缓存：新版本发布后，已缓存的旧首页不会继续引用已替换的构建产物。
+            return FileResponse(str(root / "index.html"), headers={"Cache-Control": "no-cache"})
 
     return app
 
