@@ -23,6 +23,8 @@ os.environ["MQ_BOOTSTRAP_TOKEN"] = "TestBootstrapAuthorizationSecretForSetupOnly
 
 from app.core.database import get_db, init_db, reset_db_engine
 from app.main import app
+from app.services.adapters.factory import close_exchange_adapters
+from app.services.lead_collector.binance_bapi import BinanceBapiCollector
 
 
 class _OfflineSelector(selectors.DefaultSelector):
@@ -46,9 +48,14 @@ def event_loop_policy():
 
 @pytest.fixture(autouse=True)
 async def setup_test_db():
+    # 进程级元数据与连接池不跨测试共享。
+    await close_exchange_adapters()
+    await BinanceBapiCollector.close_clients()
     await reset_db_engine()
     await init_db()
     yield
+    await close_exchange_adapters()
+    await BinanceBapiCollector.close_clients()
     await reset_db_engine()
 
 

@@ -1,0 +1,25 @@
+# 构建上下文不包含密钥、数据库、依赖缓存和开发测试。
+.git
+.codegraph
+.env
+.env.*
+!.env.example
+.venv
+**/.venv
+venv
+**/venv
+data
+**/data
+tests
+**/tests
+node_modules
+**/node_modules
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+**/*.pyc
+**/dist
+backend/static
+.agents
+.codex
+.aws

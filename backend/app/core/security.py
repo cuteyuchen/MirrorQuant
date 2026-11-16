@@ -26,6 +26,11 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from app.core.config import get_settings
 
 _ph = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=2)
+# 固定的非凭据占位哈希，参数与真实口令相同，防止用户名枚举时间差。
+DUMMY_PASSWORD_HASH = (
+    "$argon2id$v=19$m=65536,t=3,p=2$c3ludGhldGljLXNhbHQtMQ$"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+)
 _password_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mirrorquant-password")
 _password_slots: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 

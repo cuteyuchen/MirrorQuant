@@ -32,7 +32,7 @@ async def test_single_asset_contract_balance_does_not_sum_usdc(trading):
 
 @pytest.mark.parametrize("issue", ("mode_missing", "mode_string", "multi_assets", "contradiction",
     "asset_missing", "asset_duplicate", "available_missing", "equity_missing", "negative", "nan",
-    "inf", "boolean", "timestamp_invalid", "timestamp_future", "timestamp_stale"))
+    "inf", "boolean", "timestamp_invalid", "timestamp_future", "timestamp_boolean"))
 async def test_ambiguous_contract_balance_fails_closed(trading, issue):
     adapter = BinanceAdapter({})
     account = copy.deepcopy(ACCOUNT)
@@ -49,10 +49,39 @@ async def test_ambiguous_contract_balance_fails_closed(trading, issue):
         account["assets"][0]["availableBalance"] = {"negative": "-1", "nan": "nan", "inf": "inf", "boolean": True}[issue]
     elif issue == "timestamp_invalid": account["updateTime"] = "unparseable"
     elif issue == "timestamp_future": account["updateTime"] = NOW_MS + 1
-    elif issue == "timestamp_stale": account["updateTime"] = NOW_MS - 30001
+    elif issue == "timestamp_boolean": account["updateTime"] = False  # 布尔假值不能伪装成合法零时间戳。
     adapter._request = AsyncMock(side_effect=[mode, account])
     with pytest.raises(ValueError):
         await adapter.get_contract_balance(trading.spec)
+
+
+@pytest.mark.parametrize("timestamp", [None, 0, NOW_MS - 30001, 1])
+async def test_idle_collateral_timestamp_is_not_request_freshness(trading, timestamp):
+    # 余额未变动不是请求过期，账户级和资产级时间都允许陈旧或缺失。
+    adapter = BinanceAdapter({})
+    data = copy.deepcopy(ACCOUNT)
+    data["updateTime"] = timestamp
+    for asset in data["assets"]:
+        asset["updateTime"] = timestamp
+    adapter._request = AsyncMock(side_effect=[{"multiAssetsMargin": False}, data])
+    assert (await adapter.get_contract_balance(trading.spec)).eq == 1000
+
+
+async def test_slow_collateral_request_still_fails_closed(trading, monkeypatch):
+    # 超过三十秒的请求不能被闲置余额的例外放行。
+    adapter = BinanceAdapter({})
+    adapter._request = AsyncMock(side_effect=[{"multiAssetsMargin": False}, copy.deepcopy(ACCOUNT)])
+    clock = [10.0]
+    async def response(method, path):
+        if path.endswith("multiAssetsMargin"):
+            return {"multiAssetsMargin": False}
+        clock[0] = 40.001
+        return copy.deepcopy(ACCOUNT)
+    adapter._request = AsyncMock(side_effect=response)
+    with monkeypatch.context() as patch:
+        patch.setattr("app.services.adapters.binance.time.monotonic", lambda: clock[0])
+        with pytest.raises(ValueError, match="request is stale"):
+            await adapter.get_contract_balance(trading.spec)
 
 
 @pytest.mark.parametrize("available", ("0", "734.45"))

@@ -34,14 +34,15 @@ def test_direct_egress_defaults_to_enabled(monkeypatch):
 def test_healthy_preferred_proxy_is_selected_first():
     nodes = [node(1, priority=1), node(2, priority=100)]
     assert ProxyManager.select_proxy_url(nodes, preferred_proxy_id=2) == nodes[1].url
-    assert ProxyManager.ordered_proxy_urls(nodes, preferred_proxy_id=2) == [nodes[1].url, nodes[0].url]
+    assert ProxyManager.ordered_proxy_urls(nodes, preferred_proxy_id=2) == [nodes[1].url]  # 指定出口不可回退。
 
 
 @pytest.mark.parametrize("enabled, healthy", [(False, True), (True, False)])
-def test_unavailable_preferred_proxy_falls_through(enabled, healthy):
+def test_unavailable_preferred_proxy_fails_closed(enabled, healthy):
     nodes = [node(1, enabled=enabled, healthy=healthy), node(2)]
-    assert ProxyManager.select_proxy_url(nodes, preferred_proxy_id=1) == nodes[1].url
-    assert ProxyManager.ordered_proxy_urls(nodes, preferred_proxy_id=1) == [nodes[1].url]
+    for selector in (ProxyManager.select_proxy_url, ProxyManager.ordered_proxy_urls):
+        with pytest.raises(ProxyEgressError, match="Assigned proxy"):
+            selector(nodes, preferred_proxy_id=1)
 
 
 def test_failover_orders_only_healthy_nodes_without_direct_egress():
@@ -87,6 +88,7 @@ def test_client_uses_explicit_proxy_or_authorized_direct(monkeypatch, direct):
     proxy_url = None if direct else node().url
     ProxyManager.build_client(proxy_url=proxy_url)
     assert constructor.call_args.kwargs.get("proxy") == proxy_url
+    assert constructor.call_args.kwargs["follow_redirects"] is False  # 凭据不能随跳转泄漏。
 
 
 async def seed_account(db):

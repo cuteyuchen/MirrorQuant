@@ -14,6 +14,7 @@ from app.services.lead_collector.binance_bapi import (
     normalize_holdings,
     order_dedup_key,
     reconstruct_open_positions,
+    slim_closed_position,
     slim_order,
 )
 
@@ -50,13 +51,11 @@ def test_nonfinite_financial_inputs_fail_closed(value):
         PositionSizer.size_open_order(value, "0.1", spec())
 
 
-def test_partial_minimum_position_is_never_promoted_to_full_close():
-    instrument = spec(min_sz=Decimal("1"), lot_sz=Decimal("1"))
-    assert PositionSizer.size_close_order("1", False, "1", "99", instrument) == 0
-    assert PositionSizer.size_close_order("10", False, "1", "99", instrument) == 0
-    assert PositionSizer.size_close_order("10.9", True, "1", "0", instrument) == Decimal("10")
-    with pytest.raises(ValueError):
-        PositionSizer.size_close_order("10", False, "1", "-1", instrument)
+def test_quantity_rounding_never_promotes_a_subminimum_close():
+    # 出场行为由 router 的实际分配账本用例覆盖，不保留已删除的重复定量入口。
+    assert not hasattr(PositionSizer, "size_close_order")
+    assert quantize_down("0.1", "1") == 0
+    assert quantize_down("10.9", "1") == Decimal("10")
     assert quantize_down("-1", "0.01") == 0
     assert quantize_down("1", "0") == 0
 
@@ -96,6 +95,78 @@ def test_mutable_fill_fields_preserve_identity_and_ids_distinguish_orders():
     assert order_dedup_key(before) == order_dedup_key(after)
     assert order_dedup_key(before) != order_dedup_key(source_order(orderId="stable-2"))
     assert order_dedup_key(expand_slim_order(slim_order(before))) == order_dedup_key(before)
+
+
+@pytest.mark.parametrize("pnl,known", [
+    (None, False), (0, True), (-12.3, True), ("invalid", False), (True, False),
+    ("1e999", False), ("1e-999", False),  # 不把无法展示的收益补成无穷大或零。
+])
+def test_realized_pnl_evidence_survives_slim_roundtrip(pnl, known):
+    # 缺失或损坏的收益不能在归一化后变成已知零，真实零仍必须保留。
+    record = slim_order(source_order(totalPnl=pnl))
+    rebuilt = slim_order(expand_slim_order(record))
+    assert record["pnlKnown"] is known and rebuilt["pnlKnown"] is known
+    assert rebuilt["pnl"] == (pnl if known else 0)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_cached_unknown_pnl_is_not_promoted_when_source_store_is_rewritten(legacy):
+    # 旧版本无证据标志的占位零也保持未知，不能被下一轮缓存升级。
+    collector = BinanceBapiCollector()
+    record = slim_order(source_order())
+    if legacy:
+        del record["pnlKnown"]
+    store = {record["h"]: record}
+    collector.fetch_order_history = AsyncMock(return_value=[])
+    await collector.sync_orders_into_store("lead", store)
+    assert next(iter(store.values()))["pnlKnown"] is False
+
+
+def test_legacy_nonzero_pnl_is_not_erased_during_cache_upgrade():
+    # 旧代码只会把未知收益补成零，持久化的非零收益仍是有效证据。
+    record = slim_order(source_order(totalPnl="-12.3"))
+    del record["pnlKnown"]
+    rebuilt = slim_order(expand_slim_order(record))
+    assert rebuilt["pnlKnown"] is True and rebuilt["pnl"] == -12.3
+
+
+def test_corrupt_known_marker_cannot_make_a_missing_pnl_valid():
+    # 标志为真仍必须存在有效数值，损坏缓存不能伪造收益证据。
+    record = slim_order(source_order())
+    record.update(pnl=None, pnlKnown=True)
+    assert expand_slim_order(record)["pnlKnown"] is False
+    assert group_orders_into_batches([record])[0]["pnl"] is None
+
+
+@pytest.mark.parametrize("marker", [False, None, "true"])
+def test_explicitly_unproven_pnl_cannot_be_promoted_by_normalization_or_batching(marker):
+    # 显式未确认的非零收益也不能绕过标志；JSON 文本真值不是布尔真。
+    order = source_order(totalPnl="12.3", pnlKnown=marker)
+    assert expand_slim_order(order)["pnlKnown"] is False
+    assert slim_order(order)["pnlKnown"] is False
+    batch = group_orders_into_batches([order])[0]
+    assert batch["pnlKnown"] is False and batch["pnl"] is None and batch["totalPnl"] is None
+    assert batch["items"][0]["pnl"] is None
+
+
+@pytest.mark.parametrize("second_pnl,known,total", [(None, False, None), ("0", True, 12.3), ("-12.3", True, 0)])
+def test_batch_and_delivery_pnl_are_known_only_when_all_source_fills_are_known(second_pnl, known, total):
+    # 批次保留相同字段供 delivery 持久化，混合缺失收益时总数仍是未知。
+    batch = group_orders_into_batches([
+        source_order(totalPnl="12.3"),
+        source_order(orderId="second", orderTime=2000, orderUpdateTime=2100, totalPnl=second_pnl),
+    ])[0]
+    assert batch["pnlKnown"] is known and batch["pnl"] == total and batch["totalPnl"] == total
+    assert batch["qtyExact"] == "0.2" and batch["orderCount"] == 2
+    assert batch["items"][1]["pnlKnown"] is known
+
+
+@pytest.mark.parametrize("pnl,known", [(None, False), ("0", True), ("-12.3", True)])
+def test_closed_cycle_preserves_pnl_evidence_including_real_zero(pnl, known):
+    # 原始闭仓周期不会把缺失收益补成已知零。
+    closed = slim_closed_position({"positionId": "cycle", "opened": 1000, "closed": 2000, "closingPnl": pnl})
+    assert closed["pnlKnown"] is known
+    assert closed["pnl"] == (float(pnl) if known else None)
 
 
 def test_batches_preserve_open_close_open_causality_and_decimal_totals():

@@ -5,26 +5,58 @@ from app.core.time_util import to_utc_iso
 import json
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query
-from sqlalchemy import desc, select
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_current_user
+from app.api.deps import get_current_admin, get_current_user
 from app.core.database import get_db
 from app.core.secret_mask import mask_sensitive_payload, redact_error_urls
 from app.services.lead_collector.freshness import lead_freshness
 from app.services.positions import with_current_price
 from app.services.engine.equity import account_equity_display, account_usdt_hwm
+from app.services.dashboard_board import build_board, milliseconds, number
 from app.models.domain import (
     CopyBinding,
     ExecutionRecord,
     LeadSource,
+    OrderIntent,
     SystemConfig,
     TradingAccount,
     User,
 )
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
+
+
+@router.get("/board")
+async def dashboard_board(db: AsyncSession = Depends(get_db), _user: User = Depends(get_current_admin)):
+    # 管理员只读快照投影，不在 HTTP 请求中触发交易所访问。
+    return await build_board(db)
+
+
+@router.get("/intents")
+async def list_intents(
+    state: str = Query(default="UNKNOWN,SUBMITTING", max_length=120),
+    db: AsyncSession = Depends(get_db), _user: User = Depends(get_current_admin),
+):
+    # 状态白名单避免含糊过滤；时间与其余新接口统一为毫秒。
+    states = {value.strip().upper() for value in state.split(",") if value.strip()}
+    if not states or not states <= {"UNKNOWN", "SUBMITTING", "NEW", "PARTIALLY_FILLED", "RESTING"}:
+        raise HTTPException(status_code=422, detail="Only nonterminal intent states are supported")
+    rows = (await db.execute(select(OrderIntent, CopyBinding, TradingAccount)
+        .outerjoin(CopyBinding, CopyBinding.id == OrderIntent.binding_id)
+        .outerjoin(TradingAccount, TradingAccount.id == OrderIntent.account_id)
+        .where(func.upper(OrderIntent.state).in_(states))
+        .order_by(OrderIntent.created_at.desc(), OrderIntent.id.desc()))).all()
+    return {"items": [{
+        "id": intent.id, "bindingId": intent.binding_id, "bindingName": binding.name if binding else None,
+        "accountId": intent.account_id, "accountName": account.name if account else None,
+        "instId": intent.inst_id, "posSide": intent.pos_side, "state": intent.state,
+        "requestedQty": number(intent.requested_qty), "filledQty": number(intent.filled_qty),
+        "exchangeOrderId": intent.exchange_order_id, "reduceOnly": intent.reduce_only,
+        "createdAt": milliseconds(intent.created_at), "sourceEventId": intent.source_event_id,
+    } for intent, binding, account in rows]}
 
 
 @router.get("/overview")
@@ -164,15 +196,18 @@ async def list_executions(
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db),
-    _user: User = Depends(get_current_user),
+    _user: User = Depends(get_current_admin),
 ):
-    stmt = select(ExecutionRecord).order_by(desc(ExecutionRecord.created_at))
+    stmt = select(ExecutionRecord).order_by(desc(ExecutionRecord.created_at), desc(ExecutionRecord.id))
     if binding_id is not None:
         stmt = stmt.where(ExecutionRecord.binding_id == binding_id)
     if status_filter:
         stmt = stmt.where(ExecutionRecord.status == status_filter)
     rows = list((await db.scalars(stmt.offset(offset).limit(limit))).all())
+    # 总数使用相同过滤条件，不受分页影响。
+    total = await db.scalar(select(func.count()).select_from(stmt.order_by(None).subquery()))
     return {
+        "total": total,
         "items": [
             {
                 "id": r.id,
@@ -207,7 +242,11 @@ async def list_executions(
 async def public_lead_feed(db: AsyncSession = Depends(get_db)):
     """Public unauthenticated endpoint strictly exposing opted-in lead snapshots (never private accounts)."""
     cfg_row = await db.scalar(select(SystemConfig).where(SystemConfig.key == "public_monitoring_enabled"))
-    enabled = json.loads(cfg_row.value_json) if cfg_row else True
+    # 缺失、损坏或非布尔配置都按未授权公开处理。
+    try:
+        enabled = json.loads(cfg_row.value_json) is True if cfg_row else False
+    except (TypeError, ValueError):
+        enabled = False
     if not enabled:
         return {"enabled": False, "leads": []}
 

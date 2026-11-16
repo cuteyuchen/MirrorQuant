@@ -15,6 +15,15 @@ def exact(val: Any) -> Decimal:
     return res
 
 
+def format_exact(val: Any) -> str:
+    # 精确字段只去掉小数尾零，不经 float 或 normalize 的上下文舍入。
+    value = exact(val)
+    if value == 0:
+        return "0"
+    text = format(value, "f")
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
 def quantize_down(val: Any, step: Any) -> Decimal:
     d_val = exact(val)
     d_step = exact(step)
@@ -117,24 +126,4 @@ class PositionSizer:
             estimated_notional=float(est_notional),
         )
 
-    @staticmethod
-    def size_close_order(
-        local_pos_sz: Any,
-        is_full_close: bool,
-        lead_close_qty: Any,
-        lead_remaining_qty: Any,
-        spec: InstrumentSpec,
-    ) -> Decimal:
-        local, closing, remaining = map(exact, (local_pos_sz, lead_close_qty, lead_remaining_qty))
-        if local <= 0 or closing <= 0:
-            return Decimal("0")
-        if remaining < 0:
-            raise ValueError("Invalid lead inventory")
-        if is_full_close:
-            return quantize_down(local, spec.lot_sz)
-        prior = closing + remaining
-        if prior <= 0:
-            return quantize_down(local, spec.lot_sz)
-        fraction = min(Decimal("1"), closing / prior)
-        qty = quantize_down(local * fraction, spec.lot_sz)
-        return qty if qty >= spec.min_sz else Decimal("0")
+    # 平仓尺寸统一由 router._close_owned 按真实 allocation 与可平仓量计算。

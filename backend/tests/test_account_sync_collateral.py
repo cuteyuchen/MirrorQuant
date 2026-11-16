@@ -95,7 +95,7 @@ async def test_sync_account_persists_only_usdt_collateral(sync_state, available)
 
 @pytest.mark.parametrize("issue", [
     "mode_missing", "mode_string", "multi_assets", "account_mode_missing", "contradiction",
-    "timestamp_missing", "timestamp_stale", "timestamp_future", "asset_timestamp_stale",
+    "timestamp_future", "asset_timestamp_future",  # 闲置时间戳已不再代表响应过期。
     "asset_missing", "asset_duplicate", "available_missing", "equity_nan", "available_negative",
 ])
 @pytest.mark.asyncio
@@ -113,14 +113,10 @@ async def test_sync_account_invalid_collateral_preserves_persisted_risk_fields(s
         del data["multiAssetsMargin"]
     elif issue == "contradiction":
         data["multiAssetsMargin"] = True
-    elif issue == "timestamp_missing":
-        del data["updateTime"]
-    elif issue == "timestamp_stale":
-        data["updateTime"] -= 30_001
     elif issue == "timestamp_future":
         data["updateTime"] += 1
-    elif issue == "asset_timestamp_stale":
-        data["assets"][0]["updateTime"] = NOW_MS - 30_001
+    elif issue == "asset_timestamp_future":
+        data["assets"][0]["updateTime"] = NOW_MS + 1
     elif issue == "asset_missing":
         data["assets"] = [data["assets"][1]]
     elif issue == "asset_duplicate":

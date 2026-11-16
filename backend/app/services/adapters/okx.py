@@ -18,6 +18,7 @@ from app.services.adapters.base import (
     InstrumentSpec,
     OrderBook,
     OrderResult,
+    api_error,
 )
 from app.services.proxy.manager import ProxyManager
 
@@ -42,9 +43,6 @@ class OKXAdapter(BaseExchangeAdapter):
         self.secret_key = credentials.get("secret_key", "").strip()
         self.passphrase = credentials.get("passphrase", "").strip()
         self.is_simulated = environment == "demo"
-        self._instruments_cache: Dict[str, InstrumentSpec] = {}
-        self._instruments_cache_ts: float = 0.0
-        self._cache_ttl_sec: float = 600.0
 
     def _sign(self, timestamp: str, method: str, request_path: str, body_str: str = "") -> str:
         msg = f"{timestamp}{method.upper()}{request_path}{body_str}"
@@ -64,7 +62,7 @@ class OKXAdapter(BaseExchangeAdapter):
         auth: bool = True,
         retries: int = 3,
     ) -> Any:
-        self._check_rate_limit()
+        self._check_rate_limit(auth)
         method = method.upper()
         # A mutation may already have reached the exchange when its response is lost.
         attempts = max(1, retries) if method == "GET" else 1
@@ -79,9 +77,7 @@ class OKXAdapter(BaseExchangeAdapter):
         body_str = json.dumps(body, separators=(",", ":")) if body is not None else ""
 
         last_err: Optional[Exception] = None
-        async with ProxyManager.build_client(
-            proxy_url=self.proxy_url, timeout=self.timeout, exchange=self.exchange,
-        ) as client:
+        async with self.request_client(auth) as client:
             for attempt in range(attempts):
                 headers: Dict[str, str] = {
                     "Content-Type": "application/json",
@@ -107,17 +103,22 @@ class OKXAdapter(BaseExchangeAdapter):
                         raise ValueError(f"Unsupported HTTP method: {method}")
 
                     if resp.status_code == 429:
-                        self._note_rate_limit(resp)
-                    if resp.status_code != 200:
-                        raise ExchangeAPIError("okx", str(resp.status_code), f"HTTP {resp.status_code}: {resp.text[:200]}")
-
+                        self._note_rate_limit(resp, auth)
+                    # 先解析业务响应，HTML/损坏错误体仍是结果不确定。
                     payload = resp.json()
+                    if not isinstance(payload, dict):
+                        raise ExchangeAPIError("okx", "AMBIGUOUS", "Malformed API response")
                     code = str(payload.get("code", ""))
                     msg = payload.get("msg", "")
-                    if code != "0":
+                    if resp.status_code != 200 or code != "0":
+                        # 聚合失败码必须展开为实际订单的业务错误。
+                        rows = payload.get("data")
+                        if code in ("1", "2") and isinstance(rows, list) and rows and isinstance(rows[0], dict):
+                            code = str(rows[0].get("sCode") or code)
+                            msg = rows[0].get("sMsg") or msg
                         if code in ("50011", "50061"):
-                            self._note_rate_limit(resp)
-                        raise ExchangeAPIError("okx", code, msg, payload.get("data"))
+                            self._note_rate_limit(resp, auth)
+                        raise api_error("okx", code, msg, payload.get("data"), resp.status_code)
                     return payload.get("data", [])
                 except ExchangeAPIError:
                     raise
@@ -210,9 +211,9 @@ class OKXAdapter(BaseExchangeAdapter):
         return positions
 
     async def get_instruments(self, force_refresh: bool = False) -> Dict[str, InstrumentSpec]:
-        now = time.time()
-        if not force_refresh and self._instruments_cache and now - self._instruments_cache_ts < self._cache_ttl_sec:
-            return self._instruments_cache
+        cached = self._cached_instruments(force_refresh)
+        if cached is not None:
+            return cached
         data = await self._request("GET", "/api/v5/public/instruments", params={"instType": "SWAP"}, auth=False)
         result: Dict[str, InstrumentSpec] = {}
         for item in data:
@@ -234,8 +235,7 @@ class OKXAdapter(BaseExchangeAdapter):
             except (ValueError, KeyError, ArithmeticError, TypeError):
                 # Incomplete metadata suspends this instrument; never invent its units.
                 continue
-        self._instruments_cache, self._instruments_cache_ts = result, now
-        return result
+        return self._cache_instruments(result)
 
     async def get_orderbook(self, inst_id: str, depth: int = 5) -> OrderBook:
         data = await self._request(
@@ -318,12 +318,20 @@ class OKXAdapter(BaseExchangeAdapter):
         item = data[0]
         s_code = str(item.get("sCode", ""))
         if s_code != "0":
-            raise ExchangeAPIError("okx", s_code, item.get("sMsg", ""), item)
+            raise api_error("okx", s_code, item.get("sMsg", ""), item)
         return OrderResult(
             ord_id=str(item.get("ordId") or ""),
             cl_ord_id=str(item.get("clOrdId") or cl_ord_id or ""),
             raw=item,
         )
+
+    async def cancel_order(self, inst_id: str, cl_ord_id: str) -> None:
+        """撤销一笔普通挂单；撤单结果以随后的查单为准，失败时抛 ExchangeAPIError。"""
+        data = await self._request("POST", "/api/v5/trade/cancel-order",
+                                   body={"instId": inst_id, "clOrdId": cl_ord_id[:32]})
+        item = (data or [{}])[0]
+        if str(item.get("sCode", "0")) != "0":
+            raise ExchangeAPIError(self.exchange, str(item.get("sCode")), str(item.get("sMsg") or "cancel rejected"))
 
     async def get_order(
         self,
@@ -419,7 +427,7 @@ class OKXAdapter(BaseExchangeAdapter):
         item = data[0] if data else {}
         s_code = str(item.get("sCode", ""))
         if s_code != "0":
-            raise ExchangeAPIError("okx", s_code, item.get("sMsg", "TP/SL algo order rejected"), item)
+            raise api_error("okx", s_code, item.get("sMsg", "TP/SL algo order rejected"), item)
         algo_id = str(item.get("algoId") or "")
         if not algo_id:
             raise ExchangeAPIError(self.exchange, "AMBIGUOUS", "Missing protective order identity")

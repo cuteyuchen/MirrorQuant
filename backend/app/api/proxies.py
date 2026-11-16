@@ -11,9 +11,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_current_admin, get_current_user, record_audit
 from app.core.database import get_db
 from app.core.secret_mask import mask_proxy_url, merge_proxy_url, proxy_credentials_configured, redact_error_urls
-from app.models.domain import ProxyNode, User
+from app.models.domain import LeadSource, ProxyNode, TradingAccount, User
 from app.schemas.api import ProxyCreate, ProxyUpdate
 from app.services.proxy.manager import ProxyManager
+from app.services.adapters.factory import invalidate_proxy_adapters
+from app.services.engine.serialization import serialized_execution
+from app.services.lead_collector.binance_bapi import BinanceBapiCollector
 
 router = APIRouter(prefix="/api/proxies", tags=["proxies"])
 
@@ -71,6 +74,7 @@ async def create_proxy(
 
 
 @router.put("/{proxy_id}")
+@serialized_execution  # 代理变更与金融执行串行，防止中途换出口。
 async def update_proxy(
     proxy_id: int,
     payload: ProxyUpdate,
@@ -82,6 +86,7 @@ async def update_proxy(
     if not node:
         raise HTTPException(status_code=404, detail="Proxy not found")
     data = payload.model_dump(exclude_unset=True)
+    previous_url = node.url
     if "url" in data:
         try:
             data["url"] = merge_proxy_url(node.url, data["url"])
@@ -91,11 +96,16 @@ async def update_proxy(
         setattr(node, k, v)
     await record_audit(db, "UPDATE_PROXY", "proxy", str(node.id), f"Updated proxy {node.name}", current_user, request)
     await db.commit()
+    if "url" in data or "is_enabled" in data:
+        await invalidate_proxy_adapters(previous_url)
+        # 只关闭被修改出口，保留其他带单员的健康长连接。
+        await BinanceBapiCollector.close_proxy_clients(previous_url)
     await db.refresh(node)
     return {"item": _proxy_out(node)}
 
 
 @router.delete("/{proxy_id}")
+@serialized_execution
 async def delete_proxy(
     proxy_id: int,
     request: Request,
@@ -105,10 +115,18 @@ async def delete_proxy(
     node = await db.get(ProxyNode, proxy_id)
     if not node:
         raise HTTPException(status_code=404, detail="Proxy not found")
+    # SET NULL 会悄悄改为其他出口，仍被引用的代理必须先显式解绑。
+    referenced = await db.scalar(select(TradingAccount.id).where(TradingAccount.proxy_id == proxy_id).limit(1))
+    lead_reference = await db.scalar(select(LeadSource.id).where(LeadSource.proxy_id == proxy_id).limit(1))
+    if referenced is not None or lead_reference is not None:
+        raise HTTPException(status_code=409, detail="Proxy is assigned; explicitly reassign accounts and leads first")
     name = node.name
+    previous_url = node.url
     await db.delete(node)
     await record_audit(db, "DELETE_PROXY", "proxy", str(proxy_id), f"Deleted proxy {name}", current_user, request)
     await db.commit()
+    await invalidate_proxy_adapters(previous_url)
+    await BinanceBapiCollector.close_proxy_clients(previous_url)
     return {"ok": True}
 
 

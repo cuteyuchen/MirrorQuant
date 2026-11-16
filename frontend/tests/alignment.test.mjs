@@ -33,8 +33,7 @@ test("unbound, paused and stale accounts never appear aligned", () => {
     [(l, o) => { o.bindingsStatus[0].circuitBreakerTripped = true; }, "paused"],
     [(l, o) => { o.accountsStatus[0].isEnabled = false; }, "paused"],
     [(l, o) => { o.accountsStatus[0].status = "error"; }, "stale"],
-    [(l, o) => { o.accountsStatus[0].lastSyncAt = new Date(now - 100000).toISOString(); }, "stale"],
-    [(l, o) => { o.accountsStatus[0].lastSyncAt = null; }, "stale"],
+    [(l, o) => { o.accountsStatus[0].stale = true; }, "stale"],
     [(l, o) => { l.positionsKnown = false; }, "stale"],
     [(l, o) => { l.stale = true; }, "stale"],
     [(l, o) => { l.snapshotIncomplete = true; }, "stale"],
@@ -82,10 +81,13 @@ test("timestamps without Z remain UTC in every browser timezone", () => {
   }
 });
 
-test("future clock jitter is tolerated up to 30 seconds with freshness limits intact", () => {
+// 浏览器不再重复推断账户时效，服务端 stale 才是对齐判断依据。
+test("legacy alignment does not override backend freshness using local clock thresholds", () => {
   const { lead, overview } = fixture();
-  for (const [delta, expected] of [[1, "aligned"], [30000, "aligned"], [30001, "stale"], [-90000, "aligned"], [-90001, "stale"]]) {
+  for (const delta of [1, 30000, 30001, -90000, -90001]) {
     overview.accountsStatus[0].lastSyncAt = new Date(now + delta).toISOString();
-    assert.equal(getLeadAlignment(lead, overview, now), expected);
+    assert.equal(getLeadAlignment(lead, overview, now), "aligned");
   }
+  overview.accountsStatus[0].stale = true;
+  assert.equal(getLeadAlignment(lead, overview, now), "stale");
 });

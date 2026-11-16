@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import logging
 import math
 import re
 import time
@@ -18,8 +19,11 @@ from app.services.adapters.base import (
     InstrumentSpec,
     OrderBook,
     OrderResult,
+    api_error,
 )
 from app.services.proxy.manager import ProxyManager
+
+logger = logging.getLogger("mirrorquant.binance")
 
 
 class BinanceAdapter(BaseExchangeAdapter):
@@ -42,9 +46,6 @@ class BinanceAdapter(BaseExchangeAdapter):
         self.api_key = credentials.get("api_key", "").strip()
         self.secret_key = credentials.get("secret_key", "").strip()
         self.base_url = self.TESTNET_URL if environment == "demo" else self.LIVE_URL
-        self._instruments_cache: Dict[str, InstrumentSpec] = {}
-        self._instruments_cache_ts: float = 0.0
-        self._cache_ttl_sec: float = 600.0
 
     def _sign_query(self, params: Dict[str, Any]) -> str:
         clean = [(k, v) for k, v in params.items() if v is not None]
@@ -64,15 +65,13 @@ class BinanceAdapter(BaseExchangeAdapter):
         auth: bool = True,
         retries: int = 3,
     ) -> Any:
-        self._check_rate_limit()
+        self._check_rate_limit(auth)
         method = method.upper()
         # A mutation may already have reached the exchange when its response is lost.
         attempts = max(1, retries) if method == "GET" else 1
         base_params = dict(params or {})
 
-        async with ProxyManager.build_client(
-            proxy_url=self.proxy_url, timeout=self.timeout, exchange=self.exchange,
-        ) as client:
+        async with self.request_client(auth) as client:
             last_err: Optional[Exception] = None
             for attempt in range(attempts):
                 req_params = dict(base_params)
@@ -97,15 +96,18 @@ class BinanceAdapter(BaseExchangeAdapter):
                         raise ValueError(f"Unsupported HTTP method: {method}")
 
                     if resp.status_code in (418, 429):
-                        self._note_rate_limit(resp)
+                        self._note_rate_limit(resp, auth)
 
                     data = resp.json()
-                    if resp.status_code >= 400 or (isinstance(data, dict) and "code" in data and data["code"] < 0):
+                    # 错误体必须可解析；未知格式不能伪装成确定未受理。
+                    code_value = str(data.get("code", "")) if isinstance(data, dict) else ""
+                    business_error = code_value not in ("", "0", "200")
+                    if not 200 <= resp.status_code < 300 or business_error:
                         code = str(data.get("code", resp.status_code)) if isinstance(data, dict) else str(resp.status_code)
                         msg = data.get("msg", resp.text[:200]) if isinstance(data, dict) else resp.text[:200]
                         if code in ("-1003", "-1015"):
-                            self._note_rate_limit(resp)
-                        raise ExchangeAPIError("binance", code, msg, data)
+                            self._note_rate_limit(resp, auth)
+                        raise api_error("binance", code, msg, data, resp.status_code)
                     return data
                 except ExchangeAPIError:
                     raise
@@ -197,20 +199,26 @@ class BinanceAdapter(BaseExchangeAdapter):
         currency = spec.settle_ccy if spec is not None else "USDT"
         if currency not in ("USDT", "USDC"):
             raise ValueError("Unsupported Binance settlement currency")
+        # updateTime 是余额变动时间；请求往返耗时才用于新鲜度判定。
+        started = time.monotonic()
         mode = await self._request("GET", "/fapi/v1/multiAssetsMargin")
         if not isinstance(mode, dict) or mode.get("multiAssetsMargin") is not False:
             raise ValueError("Binance single-asset collateral mode is not confirmed")
         data = await self._request("GET", "/fapi/v2/account")
         if not isinstance(data, dict) or data.get("multiAssetsMargin") is not False:
             raise ValueError("Binance account collateral mode is missing or contradictory")
+        if not 0 <= time.monotonic() - started <= 30:
+            raise ValueError("Binance collateral request is stale")
         now_ms = int(time.time() * 1000) + self._time_offset_ms
 
         def validate_timestamp(value: Any) -> None:
+            if value is None or (type(value) is int and value == 0) or value == "0":
+                return
             if type(value) is not int and not (isinstance(value, str) and value.isascii() and value.isdecimal()):
                 raise ValueError("Invalid Binance collateral timestamp")
             timestamp = int(value)
-            if timestamp <= 0 or timestamp > now_ms or now_ms - timestamp > 30_000:
-                raise ValueError("Binance collateral timestamp is future or stale")
+            if timestamp < 0 or timestamp > now_ms:
+                raise ValueError("Binance collateral timestamp is future or invalid")
 
         def number(item: Dict[str, Any], field: str, signed: bool = False) -> float:
             value = item.get(field)
@@ -297,9 +305,9 @@ class BinanceAdapter(BaseExchangeAdapter):
         return positions
 
     async def get_instruments(self, force_refresh: bool = False) -> Dict[str, InstrumentSpec]:
-        now = time.time()
-        if not force_refresh and self._instruments_cache and now - self._instruments_cache_ts < self._cache_ttl_sec:
-            return self._instruments_cache
+        cached = self._cached_instruments(force_refresh)
+        if cached is not None:
+            return cached
         info = await self._request("GET", "/fapi/v1/exchangeInfo", auth=False)
         result: Dict[str, InstrumentSpec] = {}
         for item in info.get("symbols", []):
@@ -322,8 +330,7 @@ class BinanceAdapter(BaseExchangeAdapter):
                 )
             except (ValueError, KeyError, ArithmeticError, TypeError):
                 continue
-        self._instruments_cache, self._instruments_cache_ts = result, now
-        return result
+        return self._cache_instruments(result)
 
     async def get_orderbook(self, inst_id: str, depth: int = 5) -> OrderBook:
         if not 1 <= depth <= 1000:
@@ -382,6 +389,7 @@ class BinanceAdapter(BaseExchangeAdapter):
             "symbol": inst_id,
             "side": side.upper(),
             "quantity": str(sz),
+            "newOrderRespType": "RESULT",  # 尽量取得终态成交数据，仍保留查单校验。
         }
         ot = ord_type.lower()
         if ot == "ioc":
@@ -416,6 +424,11 @@ class BinanceAdapter(BaseExchangeAdapter):
             state=str(data.get("status") or "NEW"),
             raw=data,
         )
+
+    async def cancel_order(self, inst_id: str, cl_ord_id: str) -> None:
+        """撤销一笔普通挂单；撤单结果以随后的查单为准，失败时抛 ExchangeAPIError。"""
+        await self._request("DELETE", "/fapi/v1/order",
+                            params={"symbol": inst_id, "origClientOrderId": cl_ord_id})
 
     async def get_order(
         self,
@@ -498,14 +511,29 @@ class BinanceAdapter(BaseExchangeAdapter):
         if tp_px:
             out["tpOrderId"] = await _submit_cond("TAKE_PROFIT_MARKET", tp_px)
         if sl_px:
-            out["slOrderId"] = await _submit_cond("STOP_MARKET", sl_px)
+            try:
+                out["slOrderId"] = await _submit_cond("STOP_MARKET", sl_px)
+            except Exception:
+                # 只撤回本次成功提交的 TP，不撤其他策略的保护单。
+                if out["tpOrderId"]:
+                    try:
+                        await self._request("DELETE", "/fapi/v1/algoOrder",
+                            params={"symbol": inst_id, "algoId": out["tpOrderId"]})
+                    except Exception as rollback_error:
+                        logger.error("TP rollback failed for %s (%s)", inst_id, type(rollback_error).__name__)
+                        raise RuntimeError("SL placement failed and TP rollback failed; reconcile protective orders") from rollback_error
+                raise
         return out
 
     async def cancel_tp_sl(self, inst_id: str, pos_side: Optional[str] = None) -> bool:
         try:
             open_orders = await self._request("GET", "/fapi/v1/openAlgoOrders", params={"symbol": inst_id})
+            # 缺失订单列表不是空列表，撤单结果必须可核验。
+            items = open_orders.get("orders") if isinstance(open_orders, dict) else open_orders
+            if not isinstance(items, list):
+                raise ValueError("Incomplete Binance protective-order inventory")
             cancelled = False
-            for o in (open_orders.get("orders", []) if isinstance(open_orders, dict) else open_orders or []):
+            for o in items:
                 if (o.get("orderType") or o.get("type")) in ("STOP_MARKET", "TAKE_PROFIT_MARKET", "STOP", "TAKE_PROFIT"):
                     if pos_side and str(o.get("positionSide") or "").lower() not in (pos_side.lower(), "both"):
                         continue
@@ -516,5 +544,7 @@ class BinanceAdapter(BaseExchangeAdapter):
                     )
                     cancelled = True
             return cancelled
-        except Exception:
-            return False
+        except Exception as exc:
+            # 不把撤单失败伪装成无订单，且日志不携带签名 URL。
+            logger.error("Protective cancellation failed for %s (%s)", inst_id, type(exc).__name__)
+            raise

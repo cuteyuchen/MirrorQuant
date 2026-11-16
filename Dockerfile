@@ -26,7 +26,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY backend/ ./
 COPY --from=frontend-builder /build/frontend/dist ./static
 
-RUN mkdir -p /app/data && chmod 700 /app/data
+# 固定低权限 UID，宿主机绑定目录需授予该 UID 写权限。
+RUN groupadd --gid 10001 mirrorquant \
+    && useradd --uid 10001 --gid mirrorquant --no-create-home --shell /usr/sbin/nologin mirrorquant \
+    && mkdir -p /app/data \
+    && chown mirrorquant:mirrorquant /app/data \
+    && chmod 700 /app/data
+
+USER 10001:10001
 
 EXPOSE 8000
 

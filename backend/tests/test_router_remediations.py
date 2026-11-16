@@ -10,16 +10,37 @@ from sqlalchemy import select
 from app.core.database import get_session_factory
 from app.core.security import CredentialVault
 from app.models.domain import (
-    BindingDebt, BindingDelivery, CopyBinding, ExecutionRecord, LeadSource, OrderIntent,
+    BindingDebt, BindingDelivery, BindingPositionProgress, CopyBinding, ExecutionRecord, LeadSource, OrderIntent,
     PositionAllocation, PositionGuardState, ProxyNode, SystemConfig, TradingAccount,
 )
-from app.services.adapters.base import BalanceInfo, ExchangePosition, InstrumentSpec, OrderBook, OrderResult
+from app.services.adapters.base import BalanceInfo, ExchangePosition, InstrumentSpec, OrderBook, OrderRejected, OrderResult
 from app.services.engine.risk import RiskEngine
 from app.services.engine.router import CopyRouter, UnknownOrderOutcome
-from app.services.engine.sizer import PositionSizer
+from app.services.engine.sizer import PositionSizer, exact, format_exact
 
 
 NOW_MS = 2_000_000
+
+
+@pytest.mark.parametrize("value,expected", [
+    (0, "0"), (0.0, "0"), (-0.0, "0"), (1.0, "1"), ("100", "100"), ("100.000", "100"),
+    (Decimal("1.2300"), "1.23"), (Decimal("1E-20"), "0.00000000000000000001"),
+    (Decimal("1E+3"), "1000"),
+    (Decimal("123456789012345678901234567890.123456789012345678900"),
+     "123456789012345678901234567890.1234567890123456789"),
+])
+def test_exact_persistence_text_preserves_value_without_context_rounding(value, expected):
+    # 固定点规范化不能误删整数尾零，也不能按默认 Decimal 精度舍入。
+    encoded = format_exact(value)
+    assert encoded == expected
+    assert exact(encoded) == exact(value)
+
+
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity"])
+def test_exact_persistence_text_rejects_nonfinite_values(value):
+    # 文本规范化仍必须经过财务有限数门禁，不能只靠字符串清理。
+    with pytest.raises(ValueError, match="Non-finite financial input"):
+        format_exact(value)
 
 
 class OfflineExchange:
@@ -88,17 +109,40 @@ async def seed_allocation(t, qty=1, debt=25):
     return allocation, other, pending, guard
 
 
+async def test_legacy_allocation_exact_fields_are_canonical_after_reload(trading):
+    # 验证真实浮点旧记录升级后的落库值，不只检查内存里的 Decimal。
+    t = trading
+    allocation, _, debt, _ = await seed_allocation(t, qty=1.0)
+    assert allocation.owned_qty_exact is None and allocation.entry_cost_exact is None
+    migrated = await t.router._get_allocation(t.db, t.binding.id, t.account.id, "BTCUSDT", "long")
+    t.router._set_debt(debt, Decimal("25.00"))
+    await t.db.commit()
+    await t.db.refresh(migrated)
+    await t.db.refresh(debt)
+    assert migrated.owned_qty_exact == "1" and migrated.entry_cost_exact == "100"
+    assert debt.pending_usd_exact == "25"
+
+
 async def execute_batch(t, exchange, side="SELL", qty=1, remaining=0, event="test-event",
-                        position_side="LONG", avg_price="100", batch_fields=None, resilience_cfg=None):
+                        position_side="LONG", avg_price="100", batch_fields=None, resilience_cfg=None,
+                        source_proven=True, global_kill=False):
     batch = {"symbol": "BTCUSDT", "side": side, "positionSide": position_side, "qty": str(qty),
              "avgPrice": avg_price, "notional": str(Decimal(str(qty)) * 100), "_event_id": event,
              "startTime": NOW_MS - 150_000, "endTime": NOW_MS - 150_000}
     batch.update(batch_fields or {})
     is_open = (side, position_side) in (("BUY", "LONG"), ("SELL", "SHORT"))
+    if not is_open and source_proven and not t.lead.snapshot_json:
+        # 仅补未提供的业务夹具证据，不能覆盖安全用例显式保存的坏快照。
+        snapshot = current_snapshot(position_side)
+        snapshot["openPositions"] = ([{
+            "symbol": "BTCUSDT", "positionSide": position_side, "qty": remaining, "qtyExact": str(remaining),
+        }] if remaining else [])
+        t.lead.snapshot_json = json.dumps(snapshot)
+        await t.db.commit()
     await t.router._execute_batch_for_binding(
         t.db, t.binding, t.lead, t.account, exchange, batch,
         lead_margin_balance=1000, active_lead_positions={f"BTCUSDT_{position_side}": remaining}, my_equity=1000,
-        positions=[] if is_open else [t.pos], instruments={"BTCUSDT": t.spec}, global_kill=False,
+        positions=[] if is_open else [t.pos], instruments={"BTCUSDT": t.spec}, global_kill=global_kill,
         notify_cfg={}, resilience_cfg=resilience_cfg,
     )
     await t.db.commit()
@@ -500,9 +544,47 @@ async def test_failed_leverage_confirmation_prevents_order(trading):
     t = trading
     exchange = OfflineExchange()
     exchange.ensure_leverage.return_value = False
-    with pytest.raises(RuntimeError, match="leverage could not be confirmed"):
-        await execute_batch(t, exchange, side="BUY", remaining=1)
+    # 杠杆失败只记本笔失败，不再向账户循环冒泡。
+    await execute_batch(t, exchange, side="BUY", remaining=1)
     assert exchange.orders == []
+    record = await t.db.scalar(select(ExecutionRecord))
+    assert record.status == "FAILED" and "leverage could not be confirmed" in record.details
+    assert t.binding.consecutive_failures == 1 and t.account.status != "error"
+
+
+@pytest.mark.parametrize("failure", ["tier", "leverage", "validation"])
+async def test_pre_submission_failure_is_per_delivery_and_next_event_can_proceed(trading, failure):
+    # 提交前错误不得冒泡终止整个账户的后续事件。
+    t, exchange = trading, OfflineExchange()
+    if failure == "tier":
+        exchange.get_max_leverage.side_effect = RuntimeError("tier unavailable")
+    elif failure == "leverage":
+        exchange.ensure_leverage.side_effect = RuntimeError("leverage unavailable")
+    else:
+        t.spec.max_sz = Decimal("0.5")
+    await execute_batch(t, exchange, side="BUY", remaining=1, event="first-failed")
+    assert exchange.orders == [] and t.account.status != "error"
+    assert t.binding.consecutive_failures == 1
+    assert (await t.db.scalar(select(ExecutionRecord))).status == ("REJECTED" if failure == "validation" else "FAILED")
+    t.spec.max_sz = Decimal("1000")
+    successor = OfflineExchange()
+    await execute_batch(t, successor, side="BUY", remaining=1, event="next-success")
+    assert len(successor.orders) == 1
+
+
+@pytest.mark.parametrize("reason", ["global", "binding", "account"])
+async def test_entry_disable_record_names_the_real_reason(trading, reason):
+    t = trading
+    if reason == "binding":
+        t.binding.is_enabled = False
+    elif reason == "account":
+        t.account.is_enabled = False
+    await t.db.commit()
+    await execute_batch(t, OfflineExchange(), side="BUY", remaining=1, global_kill=reason == "global")
+    record = await t.db.scalar(select(ExecutionRecord))
+    assert record.status == "BLOCKED_KILL_SWITCH"
+    expected = {"global": "Global kill switch is active", "binding": "Binding is disabled", "account": "Account is disabled"}
+    assert record.details == expected[reason]
 
 
 async def test_restart_reconciles_durable_intent_without_second_post(trading):
@@ -543,11 +625,221 @@ async def test_old_closed_cycle_cannot_close_reopened_allocation(trading):
 async def test_closed_history_reconciliation_is_binding_scoped(trading):
     t = trading
     own, other, _, _ = await seed_allocation(t)
+    # 闭仓区间包住当前 allocation 的开仓时间，且观察时带单员已空仓。
+    snapshot = current_snapshot("LONG")
+    snapshot["openPositions"] = []
+    t.lead.snapshot_json = json.dumps(snapshot)
+    await t.db.commit()
     exchange = OfflineExchange()
     await t.router._reconcile_closed_position(t.db, t.binding, t.lead, t.account, exchange,
-        {"id": "closed-cycle", "symbol": "BTCUSDT", "side": "LONG", "closed": 200},
+        {"id": "closed-cycle", "symbol": "BTCUSDT", "side": "LONG", "opened": 100, "closed": 200},
         [t.pos], {"BTCUSDT": t.spec}, {})
     assert Decimal(exchange.orders[0]["sz"]) == 1 and own.owned_qty == 0 and other.owned_qty == 9
+
+
+@pytest.mark.parametrize("source_state", ["missing", "stale", "future", "invalid_json", "unopened"])
+async def test_unproven_exit_is_deferred_without_breaker_and_retries(trading, source_state):
+    # 证据不足不等价于下单失败，也不能提前消费投递。
+    t = trading
+    own, _, _, _ = await seed_allocation(t)
+    t.binding.consecutive_failures = 4
+    # 用真实持久化投递验证延期不会被 APPLIED 状态吞掉。
+    delivery = BindingDelivery(
+        binding_id=t.binding.id, source_event_id="test-event", source_sequence=NOW_MS - 150_000,
+        payload_json=json.dumps({
+            "symbol": "BTCUSDT", "side": "SELL", "positionSide": "LONG", "qty": "1",
+            "avgPrice": "100", "notional": "100", "_event_id": "test-event",
+            "startTime": NOW_MS - 150_000, "endTime": NOW_MS - 150_000,
+        }), state="PENDING",
+    )
+    t.db.add(delivery)
+    t.db.info["delivery"] = delivery
+    if source_state in ("stale", "future"):
+        snapshot = current_snapshot("LONG")
+        snapshot["openPositions"] = []
+        snapshot["openPositionsMeta"]["asOf"] = NOW_MS - 30_001 if source_state == "stale" else NOW_MS + 1
+        t.lead.snapshot_json = json.dumps(snapshot)
+    elif source_state == "invalid_json":
+        t.lead.snapshot_json = "{"
+    elif source_state == "unopened":
+        own.opened_at_ms = 0
+        snapshot = current_snapshot("LONG")
+        snapshot["openPositions"] = []
+        t.lead.snapshot_json = json.dumps(snapshot)
+    await t.db.commit()
+    exchange = OfflineExchange()
+    await execute_batch(t, exchange, source_proven=False)
+    assert exchange.orders == [] and own.owned_qty == 1
+    record = await t.db.scalar(select(ExecutionRecord))
+    assert record.status == "DEFERRED_SOURCE_UNPROVEN"
+    assert t.binding.consecutive_failures == 4 and not t.binding.circuit_breaker_tripped
+    assert delivery.state == "PENDING" and delivery.exit_target_qty is None
+    assert (await t.db.scalars(select(OrderIntent))).all() == []
+    own.opened_at_ms = 100
+    # 恢复必须来自显式的新观察，不能靠通用夹具覆盖缺陷。
+    snapshot = current_snapshot("LONG")
+    snapshot["openPositions"] = []
+    t.lead.snapshot_json = json.dumps(snapshot)
+    await t.db.commit()
+    await execute_batch(t, exchange, source_proven=False)
+    assert len(exchange.orders) == 1 and own.owned_qty == 0
+    assert delivery.state == "APPLIED" and delivery.exit_remaining_qty == "0"
+
+
+async def prepare_tracked_exit(t, exchange, monkeypatch):
+    # 持久化已跟随的开仓水位，覆盖真实循环里的 WAITING_SOURCE 门禁。
+    allocation, _, _, _ = await seed_allocation(t)
+    allocation.opened_at_ms = NOW_MS - 300_000
+    await prepare_event_router(t, exchange, monkeypatch)
+    exchange.get_positions.return_value = [t.pos]
+    snapshot = current_snapshot("LONG")
+    snapshot["openPositions"] = []
+    t.lead.snapshot_json = json.dumps(snapshot)
+    t.db.add(BindingPositionProgress(
+        binding_id=t.binding.id, symbol="BTCUSDT", position_side="LONG",
+        source_time_ms=NOW_MS - 300_000, source_event_id="prior-open",
+        source_remaining_qty="1", cycle_tracked=True,
+    ))
+    await t.db.commit()
+    return snapshot, [source_order("tracked-exit", "LONG", "SELL", NOW_MS - 150_000)]
+
+
+@pytest.mark.parametrize("gate", ["source_recheck", "admission_recheck"])
+async def test_unsubmitted_source_exit_retries_after_restart_in_real_delivery_loop(trading, monkeypatch, gate):
+    # 意图已落库但未 POST 的延期，在新路由器中仍须能重试同一冻结目标。
+    t, exchange = trading, OfflineExchange()
+    snapshot, orders = await prepare_tracked_exit(t, exchange, monkeypatch)
+    t.binding.consecutive_failures = 4
+    await t.db.commit()
+    commit = t.db.commit
+    validate = t.router._validate_exit_source
+    changed = False
+
+    async def expire_snapshot():
+        nonlocal changed
+        stale = current_snapshot("LONG")
+        stale["openPositions"] = []
+        stale["openPositionsMeta"]["asOf"] = NOW_MS - 30_001
+        t.lead.snapshot_json = json.dumps(stale)
+        changed = True
+        await commit()
+
+    async def commit_with_expiry():
+        submitting = any(isinstance(row, OrderIntent) and row.state == "SUBMITTING" for row in t.db.new)
+        await commit()
+        if submitting and not changed:
+            await expire_snapshot()
+
+    async def validate_with_expiry(*args, **kwargs):
+        result = await validate(*args, **kwargs)
+        intent = await t.db.scalar(select(OrderIntent).where(OrderIntent.state == "SUBMITTING"))
+        if intent is not None and not changed:
+            await expire_snapshot()
+        return result
+
+    if gate == "source_recheck":
+        monkeypatch.setattr(t.db, "commit", commit_with_expiry)
+    else:
+        monkeypatch.setattr(t.router, "_validate_exit_source", validate_with_expiry)
+    await t.router.process_lead_events(t.db, t.lead, orders, [], snapshot, [t.proxy])
+    monkeypatch.setattr(t.db, "commit", commit)
+    monkeypatch.setattr(t.router, "_validate_exit_source", validate)
+    assert changed and exchange.orders == []
+    intent = await t.db.scalar(select(OrderIntent))
+    delivery = await t.db.scalar(select(BindingDelivery).where(BindingDelivery.binding_id == t.binding.id))
+    assert intent.state == "REJECTED" and intent.filled_qty == "0" and intent.exchange_order_id is None
+    assert delivery.state == "PENDING" and delivery.exit_progress == "SOURCE_UNPROVEN"
+    assert delivery.exit_target_qty == delivery.exit_remaining_qty == "1"
+    assert (await t.db.scalar(select(ExecutionRecord))).status == "DEFERRED_SOURCE_UNPROVEN"
+    assert t.binding.consecutive_failures == 4 and not t.binding.circuit_breaker_tripped
+    t.lead.snapshot_json = json.dumps(snapshot)
+    await t.db.commit()
+    async with get_session_factory()() as restarted:
+        router = CopyRouter(t.router.vault)
+        lead = await restarted.get(LeadSource, t.lead.id)
+        await router.process_lead_events(restarted, lead, orders, [], snapshot, [t.proxy])
+        await router.process_lead_events(restarted, lead, orders, [], snapshot, [t.proxy])
+    await t.db.refresh(delivery)
+    assert len(exchange.orders) == 1 and exchange.orders[0]["reduce_only"] is True
+    assert delivery.state == "APPLIED" and delivery.exit_remaining_qty == "0"
+
+
+@pytest.mark.parametrize("outcome", ["terminal_zero", "terminal_zero_mislabeled", "partial", "unknown", "review"])
+async def test_source_retry_marker_never_bypasses_prior_order_or_review_gates(trading, monkeypatch, outcome):
+    # 真实 POST 的零成交、部分成交、UNKNOWN 和人工复核不能获未提交重试特权。
+    t = trading
+    exchange = OfflineExchange(fill=0.5 if outcome == "partial" else 0,
+                               state="new" if outcome == "unknown" else "canceled")
+    snapshot, orders = await prepare_tracked_exit(t, exchange, monkeypatch)
+    await t.router.process_lead_events(t.db, t.lead, orders, [], snapshot, [t.proxy])
+    assert len(exchange.orders) == 1
+    delivery = await t.db.scalar(select(BindingDelivery).where(BindingDelivery.binding_id == t.binding.id))
+    if outcome != "terminal_zero":
+        delivery.exit_progress = "SOURCE_UNPROVEN"
+    if outcome == "review":
+        state = await t.db.get(BindingPositionProgress, (t.binding.id, "BTCUSDT", "LONG"))
+        state.review_reason = "Human review is still required"
+    await t.db.commit()
+    await t.router.process_lead_events(t.db, t.lead, orders, [], snapshot, [t.proxy])
+    assert len(exchange.orders) == 1 and delivery.state == "PENDING"
+    if outcome == "unknown":
+        assert (await t.db.scalar(select(OrderIntent))).state == "UNKNOWN"
+    else:
+        assert delivery.exit_progress == ("REVIEW_REQUIRED" if outcome == "review" else "WAITING_SOURCE")
+
+
+async def test_cumulative_fill_delta_does_not_reuse_cumulative_realized_pnl(trading, monkeypatch):
+    # 数量可以按累计值差分，未存收益基线时不能把整单收益记到后续增量。
+    t, exchange = trading, OfflineExchange()
+    await seed_allocation(t, qty=2)
+    await prepare_event_router(t, exchange, monkeypatch)
+    exchange.get_positions.return_value = [t.pos]
+    order = source_order("cumulative-pnl", "LONG", "SELL", NOW_MS - 150_000)
+    order.update(totalPnl=10, pnlKnown=True)
+    snapshot = current_snapshot("LONG")
+    t.lead.snapshot_json = json.dumps(snapshot)
+    await t.db.commit()
+    await t.router.process_lead_events(t.db, t.lead, [order], [], snapshot, [t.proxy])
+    order = {**order, "executedQty": "2", "orderUpdateTime": NOW_MS - 50_000, "totalPnl": 20}
+    snapshot["openPositions"] = []
+    t.lead.snapshot_json = json.dumps(snapshot)
+    await t.db.commit()
+    await t.router.process_lead_events(t.db, t.lead, [order], [], snapshot, [t.proxy])
+    deliveries = (await t.db.scalars(select(BindingDelivery).where(
+        BindingDelivery.binding_id == t.binding.id).order_by(BindingDelivery.source_sequence))).all()
+    first, delta = [json.loads(delivery.payload_json) for delivery in deliveries]
+    assert len(exchange.orders) == 2 and first["pnlKnown"] is True and first["totalPnl"] == 10
+    assert delta["qty"] == "1" and delta["pnlKnown"] is False
+    assert delta["pnl"] is None and delta["totalPnl"] is None
+
+
+async def test_local_close_validation_rejection_creates_no_unknown_intent(trading, monkeypatch):
+    # 本地过滤器拒绝发生在提交前，不查单、不产生未决意图。
+    t, exchange = trading, OfflineExchange()
+    await seed_allocation(t)
+    monkeypatch.setattr(t.spec, "validate_order", Mock(side_effect=ValueError("invalid market quantity")))
+    exchange.get_order = AsyncMock()
+    await execute_batch(t, exchange)
+    assert exchange.orders == []
+    exchange.get_order.assert_not_awaited()
+    assert (await t.db.scalars(select(OrderIntent))).all() == []
+    assert (await t.db.scalar(select(ExecutionRecord))).status == "REJECTED"
+    assert t.binding.consecutive_failures == 1
+
+
+async def test_definite_rejection_is_terminal_and_does_not_block_next_delivery(trading):
+    # 拒单无查单、无 UNKNOWN 意图，独立下一笔仍可执行。
+    t = trading
+    exchange = OfflineExchange()
+    exchange.place_order = AsyncMock(side_effect=OrderRejected("binance", "-2019", "Insufficient margin"))
+    exchange.get_order = AsyncMock()
+    await execute_batch(t, exchange, side="BUY", remaining=1, event="rejected")
+    assert (await t.db.scalar(select(OrderIntent))).state == "REJECTED"
+    assert (await t.db.scalar(select(ExecutionRecord))).status == "REJECTED"
+    exchange.get_order.assert_not_awaited()
+    successor = OfflineExchange()
+    await execute_batch(t, successor, side="BUY", remaining=1, event="successor")
+    assert len(successor.orders) == 1 and t.binding.consecutive_failures == 0
 
 
 async def test_orphan_close_is_binding_scoped(trading):

@@ -10,6 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.core import database
+from app.core.config import get_settings
 from app.core.database import get_session_factory
 from app.core.security import CredentialVault
 from app.models.domain import CopyBinding, ExecutionRecord, LeadSource, NotificationOutbox, SystemConfig, TradingAccount
@@ -150,11 +151,38 @@ async def test_restart_recovers_expired_claims_and_exhausted_attempts(monkeypatc
             row.claimed_until = datetime.now(timezone.utc) - timedelta(seconds=1)
         await db.commit()
         ids = pending.id, exhausted.id
-    assert await NotificationOutboxDrainer().drain_once() == 1
+    assert await NotificationOutboxDrainer(max_attempts=3).drain_once() == 1
     async with get_session_factory()() as db:
         pending, exhausted = [await db.get(NotificationOutbox, row_id) for row_id in ids]
         assert pending.status == "sent" and pending.attempts == 2
         assert exhausted.status == "failed" and exhausted.attempts == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("linked", [False, True])
+async def test_restart_exhaustion_updates_only_proven_execution_receipt(monkeypatch, linked):
+    # 耗尽租约与回执同事务落盘，损坏的关联键不得伪造执行通知终态。
+    dispatch = AsyncMock()
+    monkeypatch.setattr(NotificationService, "dispatch", dispatch)
+    async with get_session_factory()() as db:
+        router, binding, lead, account = await record_execution(db)
+        execution = await router._record_execution(db, binding, lead, account,
+            "BTCUSDT", "BTC-USDT-SWAP", "BUY", "LONG", "OPEN_LONG", "EXECUTED",
+            1, 100, 100, notify_cfg={"webhook_enabled": True})
+        row = await db.scalar(select(NotificationOutbox))
+        if not linked:
+            payload = json.loads(row.payload)
+            payload["event_key"] = "unrelated"
+            row.payload = json.dumps(payload)
+        row.attempts = 3
+        row.claimed_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+        await db.commit()
+        execution_id, row_id = execution.id, row.id
+    assert await NotificationOutboxDrainer(max_attempts=3).drain_once() == 0
+    async with get_session_factory()() as db:
+        assert (await db.get(NotificationOutbox, row_id)).status == "failed"
+        assert (await db.get(ExecutionRecord, execution_id)).notification_state == ("failed" if linked else "pending")
+    dispatch.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -188,7 +216,7 @@ async def test_workers_cannot_claim_the_same_pending_row(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_graceful_shutdown_drains_pending_rows_and_finishes_retries(monkeypatch):
+async def test_graceful_shutdown_preserves_backoff_and_pending_work(monkeypatch):
     dispatch = AsyncMock(return_value={"webhook": {"ok": False}})
     monkeypatch.setattr(NotificationService, "dispatch", dispatch)
     async with get_session_factory()() as db:
@@ -196,11 +224,14 @@ async def test_graceful_shutdown_drains_pending_rows_and_finishes_retries(monkey
         enqueue_notification(db, {"webhook_enabled": True}, "title", "body")
         await db.commit()
     drainer = NotificationOutboxDrainer(max_attempts=2)
-    await drainer.start()
+    # 先制造一次失败，停机不得跳过退避强行耗尽剩余重试。
+    await drainer.drain_once()
     await drainer.stop()
-    assert drainer._task is None and dispatch.await_count == 2
+    assert drainer._task is None and dispatch.await_count == 1
     async with get_session_factory()() as db:
-        assert (await db.scalar(select(NotificationOutbox))).status == "failed"
+        row = await db.scalar(select(NotificationOutbox))
+        assert row.status == "pending" and row.attempts == 1 and row.next_attempt_at is not None
+    assert await NotificationOutboxDrainer(max_attempts=2).drain_once() == 0
 
 
 @pytest.mark.asyncio
@@ -224,6 +255,7 @@ async def test_sink_exception_details_never_escape_dispatch_or_dead_letter_queue
         raise OSError("private-credential-must-not-escape")
 
     monkeypatch.setattr(NotificationService, "_append_outbox", failing_append)
+    monkeypatch.setattr(get_settings(), "data_dir", str(tmp_path))  # 合法路径才能到达模拟磁盘异常。
     config = {"outbox_enabled": True, "outbox_path": str(tmp_path / "events.jsonl")}
     result = await NotificationService.dispatch(config, "title", "body")
     assert result["outbox"] == {"ok": False, "error": "OSError"}
@@ -252,11 +284,12 @@ async def test_shutdown_database_failure_retains_work_without_masking_shutdown(m
     drain = AsyncMock(side_effect=RuntimeError("database unavailable"))
     monkeypatch.setattr(drainer, "drain_once", drain)
     await drainer.stop()
-    drain.assert_awaited_once_with(ignore_backoff=True)
+    drain.assert_not_awaited()  # 没有在途任务时，停机不再访问数据库领取新任务。
 
 
 @pytest.mark.asyncio
 async def test_jsonl_sink_runs_file_io_off_event_loop(tmp_path, monkeypatch):
+    monkeypatch.setattr(get_settings(), "data_dir", str(tmp_path))
     loop_thread = threading.get_ident()
     worker_threads = []
     original = NotificationService._append_outbox

@@ -14,6 +14,7 @@ NOTIFICATION_SECRET_FIELDS = {
     "webhook_url": "webhookUrl",
     "wecom_webhook_url": "wecomWebhookUrl",
     "dingtalk_webhook_url": "dingtalkWebhookUrl",
+    "dingtalk_secret": "dingtalkSecret",
 }
 SECRET_KEYS = frozenset(NOTIFICATION_SECRET_FIELDS) | frozenset(NOTIFICATION_SECRET_FIELDS.values())
 _PROXY_USERINFO = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)[^/?#]*@")

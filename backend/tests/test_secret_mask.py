@@ -76,7 +76,12 @@ def test_proxy_mask_cannot_forward_stored_credentials_to_another_host():
 @pytest.mark.asyncio
 async def test_notification_secrets_masked_on_get_and_put_and_round_trip(secret_client):
     aliases = NOTIFICATION_SECRET_FIELDS
-    values = {key: f"synthetic-{key}-secret" for key in aliases}
+    # 初次写入必须满足 HTTPS 门禁，随后才能真实验证脱敏占位符回写。
+    values = {
+        key: f"https://notifications.invalid/{key}/synthetic-secret"
+        if key.endswith("_url") else f"synthetic-{key}-secret"
+        for key in aliases
+    }
     response = await secret_client.put("/api/settings", json={"notifications": {
         aliases[key]: value for key, value in values.items()
     }})
@@ -130,6 +135,13 @@ async def test_proxy_secrets_hidden_on_all_api_reads_and_preserved_on_update(sec
         assert response.json()["item"]["url_configured"] is True
         async with get_session_factory()() as db:
             assert (await db.get(ProxyNode, proxy_id)).url == url
+    # 保留占位符不能放宽 null、地址长度或凭据跨端点转发的边界。
+    for invalid in (None, "a", "ab", "x" * 256, "http://***:***@another.invalid:8080"):
+        response = await secret_client.put(f"/api/proxies/{proxy_id}", json={"url": invalid, "priority": 99})
+        assert response.status_code == 422
+        async with get_session_factory()() as db:
+            node = await db.get(ProxyNode, proxy_id)
+            assert node.url == url and node.priority == 20
     monkeypatch.setattr("app.api.proxies.ProxyManager.test_proxy", AsyncMock(return_value=ProxyTestResult(
         healthy=False, latency_ms=None, error=f"Cannot connect to {url}",
     )))

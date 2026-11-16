@@ -105,17 +105,17 @@ def test_binance_ordered_routes_never_include_direct(monkeypatch, direct_enabled
     monkeypatch.setattr(get_settings(), "direct_egress_exchanges", ["binance"])
     nodes = [proxy(1), proxy(2)]
     assert ProxyManager.ordered_proxy_urls(nodes, preferred_proxy_id=2, exchange="binance") == [
-        nodes[1].url, nodes[0].url,
+        nodes[1].url,  # 显式绑定只允许该出口。
     ]
 
 
-def test_okx_prefers_configured_healthy_proxy_and_appends_direct(monkeypatch):
+def test_okx_configured_healthy_proxy_excludes_direct(monkeypatch):
     nodes = [proxy(1), proxy(2)]
     nodes[0].priority = 1
     selected = ProxyManager.select_proxy_url(nodes, preferred_proxy_id=2, exchange="okx")
     assert selected == nodes[1].url
     assert ProxyManager.ordered_proxy_urls(nodes, preferred_proxy_id=2, exchange="okx") == [
-        nodes[1].url, None,
+        nodes[1].url,
     ]
     constructor = Mock()
     monkeypatch.setattr("app.services.proxy.manager.httpx.AsyncClient", constructor)
@@ -141,21 +141,23 @@ def test_okx_explicit_proxy_excludes_pool_favourite(preferred_proxy_id):
     favourite.priority = 1
     assert ProxyManager.select_proxy_url([favourite, assigned], preferred_proxy_id=assigned.id, exchange="okx") == assigned.url
     assert ProxyManager.ordered_proxy_urls([favourite, assigned], preferred_proxy_id=assigned.id, exchange="okx") == [
-        assigned.url, None,
+        assigned.url,
     ]
 
 
 def test_okx_unhealthy_assigned_proxy_does_not_borrow_healthy_pool():
     assigned, other = proxy(1), proxy(2)
     assigned.is_healthy = False
-    assert ProxyManager.ordered_proxy_urls([assigned, other], preferred_proxy_id=assigned.id, exchange="okx") == [None]
-    assert ProxyManager.select_proxy_url([assigned, other], preferred_proxy_id=assigned.id, exchange="okx") is None
+    for selector in (ProxyManager.ordered_proxy_urls, ProxyManager.select_proxy_url):
+        with pytest.raises(ProxyEgressError, match="Assigned proxy"):
+            selector([assigned, other], preferred_proxy_id=assigned.id, exchange="okx")
 
 
 def test_okx_missing_assigned_proxy_does_not_borrow_healthy_pool():
     nodes = [proxy(1), proxy(2)]
-    assert ProxyManager.ordered_proxy_urls(nodes, preferred_proxy_id=99, exchange="okx") == [None]
-    assert ProxyManager.select_proxy_url(nodes, preferred_proxy_id=99, exchange="okx") is None
+    for selector in (ProxyManager.ordered_proxy_urls, ProxyManager.select_proxy_url):
+        with pytest.raises(ProxyEgressError, match="Assigned proxy"):
+            selector(nodes, preferred_proxy_id=99, exchange="okx")
 
 
 def test_binance_unassigned_proxy_uses_healthy_pool_without_direct():
@@ -179,15 +181,14 @@ async def test_okx_explicit_none_builds_direct_client_despite_global_false():
 
 
 @pytest.mark.parametrize("availability", ["missing", "disabled", "unhealthy"])
-async def test_okx_unavailable_configured_proxy_falls_back_to_direct(availability):
+async def test_okx_unavailable_configured_proxy_fails_closed(availability):
     node = proxy()
     node.is_enabled = availability != "disabled"
     node.is_healthy = availability != "unhealthy"
     nodes = [proxy(2)] if availability == "missing" else [node, proxy(2)]
-    assert ProxyManager.ordered_proxy_urls(nodes, preferred_proxy_id=node.id, exchange="okx") == [None]
-    selected = ProxyManager.select_proxy_url(nodes, preferred_proxy_id=node.id, exchange="okx")
-    async with ProxyManager.build_client(proxy_url=selected, exchange="okx") as client:
-        assert not client._mounts
+    for selector in (ProxyManager.ordered_proxy_urls, ProxyManager.select_proxy_url):
+        with pytest.raises(ProxyEgressError, match="Assigned proxy"):
+            selector(nodes, preferred_proxy_id=node.id, exchange="okx")
 
 
 @pytest.mark.parametrize("exchange", [None, "unknown"])
@@ -257,6 +258,7 @@ async def test_account_proxy_applies_policy_at_every_entry_point(monkeypatch, ex
     )
     monkeypatch.setattr(f"{module}.create_exchange_adapter", factory)
     async with get_session_factory()() as db:
+        permitted = exchange == "okx" and not assigned_proxy  # 只有未指定代理时允许直连。
         node = proxy()
         node.is_healthy = False
         nodes = [node, proxy(2)] if exchange == "okx" else [node]
@@ -270,13 +272,13 @@ async def test_account_proxy_applies_policy_at_every_entry_point(monkeypatch, ex
         engine = EngineOrchestrator()
         if path == "sync_account":
             result = await engine.sync_account(db, account)
-            assert result["ok"] is (exchange == "okx")
+            assert result["ok"] is permitted
         elif path == "risk_tick":
             guards = AsyncMock()
             monkeypatch.setattr(engine.router, "check_position_guards", guards)
             monkeypatch.setattr(engine, "_check_account_equity", AsyncMock())
             await engine.risk_tick()
-            assert guards.await_count == (1 if exchange == "okx" else 0)
+            assert guards.await_count == (1 if permitted else 0)
         elif path == "router":
             reconcile = AsyncMock(return_value=True)
             monkeypatch.setattr(engine.router, "reconcile_pending_orders", reconcile)
@@ -285,8 +287,8 @@ async def test_account_proxy_applies_policy_at_every_entry_point(monkeypatch, ex
                 "asOf": int(time.time() * 1000),
             }}
             await engine.router.process_lead_events(db, lead, [], [], snapshot, nodes)
-            assert reconcile.await_count == (1 if exchange == "okx" else 0)
-        elif exchange == "binance":
+            assert reconcile.await_count == (1 if permitted else 0)
+        elif not permitted:
             with pytest.raises(HTTPException):
                 if path == "connectivity":
                     await account_connectivity(account.id, db=db, _user=None)
@@ -296,7 +298,7 @@ async def test_account_proxy_applies_policy_at_every_entry_point(monkeypatch, ex
             assert (await account_connectivity(account.id, db=db, _user=None))["ok"] is True
         else:
             await require_account_flat(db, account)
-    if exchange == "binance":
+    if not permitted:
         factory.assert_not_called()
     else:
         factory.assert_called_once()

@@ -1,331 +1,232 @@
 <script setup lang="ts">
-import { onActivated, onMounted, ref } from "vue";
-import { Download, Eye, Plus, RefreshCw, Trash2, X } from "lucide-vue-next";
-import { api } from "@/api/client";
+import { computed, nextTick, onActivated, onDeactivated, onMounted, onUnmounted, ref, watch } from "vue";
+import { useRoute, useRouter } from "vue-router";
+import { ChevronDown, Pencil, Plus, RefreshCw, Save, Trash2 } from "lucide-vue-next";
+import { api, ApiError, isCancelled } from "@/api/client";
 import { useDataCacheStore } from "@/stores/dataCache";
+import { useAsyncAction } from "@/composables/useAsyncAction";
 import { useI18n } from "@/i18n";
-import { formatUsd } from "@/utils/format";
-import LeadTelemetryPanel from "@/components/LeadTelemetryPanel.vue";
-
+import type { Lead } from "@/types/api";
+import type { TableColumn } from "@/types/ui";
+import { POLL_RULE, validateNumber } from "@/constants/validation";
+import { telemetryDirectionLabel, telemetrySide } from "@/constants/telemetry";
+import { errorMessage, fieldErrors, reasonText } from "@/utils/errors";
+import { formatDateTime, formatQty, signedUsd, timestampMs } from "@/utils/format";
+import { actionLabel, pnlClass, sideLabel } from "@/utils/status";
+import BaseModal from "@/components/BaseModal.vue";
+import DataTable from "@/components/DataTable.vue";
+import MoreMenu from "@/components/MoreMenu.vue";
+import PageHeader from "@/components/PageHeader.vue";
+import StatusBadge from "@/components/StatusBadge.vue";
+import FreshnessStamp from "@/components/FreshnessStamp.vue";
+import NumberField from "@/components/NumberField.vue";
 defineOptions({ name: "LeadsView" });
-
 const cache = useDataCacheStore();
 const { t } = useI18n();
-
-const leads = ref<any[]>(cache.leads?.data || []);
-const proxies = ref<any[]>(cache.proxies?.data || []);
-const loading = ref(!cache.leads);
-const syncingId = ref<number | null>(null);
-
+const route = useRoute();
+const router = useRouter();
+const { pending, error: actionError, run } = useAsyncAction();
+const leads = computed(() => cache.leads?.data || []);
+const proxies = computed(() => cache.proxies?.data || []);
+const loading = ref(false);
+const loadError = ref("");
+const formElement = ref<HTMLFormElement | null>(null);
+function boardLead(lead: Lead) { return cache.board?.data.leads?.find(item => item.id === lead.id); }
+function positionCount(lead: Lead): number | null {
+  const current = boardLead(lead);
+  if (current) return current.positions == null || (current.positionShow !== true && !current.positions.length) ? null : current.positions.length;
+  // 列表摘要可能把缺失快照记作零；缺少看板时只相信实际仓位列表。
+  const snapshot = cache.leadSnapshots[lead.id]?.data ?? lead.snapshot;
+  const positions = snapshot?.openPositions;
+  return positions == null || ((snapshot?.profile?.positionShow ?? lead.positionShow) !== true && !positions.length)
+    ? null : positions.length;
+}
+function stale(lead: Lead) { const current = boardLead(lead); return current ? current.stale : lead.stale ?? null; }
+function followerCount(lead: Lead): number | null {
+  if (!cache.bindings) return null;
+  const bound = (cache.bindings.data.items ?? []).filter(binding => binding.leadId === lead.id);
+  return bound.some(binding => binding.accountId == null) ? null : new Set(bound.map(binding => binding.accountId)).size;
+}
+function rowTone(lead: Lead) {
+  if (lead.lastError || lead.status?.toUpperCase() === "ERROR") return "bg-danger/10";
+  return stale(lead) === true || stale(lead) == null || positionCount(lead) == null || lead.isEnabled == null ? "bg-warning/5" : "";
+}
+const rows = computed(() => [...leads.value].sort((a, b) => {
+  const rank = (lead: Lead) => rowTone(lead).includes("danger") ? 0 : rowTone(lead) ? 1 : 2;
+  return rank(a) - rank(b) || a.id - b.id;
+}));
+const summary = computed(() => t("leads.summary", {
+  n: leads.value.length,
+  positions: leads.value.filter(lead => positionCount(lead) != null && positionCount(lead)! > 0).length,
+  stale: leads.value.filter(lead => stale(lead) === true).length,
+  unknown: leads.value.filter(lead => stale(lead) == null || positionCount(lead) == null || lead.isEnabled == null).length,
+}));
+const columns = computed<TableColumn[]>(() => [
+  { key: "name", label: t("common.name"), width: "20%", mobileWide: true },
+  // 固定操作列包含 44px 触控目标和左右内边距，不能被百分比挤窄。
+  { key: "enabled", label: t("common.enable"), width: "68px" },
+  { key: "positions", label: t("leads.openPositions"), numeric: true },
+  { key: "today", label: t("leads.todayActivity"), numeric: true },
+  { key: "pnl", label: t("leads.todayRealized"), numeric: true },
+  { key: "action", label: t("leads.latestAction"), width: "16%", mobileWide: true },
+  { key: "freshness", label: t("board.snapshot"), width: "14%", mobileWide: true },
+  { key: "followers", label: t("leads.followerAccounts"), numeric: true },
+  { key: "public", label: t("leads.publicCol"), width: "68px" },
+  { key: "actions", label: t("common.actions"), width: "68px", mobileWide: true },
+]);
+interface LatestAction { time: number | null; symbol: string | null; side: string | null; qty: number | null; action: string | null; direction: string | null }
+function latestAction(lead: Lead): LatestAction | null {
+  const event = [...(boardLead(lead)?.todayEvents ?? [])].sort((a, b) => (b.time ?? -Infinity) - (a.time ?? -Infinity))[0];
+  if (event) return { time: event.time, symbol: event.symbol, side: event.side, qty: event.qty, action: event.action, direction: null };
+  const snapshot = cache.leadSnapshots[lead.id]?.data ?? lead.snapshot;
+  const order = [...(snapshot?.orders ?? [])].sort((a, b) => (b.time ?? b.t ?? -Infinity) - (a.time ?? a.t ?? -Infinity))[0];
+  if (order) return { time: order.time ?? order.t ?? null, symbol: order.symbol ?? null, side: telemetrySide(order.dir, order.qty ?? order.q), qty: order.qty ?? order.q ?? null, action: null, direction: telemetryDirectionLabel(order.dir) };
+  const last = timestampMs(lead.lastTradeTime ?? snapshot?.profile?.lastTradeTime);
+  return last == null ? null : { time: last, symbol: null, side: null, qty: null, action: null, direction: null };
+}
+function leadAvatar(lead: Lead) { return lead.avatarUrl ?? boardLead(lead)?.avatarUrl ?? null; }
+function openDetail(lead: Lead) { void router.push(`/leads/${lead.id}`); }
 const showModal = ref(false);
-const form = ref({
-  name: "",
-  platform: "binance_bapi",
-  portfolioId: "",
-  description: "",
-  pollIntervalSec: 15,
-  proxyId: null as number | null,
-  isPublicDashboard: false,
+const editing = ref<Lead | null>(null);
+const errors = ref<Record<string, string>>({});
+const form = ref({ name: "", portfolioId: "", description: "", pollIntervalSec: 15 as number | null, proxyId: null as number | null, isPublicDashboard: false });
+const tableError = computed(() => loadError.value || (!showModal.value ? actionError.value : ""));
+let loadSequence = 0;
+let pollTimer: ReturnType<typeof setInterval> | undefined;
+async function load(force = false) {
+  const request = ++loadSequence;
+  loading.value = true;
+  if (force) { loadError.value = ""; actionError.value = ""; }
+  try {
+    await Promise.all([cache.fetchLeads(force), cache.fetchProxies(force), cache.fetchBindings(force), cache.fetchBoard(force)]);
+    if (request !== loadSequence) return;
+    // 今日没有事件时按需补取最近订单，避免只能显示列表中的一个历史时间。
+    const recent = leads.value.filter(lead => {
+      const last = timestampMs(lead.lastTradeTime);
+      const latest = latestAction(lead);
+      return !boardLead(lead)?.todayEvents?.length && last != null &&
+        (latest?.symbol == null || latest.time == null || latest.time < last);
+    });
+    await Promise.all(recent.map(lead => {
+      const latest = latestAction(lead);
+      const newer = cache.leadSnapshots[lead.id] != null && latest?.time != null && latest.time < timestampMs(lead.lastTradeTime)!;
+      return cache.fetchLeadSnapshot(lead.id, force || newer, 60_000);
+    }));
+    if (request === loadSequence) loadError.value = "";
+  } catch (cause: unknown) {
+    if (request === loadSequence && !isCancelled(cause)) loadError.value = errorMessage(cause);
+  } finally { if (request === loadSequence) loading.value = false; }
+}
+function environments(lead: Lead) { return (cache.bindings?.data.items || []).filter(binding => binding.leadId === lead.id).map(binding => binding.accountEnvironment); }
+function edit(lead: Lead | null) {
+  editing.value = lead; errors.value = {}; actionError.value = "";
+  form.value = { name: lead?.name || "", portfolioId: lead?.portfolioId || "", description: lead?.description || "",
+    pollIntervalSec: lead ? lead.pollIntervalSec ?? null : 15, proxyId: lead?.proxyId ?? null, isPublicDashboard: lead?.isPublicDashboard === true };
+  showModal.value = true;
+}
+async function save() {
+  errors.value = {};
+  const validation = validateNumber(form.value.pollIntervalSec, POLL_RULE);
+  if (validation) errors.value.poll_interval_sec = validation;
+  if (!form.value.name.trim()) errors.value.name = t("validation.required");
+  else if (form.value.name.trim().length > 120) errors.value.name = t("validation.maxLength", { n: 120 });
+  if (!editing.value && form.value.portfolioId.trim().length < 3) errors.value.portfolio_id = t("validation.minLength", { n: 3 });
+  else if (!editing.value && form.value.portfolioId.trim().length > 100) errors.value.portfolio_id = t("validation.maxLength", { n: 100 });
+  if (Object.keys(errors.value).length) { await focusError(); return; }
+  const { portfolioId, ...other } = form.value;
+  const result = await run(() => editing.value ? api.put(`/api/leads/${editing.value.id}`, { ...other, name: other.name.trim() })
+    : api.post("/api/leads", { ...form.value, name: form.value.name.trim(), portfolioId: portfolioId.trim(), platform: "binance_bapi" }), {
+    confirm: editing.value ? { title: t("common.save"), message: t("confirm.edit", { name: form.value.name }), environments: environments(editing.value),
+      strong: !cache.bindings || environments(editing.value).some(environment => environment == null) } : undefined,
+    onError: cause => { errors.value = fieldErrors(cause); void focusError(); },
+  });
+  if (result.ok) { showModal.value = false; await load(true); }
+}
+async function operate(lead: Lead, operation: "toggle" | "delete") {
+  // 服务端尚未返回启用状态时不允许猜测目标值。
+  if (operation === "toggle" && lead.isEnabled == null) return;
+  const title = t(operation === "delete" ? "common.delete" : lead.isEnabled ? "common.disable" : "common.enable");
+  const result = await run(async () => {
+    if (operation === "delete") await api.delete(`/api/leads/${lead.id}`);
+    else await api.put(`/api/leads/${lead.id}`, { isEnabled: !lead.isEnabled });
+  }, { confirm: { title, message: t(operation === "delete" ? "confirm.delete" : "confirm.toggle", { name: lead.name || "—", action: title }),
+    environments: environments(lead), strong: !cache.bindings || environments(lead).some(environment => environment == null) || (operation === "toggle" && !lead.isEnabled) } });
+  if (result.ok) await load(true);
+}
+// 是否进公开看板只影响展示，不影响跟单，所以不弹确认，点一下就切换。
+async function togglePublic(lead: Lead) {
+  if (lead.isPublicDashboard == null) return;
+  const result = await run(() => api.put(`/api/leads/${lead.id}`, { isPublicDashboard: !lead.isPublicDashboard }));
+  if (result.ok) await load(true);
+}
+async function focusError() { await nextTick(); formElement.value?.querySelector<HTMLElement>('[aria-invalid="true"]')?.focus(); }
+async function sync(lead: Lead) {
+  // 手动采集会进入跟单处理；HTTP 200 的业务失败不能误报成功。
+  const result = await run(async () => {
+    const response = await api.post<{ ok: boolean | null; error?: string | null }>(`/api/leads/${lead.id}/sync`);
+    if (response?.ok !== true) throw new ApiError(502, response?.error || "LEAD_SYNC_FAILED");
+    return response;
+  }, { confirm: { title: t("leads.syncNow"), message: t("confirm.syncLead", { name: lead.name ?? t("common.unknown") }),
+    environments: environments(lead), strong: !cache.bindings || environments(lead).some(environment => environment == null) } });
+  if (result.ok) await load(true);
+}
+// 保留旧看板的详情书签，但详情现在有独立路由而不是主导航弹窗。
+watch(() => route.query.detail, () => {
+  if (route.path !== "/leads") return;
+  const target = Number(route.query.detail);
+  if (Number.isInteger(target) && target > 0) {
+    const { detail, ...query } = route.query;
+    void router.replace({ path: `/leads/${target}`, query });
+  }
+}, { immediate: true });
+watch(() => cache.leads, value => {
+  if (value == null) { showModal.value = false; editing.value = null; errors.value = {}; actionError.value = ""; }
 });
-const formError = ref("");
-
-const detailLead = ref<any>(null);
-const detailSnapshot = ref<any>(null);
-
-async function loadData(force = false) {
-  if (!cache.leads) loading.value = true;
-  try {
-    const [lItems, pItems] = await Promise.all([
-      cache.fetchLeads(force, 12000),
-      cache.fetchProxies(force, 20000),
-    ]);
-    leads.value = lItems;
-    proxies.value = pItems;
-  } finally {
-    loading.value = false;
-  }
+function start() {
+  if (pollTimer) return;
+  void load();
+  pollTimer = setInterval(() => { if (!loading.value && !pending.value) void load(); }, 15000);
 }
-
-async function createLead() {
-  formError.value = "";
-  try {
-    await api.post("/api/leads", form.value);
-    showModal.value = false;
-    form.value = {
-      name: "",
-      platform: "binance_bapi",
-      portfolioId: "",
-      description: "",
-      pollIntervalSec: 15,
-      proxyId: null,
-      isPublicDashboard: false,
-    };
-    await loadData(true);
-  } catch (e: any) {
-    formError.value = e.message;
-  }
+function stop() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = undefined; loadSequence++; loading.value = false;
 }
-
-async function syncLead(id: number) {
-  syncingId.value = id;
-  try {
-    await api.post(`/api/leads/${id}/sync`);
-    await loadData(true);
-    if (detailLead.value?.id === id) {
-      detailSnapshot.value = await cache.fetchLeadSnapshot(id, true);
-    }
-  } catch (e) {
-    console.error("Sync failed", e);
-  } finally {
-    syncingId.value = null;
-  }
-}
-
-async function deleteLead(id: number) {
-  if (!confirm(t("leads.deleteConfirm"))) return;
-  await api.delete(`/api/leads/${id}`);
-  await loadData(true);
-}
-
-async function openDetail(lead: any) {
-  detailLead.value = lead;
-  const cached = cache.leadSnapshots[lead.id]?.data;
-  if (cached) detailSnapshot.value = cached;
-  try {
-    detailSnapshot.value = await cache.fetchLeadSnapshot(lead.id, !cached, 10000);
-  } catch {
-    if (!cached) detailSnapshot.value = null;
-  }
-}
-
-function downloadCsv(leadId: number, type: "orders" | "cycles") {
-  window.open(api.resolveUrl(`/api/leads/${leadId}/export-csv?export_type=${type}`), "_blank");
-}
-
-
-onMounted(() => loadData(false));
-onActivated(() => {
-  if (cache.leads) leads.value = cache.leads.data;
-  if (cache.proxies) proxies.value = cache.proxies.data;
-  loadData(false);
-});
+onMounted(start);
+onActivated(start);
+onDeactivated(stop);
+onUnmounted(stop);
 </script>
-
 <template>
-  <div class="space-y-6">
-    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-      <div>
-        <h2 class="text-xl sm:text-2xl font-bold text-white tracking-tight">{{ t("leads.title") }}</h2>
-        <p class="text-xs sm:text-sm text-slate-400 mt-0.5">{{ t("leads.subtitle") }}</p>
-      </div>
-      <button
-        @click="showModal = true"
-        class="px-4 py-2.5 rounded-xl bg-gradient-to-r from-accent to-brand text-slate-950 font-semibold text-xs sm:text-sm flex items-center gap-2 hover:opacity-90 shadow-lg shadow-accent/20"
-      >
-        <Plus class="w-4 h-4" />
-        <span>{{ t("leads.addBtn") }}</span>
-      </button>
-    </div>
-
-    <div v-if="loading && leads.length === 0" class="text-center py-12 text-slate-400 text-sm">
-      {{ t("leads.loading") }}
-    </div>
-
-    <div v-else-if="leads.length === 0" class="p-10 rounded-2xl bg-surface border border-slate-800 text-center">
-      <p class="text-slate-300 font-medium mb-1">{{ t("leads.emptyTitle") }}</p>
-      <p class="text-xs text-slate-400 mb-4">{{ t("leads.emptyDesc") }}</p>
-      <button @click="showModal = true" class="px-4 py-2 rounded-xl bg-accent/15 text-accent border border-accent/30 text-xs font-semibold">
-        {{ t("leads.addFirst") }}
-      </button>
-    </div>
-
-    <div v-else class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
-      <div
-        v-for="lead in leads"
-        :key="lead.id"
-        class="rounded-2xl bg-surface border border-slate-800/80 p-5 flex flex-col justify-between space-y-4 hover:border-slate-700 transition-all"
-      >
-        <div>
-          <div class="flex items-start justify-between gap-3">
-            <div>
-              <div class="flex items-center gap-2">
-                <h3 class="font-bold text-lg text-white">{{ lead.name }}</h3>
-                <span
-                  class="px-2 py-0.5 rounded-full text-xs font-mono border"
-                  :class="
-                    lead.status === 'running'
-                      ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
-                      : lead.status === 'error'
-                      ? 'bg-rose-500/10 text-rose-400 border-rose-500/30'
-                      : 'bg-slate-700/40 text-slate-400 border-slate-700'
-                  "
-                >
-                  {{ lead.status.toUpperCase() }}
-                </span>
-              </div>
-              <p class="text-xs text-slate-400 font-mono mt-0.5">ID: {{ lead.portfolioId }}</p>
-            </div>
-            <span
-              v-if="lead.isPublicDashboard"
-              class="px-2 py-0.5 rounded-md bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 text-xs font-mono"
-            >
-              {{ t("leads.publicTag") }}
-            </span>
-          </div>
-
-          <div class="grid grid-cols-2 gap-4 mt-4 p-4 rounded-xl bg-background/60 border border-slate-800/80 text-xs">
-            <div>
-              <span class="text-slate-300 block text-sm mb-1">{{ t("leads.marginBalance") }}</span>
-              <span class="text-lg font-mono font-bold text-slate-100">{{ formatUsd(lead.marginBalance) }}</span>
-            </div>
-            <div>
-              <span class="text-slate-300 block text-sm mb-1">{{ t("leads.openPositions") }}</span>
-              <span class="text-lg font-mono font-bold text-accent">{{ lead.openPositionsCount }} {{ t("leads.activeSuffix") }}</span>
-            </div>
-            <div>
-              <span class="text-slate-300 block text-sm mb-1">{{ t("leads.estUpnl") }}</span>
-              <span
-                class="text-lg font-mono font-bold"
-                :class="lead.openUnrealizedPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'"
-              >
-                {{ lead.openUnrealizedPnl >= 0 ? "+" : "" }}{{ formatUsd(lead.openUnrealizedPnl) }}
-              </span>
-            </div>
-            <div>
-              <span class="text-slate-300 block text-sm mb-1">{{ t("leads.pollInterval") }}</span>
-              <span class="font-mono text-slate-300">{{ lead.pollIntervalSec }}s</span>
-            </div>
-          </div>
-
-          <p v-if="lead.lastError" class="mt-3 text-sm text-rose-400 bg-rose-500/10 p-2 rounded-lg border border-rose-500/20 break-words">
-            {{ lead.lastError }}
-          </p>
-        </div>
-
-        <div class="flex items-center justify-between pt-3 border-t border-slate-800/80">
-          <div class="flex items-center gap-2">
-            <button
-              @click="syncLead(lead.id)"
-              :disabled="syncingId === lead.id"
-              class="px-3 py-1.5 rounded-lg bg-surface2 hover:bg-slate-700 text-xs font-medium text-slate-200 flex items-center gap-1.5 transition-colors"
-            >
-              <RefreshCw class="w-3.5 h-3.5" :class="{ 'animate-spin': syncingId === lead.id }" />
-              <span>{{ syncingId === lead.id ? t("leads.syncing") : t("leads.syncNow") }}</span>
-            </button>
-            <button
-              @click="openDetail(lead)"
-              class="px-3 py-1.5 rounded-lg bg-accent/15 hover:bg-accent/25 text-accent text-xs font-medium flex items-center gap-1.5 transition-colors"
-            >
-              <Eye class="w-3.5 h-3.5" />
-              <span>{{ t("leads.inspectBtn") }}</span>
-            </button>
-          </div>
-          <button
-            @click="deleteLead(lead.id)"
-            class="p-1.5 rounded-lg text-slate-400 hover:text-rose-400 hover:bg-rose-500/10 transition-colors"
-          >
-            <Trash2 class="w-4 h-4" />
-          </button>
-        </div>
-      </div>
-    </div>
-
-    <!-- Create Lead Modal -->
-    <div v-if="showModal" class="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
-      <div class="w-full max-w-lg bg-surface border border-slate-800 rounded-2xl p-6 shadow-2xl">
-        <div class="flex items-center justify-between mb-5">
-          <h3 class="text-lg font-bold text-white">{{ t("leads.modalAddTitle") }}</h3>
-          <button @click="showModal = false" class="text-slate-400 hover:text-white"><X class="w-5 h-5" /></button>
-        </div>
-        <form @submit.prevent="createLead" class="space-y-4">
-          <div v-if="formError" class="p-3 rounded-xl bg-rose-500/10 text-rose-400 text-xs">{{ formError }}</div>
-          <div>
-            <label class="block text-xs text-slate-400 mb-1">{{ t("leads.displayName") }}</label>
-            <input v-model="form.name" required :placeholder="t('leads.displayNamePlaceholder')" class="w-full px-3.5 py-2 rounded-xl bg-background border border-slate-700 text-sm text-white" />
-          </div>
-          <div>
-            <label class="block text-xs text-slate-400 mb-1">{{ t("leads.portfolioId") }}</label>
-            <input v-model="form.portfolioId" required placeholder="e.g. 4123456789012345678" class="w-full px-3.5 py-2 rounded-xl bg-background border border-slate-700 text-sm font-mono text-white" />
-          </div>
-          <div class="grid grid-cols-2 gap-3">
-            <div>
-              <label class="block text-xs text-slate-400 mb-1">{{ t("leads.pollSec") }}</label>
-              <input v-model.number="form.pollIntervalSec" type="number" min="5" max="3600" class="w-full px-3.5 py-2 rounded-xl bg-background border border-slate-700 text-sm text-white" />
-            </div>
-            <div>
-              <label class="block text-xs text-slate-400 mb-1">{{ t("leads.proxyNode") }}</label>
-              <select v-model="form.proxyId" class="w-full px-3.5 py-2 rounded-xl bg-background border border-slate-700 text-sm text-white">
-                <option :value="null">{{ t("leads.autoDirect") }}</option>
-                <option v-for="p in proxies" :key="p.id" :value="p.id">{{ p.name }} ({{ p.region }})</option>
-              </select>
-            </div>
-          </div>
-          <label class="flex items-center gap-2 text-xs text-slate-300 cursor-pointer">
-            <input v-model="form.isPublicDashboard" type="checkbox" class="rounded bg-background border-slate-600 text-accent" />
-            <span>{{ t("leads.exposePublic") }}</span>
-          </label>
-          <div class="flex justify-end gap-3 pt-2">
-            <button type="button" @click="showModal = false" class="px-4 py-2 rounded-xl bg-surface2 text-slate-300 text-xs font-medium">{{ t("leads.cancel") }}</button>
-            <button type="submit" class="px-4 py-2 rounded-xl bg-accent text-slate-950 font-semibold text-xs">{{ t("leads.saveLead") }}</button>
-          </div>
-        </form>
-      </div>
-    </div>
-
-    <!-- Rich Inspect / Telemetry Modal -->
-    <div v-if="detailLead" class="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-2 sm:p-5">
-      <div class="w-full max-w-screen-2xl max-h-[92vh] bg-background border border-slate-800 rounded-2xl flex flex-col shadow-2xl overflow-hidden">
-        <div class="px-5 py-3.5 bg-surface border-b border-slate-800 flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <h3 class="text-base sm:text-lg font-bold text-white">{{ detailLead.name }}</h3>
-            <p class="text-xs text-slate-400 font-mono">
-              {{
-                t("leads.inspectHeaderSub", {
-                  id: detailLead.portfolioId,
-                  mode: detailLead.positionShow === false ? t("leads.hiddenReconstructed") : t("leads.publicDirect"),
-                })
-              }}
-            </p>
-          </div>
-          <div class="flex items-center flex-wrap gap-2">
-            <button
-              @click="syncLead(detailLead.id)"
-              :disabled="syncingId === detailLead.id"
-              class="px-3 py-1.5 rounded-lg bg-surface2 hover:bg-slate-700 text-xs text-slate-200 flex items-center gap-1.5"
-            >
-              <RefreshCw class="w-3.5 h-3.5" :class="{ 'animate-spin': syncingId === detailLead.id }" />
-              <span>{{ syncingId === detailLead.id ? t("leads.syncing") : t("leads.syncNow") }}</span>
-            </button>
-            <button
-              @click="downloadCsv(detailLead.id, 'cycles')"
-              class="px-3 py-1.5 rounded-lg bg-surface2 hover:bg-slate-700 text-xs text-slate-200 flex items-center gap-1.5"
-            >
-              <Download class="w-3.5 h-3.5 text-accent" />
-              <span>{{ t("leads.exportCyclesCsv") }}</span>
-            </button>
-            <button
-              @click="downloadCsv(detailLead.id, 'orders')"
-              class="px-3 py-1.5 rounded-lg bg-surface2 hover:bg-slate-700 text-xs text-slate-200 flex items-center gap-1.5"
-            >
-              <Download class="w-3.5 h-3.5 text-brand" />
-              <span>{{ t("leads.exportOrdersCsv") }}</span>
-            </button>
-            <button @click="detailLead = null" class="p-1.5 text-slate-400 hover:text-white"><X class="w-5 h-5" /></button>
-          </div>
-        </div>
-
-        <div class="p-4 sm:p-6 overflow-y-auto flex-1">
-          <div v-if="!detailSnapshot" class="text-center py-12 text-slate-400 text-sm">
-            {{ t("leads.noSnapshot") }}
-          </div>
-          <LeadTelemetryPanel
-            v-else
-            :snapshot="detailSnapshot"
-            :portfolio-id="detailLead.portfolioId"
-            :display-name="detailLead.name"
-          />
-        </div>
-      </div>
-    </div>
+  <div class="min-w-0 space-y-5">
+    <PageHeader :title="t('leads.title')" :summary="cache.leads ? summary : t('common.loading')">
+      <template #actions><button class="icon-button" :disabled="loading || pending" :aria-label="t('common.refresh')" :title="t('common.refresh')" @click="load(true)"><RefreshCw :size="18" :class="{ 'animate-spin': loading }" /></button><button class="button-primary" :disabled="pending || !cache.leads" @click="edit(null)"><Plus :size="17" />{{ t("leads.addBtn") }}</button></template>
+    </PageHeader>
+    <DataTable :rows="rows" :columns="columns" :row-key="lead => lead.id" :row-tone="rowTone" :loading="loading" :error="tableError" :empty="t('leads.emptyTitle')" :label="t('leads.title')" selectable @retry="load(true)" @select="openDetail">
+      <template #cell-name="{ row }"><div class="flex min-w-0 items-center gap-3"><img v-if="leadAvatar(row)" :src="leadAvatar(row) ?? undefined" :alt="row.name ?? t('common.unknown')" width="32" height="32" class="h-8 w-8 shrink-0 rounded-full object-cover" /><span v-else class="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-surface3 text-xs font-semibold text-muted" aria-hidden="true">{{ row.name?.slice(0, 2) ?? t("common.unknown") }}</span><div class="min-w-0"><RouterLink :to="`/leads/${row.id}`" class="break-words text-sm font-semibold hover:text-accent">{{ row.name ?? t("common.unknown") }}</RouterLink><p class="mt-1 break-all text-xs text-muted">{{ row.portfolioId ?? t("common.unknown") }}</p></div></div></template>
+      <template #cell-enabled="{ row }"><button class="icon-button" role="switch" :aria-checked="row.isEnabled === true" :disabled="pending || row.isEnabled == null" :aria-label="t('leads.enableSwitch', { name: row.name ?? t('common.unknown') })" :title="t(row.isEnabled == null ? 'state.UNKNOWN' : row.isEnabled ? 'common.disable' : 'common.enable')" @click="operate(row, 'toggle')"><span class="relative h-5 w-9 rounded-full" :class="row.isEnabled ? 'bg-accent' : 'bg-surface3'" aria-hidden="true"><span class="absolute top-1 h-3 w-3 rounded-full bg-foreground" :class="row.isEnabled ? 'right-1' : 'left-1'" /></span></button></template>
+      <template #cell-public="{ row }"><button class="icon-button" role="switch" :aria-checked="row.isPublicDashboard === true" :disabled="pending || row.isPublicDashboard == null" :aria-label="t('leads.publicSwitch', { name: row.name ?? t('common.unknown') })" :title="t('leads.publicSwitch', { name: row.name ?? t('common.unknown') })" @click="togglePublic(row)"><span class="relative h-5 w-9 rounded-full" :class="row.isPublicDashboard ? 'bg-accent' : 'bg-surface3'" aria-hidden="true"><span class="absolute top-1 h-3 w-3 rounded-full bg-foreground" :class="row.isPublicDashboard ? 'right-1' : 'left-1'" /></span></button></template>
+      <template #cell-positions="{ row }"><span class="text-base font-semibold">{{ formatQty(positionCount(row)) }}</span></template>
+      <template #cell-today="{ row }"><span>{{ formatQty(boardLead(row)?.todayOpenCount) }} / {{ formatQty(boardLead(row)?.todayCloseCount) }}</span></template>
+      <template #cell-pnl="{ row }"><span class="font-semibold" :class="pnlClass(boardLead(row)?.todayRealizedPnl)">{{ signedUsd(boardLead(row)?.todayRealizedPnl) }}</span></template>
+      <template #cell-action="{ row }"><template v-if="latestAction(row)"><p class="break-words text-xs font-medium">{{ latestAction(row)?.symbol ?? t("common.unknown") }} · {{ sideLabel(latestAction(row)?.side, latestAction(row)?.qty) }}</p><p v-if="latestAction(row)?.action || latestAction(row)?.direction" class="mt-1 text-xs text-muted">{{ latestAction(row)?.direction ?? actionLabel(latestAction(row)?.action) }}</p><time class="mt-1 block text-xs tabular-nums text-muted">{{ formatDateTime(latestAction(row)?.time, { short: true, withSeconds: false }) }}</time></template><span v-else class="text-xs text-muted">{{ t("leads.noRecentAction") }}</span></template>
+      <template #cell-freshness="{ row }"><div class="flex flex-wrap items-center gap-2"><StatusBadge :state="row.isEnabled === false ? 'DISABLED' : stale(row) === true ? 'STALE' : row.status" /><FreshnessStamp v-if="boardLead(row)" :seconds="boardLead(row)?.snapshotAgeSec" :received-at="cache.board?.fetchedAt" :stale="stale(row)" /><FreshnessStamp v-else-if="row.snapshotAgeSec != null" :seconds="row.snapshotAgeSec" :received-at="cache.leads?.fetchedAt" :stale="row.stale" /><FreshnessStamp v-else :timestamp="row.lastSyncAt" :stale="row.stale" /></div><p v-if="row.lastError" class="mt-1 break-words text-xs text-danger">{{ reasonText(row.lastError) }}</p></template>
+      <template #cell-followers="{ row }"><span>{{ formatQty(followerCount(row)) }}</span></template>
+      <template #cell-actions="{ row }"><MoreMenu><button class="button-secondary justify-start" :disabled="pending" @click="edit(row)"><Pencil :size="16" />{{ t("common.edit") }}</button><button class="button-secondary justify-start" :disabled="pending" @click="sync(row)"><RefreshCw :size="16" />{{ t("leads.syncNow") }}</button><button class="button-danger justify-start" :disabled="pending" @click="operate(row, 'delete')"><Trash2 :size="16" />{{ t("common.delete") }}</button></MoreMenu></template>
+      <template #select-label>{{ t("common.details") }}</template>
+    </DataTable>
+    <BaseModal :open="showModal" :title="t(editing ? 'leads.editTitle' : 'leads.modalAddTitle')" :busy="pending" @close="showModal = false">
+      <form ref="formElement" novalidate @submit.prevent="save"><fieldset class="space-y-4" :disabled="pending">
+        <p v-if="actionError" class="error-banner" role="alert">{{ actionError }}</p>
+        <label class="field-label">{{ t("common.name") }} *<input v-model="form.name" name="name" class="form-input mt-1" :aria-invalid="!!errors.name" required maxlength="120" /><span v-if="errors.name" class="field-error" role="alert">{{ errors.name }}</span></label>
+        <div v-if="!editing"><label class="field-label">{{ t("leads.portfolioId") }} *<input v-model="form.portfolioId" name="portfolioId" class="form-input mt-1" :aria-invalid="!!errors.portfolio_id" required minlength="3" maxlength="100" /><span v-if="errors.portfolio_id" class="field-error" role="alert">{{ errors.portfolio_id }}</span></label><p class="mt-2 text-xs font-semibold text-muted">{{ t("leads.portfolioGuideTitle") }}</p><p class="mt-1 text-xs leading-relaxed text-muted">{{ t("leads.portfolioGuide") }}</p></div>
+        <details :open="!!(errors.poll_interval_sec || errors.proxy_id)" class="border-y border-border/50 py-2"><summary class="flex min-h-11 cursor-pointer items-center justify-between gap-2 text-sm font-semibold">{{ t("leads.extraOptions") }}<ChevronDown :size="17" /></summary><div class="mt-3 space-y-4">
+          <NumberField v-model="form.pollIntervalSec" name="pollIntervalSec" :rule="POLL_RULE" :error="errors.poll_interval_sec" />
+          <label class="field-label">{{ t("accts.proxy") }}<select v-model="form.proxyId" class="form-input mt-1" :aria-invalid="!!errors.proxy_id"><option :value="null">{{ t("accts.direct") }}</option><option v-for="proxy in proxies" :key="proxy.id" :value="proxy.id">{{ proxy.name ?? t("common.unknown") }}</option></select><span v-if="errors.proxy_id" class="field-error" role="alert">{{ errors.proxy_id }}</span></label>
+          <label class="field-label">{{ t("leads.description") }}<textarea v-model="form.description" class="form-input mt-1" rows="2" /></label>
+          <label class="flex min-h-11 items-center gap-3 text-sm"><input v-model="form.isPublicDashboard" type="checkbox" />{{ t("leads.public") }}</label>
+        </div></details>
+        <footer class="flex justify-end gap-3"><button type="button" class="button-secondary" @click="showModal = false">{{ t("common.cancel") }}</button><button type="submit" class="button-primary"><Save :size="17" />{{ t(pending ? "common.working" : "common.save") }}</button></footer>
+      </fieldset></form>
+    </BaseModal>
   </div>
 </template>

@@ -7,7 +7,7 @@ from sqlalchemy import select
 
 from app.core.database import get_session_factory
 from app.core.security import CredentialVault
-from app.models.domain import BindingDelivery, BindingPositionProgress, LeadSource, OrderIntent
+from app.models.domain import BindingDelivery, BindingPositionProgress, ExecutionRecord, LeadSource, OrderIntent
 from app.services.engine.router import CopyRouter, UnknownOrderOutcome
 from app.services.lead_collector.snapshot_clock import snapshot_source_bound_ms, source_batch_interval
 from test_auto_follow_hidden_positions import (
@@ -62,10 +62,13 @@ async def test_payload_observation_cannot_precede_its_source(fixed_clock):
 async def test_fresh_payload_clock_cannot_replace_missing_saved_holdings(trading):
     owned, other, debt, guard = await seed_allocation(trading)
     exchange = OfflineExchange()
-    await execute_batch(trading, exchange, batch_fields={"_observed_at_ms": NOW_MS})
+    # 缺失观察是本用例的门禁输入，不允许业务夹具自动补出一份快照。
+    await execute_batch(trading, exchange, batch_fields={"_observed_at_ms": NOW_MS}, source_proven=False)
     assert exchange.orders == [] and owned.owned_qty == 1 and other.owned_qty == 9
     assert debt.pending_usd == 25
     assert await trading.db.scalar(select(OrderIntent)) is None
+    assert (await trading.db.scalar(select(ExecutionRecord))).status == "DEFERRED_SOURCE_UNPROVEN"
+    assert trading.binding.consecutive_failures == 0 and not trading.binding.circuit_breaker_tripped
 
 
 @pytest.mark.parametrize("kind", ["contradictory_leg", "live_lead"])

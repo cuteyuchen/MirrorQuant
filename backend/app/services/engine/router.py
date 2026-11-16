@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_UP
 from typing import Any, Callable, Coroutine, Dict, List, Optional
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -38,14 +38,16 @@ from app.models.domain import (
 )
 from app.services.adapters.base import (
     BaseExchangeAdapter,
+    ExchangeAPIError,
     ExchangePosition,
+    OrderRejected,
     OrderResult,
     get_collateral_balance,
 )
 from app.services.adapters.factory import create_exchange_adapter
 from app.services.engine.risk import RiskEngine
 from app.services.engine.equity import collateral_available, equity_baseline, persist_equity
-from app.services.engine.sizer import PositionSizer, exact, format_decimal, quantize_down
+from app.services.engine.sizer import PositionSizer, exact, format_decimal, format_exact, quantize_down
 from app.services.engine.serialization import serialized_execution
 from app.services.lead_collector.binance_bapi import (
     direction_label,
@@ -76,6 +78,10 @@ class UnknownOrderOutcome(RuntimeError):
     """A mutation may have been accepted; reconciliation must precede further work."""
 
 
+class SourceExitUnproven(UnknownOrderOutcome):
+    """出场证据不足时只延期，不消耗下单失败预算。"""
+
+
 TERMINAL_STATES = {"filled", "canceled", "rejected", "expired"}
 
 
@@ -85,7 +91,6 @@ class CopyRouter:
     def __init__(self, vault: CredentialVault, broadcast_fn: BroadcastFn = None):
         self.vault = vault
         self.broadcast_fn = broadcast_fn
-        self._orphan_alert_ts: Dict[str, float] = {}
 
     async def _emit(self, event: Dict[str, Any]) -> None:
         if self.broadcast_fn:
@@ -202,6 +207,9 @@ class CopyRouter:
                 inst_id=inst_id, side=side, pos_side=pos_side, ord_type=ord_type,
                 sz=sz, px=px, cl_ord_id=cl_ord_id, reduce_only=reduce_only, td_mode=td_mode,
             )
+        except OrderRejected:
+            # 明确拒单不会产生未决订单，也不进行歧义查单。
+            raise
         except Exception as first_exc:
             try:
                 existing = await adapter.get_order(inst_id, cl_ord_id=cl_ord_id)
@@ -232,10 +240,11 @@ class CopyRouter:
                 owned_qty_exact="0", entry_cost_exact="0", generation=0, opened_at_ms=0)
             db.add(allocation)
             await db.flush()
+        # 旧浮点记录升级为精确文本时也统一格式，避免把 1.0 写成不同的数量字符串。
         if allocation.owned_qty_exact is None:
-            allocation.owned_qty_exact = str(self._owned_qty(allocation))
+            allocation.owned_qty_exact = format_exact(self._owned_qty(allocation))
         if allocation.entry_cost_exact is None:
-            allocation.entry_cost_exact = str(self._entry_cost(allocation))
+            allocation.entry_cost_exact = format_exact(self._entry_cost(allocation))
         return allocation
 
     @staticmethod
@@ -255,7 +264,7 @@ class CopyRouter:
 
     @staticmethod
     def _set_debt(debt, value):
-        debt.pending_usd_exact = str(exact(value))
+        debt.pending_usd_exact = format_exact(value)
         debt.pending_usd = float(value)
 
     @staticmethod
@@ -263,6 +272,7 @@ class CopyRouter:
         raw = str(value or "unknown").lower().replace("-", "_")
         return {"cancelled": "canceled", "partiallyfilledcanceled": "canceled",
                 "partially_filled_canceled": "canceled", "deactivated": "canceled",
+                "expired_in_match": "expired",  # 币安自成交保护终态，不再作为未知订单。
                 "full_fill": "filled", "live": "new", "partiallyfilled": "partially_filled"}.get(raw, raw)
 
     async def _exit_delivery(self, db, binding, account, allocation, event_id, target=None):
@@ -291,10 +301,11 @@ class CopyRouter:
             delivery.exit_pos_side = allocation.pos_side
             delivery.exit_allocation_id = allocation.id
             delivery.exit_generation = allocation.generation
-            delivery.exit_initial_owned_qty = str(owned)
-            delivery.exit_target_qty = str(target)
+            # 冻结目标与后续成交进度使用同一精确文本格式，重启后仍可直接比较。
+            delivery.exit_initial_owned_qty = format_exact(owned)
+            delivery.exit_target_qty = format_exact(target)
             delivery.exit_filled_qty = "0"
-            delivery.exit_remaining_qty = str(target)
+            delivery.exit_remaining_qty = format_exact(target)
             delivery.exit_progress = "READY" if target > 0 else "COMPLETE"
             delivery.state = "PENDING" if target > 0 else "APPLIED"
             await db.commit()
@@ -395,9 +406,9 @@ class CopyRouter:
                 if delta > owned:
                     raise UnknownOrderOutcome("Confirmed close exceeds binding allocation")
                 remaining = max(Decimal("0"), owned - delta)
-                allocation.entry_cost_exact = str(self._entry_cost(allocation) * remaining / owned if owned else Decimal("0"))
+                allocation.entry_cost_exact = format_exact(self._entry_cost(allocation) * remaining / owned if owned else Decimal("0"))
                 allocation.entry_cost = float(allocation.entry_cost_exact)
-                allocation.owned_qty_exact = str(remaining)
+                allocation.owned_qty_exact = format_exact(remaining)
                 allocation.owned_qty = float(remaining)
                 if remaining > 0 and owned > 0:
                     self._set_debt(debt, self._pending_debt(debt) * remaining / owned)
@@ -405,8 +416,8 @@ class CopyRouter:
                     self._set_debt(debt, 0)
                     await self._clear_guard(db, intent.binding_id, intent.inst_id, intent.pos_side)
                 if delivery is not None:
-                    delivery.exit_filled_qty = str(exact(delivery.exit_filled_qty) + delta)
-                    delivery.exit_remaining_qty = str(exact(delivery.exit_remaining_qty) - delta)
+                    delivery.exit_filled_qty = format_exact(exact(delivery.exit_filled_qty) + delta)
+                    delivery.exit_remaining_qty = format_exact(exact(delivery.exit_remaining_qty) - delta)
             else:
                 if owned == 0:
                     allocation.generation += 1
@@ -416,18 +427,26 @@ class CopyRouter:
                 new_cost = incremental_cost
                 if new_cost <= 0:
                     raise UnknownOrderOutcome(f"Invalid incremental fill cost for {intent.id}")
-                allocation.entry_cost_exact = str(self._entry_cost(allocation) + new_cost)
+                allocation.entry_cost_exact = format_exact(self._entry_cost(allocation) + new_cost)
                 allocation.entry_cost = float(allocation.entry_cost_exact)
-                allocation.owned_qty_exact = str(owned + delta)
+                allocation.owned_qty_exact = format_exact(owned + delta)
                 allocation.owned_qty = float(allocation.owned_qty_exact)
-                self._set_debt(debt, max(Decimal("0"), exact(intent.target_usd) - cumulative * avg_px * spec.ct_val))
+                # 限价单未成交部分到期即失效，不结转为待补金额，避免与后续加仓重复下单。
+                self._set_debt(debt, Decimal("0") if intent.expires_at_ms is not None else max(
+                    Decimal("0"), exact(intent.target_usd) - cumulative * avg_px * spec.ct_val))
                 await self._upsert_guard(db, intent.binding_id, intent.inst_id, intent.pos_side,
                     float(self._entry_cost(allocation) / self._owned_qty(allocation)))
-        intent.filled_qty = str(cumulative)
-        intent.avg_px = str(avg_px)
+        intent.filled_qty = format_exact(cumulative)
+        intent.avg_px = format_exact(avg_px)
         intent.exchange_order_id = str(info.get("ordId") or intent.exchange_order_id or "") or None
         state = self._state(info.get("state"))
-        intent.state = state.upper() if state in TERMINAL_STATES else "UNKNOWN"
+        if state in TERMINAL_STATES:
+            intent.state = state.upper()
+        elif intent.expires_at_ms is not None and state in ("new", "partially_filled"):
+            # 滑点超限改挂的限价单：在簿等待是预期状态，不算结果未知。
+            intent.state = "RESTING"
+        else:
+            intent.state = "UNKNOWN"
         if delivery is not None:
             complete = state in TERMINAL_STATES and exact(delivery.exit_remaining_qty) == 0
             delivery.state = "APPLIED" if complete else "PENDING"
@@ -454,11 +473,20 @@ class CopyRouter:
         side = ("SELL" if intent.pos_side == "long" else "BUY") if intent.reduce_only else (
             "BUY" if intent.pos_side == "long" else "SELL")
         status = ("EXECUTED" if state in TERMINAL_STATES else "PARTIAL") if quantity > 0 else "UNFILLED"
+        limit = None
+        if intent.expires_at_ms is not None and not intent.reduce_only:
+            # 限价单被撤且本次没有新成交：单独记为“限价单失效”，通知里写明原因与累计成交。
+            if quantity <= 0 and state in ("canceled", "expired"):
+                status = "LIMIT_EXPIRED"
+            limit = {"px": intent.limit_px, "requested": intent.requested_qty, "filled": intent.filled_qty,
+                     "reason": "timeout" if int(time.time() * 1000) >= intent.expires_at_ms else "lead_exit"}
         old_delivery = db.info.pop("delivery", None)
         db.info.pop("confirmed_execution", None)
         if delivery is not None:
             db.info["delivery"] = delivery
         try:
+            # 与成交、执行记录和 outbox 同一事务确认，历史补账仍需人工审计。
+            intent.reporting_complete = state in TERMINAL_STATES and not historical
             record = await self._record_execution(db, binding, lead, account,
                 source.get("symbol") or intent.inst_id, intent.inst_id, side, intent.pos_side.upper(),
                 ("CLOSE_" if intent.reduce_only else "OPEN_") + intent.pos_side.upper(), status,
@@ -472,17 +500,28 @@ class CopyRouter:
                     ("; Notification delivery unknown; human reconciliation required" if historical else ""),
                 notify_cfg=None if historical else await self._get_config(db, "notifications", DEFAULT_SYSTEM_CONFIG["notifications"]),
                 complete_delivery=not intent.reduce_only,
-                notification_state="unknown" if historical else "not_required")
+                notification_state="unknown" if historical else "not_required", limit=limit)
             db.info["confirmed_execution"] = record
         finally:
             db.info.pop("delivery", None)
             if old_delivery is not None:
                 db.info["delivery"] = old_delivery
 
+    async def _mark_unsubmitted_source_exit(self, db, intent):
+        # 只有未提交且整个出场未成交时，才允许凭新鲜证据重试；人工复核不能被覆盖。
+        if (not intent.reduce_only or intent.state != "REJECTED" or
+                intent.exchange_order_id is not None or exact(intent.filled_qty) != 0):
+            return
+        delivery = await db.get(BindingDelivery, (intent.binding_id,
+            intent.delivery_event_id or intent.source_event_id))
+        if (delivery is not None and delivery.exit_target_qty is not None and
+                exact(delivery.exit_filled_qty) == 0 and delivery.exit_progress != "REVIEW_REQUIRED"):
+            delivery.exit_progress = "SOURCE_UNPROVEN"
+
     @serialized_execution
     async def _submit_confirmed(self, db, binding, account, adapter, spec,
                                 source_event_id, target_usd=0, source_time_ms=0, observed_at_ms=0,
-                                retry_terminal=False, source_evidence=None, **order):
+                                retry_terminal=False, source_evidence=None, expires_at_ms=None, **order):
         material = f"{account.id}:{binding.id}:{source_event_id}"
         db.info.pop("confirmed_execution", None)
         cid = "mq" + hashlib.sha256(material.encode()).hexdigest()[:30]
@@ -508,9 +547,16 @@ class CopyRouter:
             if admission is not None:
                 admission_lead, admission_snapshot = admission
                 await db.refresh(admission_lead, ["snapshot_json"])
-                saved_required = bool(json.loads(admission_lead.snapshot_json or "{}"))
+                try:
+                    saved_snapshot = json.loads(admission_lead.snapshot_json or "{}")
+                except (ValueError, TypeError):
+                    saved_snapshot = None
+                saved_required = bool(saved_snapshot)
                 if not (is_routable_snapshot(admission_snapshot) and snapshot_is_current(
-                        admission_snapshot, json.loads(admission_lead.snapshot_json or "{}"))):
+                        admission_snapshot, saved_snapshot)):
+                    # 出场快照失效仍是证据延期，不计为真实下单失败。
+                    if order["reduce_only"]:
+                        raise SourceExitUnproven("Source exit snapshot expired, superseded or incomparable before submission")
                     raise RuntimeError("Lead snapshot expired, superseded or incomparable before submission")
             if not order["reduce_only"]:
                 if observed_at_ms and not 0 <= int(time.time() * 1000) - int(observed_at_ms) <= 30000:
@@ -525,14 +571,18 @@ class CopyRouter:
                 inst_id=order["inst_id"], pos_side=order["pos_side"],
                 source_event_id=source_event_id, delivery_event_id=delivery_event_id,
                 state="SUBMITTING", requested_qty=order["sz"],
-                filled_qty="0", avg_px="0", reduce_only=order["reduce_only"], target_usd=str(target_usd), source_time_ms=source_time_ms)
+                filled_qty="0", avg_px="0", reduce_only=order["reduce_only"], target_usd=format_exact(target_usd), source_time_ms=source_time_ms,
+                # 只有“滑点超限改挂限价单”带到期时间，到期后由对账流程撤单。
+                expires_at_ms=expires_at_ms, limit_px=order.get("px") if expires_at_ms is not None else None)
             db.add(intent)
             await db.commit()  # Durable before POST; restart can only query this client ID.
             if source_evidence is not None:
                 try:
                     await self._validate_exit_source(db, binding, account, *source_evidence)
-                except Exception:
+                except Exception as exc:
                     intent.state = "REJECTED"
+                    if isinstance(exc, SourceExitUnproven):
+                        await self._mark_unsubmitted_source_exit(db, intent)
                     await db.commit()
                     raise
             if admission is not None:
@@ -545,15 +595,29 @@ class CopyRouter:
                         is_routable_snapshot(admission_snapshot) and
                         snapshot_is_current(admission_snapshot, saved_snapshot)):
                     intent.state = "REJECTED"
-                    if not intent.reduce_only:
+                    if intent.reduce_only:
+                        await self._mark_unsubmitted_source_exit(db, intent)
+                    else:
                         delivery = await db.get(BindingDelivery, (binding.id,
                             intent.delivery_event_id or intent.source_event_id))
                         if delivery is not None and delivery.exit_target_qty is None:
                             delivery.state = "APPLIED"
                     await db.commit()
+                    if intent.reduce_only:
+                        raise SourceExitUnproven("Source exit snapshot became unsafe at submission boundary; no order posted")
                     raise RuntimeError("Lead snapshot became unsafe at submission boundary; no order posted")
             try:
                 res = await self._place_order_idempotent(adapter=adapter, **order)
+            except OrderRejected:
+                intent.state = "REJECTED"
+                # 本次开仓投递已明确结束，后续独立事件仍可执行。
+                if not intent.reduce_only:
+                    delivery = await db.get(BindingDelivery, (binding.id,
+                        intent.delivery_event_id or intent.source_event_id))
+                    if delivery is not None:
+                        delivery.state = "APPLIED"
+                await db.commit()
+                raise
             except BaseException:
                 intent.state = "UNKNOWN"
                 await db.commit()
@@ -604,17 +668,23 @@ class CopyRouter:
                     return OrderResult(intent.exchange_order_id or "", cid, delta, price, state)
             if attempt < 3:
                 await asyncio.sleep(0.1)
+        if intent.expires_at_ms is not None and intent.state == "RESTING":
+            # 限价单已被交易所受理并在簿等待；后续成交/到期由对账流程处理并通知。
+            return OrderResult(intent.exchange_order_id or "", cid, 0.0, float(intent.avg_px), "resting")
         intent.state = "UNKNOWN"
         await db.commit()
         raise UnknownOrderOutcome(f"Order placement outcome ambiguous for {cid}")
 
     @serialized_execution
-    async def reconcile_pending_orders(self, db, account, adapter, instruments, relevant_positions=None):
+    async def reconcile_pending_orders(self, db, account, adapter, instruments, relevant_positions=None,
+                                       cancel_resting_for=None):
         db.info.pop("confirmed_execution", None)
+        # 历史终态只审计未验证的账本；交易所查单仅针对非终态意图。
+        unresolved = not await self._audit_completed_intents(db, account, instruments, relevant_positions)
         intent_ids = (await db.scalars(select(OrderIntent.id).where(
             OrderIntent.account_id == account.id,
+            func.lower(OrderIntent.state).not_in(TERMINAL_STATES),
         ))).all()
-        unresolved = False
         for intent_id in intent_ids:
             intent = await db.get(OrderIntent, intent_id, populate_existing=True)
             if relevant_positions is not None and (intent.inst_id, intent.pos_side) not in relevant_positions:
@@ -636,6 +706,12 @@ class CopyRouter:
                     unresolved = True
                     continue
                 _, _, state = await self._apply_intent_info(db, intent, info, spec)
+                if state not in TERMINAL_STATES and intent.state == "RESTING":
+                    # 在簿限价单：到期或要给本绑定的出场让路时撤单；否则继续等待，不阻塞账户。
+                    if (int(time.time() * 1000) < intent.expires_at_ms and
+                            cancel_resting_for != intent.binding_id):
+                        continue
+                    state = await self._cancel_resting(db, intent, adapter, spec)
                 unresolved |= state not in TERMINAL_STATES
             except Exception:
                 binding_id = intent.binding_id
@@ -650,6 +726,52 @@ class CopyRouter:
                 logger.exception("Pending order remains unresolved: %s", intent_id)
                 unresolved = True
         return not unresolved
+
+    async def _cancel_resting(self, db, intent, adapter, spec):
+        """撤销在簿限价单并以交易所查单结果记账；返回订单最新状态。"""
+        try:
+            await adapter.cancel_order(intent.inst_id, intent.id)
+        except ExchangeAPIError:
+            # 撤单被拒通常是订单刚好成交或已撤，真实结果以下面的查单为准。
+            logger.info("Cancel of resting limit %s rejected; re-querying", intent.id)
+        state = "new"
+        for attempt in range(3):
+            info = await adapter.get_order(intent.inst_id, cl_ord_id=intent.id)
+            if info is not None:
+                _, _, state = await self._apply_intent_info(db, intent, info, spec)
+                if state in TERMINAL_STATES:
+                    break
+            if attempt < 2:
+                await asyncio.sleep(0.1)
+        return state
+
+    async def _has_resting(self, db, binding_id, inst_id=None, pos_side=None):
+        """该绑定（可限定合约与方向）是否有仍在簿的限价单。"""
+        query = select(OrderIntent.id).where(OrderIntent.binding_id == binding_id, OrderIntent.state == "RESTING")
+        if inst_id is not None:
+            query = query.where(OrderIntent.inst_id == inst_id, OrderIntent.pos_side == pos_side)
+        return await db.scalar(query.limit(1)) is not None
+
+    async def _audit_completed_intents(self, db, account, instruments, relevant_positions=None):
+        # 新成交已原子记录证据；旧数据只在证据完整后打完成标记。
+        intents = (await db.scalars(select(OrderIntent).where(
+            OrderIntent.account_id == account.id, OrderIntent.reporting_complete.is_(False),
+            func.lower(OrderIntent.state).in_(TERMINAL_STATES),
+        ).execution_options(populate_existing=True))).all()
+        complete = True
+        for intent in intents:
+            if relevant_positions is not None and (intent.inst_id, intent.pos_side) not in relevant_positions:
+                continue
+            spec = instruments.get(intent.inst_id)
+            proven = await self._recover_intent_reporting(db, intent, spec, require_notifications=True)
+            # 保护性出场沿用旧的局部审计语义，但不能把省略通知的审计记为完整。
+            if proven and (spec is not None or exact(intent.filled_qty) == 0):
+                intent.reporting_complete = True
+            elif not proven and relevant_positions is not None:
+                proven = await self._recover_intent_reporting(db, intent, spec, require_notifications=False)
+            complete &= proven
+        await db.commit()
+        return complete
 
     async def _recover_intent_reporting(self, db, intent, spec, require_notifications=True):
         """Repair demonstrable older reporting gaps from durable confirmed fills only.
@@ -710,7 +832,12 @@ class CopyRouter:
 
     @serialized_execution
     async def _notification_evidence(self, db, records):
-        outboxes = (await db.scalars(select(NotificationOutbox))).all()
+        # 只读取本批执行记录关联的通知；仍校验 payload 的双重关联，防止错误匹配。
+        ids = [record.id for record in records]
+        outboxes = (await db.scalars(select(NotificationOutbox).where(or_(
+            NotificationOutbox.execution_id.in_(ids),
+            NotificationOutbox.event_key.in_([f"execution:{record_id}" for record_id in ids]),
+        )))).all() if ids else []
         unresolved = False
         for record in records:
             evidence = []
@@ -736,7 +863,10 @@ class CopyRouter:
                     account = await db.get(TradingAccount, record.account_id)
                     delivery = await db.get(BindingDelivery, (record.binding_id, record.delivery_event_id)) if record.delivery_event_id else None
                     source = json.loads(delivery.payload_json) if delivery is not None else None
-                    outbox = enqueue_notification(db, config, "MirrorQuant", trade_message(record, account, source),
+                    # 带单员保证金余额用于把本笔折算到 1000U 本金。
+                    source_lead = await db.get(LeadSource, record.lead_id)
+                    outbox = enqueue_notification(db, config, "MirrorQuant",
+                        trade_message(record, account, source, getattr(source_lead, "margin_balance", None)),
                         event_type=record.status, execution_id=record.id, event_key=f"execution:{record.id}")
                     outboxes.append(outbox)
                     record.notification_state = "pending"
@@ -775,6 +905,7 @@ class CopyRouter:
         notify_cfg: Optional[Dict[str, Any]] = None,
         complete_delivery: bool = True,
         notification_state: str = "not_required",
+        limit: Optional[Dict[str, Any]] = None,
     ) -> ExecutionRecord:
         confirmed = db.info.pop("confirmed_execution", None)
         if (confirmed is not None and status in ("EXECUTED", "UNFILLED") and
@@ -817,8 +948,8 @@ class CopyRouter:
             lead_notional=float(lead_notional),
             my_qty=float(my_qty),
             my_price=float(my_price),
-            my_qty_exact=str(exact(my_qty)),
-            my_price_exact=str(exact(my_price)),
+            my_qty_exact=format_exact(my_qty),
+            my_price_exact=format_exact(my_price),
             my_notional=my_notional,
             slippage_pct=slippage_pct,
             order_id=order_id,
@@ -827,7 +958,7 @@ class CopyRouter:
         )
         db.add(rec)
         if (delivery is not None and delivery.exit_target_qty is None and complete_delivery and
-                status not in ("FAILED", "UNKNOWN", "PARTIAL")):
+                status not in ("FAILED", "UNKNOWN", "PARTIAL", "DEFERRED_SOURCE_UNPROVEN")):
             delivery.state = "APPLIED"
         await db.flush()
 
@@ -852,7 +983,9 @@ class CopyRouter:
         }
         if notify_cfg:
             should_notify = (
-                (status in ("EXECUTED", "UNFILLED", "UNKNOWN", "PARTIAL") and notify_cfg.get("notify_on_execution", True))
+                # 限价单的挂出与失效同属执行结果通知。
+                (status in ("EXECUTED", "UNFILLED", "UNKNOWN", "PARTIAL", "LIMIT_PLACED", "LIMIT_EXPIRED")
+                 and notify_cfg.get("notify_on_execution", True))
                 or (
                     (status.startswith("BLOCKED") or status in ("FAILED", "ACCUMULATED_DEBT") or status.startswith("SKIPPED"))
                     and notify_cfg.get("notify_on_risk_block", True)
@@ -860,7 +993,7 @@ class CopyRouter:
             )
             if should_notify:
                 source = json.loads(delivery.payload_json) if delivery is not None else None
-                msg = trade_message(rec, account, source)
+                msg = trade_message(rec, account, source, getattr(lead, "margin_balance", None), limit=limit)
                 event_key = f"execution:{rec.id}"
                 enqueue_notification(db, notify_cfg, "MirrorQuant", msg, event_type=status,
                                      execution_id=rec.id, event_key=event_key)
@@ -879,34 +1012,34 @@ class CopyRouter:
         await db.refresh(binding)
         if (allocation.account_id != account.id or binding.account_id != account.id or
                 allocation.binding_id != binding.id or binding.lead_id != lead.id):
-            raise UnknownOrderOutcome("Source exit allocation scope changed")
+            raise SourceExitUnproven("Source exit allocation scope changed")
         admission = db.info.get("snapshot_admission")
         await db.refresh(lead, ["snapshot_json"])
         try:
             saved = json.loads(lead.snapshot_json or "{}")
         except (ValueError, TypeError):
-            raise UnknownOrderOutcome("Source exit observation is invalid")
+            raise SourceExitUnproven("Source exit observation is invalid")
         if saved_snapshot_required and not saved:
-            raise UnknownOrderOutcome("Source exit persisted observation disappeared")
+            raise SourceExitUnproven("Source exit persisted observation disappeared")
         snapshot = source_snapshot if source_snapshot is not None else (admission[1] if admission is not None else saved)
         observed = snapshot_observed_ms(snapshot)
         if not (is_routable_snapshot(snapshot) and snapshot_is_current(snapshot, saved)):
-            raise UnknownOrderOutcome("Source exit observation is stale or incomparable")
+            raise SourceExitUnproven("Source exit observation is stale or incomparable")
         if observed is None or not 0 <= int(time.time() * 1000) - observed <= 30000:
-            raise UnknownOrderOutcome("Source exit lacks a fresh observation")
+            raise SourceExitUnproven("Source exit lacks a fresh observation")
         if "_closed" not in payload and source_batch_interval(payload, observed) is None:
-            raise UnknownOrderOutcome("Source exit timestamps are inconsistent")
+            raise SourceExitUnproven("Source exit timestamps are inconsistent")
         delivery = db.info.get("delivery")
         if delivery is not None:
             if delivery.binding_id != binding.id or delivery.source_event_id != payload.get("_event_id"):
-                raise UnknownOrderOutcome("Source exit delivery scope changed")
+                raise SourceExitUnproven("Source exit delivery scope changed")
             original = payload.get("_closed") or payload
             await db.refresh(delivery)
             payload = json.loads(delivery.payload_json)
             source = payload.get("_closed") or payload
             if (source.get("symbol"), source.get("side"), source.get("positionSide")) != (
                     original.get("symbol"), original.get("side"), original.get("positionSide")):
-                raise UnknownOrderOutcome("Source exit identity changed")
+                raise SourceExitUnproven("Source exit identity changed")
             if delivery.exit_target_qty is not None:
                 await self._exit_delivery(db, binding, account, allocation, delivery.source_event_id)
         source = payload.get("_closed") or payload
@@ -915,12 +1048,12 @@ class CopyRouter:
                 not source.get("symbol") or
                 ("_closed" in payload and source.get("positionSide", position_side) != position_side) or
                 ("_closed" not in payload and source.get("side") != ("SELL" if position_side == "LONG" else "BUY"))):
-            raise UnknownOrderOutcome("Source exit leg identity is inconsistent")
+            raise SourceExitUnproven("Source exit leg identity is inconsistent")
         active = {f"{position['symbol']}_{position['positionSide']}":
                   exact(position.get("qtyExact", position.get("qty")) or 0)
                   for position in snapshot.get("openPositions") or []}
         if "_closed" in payload and active.get(f"{source['symbol']}_{position_side}", 0) > 0:
-            raise UnknownOrderOutcome("Closed cycle conflicts with observed lead exposure")
+            raise SourceExitUnproven("Closed cycle conflicts with observed lead exposure")
         if "_closed" in payload:
             interval = closed_interval(payload["_closed"], observed)
         else:
@@ -929,7 +1062,7 @@ class CopyRouter:
         if interval is None or (self._owned_qty(allocation) > 0 and
                 (opened is None or ("_closed" in payload and not interval[0] <= opened < interval[1]) or
                  ("_closed" not in payload and interval[0] <= opened))):
-            raise UnknownOrderOutcome("Source exit cycle or interval is unprovable")
+            raise SourceExitUnproven("Source exit cycle or interval is unprovable")
         if delivery is not None:
             rows = (await db.scalars(select(BindingDelivery).where(
                 BindingDelivery.binding_id == binding.id).order_by(
@@ -943,7 +1076,7 @@ class CopyRouter:
                     (state.source_time_ms >= interval[1] and state.source_event_id != delivery.source_event_id)):
                 delivery.exit_progress = "REVIEW_REQUIRED"
                 await db.commit()
-                raise UnknownOrderOutcome(state.review_reason or "Source exit is stale or unordered")
+                raise SourceExitUnproven(state.review_reason or "Source exit is stale or unordered")
         return snapshot, saved_snapshot_required or bool(saved)
 
     def _source_timestamp(self, order):
@@ -1156,6 +1289,9 @@ class CopyRouter:
                 start, sequence = self._source_interval(order)
                 updated = {**order, "orderTime": start, "orderUpdateTime": sequence,
                     "executedQty": str(delta), "avgPrice": str(delta_notional / delta)}
+                if previous > 0 and source_fill_kind(order) == "cumulative":
+                    # 只有数量/名义金额有历史基线，累计收益不能冒充本次增量收益。
+                    updated["totalPnl"], updated["pnlKnown"] = None, False
                 batches = sorted(group_orders_into_batches([updated]),
                     key=lambda b: (b.get("startTime", 0), b.get("endTime", 0), b.get("key", "")))
                 for batch in batches:
@@ -1202,7 +1338,7 @@ class CopyRouter:
             if account is None:
                 continue
             try:
-                adapter = create_exchange_adapter(exchange=account.exchange,
+                adapter = create_exchange_adapter(exchange=account.exchange, account_id=account.id,
                     credentials=self.vault.decrypt_dict(account.encrypted_credentials),
                     environment=account.environment,
                     proxy_url=ProxyManager.select_proxy_url(proxies, account.proxy_id, exchange=account.exchange),
@@ -1294,7 +1430,14 @@ class CopyRouter:
                                 OrderIntent.binding_id == binding.id,
                                 or_(OrderIntent.source_event_id == delivery.source_event_id,
                                     OrderIntent.delivery_event_id == delivery.source_event_id)))).all()
-                            if attempts and all(intent.state.lower() in TERMINAL_STATES for intent in attempts):
+                            source_retry = (delivery.exit_progress == "SOURCE_UNPROVEN" and
+                                exact(delivery.exit_filled_qty) == 0 and attempts and
+                                all(intent.reduce_only and intent.state.lower() == "rejected" and
+                                    intent.exchange_order_id is None and exact(intent.filled_qty) == 0
+                                    for intent in attempts))
+                            # 明确未提交的零成交延期可重试，已成交余量仍等待新的源事件。
+                            if (attempts and not source_retry and
+                                    all(intent.state.lower() in TERMINAL_STATES for intent in attempts)):
                                 delivery.exit_progress = "WAITING_SOURCE"
                                 await db.commit()
                                 break
@@ -1461,6 +1604,10 @@ class CopyRouter:
 
         # Exits are limited by both binding ownership and physically reducible quantity.
         if not is_open:
+            if await self._has_resting(db, binding.id, inst_id, local_pos_side):
+                # 带单员已在减仓/平仓：先撤掉本绑定同方向未成交的限价单，避免平仓后又被动开仓。
+                await self.reconcile_pending_orders(db, account, adapter, instruments,
+                    {(inst_id, local_pos_side)}, cancel_resting_for=binding.id)
             source_time = event_timestamp(batch.get("_source_start_ms", batch.get("startTime")))
             if source_time and source_time < allocation.opened_at_ms:
                 await self._record_execution(db, binding, lead, account, symbol, inst_id, side, ps, action,
@@ -1501,9 +1648,15 @@ class CopyRouter:
                         "SKIPPED_NO_LOCAL_POS", lead_qty, lead_avg_px, lead_notional,
                         details=f"No binding-owned position to reduce; source evidence unavailable: {exc}",
                         notify_cfg=notify_cfg, complete_delivery=False)
+                elif isinstance(exc, SourceExitUnproven):
+                    # 保留投递与失败计数，下一份新鲜快照可以重试。
+                    await self._record_execution(db, binding, lead, account, symbol, inst_id, side, ps, action,
+                        "DEFERRED_SOURCE_UNPROVEN", lead_qty, lead_avg_px, lead_notional,
+                        details=str(exc), notify_cfg=notify_cfg, complete_delivery=False)
                 else:
                     await self._handle_order_failure(db, binding, lead, account, symbol, inst_id, side, ps, action,
-                        lead_qty, lead_avg_px, lead_notional, f"Close order error: {exc}", notify_cfg, resilience_cfg)
+                        lead_qty, lead_avg_px, lead_notional, f"Close order error: {exc}", notify_cfg, resilience_cfg,
+                        status="REJECTED" if isinstance(exc, OrderRejected) else "FAILED")
             return
 
         # CASE B: OPEN / ADD
@@ -1511,7 +1664,12 @@ class CopyRouter:
             await self._record_execution(
                 db, binding, lead, account, symbol, inst_id, side, ps, action,
                 "BLOCKED_KILL_SWITCH", lead_qty, lead_avg_px, lead_notional,
-                details="Global kill switch is active", notify_cfg=notify_cfg,
+                # 记录所有实际阻断原因，避免把账户停用误报为全局急停。
+                details="; ".join(reason for active, reason in (
+                    (global_kill, "Global kill switch is active"),
+                    (not binding.is_enabled, "Binding is disabled"),
+                    (not account.is_enabled, "Account is disabled")) if active),
+                notify_cfg=notify_cfg,
             )
             return
 
@@ -1528,6 +1686,14 @@ class CopyRouter:
             await self._record_execution(db, binding, lead, account, symbol, inst_id, side, ps, action,
                 "UNKNOWN", lead_qty, lead_avg_px, lead_notional,
                 details="Account has unresolved orders; increases suspended", notify_cfg=notify_cfg)
+            return
+
+        if await self._has_resting(db, binding.id, inst_id, local_pos_side):
+            # 同方向已有限价单在等待成交：不叠加新单，避免挂单与新开仓合计超出仓位/杠杆预算。
+            await self._record_execution(db, binding, lead, account, symbol, inst_id, side, ps, action,
+                "BLOCKED_RESTING_LIMIT", lead_qty, lead_avg_px, lead_notional,
+                details="A resting limit order for this position is still open; new entry not stacked",
+                notify_cfg=notify_cfg)
             return
 
         allocations = (await db.scalars(select(PositionAllocation).where(PositionAllocation.account_id == account.id))).all()
@@ -1605,7 +1771,13 @@ class CopyRouter:
             lead_avg_price=lead_avg_px,
             catchup_max_price_dev_pct=float(resilience_cfg.get("catchup_max_price_dev_pct", 0.5)),
         )
-        if not catchup_res.allowed:
+        # 滑点超限处理为“挂限价单”时，只对追价方向（买入现价更高 / 卖出现价更低）的偏离改挂单；
+        # 反向偏离、行情缺失、事件过旧等仍按原规则拦截。
+        adverse = ref_px > 0 and lead_avg_px > 0 and (
+            ref_px > lead_avg_px if order_side == "buy" else ref_px < lead_avg_px)
+        limit_mode = getattr(binding, "slippage_action", "block") == "limit" and adverse
+        use_limit = limit_mode and not catchup_res.allowed and catchup_res.code == "BLOCKED_CATCHUP_DRIFT"
+        if not catchup_res.allowed and not use_limit:
             await self._record_execution(
                 db, binding, lead, account, symbol, inst_id, side, ps, action,
                 catchup_res.code, lead_qty, lead_avg_px, lead_notional,
@@ -1626,7 +1798,8 @@ class CopyRouter:
             return
 
         slip_res = RiskEngine.check_slippage(ref_px, lead_avg_px, binding.max_slippage_pct)
-        if not slip_res.allowed:
+        use_limit = use_limit or (limit_mode and not slip_res.allowed)
+        if not slip_res.allowed and not use_limit:
             await self._record_execution(
                 db, binding, lead, account, symbol, inst_id, side, ps, action,
                 "BLOCKED_SLIPPAGE", lead_qty, lead_avg_px, lead_notional,
@@ -1634,6 +1807,20 @@ class CopyRouter:
                 details=slip_res.reason or "Slippage limit exceeded", notify_cfg=notify_cfg,
             )
             return
+
+        entry_px = ref_px
+        limit_px_dec = None
+        if use_limit:
+            # 限价 = 带单均价按“允许的最大偏离”外扩一档：买单向下取整到最小价位，卖单向上取整。
+            allowed = min(exact(binding.max_slippage_pct),
+                          exact(resilience_cfg.get("catchup_max_price_dev_pct", 0.5))) / Decimal("100")
+            if order_side == "buy":
+                limit_px_dec = quantize_down(exact(lead_avg_px) * (1 + allowed), spec.tick_sz)
+            else:
+                limit_px_dec = (exact(lead_avg_px) * (1 - allowed) / spec.tick_sz).to_integral_value(
+                    rounding=ROUND_UP) * spec.tick_sz
+            # 仓位、杠杆、保证金都按限价（最差成交价）测算。
+            entry_px = float(limit_px_dec)
 
         target_usd = PositionSizer.calculate_target_usd(
             follower_equity=my_equity,
@@ -1643,7 +1830,7 @@ class CopyRouter:
             pending_debt_usd=self._pending_debt(debt),
         )
 
-        sized = PositionSizer.size_open_order(target_usd, ref_px, spec)
+        sized = PositionSizer.size_open_order(target_usd, entry_px, spec)
         if sized.below_min:
             self._set_debt(debt, target_usd)
             await self._record_execution(
@@ -1660,7 +1847,7 @@ class CopyRouter:
         if leverage_cap_enabled:
             capped_qty, cap_reason = RiskEngine.cap_by_leverage(
                 requested_qty=sized.contracts,
-                ref_price=ref_px,
+                ref_price=entry_px,
                 spec=spec,
                 follower_equity=my_equity,
                 positions=positions,
@@ -1677,20 +1864,26 @@ class CopyRouter:
             )
             return
 
-        projected_notional = sum(abs(exact(p.notional_usd)) for p in positions if p.inst_id == inst_id) + capped_qty * exact(ref_px) * spec.ct_val
-        tier_max = await adapter.get_max_leverage(inst_id, projected_notional)
+        projected_notional = sum(abs(exact(p.notional_usd)) for p in positions if p.inst_id == inst_id) + capped_qty * exact(entry_px) * spec.ct_val
+        try:
+            tier_max = await adapter.get_max_leverage(inst_id, projected_notional)
+        except Exception as exc:
+            # 合约档位失败只影响当前投递。
+            await self._handle_order_failure(db, binding, lead, account, symbol, inst_id, side, ps, action,
+                lead_qty, lead_avg_px, lead_notional, f"Leverage tier unavailable: {exc}", notify_cfg, resilience_cfg)
+            return
         max_allowed_lvr = int(min(spec.max_lvr, tier_max))
         if leverage_cap_enabled:
             max_allowed_lvr = min(max_allowed_lvr, binding.max_instrument_leverage)
         target_lvr = PositionSizer.compute_dynamic_leverage(
-            target_notional=capped_qty * exact(ref_px) * spec.ct_val,
+            target_notional=capped_qty * exact(entry_px) * spec.ct_val,
             equity=my_equity, max_symbol_leverage=max_allowed_lvr,
         )
         margin_policy = str(resilience_cfg.get("insufficient_margin_policy", "auto_scale_down"))
         avail_eq = available_collateral
         capped_qty, margin_err, margin_note = RiskEngine.adjust_for_available_margin(
             requested_qty=capped_qty,
-            ref_price=ref_px,
+            ref_price=entry_px,
             spec=spec,
             avail_equity=avail_eq,
             leverage=target_lvr,
@@ -1706,10 +1899,6 @@ class CopyRouter:
             return
 
         await db.commit()  # Never hold a write transaction across leverage/book/order I/O.
-        confirmed = await adapter.ensure_leverage(inst_id, target_lvr, pos_side=local_pos_side, mgn_mode=account.margin_mode)
-        if confirmed is not True:
-            raise RuntimeError("Exchange leverage could not be confirmed")
-
         # A price-limited IOC makes the configured slippage limit an execution bound.
         # Market-only and IOC-then-market settings cannot bypass that bound.
         offset = exact(binding.ioc_offset_pct) / Decimal("100")
@@ -1720,17 +1909,43 @@ class CopyRouter:
         else:
             limit = max(exact(ref_px) * (1 - offset), exact(lead_avg_px) * (1 - slippage))
             ioc_px_dec = (limit / spec.tick_sz).to_integral_value(rounding=ROUND_UP) * spec.tick_sz
-        spec.validate_order("ioc", capped_qty, ioc_px_dec)
+        ord_type, order_px, expires_at_ms = "ioc", ioc_px_dec, None
+        limit_ttl_sec = int(getattr(binding, "limit_order_ttl_sec", 120) or 120)
+        if use_limit:
+            ord_type, order_px = "limit", limit_px_dec
+            expires_at_ms = int(time.time() * 1000) + limit_ttl_sec * 1000
         try:
+            # 杠杆确认和本地过滤器错误纳入本次投递，不中断整个账户。
+            confirmed = await adapter.ensure_leverage(
+                inst_id, target_lvr, pos_side=local_pos_side, mgn_mode=account.margin_mode)
+            if confirmed is not True:
+                raise RuntimeError("Exchange leverage could not be confirmed")
+            try:
+                spec.validate_order(ord_type, capped_qty, order_px)
+            except (ValueError, ArithmeticError) as exc:
+                raise OrderRejected(account.exchange, "LOCAL_VALIDATION", str(exc)) from exc
             res = await self._submit_confirmed(db, binding, account, adapter, spec,
                 source_event_id=event_id, target_usd=target_usd,
                 source_time_ms=int(batch.get("startTime") or 0),
                 observed_at_ms=batch.get("_freshness_at_ms", batch.get("_observed_at_ms", 0)), inst_id=inst_id,
-                side=order_side, pos_side=local_pos_side, ord_type="ioc",
-                sz=format_decimal(capped_qty, spec.lot_sz), px=format_decimal(ioc_px_dec, spec.tick_sz),
-                reduce_only=False, td_mode=account.margin_mode)
+                side=order_side, pos_side=local_pos_side, ord_type=ord_type,
+                sz=format_decimal(capped_qty, spec.lot_sz), px=format_decimal(order_px, spec.tick_sz),
+                reduce_only=False, td_mode=account.margin_mode, expires_at_ms=expires_at_ms)
             fill_sz, fill_px = res.fill_sz, res.avg_px
-            if fill_sz > 0:
+            if res.state == "resting":
+                # 限价单已挂出但未全部成交：单独记录并通知，成交或失效时再各通知一次。
+                binding.consecutive_failures = 0
+                resting = await db.get(OrderIntent, res.cl_ord_id)
+                await self._record_execution(db, binding, lead, account, symbol, inst_id, side, ps, action,
+                    "LIMIT_PLACED", lead_qty, lead_avg_px, lead_notional,
+                    my_price=float(limit_px_dec), slippage_pct=slip_res.value, order_id=res.ord_id,
+                    details=f"Price drift {slip_res.value}% over limit; resting limit "
+                        f"{format_decimal(limit_px_dec, spec.tick_sz)} x {format_decimal(capped_qty, spec.lot_sz)}, "
+                        f"auto-cancel after {limit_ttl_sec}s",
+                    notify_cfg=notify_cfg,
+                    limit={"px": resting.limit_px, "requested": resting.requested_qty,
+                           "filled": resting.filled_qty, "ttl_sec": limit_ttl_sec})
+            elif fill_sz > 0:
                 actual_usd = exact(fill_sz) * spec.ct_val * exact(fill_px)
                 binding.consecutive_failures = 0
                 owned_entry = float(self._entry_cost(allocation) / self._owned_qty(allocation))
@@ -1748,7 +1963,8 @@ class CopyRouter:
                     details="Terminal order has no newly confirmed fills; debt retained", notify_cfg=notify_cfg)
         except Exception as exc:
             await self._handle_order_failure(db, binding, lead, account, symbol, inst_id, side, ps, action,
-                lead_qty, lead_avg_px, lead_notional, f"Order execution failed: {exc}", notify_cfg, resilience_cfg)
+                lead_qty, lead_avg_px, lead_notional, f"Order execution failed: {exc}", notify_cfg, resilience_cfg,
+                status="REJECTED" if isinstance(exc, OrderRejected) else "FAILED")
 
     @serialized_execution
     async def _close_owned(self, db, binding, lead, account, adapter, pos, spec, quantity,
@@ -1760,7 +1976,7 @@ class CopyRouter:
                 json.loads(binding.symbol_map_json or "{}"))
             allocation = source_evidence[2]
             if not supported or (mapped, allocation.inst_id, allocation.pos_side) != (pos.inst_id, pos.inst_id, pos.pos_side):
-                raise UnknownOrderOutcome("Source exit instrument or allocation leg changed")
+                raise SourceExitUnproven("Source exit instrument or allocation leg changed")
             await self._validate_exit_source(db, binding, account, *source_evidence)
         unresolved = (await db.scalars(select(BindingPositionProgress).where(
             BindingPositionProgress.binding_id == binding.id,
@@ -1784,7 +2000,7 @@ class CopyRouter:
             if quantity == 0:
                 return False
         if not await self.reconcile_pending_orders(db, account, adapter, {spec.inst_id: spec},
-                                                   {(pos.inst_id, pos.pos_side)}):
+                                                   {(pos.inst_id, pos.pos_side)}, cancel_resting_for=binding.id):
             if delivery is not None:
                 delivery.exit_progress = "WAITING_ORDER"
                 await db.commit()
@@ -1826,7 +2042,11 @@ class CopyRouter:
                 details="Reducible quantity below exchange minimum; remainder retained", notify_cfg=notify_cfg,
                 complete_delivery=False)
             return False
-        spec.validate_order("market", qty, reduce_only=True)
+        try:
+            # 平仓的本地校验同样是确定拒单，不能留下 UNKNOWN 意图。
+            spec.validate_order("market", qty, reduce_only=True)
+        except (ValueError, ArithmeticError) as exc:
+            raise OrderRejected(account.exchange, "LOCAL_VALIDATION", str(exc)) from exc
         if delivery is not None:
             delivery.exit_progress = "WAITING_ORDER"
         order_side = "sell" if pos.pos_side == "long" else "buy"
@@ -1883,6 +2103,7 @@ class CopyRouter:
         err_msg: str,
         notify_cfg: Dict[str, Any],
         resilience_cfg: Dict[str, Any],
+        status: str = "FAILED",
     ) -> None:
         binding.consecutive_failures = (binding.consecutive_failures or 0) + 1
         max_fail = int(resilience_cfg.get("max_consecutive_failures", 5))
@@ -1891,7 +2112,7 @@ class CopyRouter:
             binding.circuit_breaker_reason = f"Consecutive order failures ({binding.consecutive_failures}/{max_fail})"
         await self._record_execution(
             db, binding, lead, account, symbol, inst_id, side, ps, action,
-            "FAILED", lead_qty, lead_avg_px, lead_notional,
+            status, lead_qty, lead_avg_px, lead_notional,
             details=err_msg, notify_cfg=notify_cfg,
         )
 
@@ -2069,9 +2290,16 @@ class CopyRouter:
                 finally:
                     db.info.pop("snapshot_admission", None)
             else:
-                alert_key = f"{binding.id}:{pos.inst_id}:{pos.pos_side}"
-                if now - self._orphan_alert_ts.get(alert_key, 0.0) >= 900.0:
-                    self._orphan_alert_ts[alert_key] = now
+                # 冷却与告警同事务持久化，重启不能重复发送同一轮孤儿仓提示。
+                identity = f"{binding.id}:{pos.inst_id}:{pos.pos_side}:{allocation.generation}"
+                alert_key = "orphan_alert:" + hashlib.sha256(identity.encode()).hexdigest()[:48]
+                cooldown = await db.get(SystemConfig, alert_key, populate_existing=True)
+                last_alert = float(json.loads(cooldown.value_json)) if cooldown else 0.0
+                if now - last_alert >= 900.0:
+                    if cooldown is None:
+                        db.add(SystemConfig(key=alert_key, value_json=json.dumps(now)))
+                    else:
+                        cooldown.value_json = json.dumps(now)
                     await self._record_execution(
                         db, binding, lead, account, pos.symbol, pos.inst_id, "ALERT", raw_ps,
                         "ORPHAN_ALERT", "BLOCKED_ORPHAN_DETECTED", 0.0, 0.0, 0.0,

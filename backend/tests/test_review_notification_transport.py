@@ -30,7 +30,7 @@ class SimulatedStream(AsyncNetworkStream):
     async def read(self, max_bytes, timeout=None):
         if self.failure:
             raise httpcore.ReadTimeout(" ".join(SECRETS))
-        body = b'{"errcode":0}'
+        body = b'{"errcode":0,"ok":true}'  # 同时满足企业机器人和 Telegram 的业务成功协议。
         return (b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode()
                 + b"\r\nLocation: https://private-notification.invalid/FAKE_LOCATION_SECRET\r\n\r\n" + body)
 
@@ -100,7 +100,7 @@ async def test_client_lifecycle_exceptions_never_escape_with_secrets(monkeypatch
                 fail()
 
         async def post(self, *args, **kwargs):
-            return httpx.Response(200, json={"errcode": 0})
+            return httpx.Response(200, json={"errcode": 0, "ok": True})
 
     monkeypatch.setattr("app.services.notifier.service.httpx.AsyncClient", Client)
     with caplog.at_level(logging.DEBUG):

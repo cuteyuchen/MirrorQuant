@@ -1,4 +1,5 @@
 import { computed, ref } from "vue";
+import { additions } from "./messages";
 
 export type Locale = "zh-CN" | "en-US";
 
@@ -9,7 +10,7 @@ function detectInitialLocale(): Locale {
     const saved = localStorage.getItem(STORAGE_KEY);
     if (saved === "zh-CN" || saved === "en-US") return saved;
   } catch {
-    // ignore storage errors
+    // 存储受限时保留默认语言。
   }
   return "zh-CN";
 }
@@ -20,7 +21,7 @@ if (typeof document !== "undefined") {
   document.documentElement.lang = currentLocale.value;
 }
 
-const messages: Record<Locale, Record<string, string>> = {
+export const messages: Record<Locale, Record<string, string>> = {
   "zh-CN": {
     "app.beijingTime": "北京时间 (UTC+8)",
     "set.loading": "正在加载设置...",
@@ -36,24 +37,13 @@ const messages: Record<Locale, Record<string, string>> = {
     "risk.capOn": "杠杆上限开启",
     "risk.autoLeverage": "自动杠杆",
     // App & Nav
-    "app.brandSub": "v1.0 · 量化跟单终端",
     "nav.dashboard": "总览大盘",
     "nav.leads": "带单监控 & PA",
     "nav.accounts": "跟单账户",
     "nav.bindings": "跟单矩阵",
     "nav.proxies": "代理节点",
     "nav.settings": "设置 & 审计",
-    "nav.mobile.dashboard": "总览",
-    "nav.mobile.leads": "带单",
-    "nav.mobile.accounts": "账户",
-    "nav.mobile.bindings": "跟单",
-    "nav.mobile.settings": "设置",
     "nav.publicFeed": "带单监控 / 雷达",
-    "nav.streamWs": "实时推送流",
-    "nav.connected": "已连接",
-    "nav.reconnecting": "重连中",
-    "nav.live": "在线",
-    "nav.off": "离线",
     "nav.signOut": "退出登录",
     "lang.toggleLabel": "中 / EN",
     "lang.current": "中文",
@@ -84,77 +74,6 @@ const messages: Record<Locale, Record<string, string>> = {
     "setup.errMinLen": "密码长度不能少于 8 位。",
     "setup.errMismatch": "两次输入的密码不一致。",
     "setup.footer": "Argon2id 密码哈希 · HttpOnly JWT · 本地 AES-256-GCM 密钥库",
-
-    // Dashboard
-    "dash.title": "终端全局总览",
-    "dash.subtitle": "实盘仓位、账户资金与浮动盈亏，实时掌握带单同步与跟单状态",
-    "dash.refresh": "刷新",
-    "dash.killActive": "全局熔断已激活（已暂停开仓）",
-    "dash.killBtn": "紧急全局熔断",
-    "dash.killBannerTitle": "全局熔断开关已开启",
-    "dash.killBannerDesc": "所有跟单新开仓指令已被拦截。减仓与全平同步指令仍保持运行以保障资金安全。",
-    "dash.resumeTrading": "恢复交易",
-    "dash.followerEquity": "跟单总权益",
-    "dash.avail": "可用保证金",
-    "dash.exposure": "持仓名义敞口",
-    "dash.effectiveLev": "实际杠杆",
-    "dash.unrealizedPnl": "未实现盈亏",
-    "dash.hwmDrawdown": "高水位回撤",
-    "dash.topology": "路由拓扑状态",
-    "dash.bindingsUnit": "条绑定",
-    "dash.leadsLabel": "带单源",
-    "dash.acctsLabel": "账户",
-    "dash.monitoredLeadPos": "带单员持仓明细",
-    "dash.activeCount": "{n} 个持仓",
-    "dash.noLeadPos": "暂未检测到带单持仓。请在“带单监控”页面添加并同步带单员。",
-    "dash.colLeadSymbol": "带单员 / 合约",
-    "dash.colSide": "方向",
-    "dash.colEntryMark": "均价 / 现价",
-    "dash.colNotional": "名义价值",
-    "dash.colEstUpnl": "预估浮盈亏",
-    "dash.colPaBias": "PA 结构研判",
-    "dash.followerPosTitle": "跟单交易所实盘持仓",
-    "dash.openCount": "{n} 笔持仓",
-    "dash.noFollowerPos": "当前已连接的跟单账户暂无活跃持仓。",
-    "dash.colAcctContract": "合约 / 账户",
-    "dash.colSizeAvgPx": "持仓量 / 均价",
-    "dash.colUpnl": "未实现盈亏",
-    "dash.execFeedTitle": "跟单执行与风控流水",
-    "dash.liveStream": "实时流",
-    "dash.waitingEvents": "等待带单交易信号...",
-    "nav.mobile.publicFeed": "雷达",
-    "dash.manageAccounts": "管理账户",
-    "dash.noFollowerHint": "同步交易所账户后，持仓、现价和浮动盈亏将在这里汇总。",
-    "dash.colSideLeverage": "方向 / 杠杆",
-    "dash.colQty": "持仓量",
-    "dash.colAvgPrice": "开仓均价",
-    "dash.colCurrentPrice": "当前现价",
-    "dash.pnlRatioNote": "盈亏百分比沿用交易所口径，可能按保证金或名义价值计算。",
-    "dash.liveEnv": "实盘",
-    "dash.demoEnv": "模拟盘",
-    "dash.lastSync": "最近同步",
-    "dash.priceSource.estimated": "名义价值推算",
-    "dash.priceSource.entry": "均价回退 · 待同步现价",
-    "dash.syncAlignmentTitle": "带单同步与跟单对齐",
-    "dash.alignmentNote": "按绑定账户比较监控快照中的标的与方向；数量和跟单比例请结合开仓测算查看。",
-    "dash.enterRadar": "进入带单雷达",
-    "dash.manageLeads": "管理带单源",
-    "dash.leadOpenCount": "带单持仓 {n} 笔",
-    "dash.openCalculator": "开仓测算器",
-    "dash.hideCalculator": "收起测算器",
-    "dash.calculatorLead": "测算带单员",
-    "dash.manageBindings": "跟单配置",
-    "dash.sync.healthy": "正常同步",
-    "dash.sync.error": "同步异常",
-    "dash.sync.paused": "已停用",
-    "dash.sync.pending": "等待首次同步",
-    "dash.sync.stale": "数据待更新",
-    "dash.alignment.aligned": "实盘与带单标的、方向一致",
-    "dash.alignment.waiting": "等待开仓 / 持仓同步",
-    "dash.alignment.mismatch": "标的或方向存在差异，请检查跟单配置",
-    "dash.alignment.unbound": "尚未绑定跟单账户",
-    "dash.alignment.paused": "跟单已暂停 / 熔断",
-    "dash.alignment.stale": "数据未就绪，等待同步后核对",
 
     // LeadsView
     "leads.title": "带单员监控与 PA 结构分析",
@@ -669,24 +588,13 @@ const messages: Record<Locale, Record<string, string>> = {
     "risk.circuitOff": "Loss breakers off",
     "risk.capOn": "Leverage caps on",
     "risk.autoLeverage": "Automatic leverage",
-    "app.brandSub": "v1.0 · QUANT TERMINAL",
     "nav.dashboard": "Dashboard",
     "nav.leads": "Leads & PA",
     "nav.accounts": "Accounts",
     "nav.bindings": "Copy Matrix",
     "nav.proxies": "Proxy Nodes",
     "nav.settings": "Settings & Audit",
-    "nav.mobile.dashboard": "Home",
-    "nav.mobile.leads": "Leads",
-    "nav.mobile.accounts": "Accounts",
-    "nav.mobile.bindings": "Copy",
-    "nav.mobile.settings": "Settings",
     "nav.publicFeed": "Lead Radar",
-    "nav.streamWs": "Stream WS",
-    "nav.connected": "CONNECTED",
-    "nav.reconnecting": "RECONNECTING",
-    "nav.live": "LIVE",
-    "nav.off": "OFF",
     "nav.signOut": "Sign out",
     "lang.toggleLabel": "中 / EN",
     "lang.current": "EN",
@@ -716,76 +624,6 @@ const messages: Record<Locale, Record<string, string>> = {
     "setup.errMinLen": "Password must be at least 8 characters.",
     "setup.errMismatch": "Passwords do not match.",
     "setup.footer": "Argon2id Password Hashing · HttpOnly JWT · Local AES-256-GCM Keyring",
-
-    "dash.title": "Terminal Overview",
-    "dash.subtitle": "Live positions, account funds and floating PnL with lead sync and copy status",
-    "dash.refresh": "Refresh",
-    "dash.killActive": "KILL SWITCH ACTIVE (HALTED)",
-    "dash.killBtn": "Emergency Kill Switch",
-    "dash.killBannerTitle": "Global Kill Switch Engaged",
-    "dash.killBannerDesc": "All new copy-trade open orders are blocked. Reduce-only and full close sync orders remain active for safety.",
-    "dash.resumeTrading": "Resume Trading",
-    "dash.followerEquity": "FOLLOWER EQUITY",
-    "dash.avail": "Avail",
-    "dash.exposure": "PORTFOLIO EXPOSURE",
-    "dash.effectiveLev": "Effective Lev",
-    "dash.unrealizedPnl": "UNREALIZED PNL",
-    "dash.hwmDrawdown": "HWM Drawdown",
-    "dash.topology": "TOPOLOGY STATUS",
-    "dash.bindingsUnit": "Bindings",
-    "dash.leadsLabel": "Leads",
-    "dash.acctsLabel": "Accts",
-    "dash.monitoredLeadPos": "Lead Position Details",
-    "dash.activeCount": "{n} Active",
-    "dash.noLeadPos": "No open lead positions detected yet. Add and sync a Lead source in the Leads view.",
-    "dash.colLeadSymbol": "Lead / Symbol",
-    "dash.colSide": "Side",
-    "dash.colEntryMark": "Entry / Mark",
-    "dash.colNotional": "Notional",
-    "dash.colEstUpnl": "Est. uPnL",
-    "dash.colPaBias": "PA Bias",
-    "dash.followerPosTitle": "Follower Exchange Positions",
-    "dash.openCount": "{n} Open",
-    "dash.noFollowerPos": "No active follower positions across connected exchange accounts.",
-    "dash.colAcctContract": "Contract / Account",
-    "dash.colSizeAvgPx": "Size / AvgPx",
-    "dash.colUpnl": "uPnL",
-    "dash.execFeedTitle": "Copy Execution & Risk Feed",
-    "dash.liveStream": "LIVE STREAM",
-    "dash.waitingEvents": "Waiting for lead trade events...",
-    "nav.mobile.publicFeed": "Radar",
-    "dash.manageAccounts": "Manage accounts",
-    "dash.noFollowerHint": "Sync an exchange account to see positions, current prices and floating PnL here.",
-    "dash.colSideLeverage": "Side / Leverage",
-    "dash.colQty": "Quantity",
-    "dash.colAvgPrice": "Avg Entry Price",
-    "dash.colCurrentPrice": "Current Price",
-    "dash.pnlRatioNote": "PnL percentage follows the exchange convention, which may use margin or notional value.",
-    "dash.liveEnv": "Live",
-    "dash.demoEnv": "Demo",
-    "dash.lastSync": "Last sync",
-    "dash.priceSource.estimated": "Estimated from notional",
-    "dash.priceSource.entry": "Entry fallback · awaiting price sync",
-    "dash.syncAlignmentTitle": "Lead sync & copy alignment",
-    "dash.alignmentNote": "Compares snapshot symbols and directions in bound accounts. Use the calculator to review quantities and copy ratios.",
-    "dash.enterRadar": "Open lead radar",
-    "dash.manageLeads": "Manage leads",
-    "dash.leadOpenCount": "{n} lead positions",
-    "dash.openCalculator": "Position calculator",
-    "dash.hideCalculator": "Hide calculator",
-    "dash.calculatorLead": "Calculator lead",
-    "dash.manageBindings": "Copy settings",
-    "dash.sync.healthy": "Sync healthy",
-    "dash.sync.error": "Sync error",
-    "dash.sync.paused": "Disabled",
-    "dash.sync.pending": "Awaiting first sync",
-    "dash.sync.stale": "Awaiting refresh",
-    "dash.alignment.aligned": "Live symbols and directions match the lead",
-    "dash.alignment.waiting": "Awaiting entries / position sync",
-    "dash.alignment.mismatch": "Symbol or direction differs; review copy settings",
-    "dash.alignment.unbound": "No bound copy account",
-    "dash.alignment.paused": "Copy paused / circuit breaker active",
-    "dash.alignment.stale": "Awaiting fresh data to compare",
 
     "leads.title": "Lead Traders & PA Analytics",
     "leads.subtitle": "Monitor Binance BAPI lead portfolios, reconstruct hidden positions, and replay trade cycles",
@@ -1275,6 +1113,12 @@ const messages: Record<Locale, Record<string, string>> = {
   },
 };
 
+// 双语新增文案统一合并，旧页面在迁移中继续使用原有 key。
+for (const [key, pair] of Object.entries(additions)) {
+  messages["zh-CN"][key] = pair[0];
+  messages["en-US"][key] = pair[1];
+}
+
 export function useI18n() {
   const locale = computed(() => currentLocale.value);
   const isZh = computed(() => currentLocale.value === "zh-CN");
@@ -1288,6 +1132,7 @@ export function useI18n() {
     }
     if (typeof document !== "undefined") {
       document.documentElement.lang = next;
+      document.title = messages[next]["app.title"];
     }
   }
 

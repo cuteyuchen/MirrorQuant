@@ -1,4 +1,5 @@
-type NumericValue = number | string | null | undefined;
+// 所有格式化入口保留未知值，不将空字符串或 null 当成零。
+export type NumericValue = number | string | null | undefined;
 
 export interface DateTimeOptions {
   withSeconds?: boolean;
@@ -6,20 +7,20 @@ export interface DateTimeOptions {
   timeZone?: string;
 }
 
-/** API timestamps without an offset are UTC, including legacy SQLite values. */
+// 旧 SQLite 字符串没有时区时按 UTC 解析，秒和毫秒时间戳都接受。
+export function timestampMs(value: Date | string | number | null | undefined): number | null {
+  if (value == null || value === "" || (typeof value === "string" && !value.trim())) return null;
+  const stamp = value instanceof Date ? value.getTime() : typeof value === "number"
+    ? (Math.abs(value) < 1e11 ? value * 1000 : value)
+    : Date.parse(/(?:Z|[+-]\d{2}:?\d{2})$/i.test(value.trim()) ? value.trim() : `${value.trim()}Z`);
+  return Number.isFinite(stamp) ? stamp : null;
+}
+
+// 日期输出统一为北京时间；显式传入时区可供导出和回归测试使用。
 export function formatDateTime(value: Date | string | number | null | undefined, options: DateTimeOptions = {}): string {
-  if (value == null || value === "") return "—";
-  let date: Date;
-  if (value instanceof Date) {
-    date = value;
-  } else if (typeof value === "number") {
-    date = new Date(Math.abs(value) < 1e11 ? value * 1000 : value);
-  } else {
-    const iso = value.trim();
-    if (!iso) return "—";
-    date = new Date(/(?:Z|[+-]\d{2}:?\d{2})$/i.test(iso) ? iso : `${iso}Z`);
-  }
-  if (!Number.isFinite(date.getTime())) return "—";
+  const stamp = timestampMs(value);
+  if (stamp == null) return "—";
+  const date = new Date(stamp);
   try {
     const parts = new Intl.DateTimeFormat("en-GB", {
       timeZone: options.timeZone || "Asia/Shanghai",
@@ -35,7 +36,13 @@ export function formatDateTime(value: Date | string | number | null | undefined,
   }
 }
 
-function finiteNumber(value: NumericValue): number | null {
+// 只取北京时间的时分秒：同一天内的动态与状态条时钟不需要重复日期。
+export function formatClock(value: Date | string | number | null | undefined, withSeconds = true): string {
+  const text = formatDateTime(value, { withSeconds });
+  return text === "—" ? text : text.slice(text.indexOf(" ") + 1);
+}
+
+export function finiteNumber(value: NumericValue): number | null {
   if (value == null || (typeof value === "string" && !value.trim())) return null;
   const number = Number(value);
   return Number.isFinite(number) ? (Object.is(number, -0) ? 0 : number) : null;
@@ -45,7 +52,7 @@ function decimals(value: number, fallback: number, maximum = 20): number {
   return Number.isFinite(value) ? Math.max(0, Math.min(maximum, Math.trunc(value))) : fallback;
 }
 
-/** Prices always use bounded decimal notation, including very small tokens. */
+// 价格限制小数位，避免小币种价格撑破数字列。
 export function formatPrice(value: NumericValue, prefix = "$", maxDecimals?: number): string {
   const number = finiteNumber(value);
   if (number === null) return "—";
@@ -59,7 +66,20 @@ export function formatPrice(value: NumericValue, prefix = "$", maxDecimals?: num
 }
 
 export function formatQty(value: NumericValue): string {
-  return (finiteNumber(value) ?? 0).toLocaleString("en-US", { maximumFractionDigits: 4 });
+  const number = finiteNumber(value);
+  if (number === null) return "—";
+  return number.toLocaleString("en-US", Math.abs(number) > 0 && Math.abs(number) < 0.001
+    ? { maximumSignificantDigits: 4 }
+    : { maximumFractionDigits: 4 });
+}
+
+export function signedUsd(value: NumericValue): string {
+  const number = finiteNumber(value);
+  return number === null ? "—" : `${number > 0 ? "+" : ""}${formatUsd(number)}`;
+}
+
+export function baseAsset(symbol?: string | null): string {
+  return symbol ? symbol.toUpperCase().replace(/[-_/]/g, "").replace(/SWAP$/, "").replace(/(?:USDT|USDC)$/, "") : "—";
 }
 
 export function formatUsd(value: NumericValue, digits = 2): string {
@@ -74,7 +94,7 @@ export function formatUsd(value: NumericValue, digits = 2): string {
   });
 }
 
-/** The input is already in percentage points (0.8 means 0.80%). */
+// 输入已经是百分点，例如 0.8 表示 0.80%。
 export function formatPct(value: NumericValue, digits = 2, signed = true): string {
   const number = finiteNumber(value);
   if (number === null) return "—";
@@ -83,4 +103,10 @@ export function formatPct(value: NumericValue, digits = 2, signed = true): strin
     minimumFractionDigits: precision,
     maximumFractionDigits: precision,
   }) + "%";
+}
+
+// 杠杆倍数统一保留两位小数并带 x；未知保留破折号，不补零。
+export function formatLeverage(value: NumericValue, digits = 2): string {
+  const number = finiteNumber(value);
+  return number === null ? "—" : `${number.toFixed(decimals(digits, 2))}x`;
 }

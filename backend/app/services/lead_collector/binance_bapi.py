@@ -156,10 +156,24 @@ def direction_label(side: Optional[str], ps: Optional[str], closing: bool) -> st
     return side or "UNKNOWN"
 
 
+def _realized_pnl(value: Any) -> Optional[Decimal]:
+    # 收益字段只作展示证据；损坏、溢出或浮点下溢均不补成零。
+    if isinstance(value, bool) or not isinstance(value, (str, int, float, Decimal)):
+        return None
+    try:
+        pnl = exact(value)
+        displayed = float(pnl)
+    except (ValueError, TypeError, ArithmeticError, OverflowError):
+        return None
+    return pnl if math.isfinite(displayed) and (pnl == 0 or displayed != 0) else None
+
+
 def slim_order(o: Dict[str, Any]) -> Dict[str, Any]:
     t = o.get("orderUpdateTime") or o.get("orderTime") or 0
     ot = o.get("orderTime") or t
     q, p = validate_source_fill(o.get("executedQty"), o.get("avgPrice"))
+    # 收益的占位零与真实零分开；布尔值不是有效的财务证据。
+    pnl = _realized_pnl(o.get("totalPnl")) if o.get("pnlKnown", True) is True else None
     result = {
         "h": order_dedup_key(o),
         "oid": o.get("orderId"),
@@ -172,7 +186,8 @@ def slim_order(o: Dict[str, Any]) -> Dict[str, Any]:
         "ty": o.get("type"),
         "q": str(q),
         "p": str(p),
-        "pnl": fnum(o.get("totalPnl")) or 0.0,
+        "pnl": float(pnl) if pnl is not None else 0.0,
+        "pnlKnown": pnl is not None,  # 看板区分真实零收益与历史缺失值。
     }
     legacy_hash = hashlib.sha1(json.dumps([
         ot, o.get("symbol"), o.get("side"), o.get("positionSide"), o.get("type"), float(q), float(p),
@@ -187,7 +202,12 @@ def slim_order(o: Dict[str, Any]) -> Dict[str, Any]:
 def expand_slim_order(o: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize slim stored orders back to Binance order-history schema."""
     if "symbol" in o and "executedQty" in o:
-        return o
+        # 原始 API 明确给出的零收益是已知，显式否认的证据不得反向提升。
+        pnl = _realized_pnl(o.get("totalPnl")) if o.get("pnlKnown", True) is True else None
+        return {**o, "totalPnl": o.get("totalPnl") if pnl is not None else None, "pnlKnown": pnl is not None}
+    # 旧缓存只有零值存在占位歧义；非零收益不能在迁移时被抹掉。
+    pnl = _realized_pnl(o.get("pnl"))
+    pnl_known = pnl is not None and (o.get("pnlKnown") is True or ("pnlKnown" not in o and pnl != 0))
     return {
         "orderId": o.get("oid"),
         "symbol": o.get("sym"),
@@ -198,7 +218,8 @@ def expand_slim_order(o: Dict[str, Any]) -> Dict[str, Any]:
         "orderUpdateTime": o.get("t") or o.get("ot") or 0,
         "executedQty": o.get("q") or 0.0,
         "avgPrice": o.get("p") or 0.0,
-        "totalPnl": o.get("pnl") or 0.0,
+        "totalPnl": float(pnl) if pnl_known else None,  # 缓存重写不补造收益证据。
+        "pnlKnown": pnl_known,
         "_legacy_keys": o.get("legacyKeys") or [],
         "_legacy_source_keys": o.get("legacySourceKeys") or [],
     }
@@ -207,6 +228,8 @@ def expand_slim_order(o: Dict[str, Any]) -> Dict[str, Any]:
 def slim_closed_position(p: Dict[str, Any]) -> Dict[str, Any]:
     opened = p.get("opened")
     closed = p.get("closed")
+    # 闭仓周期也保留真实零与缺失收益的区别，供持久化看板投影。
+    pnl = _realized_pnl(p.get("closingPnl")) if p.get("pnlKnown", True) is True else None
     return {
         "id": str(p.get("positionId")),
         "symbol": p.get("symbol"),
@@ -216,7 +239,8 @@ def slim_closed_position(p: Dict[str, Any]) -> Dict[str, Any]:
         "avgCost": fnum(p.get("avgCost")),
         "avgClosePrice": fnum(p.get("avgClosePrice")),
         "maxQty": fnum(p.get("maxOpenInterest")),
-        "pnl": fnum(p.get("closingPnl")),
+        "pnl": float(pnl) if pnl is not None else None,
+        "pnlKnown": pnl is not None,
         "roi": fnum(p.get("roi")),
         "opened": opened,
         "closed": closed,
@@ -284,7 +308,7 @@ def reconstruct_open_positions(
         out.append(
             {
                 "symbol": sym,
-                "baseAsset": sym.replace("USDT", ""),
+                "baseAsset": sym[:-4] if sym.endswith(("USDT", "USDC")) else sym,  # 只移除结算币后缀。
                 "positionSide": ps,
                 "qty": float(q),
                 "avgEntry": float(avg) if avg else None,
@@ -326,7 +350,7 @@ def normalize_holdings(holdings: Sequence[Dict[str, Any]]) -> List[Dict[str, Any
             raise ValueError("Invalid lead entry price")
         positions.append({
             "symbol": symbol,
-            "baseAsset": symbol.removesuffix("USDT"),
+            "baseAsset": symbol[:-4] if symbol.endswith(("USDT", "USDC")) else symbol,
             "positionSide": side,
             "qty": float(abs(qty)),
             "qtyExact": str(abs(qty)),
@@ -479,7 +503,11 @@ def group_orders_into_batches(orders: Sequence[Dict[str, Any]], gap_ms: int = BA
         ut = int(o.get("orderUpdateTime") or ot)
         q = exact(o.get("executedQty") or 0)
         p = exact(o.get("avgPrice") or 0)
-        pnl = exact(o.get("totalPnl") or 0)
+        # 合并不能把未知收益当零；数量和来源键仍按原始成交字段计算。
+        pnl = _realized_pnl(o.get("totalPnl")) if o.get("pnlKnown") is True else None
+        item = {"time": ut, "orderTime": ot, "qty": float(q), "price": float(p),
+                "pnl": float(pnl) if pnl is not None else None, "pnlKnown": pnl is not None,
+                "sourceKey": order_dedup_key(o)}
         if q <= 0 or p <= 0:
             continue
         closing = not is_open_leg(side, ps)
@@ -495,8 +523,9 @@ def group_orders_into_batches(orders: Sequence[Dict[str, Any]], gap_ms: int = BA
             cur["orders"] += 1
             cur["qty"] += q
             cur["_pv"] += q * p
-            cur["pnl"] += pnl
-            cur["items"].append({"time": ut, "orderTime": ot, "qty": float(q), "price": float(p), "pnl": float(pnl), "sourceKey": order_dedup_key(o)})
+            cur["pnl"] += pnl if pnl is not None else Decimal("0")
+            cur["pnlKnown"] &= pnl is not None
+            cur["items"].append(item)
         else:
             if cur:
                 batches.append(cur)
@@ -512,9 +541,10 @@ def group_orders_into_batches(orders: Sequence[Dict[str, Any]], gap_ms: int = BA
                 "orders": 1,
                 "qty": q,
                 "_pv": q * p,
-                "pnl": pnl,
+                "pnl": pnl if pnl is not None else Decimal("0"),
+                "pnlKnown": pnl is not None,
                 "isClose": closing,
-                "items": [{"time": ut, "orderTime": ot, "qty": float(q), "price": float(p), "pnl": float(pnl), "sourceKey": order_dedup_key(o)}],
+                "items": [item],
             }
     if cur:
         batches.append(cur)
@@ -530,7 +560,11 @@ def group_orders_into_batches(orders: Sequence[Dict[str, Any]], gap_ms: int = BA
         b["key"] = hashlib.sha1("|".join(item["sourceKey"] for item in b["items"]).encode()).hexdigest()[:20]
         b["orderCount"] = b["orders"]
         b["qty"] = float(b["qty"])
-        b["pnl"] = float(b["pnl"])
+        # 每一笔证据完整且合计可表示时才发布总收益。
+        pnl = _realized_pnl(b["pnl"]) if b["pnlKnown"] else None
+        b["pnlKnown"] = pnl is not None
+        b["pnl"] = float(pnl) if pnl is not None else None
+        b["totalPnl"] = b["pnl"]
 
     batches.sort(key=lambda x: (x.get("startTime", 0), x.get("endTime", 0), x.get("key", "")))
     return batches
@@ -649,6 +683,31 @@ class BinanceBapiCollector(BaseLeadCollector):
 
     platform = "binance_bapi"
     exchange = "binance"
+    _http_clients: dict = {}  # 公共采集连接按事件循环和代理复用。
+
+    @classmethod
+    async def close_clients(cls) -> None:
+        # 摘除连接后统一清理，个别异常不能阻止释放其他出口。
+        clients = list(cls._http_clients.values())
+        cls._http_clients.clear()
+        await ProxyManager.close_clients(clients)
+
+    @classmethod
+    async def close_proxy_clients(cls, proxy_url: Optional[str]) -> None:
+        # 代理修改或删除后释放旧出口，不能无限保留失效连接。
+        clients = []
+        for key in list(cls._http_clients):
+            if key[1] == proxy_url:
+                clients.append(cls._http_clients.pop(key))
+        await ProxyManager.close_clients(clients)
+
+    def _client(self, proxy_url, timeout):
+        key = (asyncio.get_running_loop(), proxy_url)
+        client = self._http_clients.get(key)
+        if client is None or client.is_closed:
+            client = ProxyManager.build_client(proxy_url=proxy_url, timeout=timeout, exchange=self.exchange)
+            self._http_clients[key] = client
+        return client
 
     def __init__(self, pa_analyzer=None):
         self.pa_analyzer = pa_analyzer
@@ -689,16 +748,15 @@ class BinanceBapiCollector(BaseLeadCollector):
         last_err: Optional[Exception] = None
         last_response = None
         try:
-            async with asyncio.timeout(retry_budget), ProxyManager.build_client(
-                proxy_url=proxy_url, timeout=timeout, headers=headers, exchange=self.exchange,
-            ) as client:
+            client = self._client(proxy_url, timeout)
+            async with asyncio.timeout(retry_budget):
                 for attempt in range(retries):
                     last_response = None
                     try:
                         if body is not None:
-                            resp = await client.post(url, json=body)
+                            resp = await client.post(url, json=body, headers=headers, timeout=timeout)
                         else:
-                            resp = await client.get(url)
+                            resp = await client.get(url, headers=headers, timeout=timeout)
                         last_response = resp
                         if resp.status_code != 200:
                             raise httpx.HTTPStatusError(
@@ -740,24 +798,23 @@ class BinanceBapiCollector(BaseLeadCollector):
         urls = [f"{FAPI_PRIMARY}{path_and_query}", f"{FAPI_FALLBACK}{path_and_query}"]
         last_err: Optional[Exception] = None
         last_response = None
-        async with ProxyManager.build_client(
-            proxy_url=proxy_url, timeout=timeout, exchange=self.exchange,
-        ) as client:
-            for attempt in range(retries):
-                last_response = None
-                target = urls[attempt % len(urls)] if attempt >= 2 else urls[0]
-                try:
-                    resp = await client.get(target)
-                    last_response = resp
-                    if resp.status_code != 200:
-                        raise httpx.HTTPStatusError(f"HTTP {resp.status_code}", request=None, response=resp)
-                    return resp.json()
-                except Exception as exc:
-                    last_err = exc
-                    if not is_retryable_exception(exc):
-                        break
-                    if attempt + 1 < retries:
-                        await asyncio.sleep(0.3 * (attempt + 1))
+        # 行情回补与 bapi 同为公共请求，复用出口连接但保留本次超时。
+        client = self._client(proxy_url, timeout)
+        for attempt in range(retries):
+            last_response = None
+            target = urls[attempt % len(urls)] if attempt >= 2 else urls[0]
+            try:
+                resp = await client.get(target, timeout=timeout)
+                last_response = resp
+                if resp.status_code != 200:
+                    raise httpx.HTTPStatusError(f"HTTP {resp.status_code}", request=None, response=resp)
+                return resp.json()
+            except Exception as exc:
+                last_err = exc
+                if not is_retryable_exception(exc):
+                    break
+                if attempt + 1 < retries:
+                    await asyncio.sleep(0.3 * (attempt + 1))
         raise RuntimeError(
             f"fapi request failed ({redact_proxy_userinfo(path_and_query)}): {describe_exception(last_err, last_response)}"
         ) from last_err
@@ -811,6 +868,63 @@ class BinanceBapiCollector(BaseLeadCollector):
             retries=4,
             retry_budget=HISTORY_RETRY_BUDGET,
         )
+
+    async def collect_closed_history(self, portfolio_id, closed_cache, previous_snapshot=None,
+                                     proxy_url=None, max_pages=25):
+        # 游标只在连续取回全部增量后前移；触顶不能用本轮残片制造下一轮的连续性。
+        def key(row):
+            identity = row.get("positionId", row.get("id"))
+            interval = closed_interval(row)
+            if identity in (None, "", "None") or interval is None:
+                return None
+            return [str(identity), row.get("symbol"), row.get("side"), *interval]
+
+        meta = (previous_snapshot or {}).get("meta") or {}
+        prior = sorted(closed_cache, key=lambda row: row.get("closed") or 0, reverse=True)
+        anchor = meta.get("closedHistoryCursor") if "closedHistoryCursor" in meta else (
+            next((value for row in prior if (value := key(row)) is not None), None))
+        rows, seen = [], set()
+        complete, total, newest = False, None, None
+        last_closed = None
+        for page_number in range(1, max_pages + 1):
+            data = await self.fetch_position_history(
+                portfolio_id, page_number=page_number, page_size=100, proxy_url=proxy_url)
+            if not isinstance(data, dict) or not isinstance(data.get("list"), list):
+                raise ValueError("Malformed closed-position history page")
+            page = data["list"]
+            raw_total = data.get("total")
+            if raw_total is not None:
+                if isinstance(raw_total, bool) or not str(raw_total).isascii() or not str(raw_total).isdecimal():
+                    raise ValueError("Invalid closed-position history total")
+                page_total = int(raw_total)
+                if total is not None and page_total != total:
+                    break  # 翻页途中数据集变化，下一轮重新取得连续证据。
+                total = page_total
+            progress, reached_anchor = False, False
+            for row in page:
+                if not isinstance(row, dict):
+                    raise ValueError("Malformed closed-position history record")
+                identity = key(row)
+                if identity is None:
+                    return rows + page, False, total, anchor
+                frozen = tuple(identity)
+                if frozen in seen:
+                    continue
+                closed_at = identity[-1]
+                if last_closed is not None and closed_at > last_closed:
+                    return rows, False, total, anchor
+                last_closed = closed_at
+                newest = newest or identity
+                seen.add(frozen)
+                rows.append(row)
+                progress = True
+                reached_anchor |= identity == anchor
+            if reached_anchor or (total is not None and len(seen) >= total):
+                complete = True
+                break
+            if not progress or len(page) < 100:
+                break
+        return rows, complete, total, (newest if complete else anchor)
 
     async def fetch_performance(
         self, portfolio_id: str, time_range: str = "30D", proxy_url: Optional[str] = None
@@ -1112,21 +1226,20 @@ class BinanceBapiCollector(BaseLeadCollector):
         # History failures must reach the orchestrator's failure/alert handling.
         closed_rows = list(closed_cache)
         closed_total = None
-        closed_history_complete = False
-        ph1 = {"list": closed_history, "total": len(closed_history)} if closed_history is not None else await self.fetch_position_history(
-            portfolio_id, page_number=1, page_size=100, proxy_url=proxy_url
-        )
-        lst = (ph1 or {}).get("list") or []
-        closed_total = (ph1 or {}).get("total")
-        closed_history_complete = closed_total is not None and int(closed_total) <= len(lst)
+        if closed_history is not None:
+            lst, closed_total, closed_history_complete, closed_cursor = closed_history, len(closed_history), True, None
+        else:
+            lst, closed_history_complete, closed_total, closed_cursor = await self.collect_closed_history(
+                portfolio_id, closed_cache, previous_snapshot, proxy_url)
         if lst:
-            seen_c: Dict[Tuple[str, Any], Dict[str, Any]] = {}
+            # 保留已知闭仓周期和刚补齐的增量，不再只保留首屏八十条。
+            seen_c = {(str(p.get("id")), p.get("opened")): p for p in closed_rows}
             for p in lst:
-                seen_c[(str(p.get("positionId")), p.get("opened"))] = p
-            closed_rows = [slim_closed_position(p) for p in seen_c.values()]
+                seen_c[(str(p.get("positionId")), p.get("opened"))] = slim_closed_position(p)
+            closed_rows = list(seen_c.values())
             closed_rows.sort(key=lambda x: x.get("closed") or 0, reverse=True)
             if closed_history is None:
-                closed_rows = closed_rows[:80]
+                closed_rows = closed_rows[:2500]
 
         # Failed or unexplained empty holdings are UNKNOWN. A previous position
         # remains useful for display for at most 60 seconds, never for execution.
@@ -1378,7 +1491,8 @@ class BinanceBapiCollector(BaseLeadCollector):
                 "type": o.get("ty"),
                 "qty": fnum(o.get("q")),
                 "avgPrice": fnum(o.get("p")),
-                "pnl": o.get("pnl"),
+                "pnl": o.get("pnl") if o.get("pnlKnown") is True else None,
+                "pnlKnown": o.get("pnlKnown", False),  # 展示缓存不能把缺失收益变成已知零。
                 "isClose": not is_open_leg(o.get("side"), o.get("ps")),
                 "dir": direction_label(o.get("side"), o.get("ps"), not is_open_leg(o.get("side"), o.get("ps"))),
             }
@@ -1402,7 +1516,9 @@ class BinanceBapiCollector(BaseLeadCollector):
                 "orderStoreSize": len(orders_store),
                 "ordersAddedThisRound": added,
                 "fullSweep": full_sweep,
+                "orderHistoryComplete": True,  # 连续性验证失败会在 sync_orders_into_store 抛错，不发布成功快照。
                 "closedHistoryComplete": closed_history_complete,
+                "closedHistoryCursor": closed_cursor,
                 "detailOk": detail_ok,
                 "detailError": detail_error,
             },

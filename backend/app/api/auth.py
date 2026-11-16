@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hmac
+import asyncio
+import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -20,6 +22,7 @@ from app.core.config import get_settings
 from app.core.database import get_db
 from app.core.security import (
     CredentialVault,
+    DUMMY_PASSWORD_HASH,
     build_totp_uri,
     create_access_token,
     create_captcha_challenge,
@@ -110,6 +113,20 @@ def _lock_duration_for_fails(fail_count: int) -> int:
     return 0
 
 
+def _pair_value(username: str, client_ip: str) -> str:
+    # 哈希组合键避免用户名或 IPv6 分隔符产生冲突。
+    return hashlib.sha256(f"{username}\0{client_ip}".encode()).hexdigest()
+
+
+def _effective_failures(guard: Optional[LoginAttemptGuard], now: datetime) -> int:
+    if guard is None:
+        return 0
+    last = _as_utc(guard.last_fail_at)
+    if last is None or (now - last).total_seconds() >= get_settings().login_attempt_window_sec:
+        return 0
+    return guard.fail_count
+
+
 async def _emit_security_alert(
     db: AsyncSession,
     client_ip: str,
@@ -143,25 +160,28 @@ async def _record_login_failure(
     audit_action: str = "LOGIN_FAILED",
 ) -> tuple[int, int]:
     now = _utcnow()
+    # 短写事务先取锁，计数更新不跨越口令哈希或延迟等待。
+    await db.execute(update(SystemConfig).where(SystemConfig.key == "bootstrap_claimed")
+                     .values(value_json=SystemConfig.value_json))
     ip_guard = await _get_or_create_guard(db, "ip", client_ip)
     user_guard = await _get_or_create_guard(db, "user", username or "__empty__")
-
-    ip_guard.fail_count += 1
-    ip_guard.last_fail_at = now
-    ip_guard.last_ip = client_ip
-    ip_guard.last_username = username[:64]
-
-    user_guard.fail_count += 1
-    user_guard.last_fail_at = now
-    user_guard.last_ip = client_ip
-    user_guard.last_username = username[:64]
-
-    max_fails = max(ip_guard.fail_count, user_guard.fail_count)
+    pair_guard = await _get_or_create_guard(db, "user_ip", _pair_value(username, client_ip))
+    for guard in (ip_guard, user_guard, pair_guard):
+        await db.refresh(guard)
+        count = _effective_failures(guard, now)
+        if count == 0:
+            guard.alert_sent_level = 0
+        guard.fail_count = count + 1
+        guard.last_fail_at = now
+        guard.last_ip = client_ip
+        guard.last_username = username[:64]
+    # 用户名只用于递增延迟；旧的用户名/IP 全局硬锁不再参与 admission。
+    ip_guard.locked_until = user_guard.locked_until = None
+    max_fails = pair_guard.fail_count
     lock_sec = _lock_duration_for_fails(max_fails)
     if lock_sec > 0:
         until = now + timedelta(seconds=lock_sec)
-        ip_guard.locked_until = until
-        user_guard.locked_until = until
+        pair_guard.locked_until = until
 
     await record_audit(
         db,
@@ -173,9 +193,8 @@ async def _record_login_failure(
         request,
     )
 
-    if max_fails >= 15 and max(ip_guard.alert_sent_level, user_guard.alert_sent_level) < 15:
-        ip_guard.alert_sent_level = 15
-        user_guard.alert_sent_level = 15
+    if max_fails >= 15 and pair_guard.alert_sent_level < 15:
+        pair_guard.alert_sent_level = 15
         await _emit_security_alert(db, client_ip, username, max_fails, lock_sec)
 
     await db.commit()
@@ -202,10 +221,8 @@ async def auth_status(
     lock_rem = 0
     captcha_required = False
     if ip_guard:
-        locked_until = _as_utc(ip_guard.locked_until)
-        if locked_until and locked_until > now:
-            lock_rem = max(1, int((locked_until - now).total_seconds()))
-        captcha_required = ip_guard.fail_count >= 3
+        # 未提供用户名的状态接口不能把某个组合键的锁扩散给整个 IP。
+        captcha_required = _effective_failures(ip_guard, now) >= 3
     return {
         "initialized": count > 0,
         "authenticated": current_user is not None,
@@ -276,13 +293,14 @@ async def login(
     user_guard = await db.scalar(
         select(LoginAttemptGuard).where(LoginAttemptGuard.guard_key == f"user:{username or '__empty__'}")
     )
+    pair_guard = await db.scalar(select(LoginAttemptGuard).where(
+        LoginAttemptGuard.guard_key == f"user_ip:{_pair_value(username, client_ip)}"))
 
-    # 1. Enforce active lockout
+    # 只有同一用户名与 IP 的组合能触发硬锁。
     active_locks = [
         dt
         for dt in (
-            _as_utc(ip_guard.locked_until) if ip_guard else None,
-            _as_utc(user_guard.locked_until) if user_guard else None,
+            _as_utc(pair_guard.locked_until) if pair_guard else None,
         )
         if dt and dt > now
     ]
@@ -301,10 +319,11 @@ async def login(
         )
 
     # 2. Enforce captcha after 3 consecutive failures
-    prior_fails = max(
-        ip_guard.fail_count if ip_guard else 0,
-        user_guard.fail_count if user_guard else 0,
-    )
+    prior_fails = _effective_failures(pair_guard, now)
+    username_fails = _effective_failures(user_guard, now)
+    if username_fails:
+        # 延迟有上限，不占全局执行锁，也不持续锁死正常管理员。
+        await asyncio.sleep(min(5.0, 0.1 * 2 ** min(username_fails - 1, 6)))
     if prior_fails >= 3 or payload.captcha_token is not None or payload.captcha_answer is not None:
         if not payload.captcha_token or payload.captcha_answer is None or not str(payload.captcha_answer).strip():
             return JSONResponse(
@@ -344,7 +363,9 @@ async def login(
 
     # 3. Verify credentials
     user = await db.scalar(select(User).where(User.username == username))
-    if not user or not await verify_password_async(payload.password, user.password_hash):
+    valid_password = await verify_password_async(
+        payload.password, user.password_hash if user else DUMMY_PASSWORD_HASH)
+    if not user or not valid_password:
         fails, lock_sec = await _record_login_failure(
             db, request, client_ip, username, "Invalid credentials"
         )
@@ -428,14 +449,11 @@ async def login(
             )
 
     # 5. Reset failure counters on clean login
-    if ip_guard:
-        ip_guard.fail_count = 0
-        ip_guard.locked_until = None
-        ip_guard.alert_sent_level = 0
-    if user_guard:
-        user_guard.fail_count = 0
-        user_guard.locked_until = None
-        user_guard.alert_sent_level = 0
+    for guard in (ip_guard, user_guard, pair_guard):
+        if guard:
+            guard.fail_count = 0
+            guard.locked_until = None
+            guard.alert_sent_level = 0
 
     user.last_login_at = now
     await record_audit(db, "LOGIN", "user", str(user.id), "Admin logged in", user, request)

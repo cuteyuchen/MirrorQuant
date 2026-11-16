@@ -16,7 +16,7 @@ from app.core.security import CredentialVault
 from app.core.secret_mask import mask_sensitive_payload, redact_error_urls, redact_proxy_userinfo
 from app.models.domain import ProxyNode, TradingAccount, User
 from app.schemas.api import AccountCreate, AccountUpdate
-from app.services.adapters.factory import create_exchange_adapter
+from app.services.adapters.factory import create_exchange_adapter, invalidate_account_adapter
 from app.services.positions import with_current_price
 from app.services.engine.orchestrator import orchestrator
 from app.services.engine.serialization import serialized_execution
@@ -149,6 +149,9 @@ async def update_account(
 
     await record_audit(db, "UPDATE_ACCOUNT", "account", str(acct.id), f"Updated account {acct.name}", current_user, request)
     await db.commit()
+    # 配置提交后再失效，不能在失败的更新中丢掉有效连接。
+    if identity_fields.intersection(data) or "proxy_id" in data:
+        await invalidate_account_adapter(acct.id)
     await db.refresh(acct)
     return {"item": _account_out(acct)}
 
@@ -171,6 +174,7 @@ async def delete_account(
     await db.delete(acct)
     await record_audit(db, "DELETE_ACCOUNT", "account", str(account_id), f"Deleted account {name}", current_user, request)
     await db.commit()
+    await invalidate_account_adapter(account_id)
     return {"ok": True}
 
 
@@ -192,6 +196,7 @@ async def test_account_connectivity(
     except ProxyEgressError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     adapter = create_exchange_adapter(
+        account_id=acct.id,  # 同一账户复用已校准的适配器与连接。
         exchange=acct.exchange,
         credentials=creds,
         environment=acct.environment,

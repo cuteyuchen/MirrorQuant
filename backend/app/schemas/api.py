@@ -1,16 +1,31 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Literal, Optional
+import os
+from typing import Any, ClassVar, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_serializer, field_validator
 from pydantic.alias_generators import to_camel
 
 from app.core.time_util import to_utc_iso
+from app.core.notification_policy import https_notification_url, notification_outbox_path
+from app.core.secret_mask import MASK_SENTINEL, is_mask_sentinel
 
 
 class CamelModel(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+
+class UpdateModel(CamelModel):
+    # 省略字段代表不改；显式 null 仅允许用于数据库可空列。
+    nullable_fields: ClassVar[frozenset[str]] = frozenset()
+
+    @field_validator("*")
+    @classmethod
+    def reject_null_column(cls, value, info):
+        if value is None and info.field_name not in cls.nullable_fields:
+            raise ValueError("Field cannot be null; omit it to keep the current value")
+        return value
 
 
 class SetupRequest(CamelModel):
@@ -19,8 +34,8 @@ class SetupRequest(CamelModel):
 
 
 class LoginRequest(CamelModel):
-    username: str
-    password: str
+    username: str = Field(min_length=1, max_length=64)  # 与用户表长度一致，限制恶意输入。
+    password: str = Field(max_length=128)
     captcha_token: Optional[str] = None
     captcha_answer: Optional[str] = None
     totp_code: Optional[str] = None
@@ -66,12 +81,18 @@ class ProxyCreate(CamelModel):
     is_enabled: bool = True
 
 
-class ProxyUpdate(CamelModel):
-    name: Optional[str] = None
-    url: Optional[str] = None
-    region: Optional[str] = None
+class ProxyUpdate(UpdateModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    url: Optional[str] = Field(default=None, min_length=3, max_length=255)
+    region: Optional[str] = Field(default=None, max_length=32)
     priority: Optional[int] = Field(default=None, ge=1, le=1000)
     is_enabled: Optional[bool] = None
+
+    @field_validator("url", mode="before")
+    @classmethod
+    def normalize_preserved_url(cls, value):
+        # 空串是保留旧地址及凭据的占位符，转换后仍执行原长度和 null 校验。
+        return MASK_SENTINEL if value == "" else value
 
 
 class LeadCreate(CamelModel):
@@ -85,8 +106,9 @@ class LeadCreate(CamelModel):
     is_public_dashboard: bool = False
 
 
-class LeadUpdate(CamelModel):
-    name: Optional[str] = None
+class LeadUpdate(UpdateModel):
+    nullable_fields = frozenset({"description", "proxy_id"})
+    name: Optional[str] = Field(default=None, min_length=1, max_length=120)
     description: Optional[str] = None
     poll_interval_sec: Optional[int] = Field(default=None, ge=5, le=3600)
     proxy_id: Optional[int] = None
@@ -106,26 +128,26 @@ class AccountCreate(CamelModel):
     margin_mode: str = Field(default="cross", pattern="^(cross|isolated)$")
     position_mode: str = Field(default="hedge", pattern="^(hedge|one_way)$")
 
+    @field_validator("exchange")
+    @classmethod
+    def experimental_exchange_gate(cls, value):
+        # 实验适配器必须由部署者显式开启，不受请求字段控制。
+        if value in ("bybit", "bitget") and os.getenv("MQ_ENABLE_EXPERIMENTAL_EXCHANGES", "").lower() != "true":
+            raise ValueError("Experimental exchange disabled; set MQ_ENABLE_EXPERIMENTAL_EXCHANGES=true to opt in")
+        return value
 
-class AccountUpdate(CamelModel):
-    name: Optional[str] = None
+
+class AccountUpdate(UpdateModel):
+    nullable_fields = frozenset({"passphrase", "proxy_id"})
+    name: Optional[str] = Field(default=None, min_length=1, max_length=120)
     environment: Optional[str] = Field(default=None, pattern="^(demo|live)$")
-    api_key: Optional[str] = None
-    secret_key: Optional[str] = None
-    passphrase: Optional[str] = None
+    api_key: Optional[str] = Field(default=None, max_length=256)
+    secret_key: Optional[str] = Field(default=None, max_length=256)
+    passphrase: Optional[str] = Field(default=None, max_length=256)
     proxy_id: Optional[int] = None
     is_enabled: Optional[bool] = None
     margin_mode: Optional[str] = Field(default=None, pattern="^(cross|isolated)$")
     position_mode: Optional[str] = Field(default=None, pattern="^(hedge|one_way)$")
-
-    @field_validator("name", "environment", "api_key", "secret_key", "is_enabled", "margin_mode", "position_mode")
-    @classmethod
-    def reject_explicit_null(cls, value):
-        # Defaults are not validated: omitted fields stay absent from exclude_unset.
-        if value is None:
-            raise ValueError("Field cannot be null; omit it to keep the current value")
-        return value
-
 
 class BindingCreate(CamelModel):
     name: str = Field(min_length=1, max_length=120)
@@ -144,6 +166,9 @@ class BindingCreate(CamelModel):
     max_spread_pct: float = Field(default=0.3, ge=0.0, le=20.0)
     ioc_offset_pct: float = Field(default=0.5, ge=0.0, le=10.0)
     order_mode: str = Field(default="ioc_then_market", pattern="^(ioc_then_market|ioc_only|market_only)$")
+    # 滑点超限处理方式与限价单有效期（秒）。
+    slippage_action: str = Field(default="block", pattern="^(block|limit)$")
+    limit_order_ttl_sec: int = Field(default=120, ge=10, le=3600)
     tp_sl_mode: str = Field(default="follow_lead", pattern="^(follow_lead|independent|hybrid_guard)$")
     enable_stop_loss: bool = False
     stop_loss_pct: float = Field(default=5.0, gt=0.0, le=95.0)
@@ -157,8 +182,8 @@ class BindingCreate(CamelModel):
     symbol_map: Dict[str, str] = Field(default_factory=dict)
 
 
-class BindingUpdate(CamelModel):
-    name: Optional[str] = None
+class BindingUpdate(UpdateModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=120)
     is_enabled: Optional[bool] = None
     enable_circuit_breaker: Optional[bool] = None
     enable_leverage_cap: Optional[bool] = None
@@ -172,6 +197,8 @@ class BindingUpdate(CamelModel):
     max_spread_pct: Optional[float] = Field(default=None, ge=0.0, le=20.0)
     ioc_offset_pct: Optional[float] = Field(default=None, ge=0.0, le=10.0)
     order_mode: Optional[str] = Field(default=None, pattern="^(ioc_then_market|ioc_only|market_only)$")
+    slippage_action: Optional[str] = Field(default=None, pattern="^(block|limit)$")
+    limit_order_ttl_sec: Optional[int] = Field(default=None, ge=10, le=3600)
     tp_sl_mode: Optional[str] = Field(default=None, pattern="^(follow_lead|independent|hybrid_guard)$")
     enable_stop_loss: Optional[bool] = None
     stop_loss_pct: Optional[float] = Field(default=None, gt=0.0, le=95.0)
@@ -183,14 +210,6 @@ class BindingUpdate(CamelModel):
     symbol_whitelist: Optional[List[str]] = None
     symbol_blacklist: Optional[List[str]] = None
     symbol_map: Optional[Dict[str, str]] = None
-
-
-    @field_validator("enable_circuit_breaker", "enable_leverage_cap")
-    @classmethod
-    def reject_null_switch(cls, value):
-        if value is None:
-            raise ValueError("Field cannot be null; omit it to keep the current value")
-        return value
 
 
 class KillSwitchRequest(CamelModel):
@@ -212,6 +231,8 @@ class RiskDefaults(CamelModel):
     max_spread_pct: float = Field(default=0.3, ge=0.0, le=20.0)
     ioc_offset_pct: float = Field(default=0.5, ge=0.0, le=10.0)
     order_mode: Literal["ioc_then_market", "ioc_only", "market_only"] = "ioc_then_market"
+    slippage_action: Literal["block", "limit"] = "block"
+    limit_order_ttl_sec: int = Field(default=120, ge=10, le=3600)
     tp_sl_mode: Literal["follow_lead", "independent", "hybrid_guard"] = "follow_lead"
     enable_stop_loss: StrictBool = False
     stop_loss_pct: float = Field(default=5.0, gt=0.0, le=95.0)
@@ -245,17 +266,33 @@ class NotificationSettings(CamelModel):
     wecom_webhook_url: str = ""
     dingtalk_enabled: StrictBool = False
     dingtalk_webhook_url: str = ""
+    # 钉钉“加签”密钥，可选；留空表示机器人用关键词或 IP 白名单。
+    dingtalk_secret: str = ""
     # Read-only hints are accepted on a GET/PUT round trip and never persisted.
     telegram_bot_token_configured: Optional[StrictBool] = Field(default=None, exclude=True)
     webhook_url_configured: Optional[StrictBool] = Field(default=None, exclude=True)
     wecom_webhook_url_configured: Optional[StrictBool] = Field(default=None, exclude=True)
     dingtalk_webhook_url_configured: Optional[StrictBool] = Field(default=None, exclude=True)
+    dingtalk_secret_configured: Optional[StrictBool] = Field(default=None, exclude=True)
     outbox_enabled: StrictBool = False
     outbox_path: str = ""
     notify_on_execution: StrictBool = True
     notify_on_lead_order: StrictBool = True
     notify_on_risk_block: StrictBool = True
     notify_on_security_alert: StrictBool = True
+
+    @field_validator("webhook_url", "wecom_webhook_url", "dingtalk_webhook_url")
+    @classmethod
+    def validate_webhook(cls, value):
+        # GET 返回的固定掩码在 PUT 中表示保留，真正发送前仍再次验证 HTTPS。
+        return value if is_mask_sentinel(value) else https_notification_url(value)
+
+    @field_validator("outbox_path")
+    @classmethod
+    def validate_outbox(cls, value):
+        if value:
+            notification_outbox_path(value)
+        return value
 
 
 class SettingsUpdate(CamelModel):

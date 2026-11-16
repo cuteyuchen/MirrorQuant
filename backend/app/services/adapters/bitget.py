@@ -18,6 +18,7 @@ from app.services.adapters.base import (
     InstrumentSpec,
     OrderBook,
     OrderResult,
+    api_error,
 )
 from app.services.proxy.manager import ProxyManager
 
@@ -43,9 +44,6 @@ class BitgetAdapter(BaseExchangeAdapter):
         self.passphrase = credentials.get("passphrase", "").strip()
         self.is_demo = environment == "demo"
         self.product_type = "SUSDT-FUTURES" if self.is_demo else "USDT-FUTURES"
-        self._instruments_cache: Dict[str, InstrumentSpec] = {}
-        self._instruments_cache_ts: float = 0.0
-        self._cache_ttl_sec: float = 600.0
 
     def _sign(self, timestamp_ms: str, method: str, request_path: str, body_str: str = "") -> str:
         msg = f"{timestamp_ms}{method.upper()}{request_path}{body_str}"
@@ -65,7 +63,7 @@ class BitgetAdapter(BaseExchangeAdapter):
         auth: bool = True,
         retries: int = 3,
     ) -> Any:
-        self._check_rate_limit()
+        self._check_rate_limit(auth)  # 私有冷却不得串扰其他账户。
         method = method.upper()
         # A mutation may already have reached the exchange when its response is lost.
         attempts = max(1, retries) if method == "GET" else 1
@@ -76,9 +74,7 @@ class BitgetAdapter(BaseExchangeAdapter):
         body_str = json.dumps(body, separators=(",", ":")) if body is not None else ""
 
         last_err: Optional[Exception] = None
-        async with ProxyManager.build_client(
-            proxy_url=self.proxy_url, timeout=self.timeout, exchange=self.exchange,
-        ) as client:
+        async with self.request_client(auth) as client:
             for attempt in range(attempts):
                 headers: Dict[str, str] = {
                     "Content-Type": "application/json",
@@ -103,16 +99,16 @@ class BitgetAdapter(BaseExchangeAdapter):
                         raise ValueError(f"Unsupported HTTP method: {method}")
 
                     if resp.status_code == 429:
-                        self._note_rate_limit(resp)
-                    if resp.status_code >= 400:
-                        raise ExchangeAPIError("bitget", str(resp.status_code), f"HTTP {resp.status_code}: {resp.text[:200]}")
-
+                        self._note_rate_limit(resp, auth)
+                    # 错误响应也要解析业务码，无法解析时保留未知结果。
                     payload = resp.json()
+                    if not isinstance(payload, dict):
+                        raise ExchangeAPIError("bitget", "AMBIGUOUS", "Malformed API response")
                     code = str(payload.get("code", ""))
-                    if code != "00000":
+                    if not 200 <= resp.status_code < 300 or code != "00000":
                         if code == "429":
-                            self._note_rate_limit(resp)
-                        raise ExchangeAPIError("bitget", code, payload.get("msg", ""), payload)
+                            self._note_rate_limit(resp, auth)
+                        raise api_error("bitget", code, payload.get("msg", ""), payload, resp.status_code)
                     return payload.get("data")
                 except ExchangeAPIError:
                     raise
@@ -217,9 +213,9 @@ class BitgetAdapter(BaseExchangeAdapter):
         return positions
 
     async def get_instruments(self, force_refresh: bool = False) -> Dict[str, InstrumentSpec]:
-        now = time.time()
-        if not force_refresh and self._instruments_cache and now - self._instruments_cache_ts < self._cache_ttl_sec:
-            return self._instruments_cache
+        cached = self._cached_instruments(force_refresh)
+        if cached is not None:
+            return cached
         data = await self._request("GET", "/api/v2/mix/market/contracts", params={"productType": self.product_type}, auth=False)
         result: Dict[str, InstrumentSpec] = {}
         for item in data or []:
@@ -239,8 +235,7 @@ class BitgetAdapter(BaseExchangeAdapter):
                 )
             except (ValueError, KeyError, ArithmeticError, TypeError):
                 continue
-        self._instruments_cache, self._instruments_cache_ts = result, now
-        return result
+        return self._cache_instruments(result)
 
     async def get_orderbook(self, inst_id: str, depth: int = 5) -> OrderBook:
         if not 1 <= depth <= 50:
@@ -329,6 +324,12 @@ class BitgetAdapter(BaseExchangeAdapter):
             cl_ord_id=str(data.get("clientOid") or cl_ord_id or ""),
             raw=data,
         )
+
+    async def cancel_order(self, inst_id: str, cl_ord_id: str) -> None:
+        """撤销一笔普通挂单；撤单结果以随后的查单为准，失败时抛 ExchangeAPIError。"""
+        await self._request("POST", "/api/v2/mix/order/cancel-order", body={
+            "symbol": inst_id, "productType": self.product_type,
+            "marginCoin": "SUSDT" if self.is_demo else "USDT", "clientOid": cl_ord_id})
 
     async def get_order(
         self,

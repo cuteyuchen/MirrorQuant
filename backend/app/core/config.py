@@ -68,6 +68,9 @@ class Settings(BaseSettings):
 
     data_dir: str = "./data"
     database_url: str = ""
+    sqlite_busy_timeout_sec: float = Field(default=30.0, gt=0, le=120)
+    retention_days: int = Field(default=90, ge=1, le=3650)  # 只清理审计和已完成记录。
+    retention_cleanup_interval_sec: int = Field(default=3600, ge=60)
 
     master_key: str = ""
     jwt_secret: str = ""
@@ -75,6 +78,7 @@ class Settings(BaseSettings):
     cookie_name: str = "mq_access_token"
     cookie_secure: bool = False
     access_token_expire_minutes: int = 1440
+    login_attempt_window_sec: int = Field(default=900, ge=60, le=86400)  # 无新失败超过窗口则衰减。
     trusted_proxy_cidrs: Annotated[List[str], NoDecode] = ["127.0.0.0/8", "::1/128"]
 
     cors_origins: Annotated[List[str], NoDecode] = [
@@ -89,7 +93,7 @@ class Settings(BaseSettings):
     enable_background_engine: bool = True
     readiness_heartbeat_max_age_sec: float = Field(default=30.0, gt=0, allow_inf_nan=False)
     readiness_db_timeout_sec: float = Field(default=2.0, gt=0, le=30, allow_inf_nan=False)
-    notification_outbox_max_attempts: int = Field(default=3, ge=1, le=20)
+    notification_outbox_max_attempts: int = Field(default=8, ge=1, le=20)  # 默认退避覆盖十五分钟以上。
     notification_outbox_poll_sec: float = Field(default=1.0, gt=0, le=60, allow_inf_nan=False)
     default_lead_poll_sec: int = 15
     lead_snapshot_stale_sec: float = Field(default=300.0, gt=0, allow_inf_nan=False)

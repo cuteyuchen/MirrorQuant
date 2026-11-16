@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -13,6 +14,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    event,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -44,7 +46,7 @@ class LoginAttemptGuard(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     guard_key: Mapped[str] = mapped_column(String(160), unique=True, nullable=False, index=True)
-    key_type: Mapped[str] = mapped_column(String(16), nullable=False)  # ip | user
+    key_type: Mapped[str] = mapped_column(String(16), nullable=False)  # ip | user | user_ip
     key_value: Mapped[str] = mapped_column(String(128), nullable=False)
     fail_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     last_fail_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -181,6 +183,9 @@ class CopyBinding(Base):
     max_spread_pct: Mapped[float] = mapped_column(Float, default=0.3, nullable=False)
     ioc_offset_pct: Mapped[float] = mapped_column(Float, default=0.5, nullable=False)
     order_mode: Mapped[str] = mapped_column(String(32), default="ioc_then_market", nullable=False)
+    # 开仓滑点超限时的处理：block=拦截不下单；limit=改挂限价单，超过有效期未成交自动撤单。
+    slippage_action: Mapped[str] = mapped_column(String(16), default="block", nullable=False)
+    limit_order_ttl_sec: Mapped[int] = mapped_column(Integer, default=120, nullable=False)
 
     tp_sl_mode: Mapped[str] = mapped_column(String(32), default="follow_lead", nullable=False)  # follow_lead | independent | hybrid_guard
     enable_stop_loss: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
@@ -297,6 +302,11 @@ class OrderIntent(Base):
     target_usd: Mapped[str] = mapped_column(String(100), default="0", nullable=False)
     source_time_ms: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
     exchange_order_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    # 仅“滑点超限改挂限价单”使用：到期时间（毫秒）与委托价；为空表示普通即时订单。
+    expires_at_ms: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    limit_px: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    # 终态账本及通知证据确认后不再逐轮扫描，历史缺口仍阻断投递。
+    reporting_complete: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 
@@ -391,12 +401,27 @@ class NotificationOutbox(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     payload: Mapped[str] = mapped_column(Text, nullable=False)
+    # 冗余关联键只用于索引定位，证据仍核对原始 payload。
+    execution_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    event_key: Mapped[Optional[str]] = mapped_column(String(160), nullable=True, index=True)
     status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False, index=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     last_error: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     next_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     # Expiring claims permit recovery after a worker dies during delivery.
     claimed_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+@event.listens_for(NotificationOutbox, "before_insert")
+@event.listens_for(NotificationOutbox, "before_update")
+def _index_notification_payload(_mapper, _connection, row) -> None:
+    # 兼容旧调用方直接构造 payload，同时不把损坏 JSON 当作有效证据。
+    try:
+        payload = json.loads(row.payload)
+        row.execution_id = payload.get("execution_id") if type(payload.get("execution_id")) is int else None
+        row.event_key = payload.get("event_key") if isinstance(payload.get("event_key"), str) else None
+    except (ValueError, TypeError, AttributeError):
+        row.execution_id = row.event_key = None
 
 
 class AuditLog(Base):

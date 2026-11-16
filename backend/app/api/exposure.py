@@ -40,7 +40,8 @@ async def require_account_flat(db: AsyncSession, account: TradingAccount, *, del
         proxies = list((await db.scalars(select(ProxyNode).order_by(ProxyNode.priority))).all())
         proxy_url = ProxyManager.select_proxy_url(proxies, account.proxy_id, exchange=account.exchange)
         adapter = create_exchange_adapter(account.exchange, credentials, account.environment, proxy_url,
-                                          margin_mode=account.margin_mode, position_mode=account.position_mode)
+                                          margin_mode=account.margin_mode, position_mode=account.position_mode,
+                                          account_id=account.id)  # 生命周期检查复用同一账户连接。
         positions = await asyncio.wait_for(adapter.get_positions(), timeout=15)
         get_open_orders = getattr(adapter, "get_open_orders", None)
         if get_open_orders is None:

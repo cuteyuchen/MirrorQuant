@@ -32,7 +32,9 @@ def get_engine(database_url: str | None = None) -> AsyncEngine:
         url = database_url or get_settings().resolved_database_url()
         connect_args = {}
         if url.startswith("sqlite"):
-            connect_args = {"check_same_thread": False, "timeout": 30}
+            # sqlite 驱动仅在写入时隐式 BEGIN IMMEDIATE，纯读取不占写锁。
+            timeout_sec = get_settings().sqlite_busy_timeout_sec
+            connect_args = {"check_same_thread": False, "timeout": timeout_sec, "isolation_level": "IMMEDIATE"}
         engine = create_async_engine(
             url,
             echo=False,
@@ -46,7 +48,7 @@ def get_engine(database_url: str | None = None) -> AsyncEngine:
                 cursor.execute("PRAGMA journal_mode=WAL;")
                 cursor.execute("PRAGMA synchronous=FULL;")
                 cursor.execute("PRAGMA foreign_keys=ON;")
-                cursor.execute("PRAGMA busy_timeout=5000;")
+                cursor.execute(f"PRAGMA busy_timeout={int(timeout_sec * 1000)};")
                 cursor.close()
         _engine = engine
     return _engine
@@ -87,7 +89,7 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 DEFAULT_SYSTEM_CONFIG = {
     "bootstrap_claimed": False,
     "global_kill_switch": False,
-    "public_monitoring_enabled": True,
+    "public_monitoring_enabled": False,  # 新部署必须显式开启公开看板。
     "notifications": {
         "webhook_enabled": False,
         "webhook_url": "",
@@ -98,6 +100,7 @@ DEFAULT_SYSTEM_CONFIG = {
         "wecom_webhook_url": "",
         "dingtalk_enabled": False,
         "dingtalk_webhook_url": "",
+        "dingtalk_secret": "",
         "outbox_enabled": False,
         "outbox_path": "",
         "notify_on_execution": True,
@@ -117,6 +120,9 @@ DEFAULT_SYSTEM_CONFIG = {
         "max_spread_pct": 0.3,
         "ioc_offset_pct": 0.5,
         "order_mode": "ioc_then_market",
+        # 滑点超限：block=拦截；limit=挂限价单，limit_order_ttl_sec 秒内未成交自动撤单。
+        "slippage_action": "block",
+        "limit_order_ttl_sec": 120,
         "tp_sl_mode": "follow_lead",
         "enable_stop_loss": False,
         "stop_loss_pct": 5.0,
@@ -132,7 +138,7 @@ DEFAULT_SYSTEM_CONFIG = {
         "reconcile_interval_sec": 60,
         "auto_close_orphan_positions": "alert_only",  # alert_only | auto_close
         "insufficient_margin_policy": "auto_scale_down",  # auto_scale_down | skip_alert
-        "flip_close_first": True,
+        "flip_close_first": False,  # 与兼容 schema 一致；真实顺序始终由事件证据决定。
         "clock_sync_interval_sec": 300,
         "max_consecutive_failures": 5,
     },
@@ -172,7 +178,11 @@ SQLITE_MIGRATIONS: Dict[str, List[Tuple[str, str]]] = {
         ("opened_at_ms", "BIGINT NOT NULL DEFAULT 0"),
     ],
     "order_intents": [("source_time_ms", "BIGINT NOT NULL DEFAULT 0"),
-                      ("delivery_event_id", "VARCHAR(100)")],
+                      ("delivery_event_id", "VARCHAR(100)"),
+                      ("reporting_complete", "BOOLEAN NOT NULL DEFAULT 0"),
+                      ("expires_at_ms", "BIGINT"),
+                      ("limit_px", "VARCHAR(100)")],
+    "notification_outbox": [("execution_id", "INTEGER"), ("event_key", "VARCHAR(160)")],
     "binding_debts": [("pending_usd_exact", "VARCHAR(100)")],
     "users": [
         ("session_version", "INTEGER NOT NULL DEFAULT 0"),
@@ -200,6 +210,9 @@ SQLITE_MIGRATIONS: Dict[str, List[Tuple[str, str]]] = {
         ("trailing_callback_pct", "FLOAT NOT NULL DEFAULT 2.0"),
         ("hard_stop_loss_pct", "FLOAT NOT NULL DEFAULT 15.0"),
         ("consecutive_failures", "INTEGER NOT NULL DEFAULT 0"),
+        # 旧绑定升级后保持原行为（拦截），需要挂限价单时在绑定里手动开启。
+        ("slippage_action", "VARCHAR(16) NOT NULL DEFAULT 'block'"),
+        ("limit_order_ttl_sec", "INTEGER NOT NULL DEFAULT 120"),
     ],
 }
 
@@ -217,6 +230,19 @@ def _apply_sqlite_migrations(sync_conn) -> None:
             if col_name not in existing_cols:
                 logger.info("Auto-migrating SQLite column %s.%s", table, col_name)
                 sync_conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_def}"))
+        if table == "notification_outbox" and not {"execution_id", "event_key"} <= existing_cols:
+            # 只在升级时回填旧关联键；日常证据检索使用索引，不再扫描整个队列。
+            for row_id, raw in sync_conn.execute(text("SELECT id, payload FROM notification_outbox")):
+                try:
+                    payload = json.loads(raw)
+                    execution_id = payload.get("execution_id")
+                    event_key = payload.get("event_key")
+                    sync_conn.execute(text(
+                        "UPDATE notification_outbox SET execution_id=:execution_id, event_key=:event_key WHERE id=:id"
+                    ), {"id": row_id, "execution_id": execution_id if type(execution_id) is int else None,
+                        "event_key": event_key if isinstance(event_key, str) else None})
+                except (ValueError, TypeError, AttributeError):
+                    continue
         if table == "binding_deliveries" and "exit_target_qty" not in existing_cols:
             deliveries = sync_conn.execute(text(
                 "SELECT binding_id, source_event_id, payload_json FROM binding_deliveries"
@@ -233,6 +259,12 @@ def _apply_sqlite_migrations(sync_conn) -> None:
                         "UPDATE binding_deliveries SET state='PENDING', exit_progress='REVIEW_REQUIRED' "
                         "WHERE binding_id=:binding_id AND source_event_id=:event_id"
                     ), {"binding_id": binding_id, "event_id": event_id})
+    # create_all 不会为既有表补索引，升级时显式且幂等创建。
+    for table, column in (("order_intents", "reporting_complete"),
+                          ("notification_outbox", "execution_id"), ("notification_outbox", "event_key"),
+                          ("notification_outbox", "created_at"), ("login_attempt_guards", "updated_at")):
+        if column in {row[1] for row in sync_conn.execute(text(f"PRAGMA table_info({table})"))}:
+            sync_conn.execute(text(f"CREATE INDEX IF NOT EXISTS ix_{table}_{column} ON {table} ({column})"))
 
 
 async def init_db() -> None:
@@ -240,6 +272,9 @@ async def init_db() -> None:
 
     engine = get_engine()
     async with engine.begin() as conn:
+        if engine.dialect.name == "sqlite":
+            # 驱动的隐式事务只覆盖 DML，DDL 升级也要失败时完整回滚。
+            await conn.execute(text("BEGIN IMMEDIATE"))
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_apply_sqlite_migrations)
 

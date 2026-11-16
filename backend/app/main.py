@@ -20,6 +20,8 @@ from app.models.domain import LeadSource, TradingAccount, User
 from app.services.lead_collector.freshness import lead_freshness
 from app.services.engine.orchestrator import orchestrator
 from app.services.notifier.outbox import notification_outbox
+from app.services.adapters.factory import close_exchange_adapters
+from app.services.lead_collector.binance_bapi import BinanceBapiCollector
 
 settings = get_settings()
 logging.basicConfig(
@@ -46,16 +48,24 @@ async def lifespan(_app: FastAPI):
                         vault.decrypt_string(encrypted)
         except Exception as exc:
             raise RuntimeError("Stored credentials cannot be decrypted; restore the correct master key") from exc
-    if settings.enable_background_engine:
-        await orchestrator.start()
-    await notification_outbox.start()
     try:
+        # 启动途中失败也进入资源清理，不能遗留后台任务和长连接。
+        if settings.enable_background_engine:
+            await orchestrator.start()
+        await notification_outbox.start()
         yield
     finally:
         try:
             await orchestrator.stop()
         finally:
-            await notification_outbox.stop()
+            try:
+                await notification_outbox.stop()
+            finally:
+                # 后台任务退出后释放长连接，不能遗留带凭据的客户端。
+                try:
+                    await close_exchange_adapters()
+                finally:
+                    await BinanceBapiCollector.close_clients()
 
 
 def create_app() -> FastAPI:

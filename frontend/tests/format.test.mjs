@@ -20,7 +20,8 @@ test("invalid and empty values never display long floats or NaN", () => {
     assert.equal(formatPrice(value), "—");
     assert.equal(formatUsd(value), "—");
     assert.equal(formatPct(value), "—");
-    assert.equal(formatQty(value), "0");
+    // 未知数量不能冒充零仓位。
+    assert.equal(formatQty(value), "—");
   }
 });
 
@@ -28,6 +29,7 @@ test("quantities remove trailing zeros and amounts and percentages keep two deci
   assert.equal(formatQty(2.123456789), "2.1235");
   assert.equal(formatQty("2.1000"), "2.1");
   assert.equal(formatQty(1234567.123456789), "1,234,567.1235");
+  assert.equal(formatQty(0.00000123456), "0.000001235");
   assert.equal(formatUsd(11.60123456), "$11.60");
   assert.equal(formatUsd(-11.60123456), "-$11.60");
   assert.equal(formatUsd(11.6, 0), "$12");

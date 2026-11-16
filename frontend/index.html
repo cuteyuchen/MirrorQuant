@@ -2,11 +2,25 @@
 <html lang="zh-CN" class="dark">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-    <title>MirrorQuant · 多交易员智能跟单与风控引擎</title>
-    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2306b6d4' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><polygon points='12 2 2 7 12 12 22 7 12 2'></polygon><polyline points='2 17 12 22 22 17'></polyline><polyline points='2 12 12 17 22 12'></polyline></svg>" />
+    <!-- 保留浏览器缩放能力，标题由 i18n 在启动时更新。 -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#080c14" />
+    <!-- 内联 SVG 图标，避免额外请求与 404。 -->
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230f172a'/%3E%3Cpath d='M6 20l5-8 4 6 4-10 7 12' fill='none' stroke='%2322d3ee' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
+    <title>MirrorQuant</title>
+    <script>
+      // 首屏渲染前确定主题，避免亮暗闪烁：默认深色，只有用户明确选过浅色才切换。
+      (function () {
+        var light = false;
+        try { light = localStorage.getItem("mq_theme") === "light"; } catch (e) { /* 隐私模式下读不到存储时保持深色 */ }
+        var root = document.documentElement;
+        root.classList.toggle("dark", !light);
+        var meta = document.querySelector('meta[name="theme-color"]');
+        if (meta) meta.setAttribute("content", light ? "#f0f4f9" : "#080c14");
+      })();
+    </script>
   </head>
-  <body class="bg-background text-slate-100 antialiased selection:bg-accent/30 selection:text-accent font-['Plus_Jakarta_Sans',sans-serif] min-h-screen">
+  <body class="min-h-screen antialiased">
     <div id="app"></div>
     <script type="module" src="/src/main.ts"></script>
   </body>

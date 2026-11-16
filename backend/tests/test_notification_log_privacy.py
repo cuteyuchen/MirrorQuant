@@ -42,7 +42,8 @@ async def test_all_channel_destinations_private_without_changing_delivery(monkey
             except httpx.ReadTimeout:
                 logging.getLogger("httpx").exception("Synthetic client failure at %s", request.url)
                 raise
-        return httpx.Response(200 if outcome == "success" else 503, json={"errcode": 0})
+        # HTTP 成功还必须包含相应渠道的业务确认。
+        return httpx.Response(200 if outcome == "success" else 503, json={"errcode": 0, "ok": True})
 
     real_client = httpx.AsyncClient
     monkeypatch.setattr("app.services.notifier.service.httpx.AsyncClient", lambda **kwargs:

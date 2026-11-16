@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from decimal import Decimal
 from email.utils import parsedate_to_datetime
 import math
+import hashlib
 import random
 import time
 from typing import Any, ClassVar, Dict, List, Optional
+
+from app.services.proxy.manager import ProxyManager
 
 
 class ExchangeAPIError(RuntimeError):
@@ -17,6 +21,54 @@ class ExchangeAPIError(RuntimeError):
         self.code = code
         self.msg = msg
         self.data = data
+
+
+class OrderRejected(ExchangeAPIError):
+    """确定未被受理的订单；不需要创建未知结果隔离。"""
+
+
+def api_error(exchange: str, code: str, msg: str, data: Any = None, http_status: int = 200) -> ExchangeAPIError:
+    # 只确认已知拒绝码；未识别数字码和重复客户单号也必须先查单。
+    # 下表已于 2026-11-15 逐码对照各交易所官方错误码文档；新增条目前必须先核对文档，
+    # 只收录“请求确定未被受理为新订单”的码。查单/撤单类（订单不存在）与文档查不到的码一律不收录。
+    rejected_codes = {
+        # 币安 U 本位合约：-2011/-2013 属撤单、查单语义，-4112 文档无此码，均已移除。
+        "binance": {
+            "-1002", "-1003", "-1013", "-1014", "-1015", "-1020", "-1021", "-1022",
+            "-1100", "-1101", "-1102", "-1103", "-1104", "-1105", "-1106", "-1111",
+            "-1114", "-1115", "-1116", "-1117", "-1118", "-1119", "-1121", "-1128", "-1130",
+            "-2010", "-2014", "-2015", "-2018", "-2019", "-2020",
+            "-2021", "-2022", "-2024", "-2025", "-2026", "-2027", "-2028",
+            "-4001", "-4002", "-4003", "-4004", "-4005", "-4013", "-4014", "-4015",
+            "-4016", "-4023", "-4024", "-4028", "-4045", "-4050", "-4051", "-4060",
+            "-4061", "-4062", "-4131", "-4164",
+        },
+        # OKX：51011/51016 指向既有订单身份，不能仅凭错误文案证明未受理；
+        # 51004/51119 文档查不到、51603 是“订单不存在”，均已移除。
+        "okx": {
+            "50011", "50061", "50101", "50102", "50103", "50104", "50105", "50106",
+            "50107", "50108", "50109", "50110", "50111", "50112", "50113", "50114",
+            "50115", "51000", "51001", "51005", "51006", "51007", "51008",
+            "51009", "51010", "51015", "51020", "51100", "51101", "51102",
+            "51103", "51104", "51105", "51112", "51120", "51121", "51122",
+            "51123", "51131", "51201", "51202", "51203", "51204", "51205",
+        },
+        # Bybit（实验性）：110001/170213 是“订单不存在”，已移除。
+        "bybit": {
+            "10001", "10002", "10003", "10004", "10005", "10006", "10007", "10008",
+            "10009", "10010", "10018", "10024", "10027", "110003", "110004",
+            "110006", "110007", "110012", "110013", "110017", "110020", "110021",
+            "110032", "110043",
+        },
+        # Bitget（实验性）：官方错误码页无法取得、未能核实，故不收录任何码，一律按结果未知查单。
+        "bitget": set(),
+    }
+    code = str(code)
+    uncertain = (http_status >= 500 or http_status == 408 or 300 <= http_status < 400
+                 or code not in rejected_codes.get(exchange, set())
+                 or "duplicate" in str(msg).lower())
+    error_type = ExchangeAPIError if uncertain else OrderRejected
+    return error_type(exchange, str(code), msg, data)
 
 
 @dataclass
@@ -159,8 +211,10 @@ class OrderResult:
 
 class BaseExchangeAdapter(ABC):
     exchange: ClassVar[str] = "base"
-    # Shared by all clients/accounts in this worker because public limits can be IP-wide.
-    _rate_limit_until: ClassVar[Dict[str, float]] = {}
+    # 私有额度按账户与出口隔离，公共接口只共享同一出口的冷却。
+    _rate_limit_until: ClassVar[dict[tuple, float]] = {}
+    _contract_cache: ClassVar[dict[tuple, tuple[float, dict]]] = {}
+    _live_clients: ClassVar[set] = set()
 
     def __init__(
         self,
@@ -180,13 +234,19 @@ class BaseExchangeAdapter(ABC):
         self._time_offset_ms: int = 0
         self._clock_calibrated_at: float = 0.0
         self._clock_uncertainty_ms: float = 0.0
+        self._http_clients: dict = {}
 
-    def _check_rate_limit(self) -> None:
-        remaining = self._rate_limit_until.get(self.exchange, 0) - time.monotonic()
+    def _rate_limit_key(self, auth: bool) -> tuple:
+        route = hashlib.sha256((self.proxy_url or "direct").encode()).hexdigest()
+        identity = hashlib.sha256(self.credentials.get("api_key", "").strip().encode()).hexdigest() if auth else "public"
+        return self.exchange, self.environment, "private" if auth else "public", route, identity
+
+    def _check_rate_limit(self, auth: bool = True) -> None:
+        remaining = self._rate_limit_until.get(self._rate_limit_key(auth), 0) - time.monotonic()
         if remaining > 0:
-            raise ExchangeAPIError(self.exchange, "RATE_LIMITED", f"Exchange cooldown active for {remaining:.2f}s")
+            raise OrderRejected(self.exchange, "RATE_LIMITED", f"Exchange cooldown active for {remaining:.2f}s")
 
-    def _note_rate_limit(self, response: Any) -> None:
+    def _note_rate_limit(self, response: Any, auth: bool = True) -> None:
         delay = 1.0
         headers = response.headers
         retry_after = headers.get("Retry-After")
@@ -207,7 +267,40 @@ class BaseExchangeAdapter(ABC):
         if not math.isfinite(delay):
             delay = 1.0
         deadline = time.monotonic() + max(1.0, delay) + random.uniform(0.05, 0.25)
-        self._rate_limit_until[self.exchange] = max(self._rate_limit_until.get(self.exchange, 0), deadline)
+        key = self._rate_limit_key(auth)
+        self._rate_limit_until[key] = max(self._rate_limit_until.get(key, 0), deadline)
+
+    @asynccontextmanager
+    async def request_client(self, auth: bool = True):
+        # 公私请求池分离，连接在账户配置失效或应用关闭时释放。
+        client = self._http_clients.get(auth)
+        if client is None or client.is_closed:
+            client = ProxyManager.build_client(
+                proxy_url=self.proxy_url, timeout=self.timeout, exchange=self.exchange)
+            self._http_clients[auth] = client
+            self._live_clients.add(client)
+        yield client
+
+    async def aclose(self) -> None:
+        # 先摘除旧池，后续请求不能在清理期间重用旧凭据的连接。
+        clients = list(self._http_clients.values())
+        self._http_clients.clear()
+        await ProxyManager.close_clients(clients)
+        self._live_clients.difference_update(clients)
+
+    def _contract_cache_key(self) -> tuple:
+        return self.exchange, self.environment, getattr(self, "base_url", getattr(self, "BASE_URL", ""))
+
+    def _cached_instruments(self, force_refresh: bool) -> Optional[dict]:
+        # 合约元数据与凭据无关，按交易所环境共享十分钟缓存。
+        cached = self._contract_cache.get(self._contract_cache_key())
+        if not force_refresh and cached is not None and time.monotonic() - cached[0] < 600:
+            return cached[1]
+        return None
+
+    def _cache_instruments(self, instruments: dict) -> dict:
+        self._contract_cache[self._contract_cache_key()] = (time.monotonic(), instruments)
+        return instruments
 
     def _calibrate_time(self, server_ms: int, sent_ms: float) -> int:
         received_ms = time.time() * 1000
@@ -223,7 +316,7 @@ class BaseExchangeAdapter(ABC):
         # A one-way account can net another binding's opposite position. Until
         # a netting policy exists, new allocation-owned entries require hedge mode.
         if self.position_mode != "hedge" or mgn_mode != "cross" or self.margin_mode != "cross":
-            raise ExchangeAPIError(self.exchange, "UNSUPPORTED_MODE", "New entries require cross margin and hedge mode")
+            raise OrderRejected(self.exchange, "UNSUPPORTED_MODE", "New entries require cross margin and hedge mode")
 
     def _symbol_matches(self, lead_symbol: str, inst_id: str,
                         instruments: Dict[str, InstrumentSpec]) -> bool:
@@ -236,18 +329,23 @@ class BaseExchangeAdapter(ABC):
 
     async def validate_order(self, inst_id: str, ord_type: str, sz: str,
                              px: Optional[str] = None, reduce_only: bool = False) -> None:
+        # 明显无效的本地参数先拒绝，不让额外行情请求掩盖拒单原因。
         if ord_type.lower() not in ("market", "limit", "ioc"):
-            raise ValueError("Unsupported order type")
+            raise OrderRejected(self.exchange, "LOCAL_VALIDATION", "Unsupported order type")
         spec = (await self.get_instruments()).get(inst_id)
         if spec is None:
-            raise ValueError(f"Unqualified instrument: {inst_id}")
+            raise OrderRejected(self.exchange, "LOCAL_VALIDATION", f"Unqualified instrument: {inst_id}")
         ref_px = px
         if px is None and not reduce_only:
             book = await self.get_orderbook(inst_id, depth=1)
             if not book.bids or not book.asks:
-                raise ValueError("Missing price for final order validation")
+                raise OrderRejected(self.exchange, "LOCAL_VALIDATION", "Missing price for final order validation")
             ref_px = str(min(book.bids[0][0], book.asks[0][0]))
-        spec.validate_order(ord_type, sz, ref_px, reduce_only)
+        try:
+            # 只包装提交前的本地校验，响应解析错误仍属于结果不确定。
+            spec.validate_order(ord_type, sz, ref_px, reduce_only)
+        except (ValueError, ArithmeticError) as exc:
+            raise OrderRejected(self.exchange, "LOCAL_VALIDATION", str(exc)) from exc
 
     async def get_max_leverage(self, inst_id: str, target_notional: Any) -> int:
         """Return an exchange-confirmed tier limit. Concrete adapters must qualify it."""
@@ -256,6 +354,10 @@ class BaseExchangeAdapter(ABC):
     async def get_open_orders(self) -> List[Dict[str, Any]]:
         """Read all ordinary and conditional pending orders, or reject an incomplete view."""
         raise ExchangeAPIError(self.exchange, "UNQUALIFIED_ORDERS", "Complete pending-order inventory unavailable")
+
+    async def cancel_order(self, inst_id: str, cl_ord_id: str) -> None:
+        """撤销一笔普通挂单；撤单结果以随后的查单为准，失败时抛 ExchangeAPIError。"""
+        raise ExchangeAPIError(self.exchange, "UNSUPPORTED_CANCEL", "Order cancellation unavailable")
 
     async def sync_time(self) -> int:
         """Synchronize clock offset (server_ms - local_ms) to prevent timestamp drift rejections."""

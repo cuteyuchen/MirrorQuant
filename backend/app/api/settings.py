@@ -82,9 +82,7 @@ async def update_settings_view(
     current_user: User = Depends(get_current_admin),
 ):
     updated = []
-    if payload.global_kill_switch is not None:
-        await _save_cfg(db, "global_kill_switch", payload.global_kill_switch)
-        updated.append("global_kill_switch")
+    # 兼容旧客户端字段，但急停只允许通过独立、可审计的入口变更。
     if payload.public_monitoring_enabled is not None:
         await _save_cfg(db, "public_monitoring_enabled", payload.public_monitoring_enabled)
         updated.append("public_monitoring_enabled")
@@ -149,8 +147,12 @@ async def test_notification(
     cfg = await _load_cfg(db, "notifications") or {}
     res = await NotificationService.dispatch(
         cfg,
-        title="MirrorQuant Test Alert",
-        message="Notification channel connectivity verified successfully.",
+        # 测试消息沿用真实成交通知的版式（数值为示例），收到即可确认渠道与排版。
+        title="MirrorQuant 测试",
+        message=("🟢 带单 开多/加多 ｜ BTCUSDT ｜ 做多\n"
+                 "💰 均价 100000 ｜ 数量 0.05 ｜ 金额 5,000.00 U\n"
+                 "🧮 1000U 本金 ≈ 开 100.00 U ｜ 建议杠杆 2x\n\n"
+                 "✅ 通知渠道连接正常（以上为示例数据，非真实成交）"),
         event_type="test",
     )
     return {"ok": True, "results": res}

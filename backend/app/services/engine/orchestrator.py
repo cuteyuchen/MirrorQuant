@@ -17,6 +17,7 @@ from app.core.config import get_settings
 from app.core.security import CredentialVault
 from app.core.secret_mask import mask_sensitive_payload, redact_proxy_userinfo
 from app.models.domain import CopyBinding, LeadSource, NotificationOutbox, ProxyNode, TradingAccount
+from app.maintenance.retention import cleanup_retained_records
 from app.services.adapters.factory import create_exchange_adapter
 from app.services.adapters.base import get_collateral_balance
 from app.services.analysis.pa_analyzer import PAAnalyzer
@@ -100,6 +101,7 @@ class EngineOrchestrator:
         self._sync_failure_log_at: Dict[int, float] = {}
         self._sync_failure_warn_at: Dict[int, float] = {}
         self._sync_failure_error_window: Dict[int, List[float]] = {}
+        self._last_retention_cleanup = 0.0  # 清理只在主轮询低频执行。
 
     async def start(self) -> None:
         if self._running:
@@ -153,6 +155,15 @@ class EngineOrchestrator:
     async def tick(self) -> None:
         factory = get_session_factory()
         async with factory() as db:
+            if time.monotonic() - self._last_retention_cleanup >= get_settings().retention_cleanup_interval_sec:
+                try:
+                    await cleanup_retained_records(db)
+                except Exception:
+                    # 维护故障与账户同步隔离，失败事务回滚后仍遵守低频重试。
+                    await db.rollback()
+                    logger.exception("Retention cleanup failed")
+                finally:
+                    self._last_retention_cleanup = time.monotonic()
             proxies = list((await db.scalars(select(ProxyNode).order_by(ProxyNode.priority))).all())
             leads = list(
                 (await db.scalars(select(LeadSource).where(LeadSource.is_enabled == True))).all()  # noqa: E712
@@ -201,6 +212,7 @@ class EngineOrchestrator:
                     credentials = self.vault.decrypt_dict(account.encrypted_credentials)
                     proxy_url = ProxyManager.select_proxy_url(proxies, account.proxy_id, exchange=account.exchange)
                     adapter = create_exchange_adapter(
+                        account_id=account.id,  # 独立风控与轮询共享账户连接。
                         exchange=account.exchange, credentials=credentials,
                         environment=account.environment, proxy_url=proxy_url,
                         margin_mode=account.margin_mode, position_mode=account.position_mode,
@@ -215,6 +227,9 @@ class EngineOrchestrator:
                         db=db, lead=lead, account=account, binding=binding, adapter=adapter,
                         local_positions=live_positions, instruments=instruments,
                     )
+                    if await self.router._has_resting(db, binding.id):
+                        # 在簿限价单约每 2 秒核对一次：及时发现成交并通知，到期自动撤单。
+                        await self.router.reconcile_pending_orders(db, account, adapter, instruments)
                     now = time.time()
                     interval = max(15, int(resilience_cfg.get("reconcile_interval_sec", 60)))
                     snapshot = json.loads(lead.snapshot_json or "{}")
@@ -519,6 +534,7 @@ class EngineOrchestrator:
             creds = self.vault.decrypt_dict(account.encrypted_credentials)
             proxy_url = ProxyManager.select_proxy_url(proxies, account.proxy_id, exchange=account.exchange)
             adapter = create_exchange_adapter(
+                account_id=account.id,  # 凭据或出口变化由工厂自动失效。
                 exchange=account.exchange,
                 credentials=creds,
                 environment=account.environment,

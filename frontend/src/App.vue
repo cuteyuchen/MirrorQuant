@@ -1,264 +1,162 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, watch } from "vue";
+import { computed, onUnmounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import {
-  Activity,
-  Cpu,
-  GitFork,
-  Globe,
-  LayoutDashboard,
-  LogOut,
-  Network,
-  Settings,
-  Users,
-  Wallet,
-} from "lucide-vue-next";
+import { Activity, ClipboardList, Ellipsis, GitFork, Globe, LayoutDashboard, LogOut, Network, Settings, Users, Wallet } from "lucide-vue-next";
 import { useAuthStore } from "@/stores/auth";
+import { useBoardStore } from "@/stores/board";
 import { useSocketStore } from "@/stores/socket";
+import { useDataCacheStore } from "@/stores/dataCache";
 import { useI18n } from "@/i18n";
+import BaseModal from "@/components/BaseModal.vue";
+import ConfirmDialog from "@/components/ConfirmDialog.vue";
+import GlobalStatusBar from "@/components/board/GlobalStatusBar.vue";
 import LangToggle from "@/components/LangToggle.vue";
+import ThemeToggle from "@/components/ThemeToggle.vue";
+import ToastHost from "@/components/ToastHost.vue";
 
+const auth = useAuthStore();
+const board = useBoardStore();
+const socket = useSocketStore();
+const cache = useDataCacheStore();
 const route = useRoute();
 const router = useRouter();
-const authStore = useAuthStore();
-const socketStore = useSocketStore();
 const { t } = useI18n();
-
-const cachedViews = [
-  "DashboardView",
-  "PublicDashboardView",
-  "LeadsView",
-  "AccountsView",
-  "BindingsView",
-  "ProxiesView",
-  "SettingsView",
+const moreOpen = ref(false);
+const loggingOut = ref(false);
+const intentsError = ref(false);
+const showShell = computed(() => auth.authenticated && route.meta.fullscreen !== true);
+const navItems = [
+  { key: "dashboard", path: "/dashboard", icon: LayoutDashboard },
+  { key: "executions", path: "/executions", icon: ClipboardList },
+  { key: "leads", path: "/leads", icon: Users },
+  { key: "accounts", path: "/accounts", icon: Wallet },
+  { key: "bindings", path: "/bindings", icon: GitFork },
+  { key: "proxies", path: "/proxies", icon: Network },
+  { key: "settings", path: "/settings", icon: Settings },
+  { key: "publicFeed", path: "/public", icon: Globe },
 ];
-
-const isPublicOrAuthLayout = computed(() => {
-  if (route.path === "/public") return !authStore.authenticated;
-  return ["/login", "/setup"].includes(route.path);
+const navGroups = [
+  { key: "monitoring", items: navItems.filter(item => ["dashboard", "executions"].includes(item.key)) },
+  { key: "configuration", items: navItems.filter(item => ["leads", "accounts", "bindings", "proxies"].includes(item.key)) },
+  { key: "system", items: navItems.filter(item => ["settings", "publicFeed"].includes(item.key)) },
+];
+const mobileItems = navItems.filter(item => ["dashboard", "executions", "leads", "bindings"].includes(item.key));
+const moreItems = navItems.filter(item => !mobileItems.includes(item));
+const pendingCount = computed(() => intentsError.value ? null : cache.intents?.data.length ?? null);
+// 侧栏底部的用户头像只取用户名首字符，不依赖外部头像服务。
+const userInitial = computed(() => (auth.user?.username?.trim() || "?").slice(0, 1).toUpperCase());
+function isActive(path: string) { return route.path === path || route.path.startsWith(`${path}/`); }
+let pollTimer: ReturnType<typeof setInterval> | undefined;
+let eventTimer: ReturnType<typeof setTimeout> | undefined;
+function stop() { clearInterval(pollTimer); clearTimeout(eventTimer); pollTimer = undefined; eventTimer = undefined; }
+function refreshGlobal(force = false) {
+  void board.refresh(force);
+  void cache.fetchIntents(force).then(() => { intentsError.value = false; }).catch(() => { intentsError.value = true; });
+}
+// 认证与错误页不启动私有轮询；待处理角标与执行页共享最新缓存。
+watch(showShell, active => {
+  stop();
+  if (active) {
+    socket.connect(); refreshGlobal();
+    pollTimer = setInterval(() => { refreshGlobal(true); }, 6000);
+  } else { socket.disconnect(); board.clear(); }
+}, { immediate: true });
+// 有界事件数组满 50 条后仍由单调递增序号触发刷新。
+watch(() => socket.eventSequence, () => {
+  if (!showShell.value) return;
+  clearTimeout(eventTimer);
+  eventTimer = setTimeout(() => { refreshGlobal(true); }, 200);
 });
-
-// Desktop Navigation Items
-const navItems = computed(() => [
-  { name: t("nav.dashboard"), path: "/dashboard", icon: LayoutDashboard },
-  { name: t("nav.publicFeed"), path: "/public", icon: Globe },
-  { name: t("nav.leads"), path: "/leads", icon: Users },
-  { name: t("nav.accounts"), path: "/accounts", icon: Wallet },
-  { name: t("nav.bindings"), path: "/bindings", icon: GitFork },
-  { name: t("nav.proxies"), path: "/proxies", icon: Network },
-  { name: t("nav.settings"), path: "/settings", icon: Settings },
-]);
-
-// Six compact tabs keep the radar accessible on mobile.
-const mobileNavItems = computed(() => [
-  { name: t("nav.mobile.dashboard"), path: "/dashboard", icon: LayoutDashboard },
-  { name: t("nav.mobile.publicFeed"), path: "/public", icon: Globe },
-  { name: t("nav.mobile.leads"), path: "/leads", icon: Users },
-  { name: t("nav.mobile.accounts"), path: "/accounts", icon: Wallet },
-  { name: t("nav.mobile.bindings"), path: "/bindings", icon: GitFork },
-  { name: t("nav.mobile.settings"), path: "/settings", icon: Settings },
-]);
-
-watch(
-  () => authStore.authenticated,
-  (isAuth) => {
-    if (isAuth) {
-      socketStore.connect();
-    } else {
-      socketStore.disconnect();
-    }
-  },
-  { immediate: true }
-);
-
-onMounted(() => {
-  if (authStore.authenticated) {
-    socketStore.connect();
-  }
-});
-
-onUnmounted(() => {
-  socketStore.disconnect();
-});
-
-async function handleLogout() {
-  await authStore.logout();
-  router.push("/login");
+watch(() => route.fullPath, () => { moreOpen.value = false; });
+onUnmounted(() => { stop(); socket.disconnect(); });
+async function logout() {
+  if (loggingOut.value) return;
+  loggingOut.value = true;
+  try { await auth.logout(); }
+  finally { loggingOut.value = false; await router.replace("/login"); }
 }
 </script>
-
 <template>
-  <div v-if="isPublicOrAuthLayout" class="min-h-screen bg-background text-slate-100">
-    <router-view />
-  </div>
-
-  <div v-else class="min-h-screen bg-background text-slate-100 flex flex-col md:flex-row">
-    <!-- Mobile Topbar: Minimal header, clean & simple, NO hamburger menu toggle -->
-    <header
-      class="md:hidden flex items-center justify-between px-4 py-3 bg-[#0d121c]/95 backdrop-blur border-b border-[#1e293b] sticky top-0 z-40"
-    >
-      <div class="flex items-center gap-2.5">
-        <div class="w-8 h-8 rounded-lg bg-accent/10 border border-accent/30 flex items-center justify-center">
-          <Cpu class="w-4 h-4 text-accent" />
-        </div>
-        <div class="flex flex-wrap items-center gap-2">
-          <span class="font-bold tracking-tight text-slate-100 text-sm">MirrorQuant</span>
-          <span class="text-[10px] px-2 py-0.5 rounded-full border border-accent/25 text-accent">{{ t("app.beijingTime") }}</span>
-          <span
-            class="inline-flex items-center gap-1 text-[10px] font-mono px-2 py-0.5 rounded-full border"
-            :class="
-              socketStore.connected
-                ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
-                : 'bg-rose-500/10 text-rose-400 border-rose-500/30'
-            "
-          >
-            <span
-              class="w-1.5 h-1.5 rounded-full"
-              :class="socketStore.connected ? 'bg-emerald-400 animate-pulse' : 'bg-rose-400'"
-            ></span>
-            {{ socketStore.connected ? t("nav.live") : t("nav.off") }}
+  <div class="min-h-dvh">
+    <a v-if="showShell" href="#main-content" class="sr-only focus:not-sr-only focus:fixed focus:left-3 focus:top-3 focus:z-50 focus:rounded-lg focus:bg-accent focus:p-3 focus:font-semibold focus:text-onAccent">{{ t("nav.skipToContent") }}</a>
+    <div class="flex min-w-0">
+      <!-- 桌面侧栏：整屏高度吸附，品牌在上、导航居中滚动、用户与主题 / 语言 / 登出固定在底部。 -->
+      <aside v-if="showShell" class="sticky top-0 hidden h-dvh w-56 shrink-0 flex-col border-r border-border/60 bg-surface/80 backdrop-blur md:flex xl:w-60">
+        <RouterLink to="/dashboard" class="flex items-center gap-3 px-4 py-4">
+          <span class="brand-mark"><Activity :size="19" aria-hidden="true" /></span>
+          <span class="min-w-0">
+            <span class="block text-base font-bold leading-tight tracking-tight">{{ t("app.name") }}</span>
+            <span class="block text-xs text-faint">{{ t("app.brandSub") }}</span>
           </span>
-        </div>
-      </div>
-      <div class="flex items-center gap-2">
-        <LangToggle />
-        <button
-          @click="handleLogout"
-          class="p-2 rounded-lg text-slate-400 hover:text-rose-400 hover:bg-rose-500/10 transition-colors"
-          :title="t('nav.signOut')"
-        >
-          <LogOut class="w-4 h-4" />
-        </button>
-      </div>
-    </header>
-
-    <!-- Desktop Sidebar (Hidden on mobile) -->
-    <aside
-      class="hidden md:flex sticky top-0 left-0 z-30 h-screen w-64 bg-surface border-r border-slate-800/80 flex-col justify-between shrink-0"
-    >
-      <div>
-        <!-- Brand Header -->
-        <div class="flex items-center justify-between px-4 py-5 border-b border-slate-800/80 gap-2">
-          <div class="flex items-center gap-2.5 min-w-0">
-            <div
-              class="w-9 h-9 rounded-xl bg-gradient-to-br from-accent/20 to-brand/20 border border-accent/30 flex items-center justify-center shadow-lg shadow-accent/10 shrink-0"
-            >
-              <Cpu class="w-5 h-5 text-accent" />
-            </div>
-            <div class="min-w-0">
-              <h1 class="font-bold text-base tracking-tight text-white">MirrorQuant</h1>
-              <p class="text-[10px] text-slate-400 font-mono truncate">{{ t("app.brandSub") }}</p>
+        </RouterLink>
+        <nav :aria-label="t('nav.main')" class="flex-1 space-y-5 overflow-y-auto px-3 py-2">
+          <div v-for="group in navGroups" :key="group.key">
+            <p class="eyebrow mb-1.5 px-3">{{ t(`nav.group.${group.key}`) }}</p>
+            <div class="space-y-1">
+              <RouterLink v-for="item in group.items" :key="item.path" :to="item.path" class="flex min-h-10 items-center gap-3 rounded-xl border px-3 py-2 text-sm font-medium transition"
+                :class="isActive(item.path) ? 'border-accent/25 bg-accent/10 text-accent shadow-sm' : 'border-transparent text-muted hover:bg-surface2 hover:text-foreground'" :aria-current="isActive(item.path) ? 'page' : undefined">
+                <component :is="item.icon" :size="18" class="shrink-0" aria-hidden="true" /><span class="min-w-0 flex-1 truncate">{{ t(`nav.${item.key}`) }}</span>
+                <span v-if="item.key === 'executions' && pendingCount != null && pendingCount > 0" class="rounded-full bg-warning/15 px-1.5 text-xs font-semibold tabular-nums text-warning" :aria-label="t('nav.pendingCount', { n: pendingCount })">{{ pendingCount }}</span>
+              </RouterLink>
             </div>
           </div>
-          <LangToggle />
-        </div>
-
-        <div class="px-4 pt-3"><span class="text-[10px] px-2 py-0.5 rounded-full border border-accent/25 text-accent">{{ t("app.beijingTime") }}</span></div>
-
-        <!-- Navigation -->
-        <nav class="p-3 space-y-1 mt-2">
-          <router-link
-            v-for="item in navItems"
-            :key="item.path"
-            :to="item.path"
-            class="flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium transition-all duration-150"
-            :class="
-              route.path === item.path
-                ? 'bg-accent/10 text-accent border border-accent/25 shadow-sm'
-                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50 border border-transparent'
-            "
-          >
-            <component :is="item.icon" class="w-4 h-4" />
-            <span>{{ item.name }}</span>
-          </router-link>
-
         </nav>
-      </div>
-
-      <!-- Footer User / Stream Info -->
-      <div class="p-4 border-t border-slate-800/80 space-y-3">
-        <div class="flex items-center justify-between px-2 py-1.5 rounded-lg bg-background/60 border border-slate-800">
-          <div class="flex items-center gap-2 text-xs text-slate-400">
-            <Activity class="w-3.5 h-3.5 text-accent" />
-            <span>{{ t("nav.streamWs") }}</span>
+        <div class="border-t border-border/60 p-3">
+          <div class="flex min-w-0 items-center gap-2.5 px-1">
+            <span class="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-border/70 bg-surface2 text-sm font-bold" aria-hidden="true">{{ userInitial }}</span>
+            <span class="min-w-0 flex-1">
+              <span class="block truncate text-sm font-semibold">{{ auth.user?.username ?? t("common.unknown") }}</span>
+              <span v-if="auth.user?.role" class="block truncate text-xs text-faint">{{ auth.user.role }}</span>
+            </span>
           </div>
-          <span
-            class="inline-flex items-center gap-1.5 text-[11px] font-mono"
-            :class="socketStore.connected ? 'text-emerald-400' : 'text-rose-400'"
-          >
-            <span
-              class="w-1.5 h-1.5 rounded-full"
-              :class="socketStore.connected ? 'bg-emerald-400 animate-pulse' : 'bg-rose-400'"
-            ></span>
-            {{ socketStore.connected ? t("nav.connected") : t("nav.reconnecting") }}
-          </span>
-        </div>
-
-        <div class="flex items-center justify-between px-2">
-          <div class="flex items-center gap-2.5 min-w-0">
-            <div
-              class="w-8 h-8 rounded-full bg-slate-800 border border-slate-700 flex items-center justify-center text-xs font-bold text-accent uppercase shrink-0"
-            >
-              {{ authStore.user?.username?.slice(0, 2) || "AD" }}
-            </div>
-            <div class="truncate">
-              <p class="text-xs font-semibold text-slate-200 truncate">{{ authStore.user?.username }}</p>
-              <p class="text-[10px] text-slate-500 uppercase font-mono">{{ authStore.user?.role }}</p>
-            </div>
+          <div class="mt-2 flex items-center justify-between gap-1">
+            <div class="flex items-center gap-1"><ThemeToggle /><LangToggle /></div>
+            <button type="button" class="icon-button" :disabled="loggingOut" :title="t('nav.signOut')" :aria-label="t('nav.signOut')" @click="logout"><LogOut :size="18" aria-hidden="true" /></button>
           </div>
-          <button
-            @click="handleLogout"
-            class="p-2 rounded-lg text-slate-400 hover:text-rose-400 hover:bg-rose-500/10 transition-colors"
-            :title="t('nav.signOut')"
-          >
-            <LogOut class="w-4 h-4" />
-          </button>
         </div>
+      </aside>
+      <div class="flex min-w-0 flex-1 flex-col">
+        <!-- 移动顶栏：只放品牌与全局开关，主导航在底栏。 -->
+        <header v-if="showShell" class="flex items-center justify-between gap-2 border-b border-border/60 bg-surface/80 px-3 py-1.5 md:hidden">
+          <RouterLink to="/dashboard" class="flex min-w-0 items-center gap-2.5">
+            <span class="brand-mark"><Activity :size="18" aria-hidden="true" /></span>
+            <span class="truncate text-base font-bold tracking-tight">{{ t("app.name") }}</span>
+          </RouterLink>
+          <div class="flex shrink-0 items-center">
+            <ThemeToggle /><LangToggle />
+            <button type="button" class="icon-button" :disabled="loggingOut" :aria-label="t('nav.signOut')" :title="t('nav.signOut')" @click="logout"><LogOut :size="18" aria-hidden="true" /></button>
+          </div>
+        </header>
+        <GlobalStatusBar v-if="showShell" />
+        <main id="main-content" tabindex="-1" class="min-w-0 flex-1 focus:outline-none" :class="showShell ? 'mx-auto w-full max-w-[1680px] px-3 py-4 pb-28 md:px-6 md:py-5 md:pb-10' : ''">
+          <RouterView v-slot="{ Component }">
+            <KeepAlive v-if="showShell" :key="auth.user?.id"><component :is="Component" /></KeepAlive>
+            <component :is="Component" v-else />
+          </RouterView>
+        </main>
       </div>
-    </aside>
-
-    <!-- Main Content with Keep-Alive Cache (Extra pb-24 on mobile prevents bottom tab overlap) -->
-    <main class="flex-1 min-w-0 p-4 pb-24 md:pb-6 md:p-6 lg:p-8 max-w-[1600px] mx-auto w-full">
-      <router-view v-slot="{ Component }">
-        <keep-alive :include="cachedViews">
-          <component :is="Component" />
-        </keep-alive>
-      </router-view>
-    </main>
-
-    <!-- Mobile Native-Style Bottom Navigation Bar (Sticky fixed bottom, sleek glassmorphism) -->
-    <nav
-      class="md:hidden fixed bottom-0 left-0 right-0 z-40 bg-[#0d121c]/95 backdrop-blur border-t border-[#1e293b] pb-safe shadow-[0_-8px_24px_rgba(0,0,0,0.5)]"
-    >
-      <div class="grid grid-cols-6 items-center justify-around h-14 max-w-md mx-auto px-1">
-        <router-link
-          v-for="item in mobileNavItems"
-          :key="item.path"
-          :to="item.path"
-          class="flex flex-col items-center justify-center h-full relative group transition-colors duration-150"
-          :class="
-            route.path === item.path
-              ? 'text-[#00f090] font-semibold'
-              : 'text-slate-400 hover:text-slate-200'
-          "
-        >
-          <!-- Active Indicator Pill/Bar -->
-          <span
-            v-if="route.path === item.path"
-            class="absolute top-0 left-1/2 -translate-x-1/2 w-8 h-0.5 bg-[#00f090] rounded-full shadow-[0_0_8px_#00f090]"
-          ></span>
-
-          <component
-            :is="item.icon"
-            class="w-5 h-5 transition-transform duration-150 group-active:scale-90"
-            :class="route.path === item.path ? 'text-[#00f090]' : 'text-slate-400'"
-          />
-          <span class="text-[10px] mt-1 tracking-tight leading-none truncate max-w-full px-0.5">
-            {{ item.name }}
-          </span>
-        </router-link>
-      </div>
+    </div>
+    <!-- 移动底栏：四个最常用入口 + “更多”，当前页用顶部指示条标出。 -->
+    <nav v-if="showShell" :aria-label="t('nav.main')" class="pb-safe fixed inset-x-0 bottom-0 z-30 grid grid-cols-5 border-t border-border/60 bg-surface/90 backdrop-blur-md md:hidden">
+      <RouterLink v-for="item in mobileItems" :key="item.path" :to="item.path" class="relative flex min-h-16 min-w-0 flex-col items-center justify-center gap-1 px-1 py-2 text-xs font-medium transition"
+        :class="isActive(item.path) ? 'text-accent' : 'text-muted'" :aria-current="isActive(item.path) ? 'page' : undefined">
+        <span v-if="isActive(item.path)" class="absolute inset-x-5 top-0 h-0.5 rounded-full bg-accent" aria-hidden="true" />
+        <span class="relative"><component :is="item.icon" :size="21" aria-hidden="true" /><span v-if="item.key === 'executions' && pendingCount != null && pendingCount > 0" class="absolute -right-3 -top-2 min-w-4 rounded-full bg-warning px-1 text-center text-xs font-bold tabular-nums text-onAccent" :aria-label="t('nav.pendingCount', { n: pendingCount })">{{ pendingCount }}</span></span>
+        <span class="max-w-full truncate">{{ t(`nav.${item.key}`) }}</span>
+      </RouterLink>
+      <button type="button" class="relative flex min-h-16 flex-col items-center justify-center gap-1 text-xs font-medium transition" :class="moreItems.some(item => isActive(item.path)) ? 'text-accent' : 'text-muted'" :aria-expanded="moreOpen" @click="moreOpen = true">
+        <span v-if="moreItems.some(item => isActive(item.path))" class="absolute inset-x-5 top-0 h-0.5 rounded-full bg-accent" aria-hidden="true" />
+        <Ellipsis :size="21" aria-hidden="true" />{{ t("nav.more") }}
+      </button>
     </nav>
+    <BaseModal :open="moreOpen" :title="t('nav.more')" @close="moreOpen = false">
+      <nav class="grid gap-1">
+        <RouterLink v-for="item in moreItems" :key="item.path" :to="item.path" class="flex min-h-12 items-center gap-3 rounded-xl border px-3 text-sm font-medium transition"
+          :class="isActive(item.path) ? 'border-accent/25 bg-accent/10 text-accent' : 'border-transparent text-foreground hover:bg-surface2'" @click="moreOpen = false">
+          <component :is="item.icon" :size="20" aria-hidden="true" />{{ t(`nav.${item.key}`) }}
+        </RouterLink>
+      </nav>
+    </BaseModal>
+    <ConfirmDialog /><ToastHost />
   </div>
 </template>

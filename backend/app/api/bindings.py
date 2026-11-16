@@ -52,6 +52,8 @@ async def _binding_out(db: AsyncSession, b: CopyBinding) -> dict:
         "maxSpreadPct": getattr(b, "max_spread_pct", 0.3),
         "iocOffsetPct": b.ioc_offset_pct,
         "orderMode": b.order_mode,
+        "slippageAction": getattr(b, "slippage_action", "block"),
+        "limitOrderTtlSec": getattr(b, "limit_order_ttl_sec", 120),
         "tpSlMode": getattr(b, "tp_sl_mode", "follow_lead"),
         "enableStopLoss": bool(getattr(b, "enable_stop_loss", False)),
         "stopLossPct": getattr(b, "stop_loss_pct", 5.0),
@@ -125,6 +127,8 @@ async def create_binding(
         max_spread_pct=payload.max_spread_pct,
         ioc_offset_pct=payload.ioc_offset_pct,
         order_mode=payload.order_mode,
+        slippage_action=payload.slippage_action,
+        limit_order_ttl_sec=payload.limit_order_ttl_sec,
         tp_sl_mode=payload.tp_sl_mode,
         enable_stop_loss=payload.enable_stop_loss,
         stop_loss_pct=payload.stop_loss_pct,
@@ -226,6 +230,7 @@ async def toggle_binding(
 
 
 @router.post("/{binding_id}/reset-breaker")
+@serialized_execution  # 与引擎下单共用锁，避免重置覆盖并发失败计数。
 async def reset_circuit_breaker(
     binding_id: int,
     request: Request,
@@ -244,6 +249,7 @@ async def reset_circuit_breaker(
 
 
 @router.post("/{binding_id}/reset-debt")
+@serialized_execution  # 债务浮点展示值和精确值在同一执行边界清零。
 async def reset_debt(
     binding_id: int,
     request: Request,
@@ -256,6 +262,7 @@ async def reset_debt(
     debts = list((await db.scalars(select(BindingDebt).where(BindingDebt.binding_id == binding_id))).all())
     for d in debts:
         d.pending_usd = 0.0
+        d.pending_usd_exact = "0"
     await record_audit(db, "RESET_DEBT", "binding", str(binding.id), "Pending debt reset", current_user, request)
     await db.commit()
     return {"item": await _binding_out(db, binding)}

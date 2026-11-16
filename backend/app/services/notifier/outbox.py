@@ -18,7 +18,7 @@ from sqlalchemy import or_, select, update
 from app.core.config import get_settings
 from app.core.database import DEFAULT_SYSTEM_CONFIG, get_session_factory
 from app.core.secret_mask import redact_proxy_userinfo
-from app.models.domain import NotificationOutbox, SystemConfig
+from app.models.domain import ExecutionRecord, NotificationOutbox, SystemConfig
 from app.services.notifier.service import NotificationService
 
 logger = logging.getLogger("mirrorquant.notification_outbox")
@@ -44,6 +44,16 @@ def enqueue_notification(db, config: Dict[str, Any], title: str, message: str,
     return row
 
 
+async def _acknowledge_execution(db, payload, status: str) -> None:
+    # 只同步有完整关联证据的执行投影，损坏或无关通知不能覆盖回执。
+    if (isinstance(payload, dict) and type(payload.get("execution_id")) is int
+            and payload.get("event_key") == f"execution:{payload['execution_id']}"):
+        await db.execute(update(ExecutionRecord).where(
+            ExecutionRecord.id == payload["execution_id"],
+            ExecutionRecord.notification_state == "pending",
+        ).values(notification_state=status))
+
+
 class NotificationOutboxDrainer:
     def __init__(self, max_attempts: Optional[int] = None, poll_interval: Optional[float] = None):
         settings = get_settings()
@@ -61,20 +71,16 @@ class NotificationOutboxDrainer:
         self._task = asyncio.create_task(self._run(), name="mirrorquant-notification-outbox")
 
     async def stop(self) -> None:
-        """Finish in-flight delivery, then drain pending rows up to their retry limit."""
+        """停止领取新任务，保留退避队列供下一次启动恢复。"""
         self._stopping.set()
         if self._task is not None:
-            await self._task
-            self._task = None
-        # Backoff is unnecessary on shutdown; active claims in other workers are
-        # still respected. Undeliverable rows finish in the durable failed queue.
-        try:
-            while await self.drain_once(ignore_backoff=True):
-                pass
-        except Exception as exc:
-            # A database outage cannot be repaired during shutdown. Rows remain
-            # durable for the next worker; preserve the original shutdown result.
-            logger.error("Shutdown notification drain deferred: %s", type(exc).__name__)
+            try:
+                # 超时取消仍保留有租约的持久化任务，不提前耗尽重试次数。
+                await asyncio.wait_for(self._task, timeout=DELIVERY_TIMEOUT_SEC + 5)
+            except asyncio.TimeoutError:
+                logger.warning("Shutdown deferred claimed notifications until lease expiry")
+            finally:
+                self._task = None
 
     async def _run(self) -> None:
         while not self._stopping.is_set():
@@ -95,10 +101,18 @@ class NotificationOutboxDrainer:
             if not ignore_backoff:
                 conditions.append(or_(NotificationOutbox.next_attempt_at.is_(None), NotificationOutbox.next_attempt_at <= now))
             async with get_session_factory()() as db:
-                await db.execute(update(NotificationOutbox).where(
+                exhausted = await db.execute(update(NotificationOutbox).where(
                     NotificationOutbox.status == "pending", available,
                     NotificationOutbox.attempts >= self.max_attempts,
-                ).values(status="failed", last_error="Delivery retry limit exhausted", claimed_until=None))
+                ).values(status="failed", last_error="Delivery retry limit exhausted", claimed_until=None)
+                    .returning(NotificationOutbox.payload))
+                # 重启后已耗尽的租约也必须留下终态回执，不再次调用通知渠道。
+                for payload_text in exhausted.scalars().all():
+                    try:
+                        payload = json.loads(payload_text)
+                    except (ValueError, TypeError):
+                        continue
+                    await _acknowledge_execution(db, payload, "failed")
                 ids = list((await db.scalars(select(NotificationOutbox.id).where(
                     *conditions, NotificationOutbox.attempts < self.max_attempts,
                 ).order_by(NotificationOutbox.id).limit(100))).all())
@@ -106,6 +120,8 @@ class NotificationOutboxDrainer:
 
             processed = 0
             for row_id in ids:
+                if self._stopping.is_set():
+                    break  # 停机只等待当前一条通知，不遍历整批。
                 async with get_session_factory()() as db:
                     # Atomic claims serialize multiple workers without holding a
                     # database write transaction open during sink I/O.
@@ -144,15 +160,20 @@ class NotificationOutboxDrainer:
                 except Exception as exc:
                     error = "Delivery failed: " + type(exc).__name__
                 async with get_session_factory()() as db:
-                    await db.execute(update(NotificationOutbox).where(
+                    final_status = "sent" if error is None else ("failed" if attempt >= self.max_attempts else "pending")
+                    acknowledged = await db.execute(update(NotificationOutbox).where(
                         NotificationOutbox.id == row_id, NotificationOutbox.status == "pending",
                         NotificationOutbox.attempts == attempt,
                     ).values(
-                        status="sent" if error is None else ("failed" if attempt >= self.max_attempts else "pending"),
+                        status=final_status,
                         last_error=error, claimed_until=None,
                         payload=json.dumps(payload, ensure_ascii=False) if payload is not None else payload_text,
-                        next_attempt_at=datetime.now(timezone.utc) + timedelta(seconds=min(60, 2 ** attempt)) if error else None,
+                        # 10/20/40/80/160/300 秒退避，保留成功渠道，不重复通知。
+                        next_attempt_at=datetime.now(timezone.utc) + timedelta(seconds=min(300, 10 * 2 ** (attempt - 1))) if error else None,
                     ))
+                    # 通知回执和执行投影一起落盘，防止终态记录一直被当作 pending。
+                    if acknowledged.rowcount:
+                        await _acknowledge_execution(db, payload, final_status)
                     await db.commit()
             return processed
 

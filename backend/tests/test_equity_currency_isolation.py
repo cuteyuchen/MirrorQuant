@@ -17,7 +17,7 @@ from app.services.adapters.base import BalanceInfo
 from app.services.engine.equity import collateral_available, equity_baseline, observe_equity, risk_state
 from app.services.engine.orchestrator import EngineOrchestrator
 from app.services.engine.risk import RiskEngine
-from test_router_remediations import NOW_MS, OfflineExchange, execute_batch, trading
+from test_router_remediations import NOW_MS, OfflineExchange, current_snapshot, execute_batch, trading
 from test_binance_usdc_balance import persisted_account
 
 
@@ -113,13 +113,18 @@ async def test_legacy_ambiguous_currency_quarantines_entries_but_allows_owned_ex
     assert allocation is not None and allocation.owned_qty == 0
     allocation.owned_qty, allocation.owned_qty_exact = 1, "1"
     allocation.entry_cost, allocation.entry_cost_exact = 100, "100"
-    allocation.opened_at_ms, allocation.generation = 100, 1
+    allocation.opened_at_ms, allocation.generation = NOW_MS - 300_000, 1
     other = PositionAllocation(binding_id=trading.other.id, account_id=account.id, inst_id="BTCUSDT",
                                pos_side="long", owned_qty=9, owned_qty_exact="9",
                                entry_cost=900, entry_cost_exact="900")
     trading.db.add(other)
+    # 遗留权益隔离不绕过出场证据门禁：显式保存本周期已空仓的新鲜观察。
+    snapshot = current_snapshot("LONG")
+    snapshot["openPositions"] = []
+    trading.lead.snapshot_json = json.dumps(snapshot)
     await trading.db.commit()
-    await execute_batch(trading, exchange, side="SELL", remaining=0, event="legacy-safe-exit")
+    await execute_batch(trading, exchange, side="SELL", remaining=0, event="legacy-safe-exit",
+                        source_proven=False)
     assert len(exchange.orders) == 1 and exchange.orders[0]["reduce_only"] is True
     assert allocation.owned_qty_exact == "0" and other.owned_qty_exact == "9"
     assert risk_state(account)["legacy_unverified"] is True

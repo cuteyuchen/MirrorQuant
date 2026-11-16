@@ -1,324 +1,170 @@
 <script setup lang="ts">
-import { onActivated, onMounted, ref } from "vue";
-import { CheckCircle2, KeyRound, Plus, RefreshCw, Shield, Trash2, Wifi, X } from "lucide-vue-next";
-import { api } from "@/api/client";
+import { computed, onActivated, onMounted, ref } from "vue";
+import { ChevronDown, Pencil, Plus, RefreshCw, Trash2, Wifi } from "lucide-vue-next";
+import { api, ApiError, isCancelled } from "@/api/client";
 import { useDataCacheStore } from "@/stores/dataCache";
+import { useBoardStore } from "@/stores/board";
+import { useAsyncAction } from "@/composables/useAsyncAction";
+import { useNow } from "@/composables/useNow";
 import { useI18n } from "@/i18n";
-import { formatUsd } from "@/utils/format";
+import type { Account, AccountTestResult } from "@/types/api";
+import { finiteNumber, formatDateTime, formatPct, formatPrice, formatQty, formatUsd, signedUsd, timestampMs } from "@/utils/format";
+import { pnlClass, sideLabel } from "@/utils/status";
+import { errorMessage, reasonText } from "@/utils/errors";
+import PageHeader from "@/components/PageHeader.vue";
+import DataTable from "@/components/DataTable.vue";
+import MoreMenu from "@/components/MoreMenu.vue";
+import EmptyState from "@/components/EmptyState.vue";
+import AccountFormModal from "@/components/AccountFormModal.vue";
+import EnvBadge from "@/components/EnvBadge.vue";
+import StatusBadge from "@/components/StatusBadge.vue";
+import FreshnessStamp from "@/components/FreshnessStamp.vue";
 
 defineOptions({ name: "AccountsView" });
-
 const cache = useDataCacheStore();
+const board = useBoardStore();
+const now = useNow();
 const { t } = useI18n();
-
-const accounts = ref<any[]>(cache.accounts?.data || []);
-const proxies = ref<any[]>(cache.proxies?.data || []);
-const loading = ref(!cache.accounts);
-const testingId = ref<number | null>(null);
-const syncingId = ref<number | null>(null);
-const testResult = ref<Record<number, any>>({});
-
+const { pending, error, run } = useAsyncAction();
+const accounts = computed(() => cache.accounts?.data || []);
+const proxies = computed(() => cache.proxies?.data || []);
 const showModal = ref(false);
-const form = ref({
-  name: "",
-  exchange: "okx",
-  environment: "demo",
-  apiKey: "",
-  secretKey: "",
-  passphrase: "",
-  proxyId: null as number | null,
-  marginMode: "cross",
-  positionMode: "hedge",
-});
-const formError = ref("");
-
-async function loadData(force = false) {
-  if (!cache.accounts) loading.value = true;
-  try {
-    const [aItems, pItems] = await Promise.all([
-      cache.fetchAccounts(force, 15000),
-      cache.fetchProxies(force, 20000),
-    ]);
-    accounts.value = aItems;
-    proxies.value = pItems;
-  } finally {
-    loading.value = false;
-  }
+const editing = ref<Account | null>(null);
+const testResult = ref<Record<number, AccountTestResult>>({});
+const expanded = ref<number | null>(null);
+const loading = ref(false);
+const loadError = ref("");
+const rows = computed(() => [...accounts.value].sort((a, b) => severity(b) - severity(a) || a.id - b.id));
+const summary = computed(() => cache.accounts ? t("accts.rowSummary", {
+  n: accounts.value.length, issues: accounts.value.filter(account => !!issue(account)).length,
+  disabled: accounts.value.filter(account => account.isEnabled === false).length,
+}) : t("accts.summaryUnknown"));
+let sequence = 0;
+async function load(force = false) {
+  if (loading.value && !force) return;
+  const request = ++sequence; loading.value = true; loadError.value = "";
+  // 代理及看板不可用不影响账户列表；金额未知仍显示横线。
+  const results = await Promise.allSettled([cache.fetchAccounts(force), cache.fetchProxies(force), board.refresh(force)]);
+  if (request !== sequence) return;
+  const core = results[0];
+  if (core.status === "rejected" && !isCancelled(core.reason)) loadError.value = errorMessage(core.reason);
+  loading.value = false;
 }
-
-async function createAccount() {
-  formError.value = "";
-  try {
-    await api.post("/api/accounts", form.value);
-    showModal.value = false;
-    form.value = {
-      name: "",
-      exchange: "okx",
-      environment: "demo",
-      apiKey: "",
-      secretKey: "",
-      passphrase: "",
-      proxyId: null,
-      marginMode: "cross",
-      positionMode: "hedge",
+function accountBoard(account: Account) { return board.data?.accounts?.find(item => item.id === account.id); }
+function metrics(account: Account) {
+  // 资金摘要消费状态条正在刷新的同一份数据；最新 null 不能回退成旧的已知金额。
+  const current = accountBoard(account);
+  return current ? { equity: current.equity, available: current.available, unrealized: current.unrealizedPnl, syncedAt: current.lastSyncAt, status: current.status }
+    : { equity: account.totalEquity ?? account.usdtEquity ?? null, available: account.availEquity, unrealized: account.unrealizedPnl, syncedAt: account.lastSyncAt, status: account.status };
+}
+function equity(account: Account) { return metrics(account).equity; }
+function drawdown(account: Account) {
+  const current = finiteNumber(equity(account)); const high = finiteNumber(account.hwmEquity);
+  return current == null || high == null || high <= 0 ? null : Math.max(0, (high - current) / high * 100);
+}
+function issue(account: Account) {
+  if (testResult.value[account.id]?.ok === false) return reasonText(testResult.value[account.id].error);
+  if (account.lastError) return reasonText(account.lastError);
+  if (account.riskEquityLegacyUnverified || accountBoard(account)?.riskLegacyUnverified) return t("accts.legacyShort");
+  if (metrics(account).status?.toLowerCase() === "error") return t("accts.connectionError");
+  if (account.isEnabled == null) return t("accts.enabledUnknown");
+  if (account.isEnabled !== true) return "";
+  const synced = timestampMs(metrics(account).syncedAt);
+  if (synced == null) return t("accts.syncMissing");
+  return now.value - synced > 90000 ? t("accts.syncStale") : "";
+}
+function severity(account: Account) { return issue(account) ? account.lastError || metrics(account).status?.toLowerCase() === "error" || testResult.value[account.id]?.ok === false ? 2 : 1 : 0; }
+function rowTone(account: Account) { return severity(account) === 2 ? "bg-danger/5" : severity(account) === 1 ? "bg-warning/5" : ""; }
+function toggleDetails(account: Account) { expanded.value = expanded.value === account.id ? null : account.id; }
+function positionRows(account: Account) {
+  // 数量和价格保留交易所实际单位；估算/开仓价不冒充实时行情。
+  return (account.positions || []).map(position => {
+    const qty = finiteNumber(position.pos ?? position.qty);
+    const price = finiteNumber(position.currentPrice ?? position.curPx ?? position.markPx ?? position.markPrice);
+    return {
+      key: `${position.instId ?? position.symbol}:${position.posSide ?? position.positionSide}:${position.cTime ?? position.openTime}`,
+      symbol: position.symbol ?? position.instId, side: sideLabel(position.posSide ?? position.positionSide, qty),
+      qty: qty == null ? null : Math.abs(qty), entry: position.avgPx ?? position.avgEntry,
+      price: position.priceSource === "entry" || position.priceSource === "unavailable" || price == null || price <= 0 ? null : price,
+      priceSource: position.priceSource, pnl: position.upl ?? position.uPnL,
+      pnlPct: position.uplRatio == null ? position.uPnLRoePct : position.uplRatio * 100, leverage: position.lever ?? position.entryLeverage,
     };
-    await loadData(true);
-  } catch (e: any) {
-    formError.value = e.message;
-  }
+  });
 }
-
-async function testConnectivity(id: number) {
-  testingId.value = id;
-  try {
-    const res = await api.post<any>(`/api/accounts/${id}/test`);
-    testResult.value[id] = res;
-    await loadData(true);
-  } catch (e: any) {
-    testResult.value[id] = { ok: false, error: e.message };
-  } finally {
-    testingId.value = null;
-  }
+function edit(account: Account | null) { editing.value = account; showModal.value = true; }
+async function change(account: Account, operation: "toggle" | "delete", event?: Event) {
+  // 取消确认时也保持开关显示服务器现态，不做乐观启用。
+  if (event) (event.target as HTMLInputElement).checked = account.isEnabled === true;
+  // 启用状态未知时不能通过取反猜测恢复交易。
+  if (operation === "toggle" && account.isEnabled == null) return;
+  const title = t(operation === "delete" ? "common.delete" : account.isEnabled ? "common.disable" : "common.enable");
+  await run(async () => {
+    if (operation === "delete") await api.delete(`/api/accounts/${account.id}`);
+    else await api.put(`/api/accounts/${account.id}`, { isEnabled: !account.isEnabled });
+    await cache.fetchAccounts(true);
+    await board.refresh(true);
+  }, { confirm: { title, message: t(operation === "delete" ? "confirm.delete" : "confirm.toggle", { name: account.name || "—", action: title }), environment: account.environment, strong: account.environment == null } });
 }
-
-async function syncAccount(id: number) {
-  syncingId.value = id;
-  try {
-    await api.post(`/api/accounts/${id}/sync`);
-    await loadData(true);
-  } finally {
-    syncingId.value = null;
-  }
+async function test(account: Account) {
+  await run(async () => {
+    const response = await api.post<AccountTestResult>(`/api/accounts/${account.id}/test`);
+    testResult.value[account.id] = response;
+    await cache.fetchAccounts(true);
+    if (response.ok !== true) throw new ApiError(400, response.error || t("accts.testUnknown"));
+    await board.refresh(true);
+  });
 }
-
-async function deleteAccount(id: number) {
-  if (!confirm(t("accts.deleteConfirm"))) return;
-  await api.delete(`/api/accounts/${id}`);
-  await loadData(true);
-}
-
-
-onMounted(() => loadData(false));
-onActivated(() => {
-  if (cache.accounts) accounts.value = cache.accounts.data;
-  if (cache.proxies) proxies.value = cache.proxies.data;
-  loadData(false);
-});
+function sync(account: Account) { return run(async () => {
+  const response = await api.post<{ ok: boolean | null; error?: string | null }>(`/api/accounts/${account.id}/sync`);
+  await cache.fetchAccounts(true);
+  if (response.ok !== true) throw new ApiError(400, response.error || t("accts.testUnknown"));
+  await board.refresh(true);
+}); }
+// 直接消费带请求序号保护的缓存，避免视图再保存一份过时列表。
+onMounted(() => { void load(); });
+onActivated(() => { void load(); });
 </script>
-
 <template>
-  <div class="space-y-6">
-    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-      <div>
-        <h2 class="text-xl sm:text-2xl font-bold text-white tracking-tight">{{ t("accts.title") }}</h2>
-        <p class="text-xs sm:text-sm text-slate-400 mt-0.5">{{ t("accts.subtitle") }}</p>
-      </div>
-      <button
-        @click="showModal = true"
-        class="px-4 py-2.5 rounded-xl bg-gradient-to-r from-accent to-brand text-slate-950 font-semibold text-xs sm:text-sm flex items-center gap-2 hover:opacity-90 shadow-lg shadow-accent/20"
-      >
-        <Plus class="w-4 h-4" />
-        <span>{{ t("accts.addBtn") }}</span>
-      </button>
-    </div>
-
-    <div v-if="loading && accounts.length === 0" class="text-center py-12 text-slate-400 text-sm">
-      {{ t("accts.loading") }}
-    </div>
-
-    <div v-else-if="accounts.length === 0" class="p-10 rounded-2xl bg-surface border border-slate-800 text-center">
-      <p class="text-slate-300 font-medium mb-1">{{ t("accts.emptyTitle") }}</p>
-      <p class="text-xs text-slate-500 mb-4">{{ t("accts.emptyDesc") }}</p>
-      <button @click="showModal = true" class="px-4 py-2 rounded-xl bg-accent/15 text-accent border border-accent/30 text-xs font-semibold">
-        {{ t("accts.addFirst") }}
-      </button>
-    </div>
-
-    <div v-else class="grid grid-cols-1 md:grid-cols-2 gap-5">
-      <div
-        v-for="acct in accounts"
-        :key="acct.id"
-        class="rounded-2xl bg-surface border border-slate-800/80 p-5 flex flex-col justify-between space-y-4"
-      >
-        <div>
-          <div class="flex items-start justify-between gap-3">
-            <div class="flex items-center gap-3">
-              <div class="w-10 h-10 rounded-xl bg-surface2 border border-slate-700 flex items-center justify-center font-bold text-xs uppercase text-accent">
-                {{ acct.exchange }}
-              </div>
-              <div>
-                <div class="flex items-center gap-2">
-                  <h3 class="font-bold text-base text-white">{{ acct.name }}</h3>
-                  <span
-                    class="px-2 py-0.5 rounded-md text-[10px] font-mono uppercase border"
-                    :class="
-                      acct.environment === 'live'
-                        ? 'bg-rose-500/15 text-rose-400 border-rose-500/30'
-                        : 'bg-cyan-500/15 text-cyan-400 border-cyan-500/30'
-                    "
-                  >
-                    {{ acct.environment }}
-                  </span>
-                </div>
-                <p class="text-xs font-mono text-slate-400 mt-0.5 flex items-center gap-1.5">
-                  <Shield class="w-3 h-3 text-emerald-400" />
-                  <span>{{ acct.apiKeyMasked }}</span>
-                  <span v-if="acct.clockOffsetMs" class="text-[10px] text-slate-500">({{ acct.clockOffsetMs }}ms)</span>
-                </p>
-              </div>
-            </div>
-
-            <span
-              class="px-2.5 py-0.5 rounded-full text-[10px] font-mono border"
-              :class="
-                acct.status === 'connected'
-                  ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
-                  : acct.status === 'error'
-                  ? 'bg-rose-500/10 text-rose-400 border-rose-500/30'
-                  : 'bg-slate-700/40 text-slate-400 border-slate-700'
-              "
-            >
-              {{ acct.status.toUpperCase() }}
-            </span>
+  <div class="space-y-5">
+    <PageHeader :title="t('accts.title')" :summary="summary"><template #actions><button class="icon-button" :disabled="loading || pending" :aria-label="t('common.refresh')" :title="t('common.refresh')" @click="load(true)"><RefreshCw :size="18" :class="{ 'animate-spin': loading }" /></button><button class="button-primary" :disabled="pending" @click="edit(null)"><Plus :size="17" />{{ t("accts.addBtn") }}</button></template></PageHeader>
+    <p v-if="error" class="error-banner" role="alert">{{ error }}</p>
+    <DataTable :rows="rows" :label="t('accts.title')" :row-key="row => row.id" :row-tone="rowTone" :loading="loading" :error="loadError" :empty="t('accts.emptyTitle')" selectable :expanded="expanded" @select="toggleDetails" @retry="load(true)" :columns="[
+      { key: 'account', label: t('accts.account'), width: '18%', mobileWide: true },
+      { key: 'funds', label: t('accts.funds'), numeric: true, width: '14%' },
+      { key: 'today', label: t('board.todayPnl'), numeric: true, width: '13%' },
+      { key: 'unrealized', label: t('board.unrealized'), numeric: true, width: '11%' },
+      { key: 'drawdown', label: t('accts.drawdown'), numeric: true, width: '9%' },
+      { key: 'sync', label: t('accts.lastSync'), width: '10%' },
+      { key: 'status', label: t('common.status'), mobileWide: true, width: '17%' },
+      { key: 'actions', label: t('common.actions'), width: '8%' },
+    ]">
+      <!-- 无空格长名称也可收缩换行，不挤出固定尺寸的展开按钮。 -->
+      <template #cell-account="{ row }"><p class="flex items-start justify-between gap-2 font-semibold"><span class="min-w-0 flex-1 [overflow-wrap:anywhere]">{{ row.name ?? t("common.unknown") }}</span><ChevronDown :size="16" class="mt-0.5 shrink-0 text-muted" :class="{ 'rotate-180': expanded === row.id }" aria-hidden="true" /></p><div class="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted"><span>{{ row.exchange?.toUpperCase() ?? t("common.unknown") }}</span><EnvBadge :environment="row.environment" /></div></template>
+      <template #cell-funds="{ row }"><strong class="text-base">{{ formatUsd(equity(row)) }}</strong><p class="text-xs text-muted">{{ t("accts.available") }} {{ formatUsd(metrics(row).available) }}</p></template>
+      <template #cell-today="{ row }"><strong :class="pnlClass(accountBoard(row)?.todayPnl)">{{ signedUsd(accountBoard(row)?.todayPnl) }}</strong><p class="text-xs" :class="pnlClass(accountBoard(row)?.todayPnlPct)">{{ formatPct(accountBoard(row)?.todayPnlPct) }}</p></template>
+      <template #cell-unrealized="{ row }"><span :class="pnlClass(metrics(row).unrealized)">{{ signedUsd(metrics(row).unrealized) }}</span></template>
+      <template #cell-drawdown="{ row }"><span :class="(drawdown(row) ?? 0) >= 20 ? 'text-danger' : 'text-muted'">{{ formatPct(drawdown(row), 2, false) }}</span></template>
+      <template #cell-sync="{ row }"><FreshnessStamp :timestamp="metrics(row).syncedAt" :warn-after="45" :critical-after="90" /><p class="mt-1 text-xs text-muted">{{ formatDateTime(metrics(row).syncedAt, { short: true, withSeconds: false }) }}</p></template>
+      <template #cell-status="{ row }"><div class="flex flex-wrap items-center gap-2"><StatusBadge :state="row.isEnabled == null ? 'unknown' : row.isEnabled === false ? 'disabled' : metrics(row).status" /><label class="inline-flex min-h-11 items-center gap-2 text-xs"><input type="checkbox" role="switch" :checked="row.isEnabled === true" :aria-label="t('accts.enabledFor', { name: row.name ?? '—' })" :disabled="pending || row.isEnabled == null" @change="change(row, 'toggle', $event)" /><span>{{ t(row.isEnabled == null ? "state.UNKNOWN" : row.isEnabled ? "common.enabled" : "common.disabled") }}</span></label></div><p v-if="issue(row)" class="mt-1 break-words text-xs" :class="severity(row) === 2 ? 'text-danger' : 'text-warning'">{{ issue(row) }}</p></template>
+      <template #cell-actions="{ row }"><div class="flex items-center justify-end gap-1"><button class="icon-button" :disabled="pending" :aria-label="t('common.edit')" :title="t('common.edit')" @click="edit(row)"><Pencil :size="17" /></button><MoreMenu><button class="menu-item" :disabled="pending" @click="test(row)"><Wifi :size="16" />{{ t("accts.test") }}</button><button class="menu-item" :disabled="pending" @click="sync(row)"><RefreshCw :size="16" />{{ t("accts.sync") }}</button><button class="menu-item text-danger" :disabled="pending" @click="change(row, 'delete')"><Trash2 :size="16" />{{ t("common.delete") }}</button></MoreMenu></div></template>
+      <template #select-label><ChevronDown :size="16" />{{ t("accts.positions") }}</template>
+      <template #details="{ row }">
+        <div class="space-y-4">
+          <p v-if="row.riskEquityLegacyUnverified || accountBoard(row)?.riskLegacyUnverified" class="border-l-2 border-warning bg-warning/5 p-3 text-sm text-warning" role="alert">{{ t("accts.legacy") }}</p>
+          <div class="flex flex-wrap items-center justify-between gap-3"><h2 class="section-title">{{ t("accts.positions") }}</h2><p class="text-xs text-muted">{{ row.exchange === "okx" ? t("accts.contractQty") : t("accts.baseQty") }}</p></div>
+          <EmptyState v-if="!row.positions?.length" :title="t(row.positions == null ? 'accts.positionsUnknown' : 'accts.positionsEmpty')" />
+          <div v-else class="divide-y divide-border/50">
+            <article v-for="position in positionRows(row)" :key="position.key" class="grid items-center gap-3 py-3 md:grid-cols-[minmax(0,1.2fr)_repeat(4,minmax(0,1fr))]">
+              <div class="min-w-0"><h3 class="break-words text-sm font-semibold">{{ position.symbol ?? t("common.unknown") }}</h3><p class="text-xs text-muted">{{ position.side }} · {{ t("unit.leverage", { n: formatQty(position.leverage) }) }}</p></div>
+              <dl class="number"><dt class="text-xs text-muted">{{ t("common.quantity") }}</dt><dd>{{ formatQty(position.qty) }}</dd></dl>
+              <dl class="number"><dt class="text-xs text-muted">{{ t("board.entry") }}</dt><dd>{{ formatPrice(position.entry) }}</dd></dl>
+              <dl class="number"><dt class="text-xs text-muted">{{ t("board.mark") }}</dt><dd class="font-semibold">{{ formatPrice(position.price) }}</dd><dd v-if="position.priceSource === 'estimated' || position.priceSource === 'entry'" class="text-xs text-warning">{{ t(`accts.price_${position.priceSource}`) }}</dd></dl>
+              <dl class="number"><dt class="text-xs text-muted">{{ t("common.pnl") }}</dt><dd :class="pnlClass(position.pnl)">{{ signedUsd(position.pnl) }} <span class="text-xs">{{ formatPct(position.pnlPct) }}</span></dd></dl>
+            </article>
           </div>
-
-          <div class="grid grid-cols-3 gap-3 mt-4 p-3 rounded-xl bg-background/60 border border-slate-800/80 text-xs font-mono">
-            <div>
-              <span class="text-[10px] text-slate-500 block">{{ t("accts.totalEquity") }}</span>
-              <span class="font-bold text-white">{{ formatUsd(acct.totalEquity ?? acct.usdtEquity) }}</span>
-            </div>
-            <div>
-              <span class="text-[10px] text-slate-500 block">{{ t("accts.available") }}</span>
-              <span class="text-slate-200">{{ formatUsd(acct.availEquity) }}</span>
-            </div>
-            <div>
-              <span class="text-[10px] text-slate-500 block">{{ t("accts.unrealizedPnl") }}</span>
-              <span :class="acct.unrealizedPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'">
-                {{ acct.unrealizedPnl >= 0 ? "+" : "" }}{{ formatUsd(acct.unrealizedPnl) }}
-              </span>
-            </div>
-          </div>
-
-          <div v-if="testResult[acct.id]" class="mt-3 p-2.5 rounded-lg text-xs font-mono border"
-            :class="testResult[acct.id].ok ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300' : 'bg-rose-500/10 border-rose-500/30 text-rose-300'"
-          >
-            <div v-if="testResult[acct.id].ok" class="flex flex-wrap items-center gap-1.5">
-              <CheckCircle2 class="w-3.5 h-3.5" />
-              <span>{{ t("accts.connectedMsg", { mode: testResult[acct.id].posMode, eq: formatUsd(testResult[acct.id].totalEquity ?? testResult[acct.id].usdtEquity) }) }}</span>
-              <span v-if="testResult[acct.id].usdcEquity > 0" class="text-[11px] text-emerald-400/80 ml-2">(USDT: {{ formatUsd(testResult[acct.id].usdtEquity) }} · USDC: {{ formatUsd(testResult[acct.id].usdcEquity) }})</span>
-            </div>
-            <div v-else>Error: {{ testResult[acct.id].error }}</div>
-          </div>
-
-          <p v-if="acct.lastError && !testResult[acct.id]" class="mt-2 text-[11px] text-rose-400 break-words">
-            {{ acct.lastError }}
-          </p>
         </div>
-
-        <div class="flex items-center justify-between pt-3 border-t border-slate-800/80">
-          <div class="flex items-center gap-2">
-            <button
-              @click="testConnectivity(acct.id)"
-              :disabled="testingId === acct.id"
-              class="px-3 py-1.5 rounded-lg bg-accent/15 hover:bg-accent/25 text-accent text-xs font-medium flex items-center gap-1.5"
-            >
-              <Wifi class="w-3.5 h-3.5" />
-              <span>{{ testingId === acct.id ? t("accts.testing") : t("accts.testApi") }}</span>
-            </button>
-            <button
-              @click="syncAccount(acct.id)"
-              :disabled="syncingId === acct.id"
-              class="px-3 py-1.5 rounded-lg bg-surface2 hover:bg-slate-700 text-slate-200 text-xs font-medium flex items-center gap-1.5"
-            >
-              <RefreshCw class="w-3.5 h-3.5" :class="{ 'animate-spin': syncingId === acct.id }" />
-              <span>{{ t("accts.sync") }}</span>
-            </button>
-          </div>
-          <button
-            @click="deleteAccount(acct.id)"
-            class="p-1.5 rounded-lg text-slate-500 hover:text-rose-400 hover:bg-rose-500/10"
-          >
-            <Trash2 class="w-4 h-4" />
-          </button>
-        </div>
-      </div>
-    </div>
-
-    <!-- Add Account Modal -->
-    <div v-if="showModal" class="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
-      <div class="w-full max-w-lg bg-surface border border-slate-800 rounded-2xl p-6 shadow-2xl">
-        <div class="flex items-center justify-between mb-5">
-          <h3 class="text-lg font-bold text-white flex items-center gap-2">
-            <KeyRound class="w-5 h-5 text-accent" />
-            <span>{{ t("accts.modalTitle") }}</span>
-          </h3>
-          <button @click="showModal = false" class="text-slate-400 hover:text-white"><X class="w-5 h-5" /></button>
-        </div>
-        <form @submit.prevent="createAccount" class="space-y-4">
-          <div v-if="formError" class="p-3 rounded-xl bg-rose-500/10 text-rose-400 text-xs">{{ formError }}</div>
-          <div class="grid grid-cols-2 gap-3">
-            <div>
-              <label class="block text-xs text-slate-400 mb-1">{{ t("accts.exchange") }}</label>
-              <select v-model="form.exchange" class="w-full px-3.5 py-2 rounded-xl bg-background border border-slate-700 text-sm text-white">
-                <option value="okx">OKX V5</option>
-                <option value="binance">Binance USDT-M</option>
-                <option value="bybit">Bybit V5</option>
-                <option value="bitget">Bitget V2</option>
-              </select>
-            </div>
-            <div>
-              <label class="block text-xs text-slate-400 mb-1">{{ t("accts.environment") }}</label>
-              <select v-model="form.environment" class="w-full px-3.5 py-2 rounded-xl bg-background border border-slate-700 text-sm text-white">
-                <option value="demo">{{ t("accts.envDemo") }}</option>
-                <option value="live">{{ t("accts.envLive") }}</option>
-              </select>
-            </div>
-          </div>
-          <div>
-            <label class="block text-xs text-slate-400 mb-1">{{ t("accts.label") }}</label>
-            <input v-model="form.name" required :placeholder="t('accts.labelPlaceholder')" class="w-full px-3.5 py-2 rounded-xl bg-background border border-slate-700 text-sm text-white" />
-          </div>
-          <div>
-            <label class="block text-xs text-slate-400 mb-1">{{ t("accts.apiKey") }}</label>
-            <input v-model="form.apiKey" required class="w-full px-3.5 py-2 rounded-xl bg-background border border-slate-700 text-sm font-mono text-white" />
-          </div>
-          <div>
-            <label class="block text-xs text-slate-400 mb-1">{{ t("accts.secretKey") }}</label>
-            <input v-model="form.secretKey" type="password" required class="w-full px-3.5 py-2 rounded-xl bg-background border border-slate-700 text-sm font-mono text-white" />
-          </div>
-          <div v-if="form.exchange === 'okx' || form.exchange === 'bitget'">
-            <label class="block text-xs text-slate-400 mb-1">{{ t("accts.passphrase") }}</label>
-            <input v-model="form.passphrase" type="password" required class="w-full px-3.5 py-2 rounded-xl bg-background border border-slate-700 text-sm font-mono text-white" />
-          </div>
-          <div class="grid grid-cols-3 gap-3">
-            <div>
-              <label class="block text-xs text-slate-400 mb-1">{{ t("accts.marginMode") }}</label>
-              <select v-model="form.marginMode" class="w-full px-3 py-2 rounded-xl bg-background border border-slate-700 text-xs text-white">
-                <option value="cross">{{ t("accts.cross") }}</option>
-                <option value="isolated">{{ t("accts.isolated") }}</option>
-              </select>
-            </div>
-            <div>
-              <label class="block text-xs text-slate-400 mb-1">{{ t("accts.posMode") }}</label>
-              <select v-model="form.positionMode" class="w-full px-3 py-2 rounded-xl bg-background border border-slate-700 text-xs text-white">
-                <option value="hedge">{{ t("accts.hedge") }}</option>
-                <option value="one_way">{{ t("accts.oneWay") }}</option>
-              </select>
-            </div>
-            <div>
-              <label class="block text-xs text-slate-400 mb-1">{{ t("accts.proxy") }}</label>
-              <select v-model="form.proxyId" class="w-full px-3 py-2 rounded-xl bg-background border border-slate-700 text-xs text-white">
-                <option :value="null">{{ t("accts.direct") }}</option>
-                <option v-for="p in proxies" :key="p.id" :value="p.id">{{ p.name }}</option>
-              </select>
-            </div>
-          </div>
-          <div class="flex justify-end gap-3 pt-2">
-            <button type="button" @click="showModal = false" class="px-4 py-2 rounded-xl bg-surface2 text-slate-300 text-xs font-medium">{{ t("leads.cancel") }}</button>
-            <button type="submit" class="px-4 py-2 rounded-xl bg-accent text-slate-950 font-semibold text-xs">{{ t("accts.saveBtn") }}</button>
-          </div>
-        </form>
-      </div>
-    </div>
+      </template>
+    </DataTable>
+    <AccountFormModal :open="showModal" :account="editing" :proxies="proxies" @close="showModal = false" @saved="load(true)" />
   </div>
 </template>

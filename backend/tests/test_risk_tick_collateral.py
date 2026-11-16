@@ -54,6 +54,8 @@ async def test_risk_tick_checks_position_guards_when_collateral_check_returns_fa
     engine.router = SimpleNamespace(
         _get_config=AsyncMock(return_value={"reconcile_interval_sec": 60}),
         check_position_guards=AsyncMock(),
+        # 风控轮询新增的“在簿限价单”检查：本用例没有挂单。
+        _has_resting=AsyncMock(return_value=False),
         reconcile_orphan_positions=AsyncMock(),
     )
     engine._last_reconcile = {}

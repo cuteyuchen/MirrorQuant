@@ -1,0 +1,7 @@
+# 本地依赖、预览和验收产物不进入源码变更。
+node_modules/
+dist/
+.npm-cache/
+output/
+.playwright-cli/
+*.tsbuildinfo

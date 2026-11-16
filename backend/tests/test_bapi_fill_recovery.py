@@ -16,7 +16,7 @@ from app.core.database import get_session_factory
 from app.maintenance.rebuild_lead_store import (
     apply_bundle, fetch_closed_history, prepare, rollback, state_of,
 )
-from app.models.domain import LeadSource, NotificationOutbox
+from app.models.domain import LeadSource, NotificationOutbox, SystemConfig
 from app.services.engine.orchestrator import EngineOrchestrator
 from app.services.lead_collector.binance_bapi import (
     BinanceBapiCollector, check_source_fill_update, expand_slim_order,
@@ -263,6 +263,13 @@ async def test_full_sweep_cannot_accept_duplicate_pages_as_complete(monkeypatch)
 async def test_stale_failure_notifies_once_and_preserves_original_generated_at(async_client, caplog):
     caplog.set_level(logging.DEBUG, logger="mirrorquant.orchestrator")
     async with get_session_factory()() as db:
+        # 本用例验证已公开的陈旧快照，必须显式开启看板，不能改变默认关闭的安全门禁。
+        public_monitoring = await db.scalar(
+            select(SystemConfig).where(SystemConfig.key == "public_monitoring_enabled")
+        )
+        assert public_monitoring is not None
+        public_monitoring.value_json = "true"
+        await db.commit()
         generated = int((datetime.now(timezone.utc) - timedelta(hours=9)).timestamp() * 1000)
         lead = await make_lead(db, snapshot_json=json.dumps({"meta": {"generatedAt": generated},
                                                             "openPositions": []}), status="running")

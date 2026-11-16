@@ -3,6 +3,9 @@ from __future__ import annotations
 from app.core.time_util import to_utc_iso
 
 import json
+import csv
+import io
+from urllib.parse import quote
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
@@ -17,6 +20,7 @@ from app.models.domain import CopyBinding, LeadSource, ProxyNode, User
 from app.schemas.api import LeadCreate, LeadUpdate
 from app.services.engine.orchestrator import orchestrator
 from app.services.engine.serialization import serialized_execution
+from app.services.lead_collector.binance_bapi import BinanceBapiCollector
 from app.services.proxy.manager import ProxyEgressError, ProxyManager
 
 router = APIRouter(prefix="/api/leads", tags=["leads"])
@@ -113,10 +117,15 @@ async def update_lead(
         raise HTTPException(status_code=404, detail="Lead not found")
 
     data = payload.model_dump(exclude_unset=True)
+    previous_proxy_id = lead.proxy_id
     for k, v in data.items():
         setattr(lead, k, v)
     await record_audit(db, "UPDATE_LEAD", "lead", str(lead.id), f"Updated fields: {list(data.keys())}", current_user, request)
     await db.commit()
+    if "proxy_id" in data and previous_proxy_id != data["proxy_id"]:
+        # 显式换出口后不再保留该出口的旧采集连接。
+        previous_proxy = await db.get(ProxyNode, previous_proxy_id) if previous_proxy_id is not None else None
+        await BinanceBapiCollector.close_proxy_clients(previous_proxy.url if previous_proxy else None)
     await db.refresh(lead)
     return {"item": _lead_summary(lead)}
 
@@ -227,34 +236,35 @@ async def export_lead_csv(
         raise HTTPException(status_code=404, detail="Lead not found")
 
     snap = json.loads(lead.snapshot_json) if lead.snapshot_json else {}
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    # 标准 CSV 转义与公式防护同时生效，真正的数值负号不受影响。
+    def cell(value):
+        if isinstance(value, str) and (value.lstrip("\ufeff \t\r\n").startswith(("=", "+", "-", "@"))
+                                       or value.startswith(("\t", "\r", "\n"))):
+            return "'" + value
+        return value
+
     if export_type == "cycles":
-        cycles = snap.get("tradeCycles") or []
-        lines = [
-            "cycle_id,symbol,position_side,status,start_time,end_time,duration,entry_count,exit_count,scale_in_count,total_entry_qty,total_exit_qty,avg_entry_price,avg_exit_price,realized_pnl,net_remaining"
-        ]
-        for c in cycles:
-            lines.append(
-                f'"{c.get("cycleId")}","{c.get("symbol")}","{c.get("positionSide")}","{c.get("status")}",'
-                f'{c.get("startTime")},{c.get("endTime")},"{c.get("durationFormatted")}",'
-                f'{c.get("entryCount")},{c.get("exitCount")},{c.get("scaleInCount")},'
-                f'{c.get("totalEntryQty")},{c.get("totalExitQty")},{c.get("avgEntryPrice")},'
-                f'{c.get("avgExitPrice")},{c.get("realizedPnl")},{c.get("netRemainingQty", 0.0)}'
-            )
-        csv_text = "\n".join(lines)
+        writer.writerow(["cycle_id", "symbol", "position_side", "status", "start_time", "end_time", "duration",
+                         "entry_count", "exit_count", "scale_in_count", "total_entry_qty", "total_exit_qty",
+                         "avg_entry_price", "avg_exit_price", "realized_pnl", "net_remaining"])
+        fields = ("cycleId", "symbol", "positionSide", "status", "startTime", "endTime", "durationFormatted",
+                  "entryCount", "exitCount", "scaleInCount", "totalEntryQty", "totalExitQty",
+                  "avgEntryPrice", "avgExitPrice", "realizedPnl", "netRemainingQty")
+        for row in snap.get("tradeCycles") or []:
+            writer.writerow([cell(row.get(field)) for field in fields])
         filename = f"{lead.name}_trade_cycles.csv"
     else:
-        orders = snap.get("orders") or []
-        lines = ["time,order_time,symbol,side,position_side,direction,type,qty,avg_price,pnl"]
-        for o in orders:
-            lines.append(
-                f'{o.get("time")},{o.get("orderTime")},"{o.get("symbol")}","{o.get("side")}","{o.get("positionSide")}",'
-                f'"{o.get("dir")}","{o.get("type")}",{o.get("qty")},{o.get("avgPrice")},{o.get("pnl")}'
-            )
-        csv_text = "\n".join(lines)
+        writer.writerow(["time", "order_time", "symbol", "side", "position_side", "direction", "type", "qty", "avg_price", "pnl"])
+        fields = ("time", "orderTime", "symbol", "side", "positionSide", "dir", "type", "qty", "avgPrice", "pnl")
+        for row in snap.get("orders") or []:
+            writer.writerow([cell(row.get(field)) for field in fields])
         filename = f"{lead.name}_orders.csv"
 
     return Response(
-        content=csv_text,
+        content=output.getvalue(),
         media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": f"attachment; filename=\"lead-{lead.id}-{export_type}.csv\"; "
+                 f"filename*=UTF-8''{quote(filename, safe='')}"},
     )

@@ -1,499 +1,252 @@
 <script setup lang="ts">
-import { onActivated, onMounted, ref } from "vue";
-import { AlertTriangle, ArrowRight, Layers, Plus, Power, RotateCcw, Settings2, Trash2, X } from "lucide-vue-next";
-import { api } from "@/api/client";
+import { computed, nextTick, onActivated, onDeactivated, onMounted, onUnmounted, ref, watch } from "vue";
+import { AlertTriangle, ArrowRight, ChevronDown, Pencil, Plus, RefreshCw, RotateCcw, Save, Trash2 } from "lucide-vue-next";
+import { api, isCancelled } from "@/api/client";
 import { useDataCacheStore } from "@/stores/dataCache";
+import { useAsyncAction } from "@/composables/useAsyncAction";
 import { useI18n } from "@/i18n";
-import { formatUsd } from "@/utils/format";
+import type { Binding, RiskSettings } from "@/types/api";
+import type { TableColumn } from "@/types/ui";
+import { bindingRisk, DEFAULT_RISK, FLAT_REQUIRED_RISK_FIELDS, ORDER_MODES, RISK_FIELD_GROUPS, RISK_RULES, RISK_SCALE_RULE, RISK_SWITCHES, riskReductions, SLIPPAGE_ACTIONS, TP_SL_MODES, validateFields, validateNumber } from "@/constants/validation";
+import { bindingPresentation, bindingSummary, fetchTodayExecutionCounts, type ExecutionCounts } from "@/constants/bindingStatus";
+import { errorMessage, fieldErrors, reasonText } from "@/utils/errors";
+import { formatQty, formatUsd } from "@/utils/format";
+import BaseModal from "@/components/BaseModal.vue";
+import DataTable from "@/components/DataTable.vue";
+import EnvBadge from "@/components/EnvBadge.vue";
+import FreshnessStamp from "@/components/FreshnessStamp.vue";
+import MoreMenu from "@/components/MoreMenu.vue";
+import PageHeader from "@/components/PageHeader.vue";
+import StatusBadge from "@/components/StatusBadge.vue";
+import NumberField from "@/components/NumberField.vue";
+import RiskPolicyFields from "@/components/RiskPolicyFields.vue";
 
 defineOptions({ name: "BindingsView" });
-
-const cache = useDataCacheStore();
 const { t } = useI18n();
-
-const bindings = ref<any[]>(cache.bindings?.data.items || []);
-const leads = ref<any[]>(cache.leads?.data || []);
-const accounts = ref<any[]>(cache.accounts?.data || []);
-const globalKillSwitch = ref(cache.bindings?.data.globalKillSwitch || false);
-const loading = ref(!cache.bindings);
-
+const cache = useDataCacheStore();
+const { pending, error: actionError, run } = useAsyncAction();
+const bindings = computed(() => cache.bindings?.data.items || []);
+const accounts = computed(() => cache.accounts?.data || []);
+const leads = computed(() => cache.leads?.data || []);
+const board = computed(() => cache.board?.data ?? null);
+const intents = computed(() => cache.intents?.data ?? null);
+const defaults = computed(() => cache.settings?.data.risk_defaults ?? null);
+// 急停取较新的响应；较新响应未知时不拿旧的 false 代替。
+const killSwitch = computed(() => cache.board && (!cache.bindings || cache.board.fetchedAt >= cache.bindings.fetchedAt)
+  ? cache.board.data.globalKillSwitch : cache.bindings?.data.globalKillSwitch ?? null);
+const summary = computed(() => bindingSummary(bindings.value, board.value, intents.value, killSwitch.value));
+const presentations = computed(() => new Map(bindings.value.map(binding => [binding.id, bindingPresentation(binding, board.value, intents.value, killSwitch.value)])));
+function status(binding: Binding) { return presentations.value.get(binding.id)!; }
+const rows = computed(() => [...bindings.value].sort((a, b) => {
+  const rank = { danger: 0, warning: 1, neutral: 2 };
+  return rank[status(a).tone] - rank[status(b).tone] || a.id - b.id;
+}));
+const columns = computed<TableColumn[]>(() => [
+  { key: "relationship", label: t("bind.relationship"), width: "28%", mobileWide: true },
+  // 操作列保留触控尺寸，剩余数字列平分可用宽度。
+  { key: "enabled", label: t("common.enable"), width: "68px" },
+  { key: "scale", label: t("bind.riskScale"), numeric: true },
+  { key: "status", label: t("bind.runtimeStatus"), width: "23%", mobileWide: true },
+  { key: "positions", label: t("bind.positionsAndDebt"), numeric: true },
+  { key: "executions", label: t("bind.todayExecutions"), numeric: true },
+  { key: "actions", label: t("common.actions"), width: "68px", mobileWide: true },
+]);
+const loading = ref(false);
+const loadError = ref("");
+const statistics = ref<Record<number, ExecutionCounts> | null>(null);
+const statisticsError = ref("");
+const statisticsLoading = ref(false);
+const statisticsAsOf = ref<number | null>(null);
+const editing = ref<Binding | null>(null);
 const showModal = ref(false);
-const editingId = ref<number | null>(null);
-
-function defaultForm() {
-  const rd = cache.settings?.data?.risk_defaults || {};
-  return {
-    name: "",
-    leadId: null as number | null,
-    accountId: null as number | null,
-    enableCircuitBreaker: rd.enable_circuit_breaker ?? true,
-    enableLeverageCap: rd.enable_leverage_cap ?? false,
-    riskScale: 1.0,
-    maxTotalLeverage: rd.max_total_leverage ?? 8.0,
-    maxSingleLeverage: rd.max_single_leverage ?? 4.0,
-    maxInstrumentLeverage: rd.max_instrument_leverage ?? 20,
-    maxDrawdownPct: rd.max_drawdown_pct ?? 30.0,
-    dailyMaxLossPct: rd.daily_max_loss_pct ?? 10.0,
-    maxSlippagePct: rd.max_slippage_pct ?? 1.0,
-    maxSpreadPct: rd.max_spread_pct ?? 0.3,
-    iocOffsetPct: rd.ioc_offset_pct ?? 0.5,
-    orderMode: rd.order_mode ?? "ioc_then_market",
-    tpSlMode: rd.tp_sl_mode ?? "follow_lead",
-    enableStopLoss: rd.enable_stop_loss ?? false,
-    stopLossPct: rd.stop_loss_pct ?? 5.0,
-    enableTakeProfit: rd.enable_take_profit ?? false,
-    takeProfitPct: rd.take_profit_pct ?? 10.0,
-    enableTrailingStop: rd.enable_trailing_stop ?? false,
-    trailingCallbackPct: rd.trailing_callback_pct ?? 2.0,
-    hardStopLossPct: rd.hard_stop_loss_pct ?? 15.0,
-  };
-}
-
-const form = ref(defaultForm());
-const formError = ref("");
-
-async function loadData(force = false) {
-  if (!cache.bindings) loading.value = true;
+const initialRisk = ref<RiskSettings | null>(null);
+const formElement = ref<HTMLFormElement | null>(null);
+const form = ref({ name: "", leadId: null as number | null, accountId: null as number | null, riskScale: 1 as number | null,
+  risk: { ...DEFAULT_RISK }, whitelist: "", blacklist: "", symbolMap: "" });
+const errors = ref<Record<string, string>>({});
+const environment = computed(() => editing.value?.accountEnvironment ?? accounts.value.find(account => account.id === form.value.accountId)?.environment ?? null);
+const protectionLocked = computed(() => !!editing.value && (status(editing.value)?.positionCount == null ||
+  status(editing.value)?.pendingCount == null || status(editing.value).positionCount! > 0 || status(editing.value).pendingCount! > 0));
+const lockMessage = computed(() => t(editing.value && (status(editing.value)?.positionCount == null || status(editing.value)?.pendingCount == null)
+  ? "bind.unverifiedProtection" : "bind.lockedProtection"));
+const disabledRiskFields = computed(() => protectionLocked.value ? FLAT_REQUIRED_RISK_FIELDS : []);
+const tableError = computed(() => loadError.value || (!showModal.value ? actionError.value : ""));
+let loadSequence = 0;
+let statisticsSequence = 0;
+let pollTimer: ReturnType<typeof setInterval> | undefined;
+async function refreshStatistics() {
+  if (statisticsLoading.value || board.value?.dayStart == null || board.value.serverTime == null) return;
+  const request = ++statisticsSequence;
+  const cutoff = board.value.serverTime;
+  statisticsLoading.value = true;
   try {
-    const [bRes, lItems, aItems] = await Promise.all([
-      cache.fetchBindings(force, 12000),
-      cache.fetchLeads(force, 12000),
-      cache.fetchAccounts(force, 15000),
-      cache.fetchSettings(false, 20000),
-    ]);
-    bindings.value = bRes.items;
-    globalKillSwitch.value = bRes.globalKillSwitch;
-    leads.value = lItems;
-    accounts.value = aItems;
-  } finally {
-    loading.value = false;
-  }
-}
-
-function openCreate() {
-  editingId.value = null;
-  form.value = defaultForm();
-  formError.value = "";
-  showModal.value = true;
-}
-
-function openEdit(b: any) {
-  editingId.value = b.id;
-  formError.value = "";
-  form.value = {
-    name: b.name,
-    leadId: b.leadId,
-    accountId: b.accountId,
-    enableCircuitBreaker: b.enableCircuitBreaker ?? true,
-    enableLeverageCap: b.enableLeverageCap ?? false,
-    riskScale: b.riskScale,
-    maxTotalLeverage: b.maxTotalLeverage,
-    maxSingleLeverage: b.maxSingleLeverage,
-    maxInstrumentLeverage: b.maxInstrumentLeverage,
-    maxDrawdownPct: b.maxDrawdownPct,
-    dailyMaxLossPct: b.dailyMaxLossPct ?? 10.0,
-    maxSlippagePct: b.maxSlippagePct,
-    maxSpreadPct: b.maxSpreadPct ?? 0.3,
-    iocOffsetPct: b.iocOffsetPct,
-    orderMode: b.orderMode,
-    tpSlMode: b.tpSlMode ?? "follow_lead",
-    enableStopLoss: !!b.enableStopLoss,
-    stopLossPct: b.stopLossPct ?? 5.0,
-    enableTakeProfit: !!b.enableTakeProfit,
-    takeProfitPct: b.takeProfitPct ?? 10.0,
-    enableTrailingStop: !!b.enableTrailingStop,
-    trailingCallbackPct: b.trailingCallbackPct ?? 2.0,
-    hardStopLossPct: b.hardStopLossPct ?? 15.0,
-  };
-  showModal.value = true;
-}
-
-async function saveBinding() {
-  formError.value = "";
-  if (!editingId.value && (!form.value.leadId || !form.value.accountId)) {
-    formError.value = t("bind.errSelectBoth");
-    return;
-  }
-  try {
-    if (editingId.value) {
-      await api.put(`/api/bindings/${editingId.value}`, {
-        name: form.value.name,
-        enable_circuit_breaker: form.value.enableCircuitBreaker,
-        enable_leverage_cap: form.value.enableLeverageCap,
-        risk_scale: form.value.riskScale,
-        max_total_leverage: form.value.maxTotalLeverage,
-        max_single_leverage: form.value.maxSingleLeverage,
-        max_instrument_leverage: form.value.maxInstrumentLeverage,
-        max_drawdown_pct: form.value.maxDrawdownPct,
-        daily_max_loss_pct: form.value.dailyMaxLossPct,
-        max_slippage_pct: form.value.maxSlippagePct,
-        max_spread_pct: form.value.maxSpreadPct,
-        ioc_offset_pct: form.value.iocOffsetPct,
-        order_mode: form.value.orderMode,
-        tp_sl_mode: form.value.tpSlMode,
-        enable_stop_loss: form.value.enableStopLoss,
-        stop_loss_pct: form.value.stopLossPct,
-        enable_take_profit: form.value.enableTakeProfit,
-        take_profit_pct: form.value.takeProfitPct,
-        enable_trailing_stop: form.value.enableTrailingStop,
-        trailing_callback_pct: form.value.trailingCallbackPct,
-        hard_stop_loss_pct: form.value.hardStopLossPct,
-      });
-    } else {
-      await api.post("/api/bindings", form.value);
+    const counts = await fetchTodayExecutionCounts(board.value.dayStart, cutoff, () => request === statisticsSequence);
+    if (request === statisticsSequence) {
+      statistics.value = counts; statisticsAsOf.value = cutoff; statisticsError.value = "";
     }
-    showModal.value = false;
-    await loadData(true);
-  } catch (e: any) {
-    formError.value = e.message;
-  }
+  } catch (cause: unknown) {
+    if (request === statisticsSequence && !isCancelled(cause)) {
+      statistics.value = null; statisticsAsOf.value = null; statisticsError.value = errorMessage(cause);
+    }
+  } finally { if (request === statisticsSequence) statisticsLoading.value = false; }
 }
-
-async function toggleBinding(id: number) {
-  await api.post(`/api/bindings/${id}/toggle`);
-  await loadData(true);
+async function load(force = false) {
+  const request = ++loadSequence;
+  loading.value = true;
+  if (force) { loadError.value = ""; actionError.value = ""; }
+  try {
+    await Promise.all([cache.fetchBindings(force), cache.fetchAccounts(force), cache.fetchLeads(force),
+      cache.fetchSettings(force), cache.fetchBoard(force), cache.fetchIntents(force)]);
+    if (request === loadSequence) { loadError.value = ""; void refreshStatistics(); }
+  } catch (cause: unknown) {
+    if (request === loadSequence && !isCancelled(cause)) loadError.value = errorMessage(cause);
+  } finally { if (request === loadSequence) loading.value = false; }
 }
-
-async function resetBreaker(id: number) {
-  await api.post(`/api/bindings/${id}/reset-breaker`);
-  await loadData(true);
-}
-
-async function resetDebt(id: number) {
-  await api.post(`/api/bindings/${id}/reset-debt`);
-  await loadData(true);
-}
-
-async function deleteBinding(id: number) {
-  if (!confirm(t("bind.deleteConfirm"))) return;
-  await api.delete(`/api/bindings/${id}`);
-  await loadData(true);
-}
-
-function tpSlLabel(mode: string): string {
-  if (mode === "independent") return t("bind.tpslIndependent");
-  if (mode === "hybrid_guard") return t("bind.tpslHybrid");
-  return t("bind.tpslFollowLead");
-}
-
-onMounted(() => loadData(false));
-onActivated(() => {
-  if (cache.bindings) {
-    bindings.value = cache.bindings.data.items;
-    globalKillSwitch.value = cache.bindings.data.globalKillSwitch;
-  }
-  if (cache.leads) leads.value = cache.leads.data;
-  if (cache.accounts) accounts.value = cache.accounts.data;
-  loadData(false);
+// 跨日与登出都作废局部统计，不能把昨天或上一会话的计数继续标为“今日”。
+watch(() => board.value?.dayStart, (dayStart, previous) => {
+  if (dayStart === previous) return;
+  statisticsSequence++; statisticsLoading.value = false; statistics.value = null; statisticsAsOf.value = null; statisticsError.value = "";
+  if (dayStart != null && pollTimer) void refreshStatistics();
 });
+watch(() => cache.bindings, value => {
+  if (value == null) { showModal.value = false; editing.value = null; errors.value = {}; actionError.value = ""; }
+});
+function open(binding: Binding | null) {
+  editing.value = binding; errors.value = {}; actionError.value = "";
+  initialRisk.value = binding ? bindingRisk(binding) : { ...(defaults.value ?? DEFAULT_RISK) };
+  form.value = { name: binding?.name || "", leadId: binding?.leadId ?? null, accountId: binding?.accountId ?? null,
+    riskScale: binding ? binding.riskScale : 1, risk: { ...initialRisk.value },
+    whitelist: binding?.symbolWhitelist?.join(", ") || "", blacklist: binding?.symbolBlacklist?.join(", ") || "",
+    symbolMap: Object.entries(binding?.symbolMap || {}).map(([source, target]) => `${source}=${target}`).join("\n") };
+  showModal.value = true;
+}
+function symbols(value: string) { return [...new Set(value.split(/[\s,，]+/).map(symbol => symbol.trim().toUpperCase()).filter(Boolean))]; }
+function sectionHasError(section: keyof typeof RISK_FIELD_GROUPS) {
+  const fields: readonly string[] = section === "protection" ? [...RISK_FIELD_GROUPS.protection, ...FLAT_REQUIRED_RISK_FIELDS] :
+    section === "risk" ? [...RISK_FIELD_GROUPS.risk, "enable_circuit_breaker", "enable_leverage_cap"] : [...RISK_FIELD_GROUPS.execution, "order_mode", "slippage_action"];
+  return fields.some(field => !!errors.value[field]);
+}
+async function focusError() {
+  await nextTick();
+  formElement.value?.querySelector<HTMLElement>('[aria-invalid="true"]')?.focus();
+}
+async function saveBinding() {
+  errors.value = validateFields(form.value.risk, RISK_RULES);
+  const scaleError = validateNumber(form.value.riskScale, RISK_SCALE_RULE);
+  if (scaleError) errors.value.riskScale = scaleError;
+  if (!form.value.name.trim()) errors.value.name = t("validation.required");
+  else if (form.value.name.trim().length > 120) errors.value.name = t("validation.maxLength", { n: 120 });
+  if (!form.value.accountId || !form.value.leadId) errors.value.accountId = t("bind.errSelectBoth");
+  for (const key of Object.keys(RISK_SWITCHES) as (keyof typeof RISK_SWITCHES)[]) if (form.value.risk[key] == null) errors.value[key] = t("validation.required");
+  if (!ORDER_MODES.includes(form.value.risk.order_mode as typeof ORDER_MODES[number])) errors.value.order_mode = t("validation.invalid");
+  if (!SLIPPAGE_ACTIONS.includes(form.value.risk.slippage_action as typeof SLIPPAGE_ACTIONS[number])) errors.value.slippage_action = t("validation.invalid");
+  if (!TP_SL_MODES.includes(form.value.risk.tp_sl_mode as typeof TP_SL_MODES[number])) errors.value.tp_sl_mode = t("validation.invalid");
+  const whitelist = symbols(form.value.whitelist);
+  const blacklist = symbols(form.value.blacklist);
+  if (whitelist.some(symbol => blacklist.includes(symbol))) errors.value.whitelist = t("bind.symbolConflict");
+  const symbolMap: Record<string, string> = {};
+  for (const line of form.value.symbolMap.split("\n").filter(line => line.trim())) {
+    const [source, target, extra] = line.trim().toUpperCase().split("=").map(value => value.trim());
+    if (!source || !target || extra != null || symbolMap[source]) { errors.value.symbolMap = t("bind.symbolMapError"); break; }
+    symbolMap[source] = target;
+  }
+  if (protectionLocked.value && editing.value) {
+    for (const key of FLAT_REQUIRED_RISK_FIELDS) if (form.value.risk[key] !== initialRisk.value?.[key]) errors.value[key] = lockMessage.value;
+    const original = editing.value.symbolMap ?? {};
+    if (Object.keys(symbolMap).length !== Object.keys(original).length || Object.keys(symbolMap).some(key => symbolMap[key] !== original[key])) {
+      errors.value.symbolMap = lockMessage.value;
+    }
+  }
+  if (Object.keys(errors.value).length) { await focusError(); return; }
+  const reduced = riskReductions(initialRisk.value, form.value.risk);
+  const payload = { name: form.value.name.trim(), risk_scale: form.value.riskScale, ...form.value.risk,
+    symbol_whitelist: whitelist, symbol_blacklist: blacklist, symbol_map: symbolMap };
+  // 新建实盘绑定默认停用，启用必须再走独立的强确认。
+  const result = await run(() => editing.value ? api.put(`/api/bindings/${editing.value.id}`, payload) :
+    api.post("/api/bindings", { ...payload, leadId: form.value.leadId, accountId: form.value.accountId, isEnabled: environment.value === "demo" }), {
+    confirm: editing.value || environment.value !== "demo" || reduced.length > 0 ? { title: t("common.save"),
+      message: reduced.length ? t("confirm.riskOff", { items: reduced.join("、") }) : t("confirm.edit", { name: form.value.name }),
+      environment: environment.value, strong: environment.value == null || reduced.length > 0 } : undefined,
+    onError: cause => { errors.value = fieldErrors(cause); void focusError(); },
+  });
+  if (result.ok) { showModal.value = false; await load(true); }
+}
+async function operate(binding: Binding, kind: "toggle" | "delete" | "reset-breaker" | "reset-debt") {
+  // 未知状态不能通过取反被解释为恢复交易。
+  if (kind === "toggle" && binding.isEnabled == null) return;
+  const title = t(kind === "delete" ? "common.delete" : kind === "toggle" ? (binding.isEnabled ? "common.disable" : "common.enable") : kind === "reset-breaker" ? "bind.resetBreaker" : "bind.pendingDebt");
+  const messageKey = kind === "delete" ? "confirm.delete" : kind === "toggle" ? "confirm.toggle" : kind === "reset-breaker" ? "confirm.resetBreaker" : "confirm.resetDebt";
+  const result = await run(async () => {
+    // PUT 明确目标状态，避免旧页面上的 toggle 意外恢复交易。
+    if (kind === "toggle") await api.put(`/api/bindings/${binding.id}`, { isEnabled: !binding.isEnabled });
+    else if (kind === "delete") await api.delete(`/api/bindings/${binding.id}`);
+    else await api.post(`/api/bindings/${binding.id}/${kind}`);
+  }, { confirm: { title, message: t(messageKey, { name: binding.name || "—", action: title }),
+    environment: binding.accountEnvironment, strong: binding.accountEnvironment == null || kind === "reset-breaker" || (kind === "toggle" && !binding.isEnabled) } });
+  if (result.ok) await load(true);
+}
+function start() {
+  if (pollTimer) return;
+  void load();
+  pollTimer = setInterval(() => { if (!loading.value && !pending.value) void load(); }, 15000);
+}
+function stop() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = undefined; loadSequence++; statisticsSequence++; loading.value = false; statisticsLoading.value = false;
+}
+onMounted(start);
+onActivated(start);
+onDeactivated(stop);
+onUnmounted(stop);
 </script>
-
 <template>
-  <div class="space-y-6">
-    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-      <div>
-        <h2 class="text-xl sm:text-2xl font-bold text-white tracking-tight">{{ t("bind.title") }}</h2>
-        <p class="text-xs sm:text-sm text-slate-400 mt-0.5">{{ t("bind.subtitle") }}</p>
-      </div>
-      <button
-        @click="openCreate"
-        class="px-4 py-2.5 rounded-xl bg-gradient-to-r from-accent to-brand text-slate-950 font-semibold text-xs sm:text-sm flex items-center gap-2 hover:opacity-90 shadow-lg shadow-accent/20"
-      >
-        <Plus class="w-4 h-4" />
-        <span>{{ t("bind.newBtn") }}</span>
-      </button>
-    </div>
-
-    <div v-if="loading && bindings.length === 0" class="text-center py-12 text-slate-400 text-sm">
-      {{ t("bind.loading") }}
-    </div>
-
-    <div v-else-if="bindings.length === 0" class="p-10 rounded-2xl bg-surface border border-slate-800 text-center">
-      <p class="text-slate-300 font-medium mb-1">{{ t("bind.emptyTitle") }}</p>
-      <p class="text-xs text-slate-500 mb-4">{{ t("bind.emptyDesc") }}</p>
-      <button @click="openCreate" class="px-4 py-2 rounded-xl bg-accent/15 text-accent border border-accent/30 text-xs font-semibold">
-        {{ t("bind.createFirst") }}
-      </button>
-    </div>
-
-    <div v-else class="space-y-4">
-      <div
-        v-for="b in bindings"
-        :key="b.id"
-        class="rounded-2xl bg-surface border p-5 transition-all"
-        :class="b.circuitBreakerTripped ? 'border-rose-500/50 bg-rose-950/10' : 'border-slate-800/80'"
-      >
-        <div class="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
-          <div class="space-y-1.5">
-            <div class="flex flex-wrap items-center gap-2.5">
-              <Layers class="w-4 h-4 text-accent" />
-              <h3 class="font-bold text-base text-white">{{ b.name }}</h3>
-              <span
-                class="px-2 py-0.5 rounded-full text-[10px] font-mono border"
-                :class="
-                  b.isEnabled
-                    ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
-                    : 'bg-slate-700/40 text-slate-400 border-slate-700'
-                "
-              >
-                {{ b.isEnabled ? t("bind.active") : t("bind.paused") }}
-              </span>
-              <span class="px-2 py-0.5 rounded-full border text-[10px]" :class="b.enableCircuitBreaker !== false ? 'text-amber-300 border-amber-500/30' : 'text-slate-400 border-slate-700'">
-                {{ b.enableCircuitBreaker !== false ? t("risk.circuitOn") : t("risk.circuitOff") }}
-              </span>
-              <span class="px-2 py-0.5 rounded-full border border-accent/25 text-accent text-[10px]">
-                {{ b.enableLeverageCap ? t("risk.capOn") : t("risk.autoLeverage") }}
-              </span>
-              <span v-if="b.baselineSeeded" class="px-2 py-0.5 rounded bg-slate-800 text-slate-400 text-[10px] font-mono">
-                {{ t("bind.baselineSeeded") }}
-              </span>
-              <span class="px-2 py-0.5 rounded bg-accent/10 text-accent border border-accent/25 text-[10px] font-mono">
-                {{ tpSlLabel(b.tpSlMode || 'follow_lead') }}
-              </span>
-            </div>
-
-            <div class="flex flex-wrap items-center gap-2 text-xs font-mono text-slate-300">
-              <span class="px-2.5 py-1 rounded-lg bg-background border border-slate-800">{{ b.leadName }}</span>
-              <ArrowRight class="w-3.5 h-3.5 text-accent" />
-              <span class="px-2.5 py-1 rounded-lg bg-background border border-slate-800">
-                {{ b.accountName }} ({{ b.accountExchange?.toUpperCase() }} {{ b.accountEnvironment }})
-              </span>
-            </div>
+  <div class="min-w-0 space-y-5">
+    <PageHeader :title="t('bind.title')" :summary="cache.bindings ? t('bind.summary', { n: summary.total, tripped: summary.tripped, disabled: summary.disabled, pending: summary.pending ?? t('common.unknown'), unknown: summary.unknown }) : t('common.loading')">
+      <template #actions><button class="icon-button" :disabled="loading || pending" :aria-label="t('common.refresh')" :title="t('common.refresh')" @click="load(true)"><RefreshCw :size="18" :class="{ 'animate-spin': loading }" /></button><button class="button-primary" :disabled="pending || !cache.accounts || !cache.leads" @click="open(null)"><Plus :size="17" />{{ t("bind.newBtn") }}</button></template>
+    </PageHeader>
+    <div v-if="killSwitch === true" class="flex items-start gap-3 border-l-4 border-danger bg-danger/10 px-4 py-3 text-sm text-danger" role="alert" data-testid="binding-kill-banner"><AlertTriangle :size="20" class="shrink-0" /><p>{{ t("bind.killBanner") }}</p></div>
+    <DataTable :rows="rows" :columns="columns" :row-key="binding => binding.id" :loading="loading" :error="tableError" :empty="t('bind.emptyTitle')" :label="t('bind.title')" :row-tone="binding => status(binding).tone === 'danger' ? 'bg-danger/10' : status(binding).tone === 'warning' ? 'bg-warning/5' : ''" @retry="load(true)">
+      <template #cell-relationship="{ row }">
+        <div class="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-sm font-semibold [overflow-wrap:anywhere]"><RouterLink v-if="row.leadId != null" :to="`/leads/${row.leadId}`" class="min-w-0 hover:text-accent">{{ row.leadName ?? t("common.unknown") }}</RouterLink><span v-else class="min-w-0">{{ row.leadName ?? t("common.unknown") }}</span><ArrowRight :size="14" class="shrink-0 text-muted" /><span class="min-w-0">{{ row.accountName ?? t("common.unknown") }}</span><EnvBadge :environment="row.accountEnvironment" /></div>
+        <p class="mt-1 break-words text-xs text-muted">{{ row.name ?? t("common.unknown") }} · {{ row.accountExchange?.toUpperCase() ?? t("common.unknown") }}</p>
+      </template>
+      <template #cell-enabled="{ row }"><button class="icon-button" role="switch" :aria-checked="row.isEnabled === true" :disabled="pending || row.isEnabled == null" :aria-label="t('bind.enableSwitch', { name: row.name ?? t('common.unknown') })" :title="t(row.isEnabled == null ? 'state.UNKNOWN' : row.isEnabled ? 'common.disable' : 'common.enable')" @click="operate(row, 'toggle')"><span class="relative h-5 w-9 rounded-full" :class="row.isEnabled ? 'bg-accent' : 'bg-surface3'" aria-hidden="true"><span class="absolute top-1 h-3 w-3 rounded-full bg-foreground" :class="row.isEnabled ? 'right-1' : 'left-1'" /></span></button></template>
+      <template #cell-scale="{ row }"><span class="font-semibold">{{ formatQty(row.riskScale) }}</span><span v-if="row.riskScale != null" class="ml-1 text-xs text-muted">{{ t("unit.x") }}</span></template>
+      <template #cell-status="{ row }"><StatusBadge :state="status(row).state" /><p v-for="reason in status(row).reasons" :key="reason" class="mt-1 break-words text-xs" :class="status(row).tone === 'danger' ? 'text-danger' : 'text-muted'">{{ reasonText(reason) }}</p><RouterLink v-if="status(row).pendingCount != null && status(row).pendingCount! > 0" to="/executions?tab=intents" class="mt-1 block text-xs text-warning">{{ t("bind.pendingCount", { n: status(row).pendingCount ?? t("common.unknown") }) }}</RouterLink></template>
+      <template #cell-positions="{ row }"><p class="font-semibold">{{ t("bind.positionCount", { n: status(row).positionCount ?? t("common.unknown") }) }}</p><p class="mt-1 text-xs" :class="row.pendingDebtUsd != null && row.pendingDebtUsd > 0 ? 'text-warning' : 'text-muted'">{{ formatUsd(row.pendingDebtUsd) }}</p></template>
+      <template #cell-executions="{ row }"><p class="text-xs" :class="(statistics?.[row.id]?.failed ?? 0) > 0 ? 'text-danger' : 'text-muted'">{{ statistics == null ? t("common.unknown") : t("bind.executionCounts", { success: statistics[row.id]?.success ?? 0, failed: statistics[row.id]?.failed ?? 0 }) }}</p></template>
+      <template #cell-actions="{ row }"><MoreMenu><button class="button-secondary justify-start" :disabled="pending" @click="open(row)"><Pencil :size="16" />{{ t("common.edit") }}</button><RouterLink :to="`/executions?binding_id=${row.id}`" class="button-secondary justify-start">{{ t("executions.title") }}</RouterLink><button v-if="row.circuitBreakerTripped === true" class="button-danger justify-start" :disabled="pending" @click="operate(row, 'reset-breaker')"><RotateCcw :size="16" />{{ t("bind.resetBreaker") }}</button><button v-if="row.pendingDebtUsd != null && row.pendingDebtUsd > 0" class="button-secondary justify-start text-warning" :disabled="pending" @click="operate(row, 'reset-debt')"><RotateCcw :size="16" />{{ t("bind.clearDebt", { amt: formatUsd(row.pendingDebtUsd) }) }}</button><button class="button-danger justify-start" :disabled="pending" @click="operate(row, 'delete')"><Trash2 :size="16" />{{ t("common.delete") }}</button></MoreMenu></template>
+    </DataTable>
+    <footer v-if="bindings.length" class="flex flex-wrap items-center justify-between gap-2 text-xs text-muted">
+      <span v-if="statisticsAsOf" class="inline-flex items-center gap-2">{{ t("bind.statsAsOf") }}<FreshnessStamp :timestamp="statisticsAsOf" /></span>
+      <span v-else-if="statisticsError" class="text-warning">{{ t("bind.statsError") }} · {{ statisticsError }}</span>
+      <span v-else-if="statisticsLoading">{{ t("common.loading") }}</span>
+      <RouterLink to="/executions" class="text-accent">{{ t("executions.title") }}</RouterLink>
+    </footer>
+    <BaseModal :open="showModal" :title="t(editing ? 'bind.editModalTitle' : 'bind.modalTitle')" :busy="pending" wide @close="showModal = false">
+      <form ref="formElement" novalidate @submit.prevent="saveBinding"><fieldset class="space-y-5" :disabled="pending">
+        <p v-if="actionError" class="error-banner" role="alert">{{ actionError }}</p>
+        <div class="flex flex-wrap items-center gap-3"><EnvBadge :environment="environment" /><span v-if="!editing && environment === 'live'" class="text-sm text-warning">{{ t("bind.liveDisabled") }}</span></div>
+        <details open class="border-b border-border/50 pb-4"><summary class="flex min-h-11 cursor-pointer items-center justify-between gap-2 text-sm font-semibold">{{ t("bind.basicSection") }}<ChevronDown :size="17" /></summary>
+          <div class="mt-3 grid gap-4 sm:grid-cols-2">
+            <label class="field-label">{{ t("bind.label") }} *<input v-model="form.name" name="name" class="form-input mt-1" :aria-invalid="!!errors.name" required maxlength="120" /><span v-if="errors.name" class="field-error" role="alert">{{ errors.name }}</span></label>
+            <NumberField v-model="form.riskScale" name="riskScale" :rule="RISK_SCALE_RULE" :error="errors.riskScale || errors.risk_scale" />
+            <label class="field-label">{{ t("bind.leadSource") }} *<select v-model="form.leadId" class="form-input mt-1" :disabled="!!editing" :aria-invalid="!!errors.lead_id" required><option :value="null">{{ t("bind.selectLead") }}</option><option v-for="lead in leads" :key="lead.id" :value="lead.id">{{ lead.name ?? t("common.unknown") }}</option></select><span v-if="errors.lead_id" class="field-error" role="alert">{{ errors.lead_id }}</span></label>
+            <label class="field-label">{{ t("bind.followerAccount") }} *<select v-model="form.accountId" class="form-input mt-1" :disabled="!!editing" :aria-invalid="!!(errors.accountId || errors.account_id)" required><option :value="null">{{ t("bind.selectAccount") }}</option><option v-for="account in accounts" :key="account.id" :value="account.id">{{ account.name ?? t("common.unknown") }} · {{ t(account.environment === 'live' ? 'env.live' : account.environment === 'demo' ? 'env.demo' : 'common.unknown') }}</option></select><span v-if="errors.accountId || errors.account_id" class="field-error" role="alert">{{ errors.accountId || errors.account_id }}</span></label>
+            <div class="sm:col-span-2"><RiskPolicyFields v-model="form.risk" section="execution" :errors="errors" :defaults="defaults" /></div>
           </div>
-
-          <div class="flex flex-wrap items-center gap-2">
-            <button
-              @click="openEdit(b)"
-              class="px-3 py-1.5 rounded-lg bg-surface2 hover:bg-slate-700 text-xs text-slate-200 flex items-center gap-1.5"
-            >
-              <Settings2 class="w-3.5 h-3.5 text-accent" />
-              <span>{{ t("bind.editBtn") }}</span>
-            </button>
-
-            <button
-              @click="toggleBinding(b.id)"
-              class="px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 border transition-colors"
-              :class="
-                b.isEnabled
-                  ? 'bg-amber-500/10 border-amber-500/30 text-amber-300 hover:bg-amber-500/20'
-                  : 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300 hover:bg-emerald-500/20'
-              "
-            >
-              <Power class="w-3.5 h-3.5" />
-              <span>{{ b.isEnabled ? t("bind.pause") : t("bind.enable") }}</span>
-            </button>
-
-            <button
-              v-if="b.pendingDebtUsd > 0"
-              @click="resetDebt(b.id)"
-              class="px-3 py-1.5 rounded-lg bg-surface2 hover:bg-slate-700 text-xs text-amber-300 flex items-center gap-1.5"
-            >
-              <RotateCcw class="w-3.5 h-3.5" />
-              <span>{{ t("bind.clearDebt", { amt: formatUsd(b.pendingDebtUsd) }) }}</span>
-            </button>
-
-            <button
-              v-if="b.circuitBreakerTripped"
-              @click="resetBreaker(b.id)"
-              class="px-3 py-1.5 rounded-lg bg-rose-500 text-white text-xs font-semibold flex items-center gap-1.5 hover:bg-rose-600"
-            >
-              <AlertTriangle class="w-3.5 h-3.5" />
-              <span>{{ t("bind.resetBreaker") }}</span>
-            </button>
-
-            <button @click="deleteBinding(b.id)" class="p-2 rounded-lg text-slate-500 hover:text-rose-400 hover:bg-rose-500/10">
-              <Trash2 class="w-4 h-4" />
-            </button>
+        </details>
+        <details :open="sectionHasError('risk')" class="border-b border-border/50 pb-4"><summary class="flex min-h-11 cursor-pointer items-center justify-between gap-2 text-sm font-semibold">{{ t("bind.riskSection") }}<ChevronDown :size="17" /></summary><div class="mt-3"><RiskPolicyFields v-model="form.risk" section="risk" :errors="errors" :defaults="defaults" /></div></details>
+        <details :open="sectionHasError('protection')" class="border-b border-border/50 pb-4"><summary class="flex min-h-11 cursor-pointer items-center justify-between gap-2 text-sm font-semibold">{{ t("bind.protectionSection") }}<ChevronDown :size="17" /></summary><div class="mt-3 space-y-3"><p v-if="protectionLocked" class="text-xs text-warning">{{ lockMessage }}</p><RiskPolicyFields v-model="form.risk" section="protection" :errors="errors" :defaults="defaults" :disabled-fields="disabledRiskFields" /></div></details>
+        <details :open="!!(errors.whitelist || errors.symbol_whitelist || errors.symbol_blacklist || errors.symbolMap || errors.symbol_map)" class="border-b border-border/50 pb-4"><summary class="flex min-h-11 cursor-pointer items-center justify-between gap-2 text-sm font-semibold">{{ t("bind.filterSection") }}<ChevronDown :size="17" /></summary>
+          <div class="mt-3 grid gap-4 sm:grid-cols-2">
+            <label class="field-label">{{ t("bind.symbolWhitelist") }}<textarea v-model="form.whitelist" :placeholder="t('bind.symbolPlaceholder')" :aria-invalid="!!(errors.whitelist || errors.symbol_whitelist)" class="form-input mt-1" rows="2" /><span class="mt-1 block text-xs text-muted">{{ t("bind.whitelistHelp") }}</span><span v-if="errors.whitelist || errors.symbol_whitelist" class="field-error" role="alert">{{ errors.whitelist || errors.symbol_whitelist }}</span></label>
+            <label class="field-label">{{ t("bind.symbolBlacklist") }}<textarea v-model="form.blacklist" :placeholder="t('bind.symbolPlaceholder')" :aria-invalid="!!errors.symbol_blacklist" class="form-input mt-1" rows="2" /><span class="mt-1 block text-xs text-muted">{{ t("bind.blacklistHelp") }}</span><span v-if="errors.symbol_blacklist" class="field-error" role="alert">{{ errors.symbol_blacklist }}</span></label>
+            <label class="field-label sm:col-span-2">{{ t("bind.symbolMap") }}<textarea v-model="form.symbolMap" :placeholder="t('bind.symbolMapPlaceholder')" :disabled="protectionLocked" :aria-invalid="!!(errors.symbolMap || errors.symbol_map)" class="form-input mt-1 font-mono" rows="3" /><span class="mt-1 block text-xs" :class="protectionLocked ? 'text-warning' : 'text-muted'">{{ protectionLocked ? lockMessage : t("bind.mappingHelp") }}</span><span v-if="errors.symbolMap || errors.symbol_map" class="field-error" role="alert">{{ errors.symbolMap || errors.symbol_map }}</span></label>
           </div>
-        </div>
-
-        <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-7 gap-3 mt-4 p-3 rounded-xl bg-background/60 border border-slate-800/80 text-xs font-mono">
-          <div>
-            <span class="text-[10px] text-slate-500 block">{{ t("bind.riskScale") }}</span>
-            <span class="text-accent font-bold">{{ b.riskScale }}x</span>
-          </div>
-          <div>
-            <span class="text-[10px] text-slate-500 block">{{ t("bind.maxLev") }}</span>
-            <span class="text-slate-200">{{ b.enableLeverageCap ? `${b.maxSingleLeverage}x / ${b.maxTotalLeverage}x` : t("risk.autoLeverage") }}</span>
-          </div>
-          <div>
-            <span class="text-[10px] text-slate-500 block">{{ t("bind.drawdownBreaker") }}</span>
-            <span class="text-slate-200">{{ b.enableCircuitBreaker === false ? t("risk.circuitOff") : `${b.maxDrawdownPct}% / ${b.dailyMaxLossPct ?? 10}%` }}</span>
-          </div>
-          <div>
-            <span class="text-[10px] text-slate-500 block">{{ t("bind.slippageGuard") }}</span>
-            <span class="text-slate-200">{{ b.maxSlippagePct }}% / {{ b.maxSpreadPct ?? 0.3 }}%</span>
-          </div>
-          <div>
-            <span class="text-[10px] text-slate-500 block">{{ t("bind.orderPolicy") }}</span>
-            <span class="text-slate-200 uppercase">{{ b.orderMode }}</span>
-          </div>
-          <div>
-            <span class="text-[10px] text-slate-500 block">{{ t("bind.tpSlShort") }}</span>
-            <span class="text-slate-200">
-              <template v-if="b.tpSlMode === 'follow_lead'">{{ t("bind.tpslFollowShort") }}</template>
-              <template v-else-if="b.tpSlMode === 'hybrid_guard'">SL -{{ b.hardStopLossPct }}%</template>
-              <template v-else>{{ b.enableTakeProfit ? `+${b.takeProfitPct}%` : '-' }} / {{ b.enableStopLoss ? `-${b.stopLossPct}%` : '-' }}</template>
-            </span>
-          </div>
-          <div>
-            <span class="text-[10px] text-slate-500 block">{{ t("bind.pendingDebt") }}</span>
-            <span :class="b.pendingDebtUsd > 0 ? 'text-amber-400' : 'text-slate-400'">{{ formatUsd(b.pendingDebtUsd) }}</span>
-          </div>
-        </div>
-
-        <div v-if="b.circuitBreakerTripped" class="mt-3 p-2.5 rounded-lg bg-rose-500/15 border border-rose-500/30 text-xs text-rose-300 flex items-center gap-2">
-          <AlertTriangle class="w-4 h-4 shrink-0" />
-          <span>{{ t("bind.breakerBanner", { reason: b.circuitBreakerReason }) }}</span>
-        </div>
-      </div>
-    </div>
-
-    <!-- Modal -->
-    <div v-if="showModal" class="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
-      <div class="w-full max-w-2xl bg-surface border border-slate-800 rounded-2xl p-6 shadow-2xl max-h-[90vh] overflow-y-auto">
-        <div class="flex items-center justify-between mb-5">
-          <h3 class="text-lg font-bold text-white">{{ editingId ? t("bind.editModalTitle") : t("bind.modalTitle") }}</h3>
-          <button @click="showModal = false" class="text-slate-400 hover:text-white"><X class="w-5 h-5" /></button>
-        </div>
-        <form @submit.prevent="saveBinding" class="space-y-4">
-          <div v-if="formError" class="p-3 rounded-xl bg-rose-500/10 text-rose-400 text-xs">{{ formError }}</div>
-          <div>
-            <label class="block text-xs text-slate-400 mb-1">{{ t("bind.label") }}</label>
-            <input v-model="form.name" required :placeholder="t('bind.labelPlaceholder')" class="w-full px-3.5 py-2 rounded-xl bg-background border border-slate-700 text-sm text-white" />
-          </div>
-          <div v-if="!editingId" class="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <div>
-              <label class="block text-xs text-slate-400 mb-1">{{ t("bind.leadSource") }}</label>
-              <select v-model="form.leadId" required class="w-full px-3.5 py-2 rounded-xl bg-background border border-slate-700 text-sm text-white">
-                <option :value="null" disabled>{{ t("bind.selectLead") }}</option>
-                <option v-for="l in leads" :key="l.id" :value="l.id">{{ l.name }}</option>
-              </select>
-            </div>
-            <div>
-              <label class="block text-xs text-slate-400 mb-1">{{ t("bind.followerAccount") }}</label>
-              <select v-model="form.accountId" required class="w-full px-3.5 py-2 rounded-xl bg-background border border-slate-700 text-sm text-white">
-                <option :value="null" disabled>{{ t("bind.selectAccount") }}</option>
-                <option v-for="a in accounts" :key="a.id" :value="a.id">{{ a.name }} ({{ a.exchange }} {{ a.environment }})</option>
-              </select>
-            </div>
-          </div>
-
-          <div class="space-y-3 p-3 rounded-xl bg-background/60 border border-slate-800 text-xs">
-            <label class="flex items-center gap-2 text-slate-200">
-              <input v-model="form.enableCircuitBreaker" type="checkbox" class="w-4 h-4 rounded text-accent" />
-              {{ t("risk.circuitBreaker") }}
-            </label>
-            <p v-if="!form.enableCircuitBreaker" class="text-amber-300">{{ t("risk.circuitDisabledHint") }}</p>
-            <label class="flex items-center gap-2 text-slate-200">
-              <input v-model="form.enableLeverageCap" type="checkbox" class="w-4 h-4 rounded text-accent" />
-              {{ t("risk.leverageCap") }}
-            </label>
-            <p v-if="!form.enableLeverageCap" class="text-accent">{{ t("risk.autoLeverageHint") }}</p>
-            <p class="text-slate-400">{{ t("risk.zeroSkips") }}</p>
-          </div>
-          <div class="grid grid-cols-2 sm:grid-cols-3 gap-3">
-            <div>
-              <label class="block text-xs text-slate-400 mb-1">{{ t("bind.riskScaleInput") }}</label>
-              <input v-model.number="form.riskScale" type="number" step="0.1" min="0.1" max="20" class="w-full px-3 py-2 rounded-xl bg-background border border-slate-700 text-sm text-white" />
-            </div>
-            <div>
-              <label class="block text-xs text-slate-400 mb-1">{{ t("bind.maxSingleLev") }}</label>
-              <input v-model.number="form.maxSingleLeverage" :disabled="!form.enableLeverageCap" type="number" step="0.5" min="0" max="100" class="disabled:opacity-40 w-full px-3 py-2 rounded-xl bg-background border border-slate-700 text-sm text-white" />
-            </div>
-            <div>
-              <label class="block text-xs text-slate-400 mb-1">{{ t("bind.maxTotalLev") }}</label>
-              <input v-model.number="form.maxTotalLeverage" :disabled="!form.enableLeverageCap" type="number" step="0.5" min="0" max="100" class="disabled:opacity-40 w-full px-3 py-2 rounded-xl bg-background border border-slate-700 text-sm text-white" />
-            </div>
-            <div>
-              <label class="block text-xs text-slate-400 mb-1">{{ t("set.maxInstLev") }}</label>
-              <input v-model.number="form.maxInstrumentLeverage" :disabled="!form.enableLeverageCap" type="number" step="1" min="1" max="125" class="w-full px-3 py-2 rounded-xl bg-background border border-slate-700 text-sm text-white disabled:opacity-40" />
-            </div>
-            <div>
-              <label class="block text-xs text-slate-400 mb-1">{{ t("bind.maxDrawdown") }}</label>
-              <input v-model.number="form.maxDrawdownPct" :disabled="!form.enableCircuitBreaker" type="number" step="1" min="0" max="100" class="disabled:opacity-40 w-full px-3 py-2 rounded-xl bg-background border border-slate-700 text-sm text-white" />
-            </div>
-            <div>
-              <label class="block text-xs text-slate-400 mb-1">{{ t("bind.dailyMaxLoss") }}</label>
-              <input v-model.number="form.dailyMaxLossPct" :disabled="!form.enableCircuitBreaker" type="number" step="0.5" min="0" max="100" class="disabled:opacity-40 w-full px-3 py-2 rounded-xl bg-background border border-slate-700 text-sm text-white" />
-            </div>
-            <div>
-              <label class="block text-xs text-slate-400 mb-1">{{ t("bind.maxSlippage") }}</label>
-              <input v-model.number="form.maxSlippagePct" type="number" step="0.1" min="0.1" max="50" class="w-full px-3 py-2 rounded-xl bg-background border border-slate-700 text-sm text-white" />
-            </div>
-            <div>
-              <label class="block text-xs text-slate-400 mb-1">{{ t("bind.maxSpread") }}</label>
-              <input v-model.number="form.maxSpreadPct" type="number" step="0.05" min="0.05" max="10" class="w-full px-3 py-2 rounded-xl bg-background border border-slate-700 text-sm text-white" />
-            </div>
-            <div>
-              <label class="block text-xs text-slate-400 mb-1">{{ t("bind.iocOffset") }}</label>
-              <input v-model.number="form.iocOffsetPct" type="number" step="0.05" min="0" max="10" class="w-full px-3 py-2 rounded-xl bg-background border border-slate-700 text-sm text-white" />
-            </div>
-            <div>
-              <label class="block text-xs text-slate-400 mb-1">{{ t("bind.orderMode") }}</label>
-              <select v-model="form.orderMode" class="w-full px-3 py-2 rounded-xl bg-background border border-slate-700 text-xs text-white">
-                <option value="ioc_then_market">{{ t("bind.modeIocMarket") }}</option>
-                <option value="ioc_only">{{ t("bind.modeIocOnly") }}</option>
-                <option value="market_only">{{ t("bind.modeMarketOnly") }}</option>
-              </select>
-            </div>
-          </div>
-
-          <div class="p-3.5 rounded-xl bg-background/70 border border-slate-800 space-y-3">
-            <div>
-              <label class="block text-xs font-semibold text-white mb-1">{{ t("bind.tpSlModeLabel") }}</label>
-              <select v-model="form.tpSlMode" class="w-full px-3 py-2 rounded-xl bg-surface border border-slate-700 text-xs text-white">
-                <option value="follow_lead">{{ t("bind.tpslFollowLeadDesc") }}</option>
-                <option value="independent">{{ t("bind.tpslIndependentDesc") }}</option>
-                <option value="hybrid_guard">{{ t("bind.tpslHybridDesc") }}</option>
-              </select>
-            </div>
-
-            <div v-if="form.tpSlMode === 'hybrid_guard'" class="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <div>
-                <label class="block text-xs text-slate-400 mb-1">{{ t("bind.hardSlPct") }}</label>
-                <input v-model.number="form.hardStopLossPct" type="number" step="0.5" min="1" max="90" class="w-full px-3 py-2 rounded-lg bg-surface border border-slate-700 text-xs text-white" />
-              </div>
-              <div>
-                <label class="flex items-center gap-2 text-xs text-slate-300 mb-1 cursor-pointer">
-                  <input v-model="form.enableTakeProfit" type="checkbox" class="rounded bg-surface border-slate-600 text-accent" />
-                  <span>{{ t("bind.tpPct") }}</span>
-                </label>
-                <input v-model.number="form.takeProfitPct" :disabled="!form.enableTakeProfit" type="number" step="0.5" min="0.5" max="500" class="w-full px-3 py-2 rounded-lg bg-surface border border-slate-700 text-xs text-white disabled:opacity-40" />
-              </div>
-            </div>
-
-            <div v-if="form.tpSlMode === 'independent'" class="grid grid-cols-1 sm:grid-cols-3 gap-3">
-              <div>
-                <label class="flex items-center gap-2 text-xs text-slate-300 mb-1 cursor-pointer">
-                  <input v-model="form.enableStopLoss" type="checkbox" class="rounded bg-surface border-slate-600 text-accent" />
-                  <span>{{ t("bind.slPct") }}</span>
-                </label>
-                <input v-model.number="form.stopLossPct" :disabled="!form.enableStopLoss" type="number" step="0.5" min="0.5" max="95" class="w-full px-3 py-2 rounded-lg bg-surface border border-slate-700 text-xs text-white disabled:opacity-40" />
-              </div>
-              <div>
-                <label class="flex items-center gap-2 text-xs text-slate-300 mb-1 cursor-pointer">
-                  <input v-model="form.enableTakeProfit" type="checkbox" class="rounded bg-surface border-slate-600 text-accent" />
-                  <span>{{ t("bind.tpPct") }}</span>
-                </label>
-                <input v-model.number="form.takeProfitPct" :disabled="!form.enableTakeProfit" type="number" step="0.5" min="0.5" max="500" class="w-full px-3 py-2 rounded-lg bg-surface border border-slate-700 text-xs text-white disabled:opacity-40" />
-              </div>
-              <div>
-                <label class="flex items-center gap-2 text-xs text-slate-300 mb-1 cursor-pointer">
-                  <input v-model="form.enableTrailingStop" type="checkbox" class="rounded bg-surface border-slate-600 text-accent" />
-                  <span>{{ t("bind.trailingPct") }}</span>
-                </label>
-                <input v-model.number="form.trailingCallbackPct" :disabled="!form.enableTrailingStop" type="number" step="0.2" min="0.2" max="50" class="w-full px-3 py-2 rounded-lg bg-surface border border-slate-700 text-xs text-white disabled:opacity-40" />
-              </div>
-            </div>
-          </div>
-
-          <div class="flex justify-end gap-3 pt-2">
-            <button type="button" @click="showModal = false" class="px-4 py-2 rounded-xl bg-surface2 text-slate-300 text-xs font-medium">{{ t("leads.cancel") }}</button>
-            <button type="submit" class="px-4 py-2 rounded-xl bg-accent text-slate-950 font-semibold text-xs">{{ editingId ? t("bind.saveEditBtn") : t("bind.createBtn") }}</button>
-          </div>
-        </form>
-      </div>
-    </div>
+        </details>
+        <footer class="flex justify-end gap-3"><button type="button" class="button-secondary" @click="showModal = false">{{ t("common.cancel") }}</button><button class="button-primary" type="submit"><Save :size="17" />{{ t(pending ? "common.working" : "common.save") }}</button></footer>
+      </fieldset></form>
+    </BaseModal>
   </div>
 </template>

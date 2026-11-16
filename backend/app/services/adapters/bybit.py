@@ -18,6 +18,7 @@ from app.services.adapters.base import (
     InstrumentSpec,
     OrderBook,
     OrderResult,
+    api_error,
 )
 from app.services.proxy.manager import ProxyManager
 
@@ -47,9 +48,6 @@ class BybitAdapter(BaseExchangeAdapter):
             or self.TESTNET_URL
         )
         self.base_url = demo_url.rstrip("/") if environment == "demo" else self.LIVE_URL
-        self._instruments_cache: Dict[str, InstrumentSpec] = {}
-        self._instruments_cache_ts: float = 0.0
-        self._cache_ttl_sec: float = 600.0
 
     def _sign(self, timestamp_ms: str, recv_window: str, payload_str: str) -> str:
         msg = f"{timestamp_ms}{self.api_key}{recv_window}{payload_str}"
@@ -73,7 +71,7 @@ class BybitAdapter(BaseExchangeAdapter):
         auth: bool = True,
         retries: int = 3,
     ) -> Dict[str, Any]:
-        self._check_rate_limit()
+        self._check_rate_limit(auth)  # 私有冷却不得串扰其他账户。
         method = method.upper()
         # A mutation may already have reached the exchange when its response is lost.
         attempts = max(1, retries) if method == "GET" else 1
@@ -84,9 +82,7 @@ class BybitAdapter(BaseExchangeAdapter):
         recv_window = "5000"
 
         last_err: Optional[Exception] = None
-        async with ProxyManager.build_client(
-            proxy_url=self.proxy_url, timeout=self.timeout, exchange=self.exchange,
-        ) as client:
+        async with self.request_client(auth) as client:
             for attempt in range(attempts):
                 headers: Dict[str, str] = {
                     "Content-Type": "application/json",
@@ -110,16 +106,16 @@ class BybitAdapter(BaseExchangeAdapter):
                         raise ValueError(f"Unsupported HTTP method: {method}")
 
                     if resp.status_code == 429:
-                        self._note_rate_limit(resp)
-                    if resp.status_code >= 400:
-                        raise ExchangeAPIError("bybit", str(resp.status_code), f"HTTP {resp.status_code}: {resp.text[:200]}")
-
+                        self._note_rate_limit(resp, auth)
+                    # 状态码不能替代可解析的业务拒绝证据。
                     payload = resp.json()
+                    if not isinstance(payload, dict):
+                        raise ExchangeAPIError("bybit", "AMBIGUOUS", "Malformed API response")
                     ret_code = int(payload.get("retCode", -1))
-                    if ret_code != 0:
+                    if not 200 <= resp.status_code < 300 or ret_code != 0:
                         if ret_code in (10006, 10018):
-                            self._note_rate_limit(resp)
-                        raise ExchangeAPIError("bybit", str(ret_code), payload.get("retMsg", ""), payload)
+                            self._note_rate_limit(resp, auth)
+                        raise api_error("bybit", str(ret_code), payload.get("retMsg", ""), payload, resp.status_code)
                     return payload.get("result") or {}
                 except ExchangeAPIError:
                     raise
@@ -245,9 +241,9 @@ class BybitAdapter(BaseExchangeAdapter):
         return positions
 
     async def get_instruments(self, force_refresh: bool = False) -> Dict[str, InstrumentSpec]:
-        now = time.time()
-        if not force_refresh and self._instruments_cache and now - self._instruments_cache_ts < self._cache_ttl_sec:
-            return self._instruments_cache
+        cached = self._cached_instruments(force_refresh)
+        if cached is not None:
+            return cached
         rows = await self._all_pages("/v5/market/instruments-info", {"category": "linear", "limit": 1000}, auth=False)
         result: Dict[str, InstrumentSpec] = {}
         for item in rows:
@@ -266,8 +262,7 @@ class BybitAdapter(BaseExchangeAdapter):
                 )
             except (ValueError, KeyError, ArithmeticError, TypeError):
                 continue
-        self._instruments_cache, self._instruments_cache_ts = result, now
-        return result
+        return self._cache_instruments(result)
 
     async def get_orderbook(self, inst_id: str, depth: int = 5) -> OrderBook:
         res = await self._request(
@@ -348,6 +343,11 @@ class BybitAdapter(BaseExchangeAdapter):
             cl_ord_id=str(res.get("orderLinkId") or cl_ord_id or ""),
             raw=res,
         )
+
+    async def cancel_order(self, inst_id: str, cl_ord_id: str) -> None:
+        """撤销一笔普通挂单；撤单结果以随后的查单为准，失败时抛 ExchangeAPIError。"""
+        await self._request("POST", "/v5/order/cancel",
+                            body={"category": "linear", "symbol": inst_id, "orderLinkId": cl_ord_id})
 
     async def get_order(
         self,

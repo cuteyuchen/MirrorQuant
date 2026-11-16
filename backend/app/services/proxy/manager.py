@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 import time
 from dataclasses import dataclass
 from typing import Optional, Sequence
@@ -9,6 +11,9 @@ import httpx
 from app.core.config import get_settings
 from app.core.secret_mask import redact_proxy_userinfo
 from app.models.domain import ProxyNode
+
+
+logger = logging.getLogger("mirrorquant.proxy")
 
 
 class ProxyEgressError(RuntimeError):
@@ -58,13 +63,21 @@ class ProxyManager:
         kwargs: dict = {
             "timeout": httpx.Timeout(timeout),
             "headers": merged_headers,
-            "follow_redirects": True,
+            "follow_redirects": False,  # 重定向不得将凭据或请求转发到其他主机。
             # Only the selected route may determine egress, including direct routes.
             "trust_env": False,
         }
         if proxy_url:
             kwargs["proxy"] = proxy_url
         return httpx.AsyncClient(**kwargs)
+
+    @staticmethod
+    async def close_clients(clients: Sequence[httpx.AsyncClient]) -> None:
+        # 一个连接关闭失败也要清理其余连接，日志只暴露异常类型。
+        results = await asyncio.gather(*(client.aclose() for client in clients), return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                logger.error("HTTP client cleanup failed (%s)", type(result).__name__)
 
     @staticmethod
     def select_proxy_url(
@@ -84,8 +97,10 @@ class ProxyManager:
         ordered: list[Optional[str]] = []
         if preferred_proxy_id is not None:
             for n in enabled:
-                if n.id == preferred_proxy_id and n.is_healthy and n.url not in ordered:
-                    ordered.append(n.url)
+                if n.id == preferred_proxy_id and n.is_healthy and n.url and n.url.strip():
+                    return [n.url]
+            # 显式代理是出口约束，不是可降级的优先级提示。
+            raise ProxyEgressError("Assigned proxy is missing, disabled or unhealthy; egress blocked")
         settings = get_settings()
         exchange = exchange.strip().lower() if exchange else None
         if exchange in settings.direct_egress_exchanges and exchange not in settings.proxy_required_exchanges:
@@ -116,7 +131,7 @@ class ProxyManager:
             async with cls.build_client(proxy_url=proxy_url, timeout=timeout) as client:
                 resp = await client.get(test_url)
             latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
-            if resp.status_code < 400:
+            if 200 <= resp.status_code < 300:  # 未跟随的重定向也不能作为出口健康证据。
                 return ProxyTestResult(
                     healthy=True,
                     latency_ms=latency_ms,

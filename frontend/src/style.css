@@ -3,28 +3,283 @@
 @tailwind utilities;
 
 @layer base {
+  /*
+   * 语义色以 RGB 三元组声明，Tailwind 通过 rgb(var(--c-x) / <alpha>) 引用，
+   * 因此 bg-accent/10 之类的透明度写法在亮/暗两套主题下都有效。
+   * :root 为亮色主题，html.dark 覆盖为暗色主题（默认主题由 index.html 首屏脚本决定）。
+   */
+  :root {
+    color-scheme: light;
+    --c-bg: 240 244 249;
+    --c-surface: 255 255 255;
+    --c-surface2: 237 242 248;
+    --c-surface3: 222 229 239;
+    --c-border: 203 213 225;
+    --c-fg: 15 23 42;
+    --c-muted: 71 85 105;
+    --c-faint: 100 116 139;
+    --c-accent: 14 116 144;
+    --c-brand: 37 99 235;
+    --c-success: 4 120 87;
+    --c-danger: 190 18 60;
+    --c-danger-solid: 190 18 60;
+    --c-warning: 180 83 9;
+    --c-on-accent: 255 255 255;
+    --c-scrim: 15 23 42;
+    --glow-alpha: 0.07;
+    --shadow-card: 0 1px 2px rgb(15 23 42 / 0.05), 0 10px 28px -16px rgb(15 23 42 / 0.18);
+    --shadow-pop: 0 18px 48px -14px rgb(15 23 42 / 0.32);
+    /*
+     * 图表分类色：固定顺序 蓝→橙→紫→黄→品红，刻意避开盈亏状态色与强调色。
+     * 已对白色表面做过色弱可分辨校验；黄与品红对比度偏低，使用处必须配文字图例。
+     */
+    --c-chart-1: 42 120 214;
+    --c-chart-2: 235 104 52;
+    --c-chart-3: 98 80 214;
+    --c-chart-4: 237 161 0;
+    --c-chart-5: 232 123 164;
+  }
+  .dark {
+    color-scheme: dark;
+    --c-bg: 8 12 20;
+    --c-surface: 15 23 42;
+    --c-surface2: 30 41 59;
+    --c-surface3: 45 58 80;
+    --c-border: 51 65 85;
+    --c-fg: 241 245 249;
+    --c-muted: 148 163 184;
+    --c-faint: 125 140 162;
+    --c-accent: 34 211 238;
+    --c-brand: 96 165 250;
+    --c-success: 52 211 153;
+    --c-danger: 251 113 133;
+    --c-danger-solid: 190 18 60;
+    --c-warning: 251 191 36;
+    --c-on-accent: 3 19 30;
+    --c-scrim: 2 6 16;
+    --glow-alpha: 0.09;
+    --shadow-card: inset 0 1px 0 rgb(255 255 255 / 0.03), 0 14px 34px -18px rgb(0 0 0 / 0.75);
+    --shadow-pop: 0 22px 56px -14px rgb(0 0 0 / 0.8);
+    /* 暗色表面单独选的一组分类色（同色相、不同明度），不是亮色的自动反转。 */
+    --c-chart-1: 57 135 229;
+    --c-chart-2: 217 89 38;
+    --c-chart-3: 144 133 233;
+    --c-chart-4: 201 133 0;
+    --c-chart-5: 213 81 129;
+  }
+
   body {
-    background-color: #080c14;
-    color: #f1f5f9;
+    @apply bg-background font-sans text-sm text-foreground;
+  }
+  /* 页面顶部的两团柔光增加层次；用固定伪元素而不是 background-attachment，移动端滚动更顺。 */
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    background-image:
+      radial-gradient(1100px 520px at 0% -10%, rgb(var(--c-accent) / var(--glow-alpha)), transparent 62%),
+      radial-gradient(900px 480px at 100% -12%, rgb(var(--c-brand) / var(--glow-alpha)), transparent 58%);
+  }
+  :focus-visible { @apply outline outline-2 outline-offset-2 outline-accent; }
+  button, a, input, select, textarea { touch-action: manipulation; }
+  button:disabled { @apply cursor-not-allowed opacity-50; }
+  input[type="checkbox"] { @apply h-5 w-5 shrink-0 cursor-pointer accent-accent; }
+  /* 语义为开关的复选框直接画成滑动开关，页面无需各自实现。 */
+  input[type="checkbox"][role="switch"] {
+    @apply relative h-6 w-11 appearance-none rounded-full border border-border/70 bg-surface3 transition-colors;
+  }
+  input[type="checkbox"][role="switch"]::after {
+    content: "";
+    @apply absolute left-0.5 top-0.5 h-[18px] w-[18px] rounded-full bg-white shadow transition-transform;
+  }
+  input[type="checkbox"][role="switch"]:checked { @apply border-accent bg-accent; }
+  input[type="checkbox"][role="switch"]:checked::after { transform: translateX(1.25rem); }
+  input[type="checkbox"]:disabled { @apply cursor-not-allowed opacity-50; }
+  th, td { @apply break-words; }
+  th { @apply font-medium text-muted; }
+  h1, h2, h3, p, dd, dt { overflow-wrap: anywhere; }
+  ::selection { @apply bg-accent/30; }
+}
+
+@layer components {
+  /* —— 容器：卡片承载一个完整区块，瓦片承载卡片里的单个指标 —— */
+  .card { @apply min-w-0 rounded-2xl border border-border/60 bg-surface shadow-card; }
+  .card-header { @apply flex flex-wrap items-center justify-between gap-3 border-b border-border/50 px-4 py-3 sm:px-5; }
+  .card-body { @apply p-4 sm:p-5; }
+  .tile { @apply min-w-0 rounded-xl border border-border/50 bg-background/60 p-3; }
+  /* 顶部一道强调色光带，用于需要被一眼看到的卡片。 */
+  .card-accent { @apply relative overflow-hidden; }
+  .card-accent::before {
+    content: "";
+    @apply pointer-events-none absolute inset-x-0 top-0 h-0.5;
+    background: linear-gradient(90deg, transparent, rgb(var(--c-accent) / 0.85), transparent);
+  }
+
+  /* —— 指标文字 —— */
+  .eyebrow { @apply text-xs font-semibold uppercase tracking-wider text-muted; }
+  .kpi-label { @apply flex items-center gap-1.5 text-xs font-medium text-muted; }
+  .kpi-value { @apply mt-1 font-mono text-xl font-bold leading-tight tabular-nums tracking-tight; overflow-wrap: anywhere; }
+  .kpi-sub { @apply mt-1 text-xs text-muted; overflow-wrap: anywhere; }
+  /* 带语义色调的 KPI 卡：色调由下方 .tone-* 提供，缺省为中性边框色。 */
+  .kpi-card {
+    --tone: initial;
+    @apply relative min-w-0 overflow-hidden rounded-2xl border bg-surface p-4 shadow-card;
+    border-color: rgb(var(--tone, var(--c-border)) / 0.45);
+    background-image: linear-gradient(140deg, rgb(var(--tone, var(--c-border)) / 0.14), transparent 62%);
+  }
+
+  /* —— 胶囊徽章：同样通过 .tone-* 取色 —— */
+  .pill {
+    --tone: initial;
+    @apply inline-flex shrink-0 items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-medium leading-5;
+    color: rgb(var(--tone, var(--c-muted)));
+    border-color: rgb(var(--tone, var(--c-muted)) / 0.32);
+    background-color: rgb(var(--tone, var(--c-muted)) / 0.12);
+  }
+  /* 多空方向徽章：多头用盈利色，空头用亏损色。 */
+  .side-long { @apply inline-flex shrink-0 items-center gap-1 rounded-md border border-success/35 bg-success/15 px-2 py-0.5 text-xs font-bold text-success; }
+  .side-short { @apply inline-flex shrink-0 items-center gap-1 rounded-md border border-danger/35 bg-danger/15 px-2 py-0.5 text-xs font-bold text-danger; }
+  .side-unknown { @apply inline-flex shrink-0 items-center gap-1 rounded-md border border-border/60 bg-surface2 px-2 py-0.5 text-xs font-bold text-muted; }
+  /* 呼吸圆点表示数据仍在实时刷新。 */
+  .live-dot { @apply relative inline-flex h-2 w-2 shrink-0 rounded-full bg-current; }
+  .live-dot::after { content: ""; @apply absolute inset-0 animate-ping rounded-full bg-current opacity-60; }
+
+  /* —— 按钮与表单 —— */
+  .button-primary { @apply inline-flex min-h-11 items-center justify-center gap-2 rounded-lg bg-accent px-4 py-2 text-sm font-semibold text-onAccent shadow-sm transition hover:brightness-110 active:brightness-95 md:min-h-10; }
+  .button-secondary { @apply inline-flex min-h-11 items-center justify-center gap-2 rounded-lg border border-border/70 bg-surface2/70 px-3 py-2 text-sm font-medium text-foreground transition hover:border-border hover:bg-surface3 md:min-h-10; }
+  .button-danger { @apply inline-flex min-h-11 items-center justify-center gap-2 rounded-lg bg-dangerSolid px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:brightness-110 active:brightness-95 md:min-h-10; }
+  .button-ghost { @apply inline-flex min-h-11 items-center justify-center gap-2 rounded-lg px-3 py-2 text-sm font-medium text-muted transition hover:bg-surface2 hover:text-foreground md:min-h-10; }
+  .icon-button { @apply inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-muted transition hover:bg-surface2 hover:text-foreground md:h-10 md:w-10; }
+  .menu-item { @apply flex min-h-11 w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm font-medium text-foreground transition hover:bg-surface2 md:min-h-10; }
+  .field-label { @apply block text-sm font-medium text-muted; }
+  .form-input { @apply min-h-11 w-full min-w-0 rounded-lg border border-border bg-background/70 px-3 py-2 text-base text-foreground transition placeholder:text-faint focus:border-accent focus:outline-none focus:ring-2 focus:ring-accent/25 md:min-h-10 md:text-sm; }
+  .form-input[aria-invalid="true"] { @apply border-danger focus:border-danger focus:ring-danger/25; }
+  .field-error { @apply mt-1 text-xs text-danger; }
+
+  /* 只在宽度不足时断开长数字，正常金额继续纵向等宽对齐。 */
+  .number { @apply text-right font-mono tabular-nums; overflow-wrap: anywhere; }
+
+  /* —— 页面骨架 —— */
+  .page-heading { @apply flex flex-wrap items-center justify-between gap-3; }
+  .page-title { @apply text-xl font-bold tracking-tight md:text-2xl; }
+  .section-title { @apply text-base font-semibold; }
+  .empty-state { @apply py-10 text-center text-sm text-muted; }
+  .error-banner { @apply flex flex-wrap items-center justify-between gap-3 rounded-xl border border-danger/40 bg-danger/10 p-3 text-sm text-danger; }
+  .warning-banner { @apply rounded-xl border border-l-4 border-warning/40 border-l-warning bg-warning/10 p-3 text-sm text-warning; }
+
+  /* —— 品牌图标块：侧栏、移动顶栏、登录页与公开页共用 —— */
+  .brand-mark {
+    @apply inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-accent/30 bg-gradient-to-br from-accent/25 to-brand/25 text-accent;
+    box-shadow: 0 6px 18px -8px rgb(var(--c-accent) / 0.6);
+  }
+  /* KPI 卡右上角的图标跟随卡片色调。 */
+  .kpi-icon { @apply shrink-0; color: rgb(var(--tone, var(--c-muted))); }
+  /* 持仓卡左缘的强调条：标记今日新开的仓位。 */
+  .today-edge { box-shadow: inset 3px 0 0 rgb(var(--c-accent)); }
+  /* 止损→止盈位置条的底轨，两端用亏损 / 盈利色提示方向。 */
+  .level-track {
+    @apply relative h-1.5 rounded-full;
+    background: linear-gradient(90deg, rgb(var(--c-danger) / 0.4), rgb(var(--c-surface3)) 22%, rgb(var(--c-surface3)) 78%, rgb(var(--c-success) / 0.4));
+  }
+
+  /*
+   * —— 表格：表头是一条浅底圆角横条，行悬停高亮 ——
+   * 用 separate 边框模型，表头首尾单元格的圆角才稳定生效；
+   * 外层卡片不裁剪溢出，行内的下拉菜单可以伸出表格。
+   */
+  .data-table { @apply w-full table-fixed border-separate border-spacing-0 text-sm; }
+  .data-table th, .data-table td { @apply border-b border-border/40 px-3 py-3 align-top; }
+  .data-table thead th { @apply border-b-0 bg-surface2/70 py-2.5 text-xs font-semibold text-muted; }
+  .data-table thead th:first-child { @apply rounded-l-lg; }
+  .data-table thead th:last-child { @apply rounded-r-lg; }
+  .data-table tbody:last-child > tr:last-child > td { @apply border-b-0; }
+  .data-table tbody tr { @apply transition-colors; }
+
+  /* —— 页签：分段控件样式，选中项用强调色底 —— */
+  .tab-list { @apply inline-flex max-w-full flex-wrap gap-1 rounded-xl border border-border/60 bg-surface p-1 shadow-card; }
+  .tab-button { @apply inline-flex min-h-11 items-center justify-center gap-2 rounded-lg px-3 py-2 text-sm font-medium text-muted transition hover:bg-surface2 hover:text-foreground md:min-h-9; }
+  .tab-button[aria-selected="true"], .tab-button[aria-pressed="true"] {
+    @apply bg-accent/15 text-accent;
+    box-shadow: inset 0 0 0 1px rgb(var(--c-accent) / 0.32);
+  }
+
+  /* —— 指标小格（StatTile）：标签、数值、副文案 —— */
+  .stat-label { @apply text-xs font-medium text-muted; }
+  .stat-value { @apply mt-1 font-mono text-sm font-semibold tabular-nums; overflow-wrap: anywhere; }
+  .stat-sub { @apply mt-0.5 text-xs text-muted; overflow-wrap: anywhere; }
+  /* 区块标题左侧的图标块：比品牌图标块更安静，只用强调色淡底。 */
+  .section-icon { @apply inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-accent/10 text-accent; }
+  /* 小号选择片：快捷金额、周期切换等次要选项。 */
+  .chip-button { @apply inline-flex min-h-9 items-center justify-center rounded-lg border border-border/60 bg-surface2/50 px-2.5 py-1 font-mono text-xs font-semibold tabular-nums text-muted transition hover:border-border hover:text-foreground md:min-h-8; }
+  .chip-button[aria-pressed="true"] { @apply border-accent/40 bg-accent/15 text-accent; }
+  /* 占比条：底轨 + 填充段，宽度由内联样式给出。 */
+  .meter-track { @apply flex h-2 w-full overflow-hidden rounded-full bg-surface3; }
+  /* 72 小时区间条：低位偏盈利色、高位偏亏损色，标出均价与现价落点。 */
+  .range-track {
+    @apply relative h-2 rounded-full;
+    background: linear-gradient(90deg, rgb(var(--c-success) / 0.45), rgb(var(--c-surface3)) 35%, rgb(var(--c-surface3)) 65%, rgb(var(--c-danger) / 0.45));
   }
 }
+
+/* 色调类只负责设置 --tone，供 .pill / .kpi-card 取色；写在 layer 之外，动态拼接的类名也不会被裁剪。 */
+.tone-accent { --tone: var(--c-accent); }
+.tone-brand { --tone: var(--c-brand); }
+.tone-success { --tone: var(--c-success); }
+.tone-danger { --tone: var(--c-danger); }
+.tone-warning { --tone: var(--c-warning); }
+.tone-neutral { --tone: var(--c-muted); }
 
 .pb-safe {
   padding-bottom: max(0.5rem, env(safe-area-inset-bottom, 0px));
 }
 
-/* Custom scrollbars */
+/* 区块直达的落点：吸顶状态栏把自身高度写进 --sticky-top，没有吸顶栏的页面只留一点呼吸空间。 */
+[data-section] { scroll-margin-top: var(--sticky-top, 1rem); }
+
+/*
+ * —— 容器查询栅格 ——
+ * 卡片按“自身宽度”而不是视口宽度决定列数：旁边并排了时间线或侧栏时，
+ * 数字小格也不会被挤到换行。.cq 声明容器，其余类在最近的容器内响应。
+ */
+.cq { container-type: inline-size; }
+.cq-tiles, .cq-tiles-6 { display: grid; gap: 0.5rem; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.cq-split { display: grid; gap: 1rem; min-width: 0; }
+@container (min-width: 520px) { .cq-tiles { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+@container (min-width: 620px) { .cq-tiles-6 { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@container (min-width: 1120px) { .cq-tiles-6 { grid-template-columns: repeat(6, minmax(0, 1fr)); } }
+/* 持仓卡足够宽时，基础数据与 PA / SMC 分析左右并排。 */
+@container (min-width: 1200px) { .cq-split { grid-template-columns: minmax(0, 1fr) minmax(0, 1.05fr); } }
+
+/* 价格跳动时的短暂闪烁，方向由类名决定。 */
+@keyframes mq-flash-up {
+  from { background-color: rgb(var(--c-success) / 0.32); }
+  to { background-color: transparent; }
+}
+@keyframes mq-flash-down {
+  from { background-color: rgb(var(--c-danger) / 0.32); }
+  to { background-color: transparent; }
+}
+.flash-up { animation: mq-flash-up 0.9s ease-out; }
+.flash-down { animation: mq-flash-down 0.9s ease-out; }
+
+/* 滚动条跟随主题语义色。 */
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 8px;
+  height: 8px;
 }
 ::-webkit-scrollbar-track {
-  background: #0b0f19;
+  background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: #27354a;
-  border-radius: 3px;
+  background: rgb(var(--c-surface3));
+  border-radius: 4px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #3b4e6b;
+  background: rgb(var(--c-border));
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 }

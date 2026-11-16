@@ -5,15 +5,22 @@ services:
       dockerfile: Dockerfile
     container_name: mirrorquant-app
     restart: unless-stopped
+    stop_grace_period: 70s  # 等待当前通知结束，未决队列留待重启恢复。
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     env_file:
       - path: .env
         required: false
     environment:
       - MQ_DATA_DIR=/app/data
-      - MQ_DATABASE_URL=sqlite+aiosqlite:////app/data/mirrorquant.db
-      - MQ_TRUSTED_PROXY_CIDRS=127.0.0.0/8,::1/128,172.30.0.3/32
+      - MQ_DATABASE_URL=${MQ_DATABASE_URL:-sqlite+aiosqlite:////app/data/mirrorquant.db}
+      # 显式 .env（包括空值）优先；未定义才信任固定 Nginx 地址。
+      - MQ_TRUSTED_PROXY_CIDRS=${MQ_TRUSTED_PROXY_CIDRS-127.0.0.0/8,::1/128,172.30.0.3/32}
     ports:
-      - "${MQ_PORT:-8000}:8000"
+      - "127.0.0.1:${MQ_PORT:-8000}:8000"  # 公网只能经过 Nginx 的安全边界。
     volumes:
       - ./data:/app/data
     healthcheck:
@@ -26,6 +33,12 @@ services:
     image: nginx:1.27-alpine
     container_name: mirrorquant-nginx
     restart: unless-stopped
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     depends_on:
       mirrorquant:
         condition: service_healthy

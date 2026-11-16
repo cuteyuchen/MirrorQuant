@@ -1,0 +1,5 @@
+# 开发与离线回归工具不进入生产镜像。
+-r requirements.txt
+pytest>=8.3.3,<9
+pytest-asyncio>=0.24.0,<1
+respx>=0.21.1,<0.23

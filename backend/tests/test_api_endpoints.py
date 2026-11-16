@@ -105,6 +105,15 @@ async def test_api_full_workflow(async_client: AsyncClient):
     # 11. Public Feed
     res = await async_client.get("/api/dashboard/public")
     assert res.status_code == 200
+    # 公开看板默认关闭，管理员显式授权后才验证公开数据。
+    assert res.json() == {"enabled": False, "leads": []}
+    res = await async_client.put(
+        "/api/settings", headers=headers, json={"public_monitoring_enabled": True},
+    )
+    assert res.status_code == 200
+    assert res.json()["public_monitoring_enabled"] is True
+    res = await async_client.get("/api/dashboard/public")
+    assert res.status_code == 200
     assert res.json()["enabled"] is True
     assert len(res.json()["leads"]) == 1
     assert res.json()["leads"][0]["name"] == "Alpha-Lead-1"

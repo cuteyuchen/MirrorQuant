@@ -58,6 +58,9 @@ async def test_nested_stored_telemetry_masks_proxy_credentials(telemetry, endpoi
         "accounts": "/api/accounts",
     }[endpoint]
     if endpoint == "public":
+        # 公开看板默认关闭；先通过管理员入口开启再验证实际公开数据脱敏。
+        enabled = await client.put("/api/settings", json={"publicMonitoringEnabled": True})
+        assert enabled.status_code == 200 and enabled.json()["public_monitoring_enabled"] is True
         client.headers.pop("Authorization")
     response = await client.get(path)
     assert response.status_code == 200
@@ -195,6 +198,9 @@ async def test_historical_partial_credentials_hidden_on_all_diagnostic_reads(tel
         "audit": "/api/settings/audit-logs",
     }[endpoint]
     if endpoint == "public":
+        # 历史敏感数据也必须在显式开启的公开响应中验证，不能只检查空看板。
+        enabled = await client.put("/api/settings", json={"publicMonitoringEnabled": True})
+        assert enabled.status_code == 200 and enabled.json()["public_monitoring_enabled"] is True
         client.headers.pop("Authorization")
     response = await client.get(path)
     assert response.status_code == 200

@@ -26,8 +26,8 @@ def message_record():
 
 
 @pytest.mark.parametrize("side,direction,label", [
-    ("BUY", "LONG", "买入开多/加多"), ("SELL", "SHORT", "卖出开空/加空"),
-    ("SELL", "LONG", "卖出平多/减多"), ("BUY", "SHORT", "买入平空/减空"),
+    ("BUY", "LONG", "🟢 带单 开多/加多"), ("SELL", "SHORT", "🔴 带单 开空/加空"),
+    ("SELL", "LONG", "🟢 带单 平多/减多"), ("BUY", "SHORT", "🔴 带单 平空/减空"),
 ])
 def test_independent_lead_leg_precedes_different_follower_fill(side, direction, label):
     rec = message_record()
@@ -35,11 +35,12 @@ def test_independent_lead_leg_precedes_different_follower_fill(side, direction, 
                   avgPrice="123.45", notionalExact="15.24148161729148160205")
     msg = trade_message(rec, SimpleNamespace(exchange="binance", environment="live"), source)
     lead, follower = msg.split("\n\n")
-    assert label in lead and "ZECUSDT" in lead and direction in lead
+    assert label in lead and "ZECUSDT" in lead and {"LONG": "做多", "SHORT": "做空"}[direction] in lead
     assert "0.123456789123456789" in lead and "123.45" in lead
-    assert "15.24148161729148160205" in lead
+    assert "金额 15.24 U" in lead  # 金额统一两位小数，价格与数量保留原始精度。
+    assert "1000U" not in lead  # 没有带单员保证金余额时不估算折算仓位。
     assert "✅ 已成交" in follower and "账户 #1 / 绑定 #2" in follower
-    assert "跟单确认数量: 1 | 成交均价: 101 | 名义金额: 101" in follower
+    assert "📦 数量 1 ｜ 均价 101 ｜ 金额 101.00 U" in follower
     assert "张" not in msg  # Lead units and follower contracts are not interchangeable.
 
 
@@ -83,22 +84,39 @@ def test_unknown_lead_values_and_autonomous_follower_exit_are_not_fabricated():
     rec = message_record()
     rec.action, rec.lead_qty, rec.lead_price, rec.lead_notional = "TP_CLOSE", 0, 0, 0
     msg = trade_message(rec, SimpleNamespace(exchange="okx", environment="live"))
-    assert "带单动作: 未知" in msg
-    assert "带单成交均价: 未知 | 数量: 未知 | 名义金额: 未知" in msg
+    assert "带单 未知" in msg
+    assert "均价 未知 ｜ 数量 未知 ｜ 金额 未知" in msg
     header, follower = msg.split("\n\n")
-    assert "BTCUSDT" not in header and "方向 未知" in header
-    assert "BTCUSDT" in follower and "跟单账户" in follower
+    assert "BTCUSDT" not in header and "方向未知" in header and "1000U" not in header
+    assert "BTCUSDT" in follower and "跟单账户 #1" in follower
     assert "✅ 已成交" in msg  # The follower's confirmed fill remains accurately reported.
     source = dict(symbol="ZECUSDT", side="SELL", positionSide="LONG", qty="2", avgPrice=None)
     lead = trade_message(rec, SimpleNamespace(exchange="okx", environment="live"), source).split("\n\n")[0]
-    assert "卖出平多/减多" in lead and "均价: 未知 | 数量: 2 | 名义金额: 未知" in lead
+    assert "平多/减多" in lead and "均价 未知 ｜ 数量 2 ｜ 金额 未知" in lead
+
+
+@pytest.mark.parametrize("side,direction,margin,expected", [
+    ("BUY", "LONG", 4000, "🧮 1000U 本金 ≈ 开 50.00 U ｜ 建议杠杆 2x"),  # 200/4000，即 5% 仓位
+    ("SELL", "SHORT", 100, "🧮 1000U 本金 ≈ 开 2,000.00 U ｜ 建议杠杆 40x"),  # 2 倍名义对应 40x
+    ("BUY", "LONG", 10, "建议杠杆 50x"),  # 杠杆上限 50x
+    ("SELL", "LONG", 4000, None), ("BUY", "SHORT", 4000, None),  # 平仓不给折算与杠杆
+    ("BUY", "LONG", 0, None), ("BUY", "LONG", None, None), ("BUY", "LONG", float("nan"), None),
+])
+def test_reference_capital_line_only_for_opening_legs_with_known_margin(side, direction, margin, expected):
+    source = dict(symbol="BTCUSDT", side=side, positionSide=direction, qty="2", avgPrice="100", notional="200")
+    msg = trade_message(message_record(), SimpleNamespace(exchange="okx", environment="live"), source, margin)
+    lead = msg.split("\n\n")[0]
+    if expected is None:
+        assert "1000U" not in lead and "杠杆" not in lead
+    else:
+        assert expected in lead
 
 
 def test_historical_close_does_not_use_peak_quantity_or_follower_amount():
     source = {"_closed": {"symbol": "ZECUSDT", "side": "SHORT", "avgClosePrice": "123.45", "maxQty": 99}}
     lead = trade_message(message_record(), SimpleNamespace(exchange="okx", environment="live"), source).split("\n\n")[0]
-    assert "平仓（历史持仓记录）" in lead and "方向 SHORT" in lead
-    assert "均价: 123.45 | 数量: 未知 | 名义金额: 未知" in lead
+    assert "平仓（历史持仓记录）" in lead and "🔴" in lead and "做空" in lead
+    assert "均价 123.45 ｜ 数量 未知 ｜ 金额 未知" in lead
 
 
 def test_trade_payload_excludes_names_errors_urls_and_order_ids():
@@ -134,8 +152,8 @@ async def test_fanout_keeps_source_identity_and_does_not_duplicate_messages(monk
         assert len((await db.scalars(select(ExecutionRecord))).all()) == 3 * independent_fills
         assert all(d.state == "APPLIED" for d in (await db.scalars(select(BindingDelivery))).all())
         headers = [json.loads(r.payload)["message"].split("\n\n")[0] for r in rows]
-        assert len(set(headers)) == 1 and "买入开多/加多" in headers[0] and "BTCUSDT" in headers[0]
-        assert "数量: 0.1 | 名义金额: 10.0" in headers[0]
+        assert len(set(headers)) == 1 and "开多/加多" in headers[0] and "BTCUSDT" in headers[0]
+        assert "数量 0.1 ｜ 金额 10.00 U" in headers[0]
         assert [json.loads(r.payload)["event_type"] for r in rows] == [o for o in outcomes for _ in range(independent_fills)]
 
 
@@ -162,7 +180,7 @@ async def test_actual_filled_unfilled_and_risk_paths_keep_terminal_states(workfl
     rows = (await t.db.scalars(select(NotificationOutbox))).all()
     assert len(rows) == 1
     msg = json.loads(rows[0].payload)["message"]
-    assert "买入开多/加多" in msg and "带单成交均价: 100 | 数量: 1 | 名义金额: 100" in msg
+    assert "开多/加多" in msg and "均价 100 ｜ 数量 1 ｜ 金额 100.00 U" in msg
     assert ("✅" in msg) is (outcome == "EXECUTED")
     assert all(d.state == "APPLIED" for d in (await t.db.scalars(select(BindingDelivery))).all())
     if outcome.startswith(("BLOCKED", "SKIPPED")):
@@ -184,7 +202,7 @@ async def test_partial_fill_and_later_failure_never_claim_full_success(workflow)
     rows = (await t.db.scalars(select(NotificationOutbox).order_by(NotificationOutbox.id))).all()
     assert [json.loads(r.payload)["event_type"] for r in rows] == ["PARTIAL", "FAILED"]
     partial = json.loads(rows[0].payload)["message"]
-    assert "⚠️ 部分成交" in partial and "跟单确认数量: 0.5" in partial
+    assert "⚠️ 部分成交" in partial and "📦 数量 0.5" in partial
     assert all("✅" not in json.loads(r.payload)["message"] for r in rows)
     assert (await t.db.scalar(select(BindingDelivery))).state == "PENDING"
     assert (await t.db.scalar(select(OrderIntent))).state == "UNKNOWN"
@@ -258,3 +276,41 @@ async def test_dingtalk_business_failure_retries_without_resending_successful_ch
         assert row.status == ("sent" if eventual_success else "failed") and row.attempts == 2
         assert json.loads(row.payload)["delivered_channels"] == (["dingtalk", "webhook"] if eventual_success else ["webhook"])
     assert requests.count("/notify") == 1 and requests.count("/ding") == 2
+
+
+@pytest.mark.parametrize("secret", ["SYNTHETIC_SIGNING_SECRET", "", None])
+async def test_dingtalk_signs_only_when_a_secret_is_configured(monkeypatch, secret):
+    """加签密钥只参与签名，绝不出现在请求地址、正文或返回结果里。"""
+    import base64, hashlib, hmac
+    from urllib.parse import parse_qs, urlsplit
+    real_client = httpx.AsyncClient
+    seen = []
+
+    def respond(request):
+        seen.append(str(request.url))
+        assert "SYNTHETIC_SIGNING_SECRET" not in str(request.url) + request.content.decode()
+        return httpx.Response(200, json={"errcode": 0})
+
+    monkeypatch.setattr("app.services.notifier.service.httpx.AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(respond), **kwargs))
+    result = await NotificationService.dispatch({"dingtalk_enabled": True, "dingtalk_secret": secret,
+        "dingtalk_webhook_url": "https://example.test/robot/send?access_token=synthetic"}, "MirrorQuant", "synthetic")
+    assert result["dingtalk"] == {"ok": True, "status": 200, "errcode": 0}
+    query = parse_qs(urlsplit(seen[0]).query)
+    assert query["access_token"] == ["synthetic"]
+    if not secret:
+        assert "sign" not in query and "timestamp" not in query
+        return
+    timestamp = query["timestamp"][0]
+    expected = base64.b64encode(hmac.new(secret.encode(), f"{timestamp}\n{secret}".encode(), hashlib.sha256).digest()).decode()
+    assert query["sign"] == [expected] and abs(int(timestamp) - __import__("time").time() * 1000) < 60_000
+
+
+async def test_wecom_reports_the_platform_receipt_code(monkeypatch):
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr("app.services.notifier.service.httpx.AsyncClient", lambda **kwargs: real_client(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"errcode": 93000, "errmsg": "synthetic-sensitive-marker"})), **kwargs))
+    result = await NotificationService.dispatch({"wecom_enabled": True,
+        "wecom_webhook_url": "https://example.test/wecom"}, "MirrorQuant", "synthetic")
+    assert result["wecom"] == {"ok": False, "status": 200, "errcode": 93000}
+    assert "synthetic-sensitive-marker" not in json.dumps(result)
