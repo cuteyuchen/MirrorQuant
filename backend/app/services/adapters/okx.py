@@ -365,8 +365,9 @@ class OKXAdapter(BaseExchangeAdapter):
     async def get_open_orders(self) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
         queries = [("/api/v5/trade/orders-pending", {}, "ordId")]
+        # move_order 不是该端点接受的 ordType（OKX 实测报 51000，整个查询失败），已剔除。
         queries.extend(("/api/v5/trade/orders-algo-pending", {"ordType": kind}, "algoId")
-                       for kind in ("conditional", "oco", "trigger", "move_order", "iceberg", "twap"))
+                       for kind in ("conditional", "oco", "trigger", "iceberg", "twap"))
         for path, extra, key in queries:
             after, seen = None, set()
             while True:

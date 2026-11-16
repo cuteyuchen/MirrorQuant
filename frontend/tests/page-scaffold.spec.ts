@@ -22,6 +22,9 @@ describe("页面骨架", () => {
     expect(wrapper.find("h1").text()).toBe("账户");
     expect(wrapper.text()).toContain("3 个账户，1 个异常");
     expect(wrapper.find("button").text()).toBe("新建账户");
+    // 窄屏标题区先占满一行，操作按钮换到下一行，不挤摘要。
+    expect(wrapper.find("header > div").classes()).toContain("basis-full");
+    expect(wrapper.find("header > div").classes()).toContain("sm:basis-0");
   });
 
   it("表格分别呈现加载、空、错误与重试状态", async () => {
@@ -39,9 +42,11 @@ describe("页面骨架", () => {
   it("手机单元格限制最小宽度并允许长数字换行", () => {
     const wrapper = table({ rows: [{ id: 1 }] });
     const mobile = wrapper.find("article");
-    const cell = mobile.find(".number");
+    const cell = mobile.find(".grid > div");
     expect(cell.classes()).toContain("min-w-0");
     expect(cell.classes()).toContain("[overflow-wrap:anywhere]");
+    // 数字列的右对齐只属于桌面表格；手机卡片标签在值上方，一律左对齐。
+    expect(cell.classes()).not.toContain("number");
     expect(cell.text()).toContain("$123,456,789,012,345.67");
     expect(wrapper.find("td").classes()).toContain("number");
   });

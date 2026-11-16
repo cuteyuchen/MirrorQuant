@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 import os
 from typing import Any, ClassVar, Dict, List, Literal, Optional
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_serializer, field_validator
 from pydantic.alias_generators import to_camel
@@ -283,9 +284,18 @@ class NotificationSettings(CamelModel):
 
     @field_validator("webhook_url", "wecom_webhook_url", "dingtalk_webhook_url")
     @classmethod
-    def validate_webhook(cls, value):
+    def validate_webhook(cls, value, info):
         # GET 返回的固定掩码在 PUT 中表示保留，真正发送前仍再次验证 HTTPS。
-        return value if is_mask_sentinel(value) else https_notification_url(value)
+        if is_mask_sentinel(value):
+            return value
+        checked = https_notification_url(value)
+        # 渠道 webhook 只能发往本平台域名：钉钉 URL 一旦存进企业微信字段（或反之），
+        # 发送时会静默走错渠道且界面显示与实际不符，保存时直接拦下。
+        expected_host = {"wecom_webhook_url": "qyapi.weixin.qq.com",
+                         "dingtalk_webhook_url": "oapi.dingtalk.com"}.get(info.field_name)
+        if expected_host and checked and urlsplit(checked).hostname != expected_host:
+            raise ValueError(f"Webhook URL must use host {expected_host}")
+        return checked
 
     @field_validator("outbox_path")
     @classmethod

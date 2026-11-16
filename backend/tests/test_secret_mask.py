@@ -76,10 +76,14 @@ def test_proxy_mask_cannot_forward_stored_credentials_to_another_host():
 @pytest.mark.asyncio
 async def test_notification_secrets_masked_on_get_and_put_and_round_trip(secret_client):
     aliases = NOTIFICATION_SECRET_FIELDS
-    # 初次写入必须满足 HTTPS 门禁，随后才能真实验证脱敏占位符回写。
+    # 初次写入必须满足 HTTPS 门禁与渠道域名门禁，随后才能真实验证脱敏占位符回写。
     values = {
-        key: f"https://notifications.invalid/{key}/synthetic-secret"
-        if key.endswith("_url") else f"synthetic-{key}-secret"
+        key: ("https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=synthetic-secret"
+              if key == "wecom_webhook_url" else
+              "https://oapi.dingtalk.com/robot/send?access_token=synthetic-secret"
+              if key == "dingtalk_webhook_url" else
+              f"https://notifications.invalid/{key}/synthetic-secret"
+              if key.endswith("_url") else f"synthetic-{key}-secret")
         for key in aliases
     }
     response = await secret_client.put("/api/settings", json={"notifications": {

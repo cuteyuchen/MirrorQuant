@@ -55,6 +55,21 @@ def test_non_https_or_credential_bearing_webhook_rejected(url):
     assert NotificationSettings(webhook_url=MASK_SENTINEL).webhook_url == MASK_SENTINEL
 
 
+@pytest.mark.parametrize("field,good,bad", [
+    ("dingtalk_webhook_url", "https://oapi.dingtalk.com/robot/send?access_token=x",
+     "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=x"),
+    ("wecom_webhook_url", "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=x",
+     "https://oapi.dingtalk.com/robot/send?access_token=x"),
+])
+def test_channel_webhook_must_match_platform_host(field, good, bad):
+    # 钉钉 URL 存进企业微信字段会在发送时静默走错渠道，保存时按域名拦下。
+    assert getattr(NotificationSettings(**{field: good}), field) == good
+    with pytest.raises(ValueError, match="must use host"):
+        NotificationSettings(**{field: bad})
+    assert getattr(NotificationSettings(**{field: MASK_SENTINEL}), field) == MASK_SENTINEL
+    assert getattr(NotificationSettings(**{field: ""}), field) == ""
+
+
 def test_outbox_must_remain_inside_data_directory(tmp_path, monkeypatch):
     root = tmp_path / "data"
     root.mkdir()

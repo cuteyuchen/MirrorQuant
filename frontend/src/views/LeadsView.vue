@@ -64,14 +64,15 @@ const summary = computed(() => t("leads.summary", {
 const columns = computed<TableColumn[]>(() => [
   { key: "name", label: t("common.name"), width: "20%", mobileWide: true },
   // 固定操作列包含 44px 触控目标和左右内边距，不能被百分比挤窄。
-  { key: "enabled", label: t("common.enable"), width: "68px" },
-  { key: "positions", label: t("leads.openPositions"), numeric: true },
-  { key: "today", label: t("leads.todayActivity"), numeric: true },
-  { key: "pnl", label: t("leads.todayRealized"), numeric: true },
+  // 手机卡片全部单列：开关与数字混在双栏网格里基线对不齐，看着错乱。
+  { key: "enabled", label: t("common.enable"), width: "68px", mobileWide: true },
+  { key: "positions", label: t("leads.openPositions"), numeric: true, mobileWide: true },
+  { key: "today", label: t("leads.todayActivity"), numeric: true, mobileWide: true },
+  { key: "pnl", label: t("leads.todayRealized"), numeric: true, mobileWide: true },
   { key: "action", label: t("leads.latestAction"), width: "16%", mobileWide: true },
   { key: "freshness", label: t("board.snapshot"), width: "14%", mobileWide: true },
-  { key: "followers", label: t("leads.followerAccounts"), numeric: true },
-  { key: "public", label: t("leads.publicCol"), width: "68px" },
+  { key: "followers", label: t("leads.followerAccounts"), numeric: true, mobileWide: true },
+  { key: "public", label: t("leads.publicCol"), width: "68px", mobileWide: true },
   { key: "actions", label: t("common.actions"), width: "68px", mobileWide: true },
 ]);
 interface LatestAction { time: number | null; symbol: string | null; side: string | null; qty: number | null; action: string | null; direction: string | null }

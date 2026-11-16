@@ -43,8 +43,9 @@ function select(event: Event, row: T) {
       <div class="space-y-3 md:hidden">
         <article v-for="row in rows" :key="rowKey(row)" class="min-w-0 rounded-2xl border border-border/60 bg-surface p-3.5 shadow-card" :class="rowTone?.(row)">
           <div class="grid min-w-0 grid-cols-2 gap-x-3 gap-y-3">
-            <!-- 长名称与极端金额允许在窄轨道内换行，不撑大手机卡片。 -->
-            <div v-for="column in columns" :key="column.key" class="min-w-0 [overflow-wrap:anywhere]" :class="[column.mobileWide ? 'col-span-2' : '', column.numeric ? 'number' : '']">
+            <!-- 手机卡片标签在值上方，一律左对齐：数字列的右对齐只属于桌面表格， -->
+            <!-- 在卡片里会让标签和值分居两端、与相邻列基线错开。 -->
+            <div v-for="column in columns" :key="column.key" class="min-w-0 [overflow-wrap:anywhere]" :class="[column.mobileWide ? 'col-span-2' : '']">
               <p class="mb-1 font-sans text-xs font-medium text-muted">{{ column.label }}</p>
               <slot :name="`cell-${column.key}`" :row="row" />
             </div>
