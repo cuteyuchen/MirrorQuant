@@ -347,6 +347,8 @@ async def test_unreliable_upstream_never_closes_existing_allocation(trading, mon
 
 
 async def test_independent_late_earlier_reduce_after_later_applied(trading, monkeypatch):
+    # 证据矛盾的窗口内必须冻结；迟到事件补齐证据后，两笔减仓按因果顺序
+    # 补执行，而不是永久冻结等人工。审查结论是派生 verdict，随证据重算。
     t = trading
     sim, engine, _ = await prepare_simulation(t, monkeypatch)
     for _ in range(4):
@@ -358,14 +360,19 @@ async def test_independent_late_earlier_reduce_after_later_applied(trading, monk
     await engine.sync_lead(t.db, t.lead, proxies=[])
     own = await t.db.scalar(select(PositionAllocation).where(PositionAllocation.binding_id == t.binding.id))
     print("after later event", own.owned_qty_exact, [o["quantity"] for o in sim.orders.values()])
-    sim.history.append(delayed)
-    await engine.sync_lead(t.db, t.lead, proxies=[])
-    await t.db.refresh(own)
-    print("after late earlier event", own.owned_qty_exact, [o["quantity"] for o in sim.orders.values()])
     assert Decimal(own.owned_qty_exact) == Decimal("4")
     assert len(sim.orders) == 4
     state = await t.db.get(BindingPositionProgress, (t.binding.id, "BTCUSDT", "LONG"))
     assert state.review_reason and "causal" in state.review_reason
+    sim.history.append(delayed)
+    await engine.sync_lead(t.db, t.lead, proxies=[])
+    await t.db.refresh(own)
+    print("after late earlier event", own.owned_qty_exact, [o["quantity"] for o in sim.orders.values()])
+    assert Decimal(own.owned_qty_exact) == Decimal("1")
+    assert len(sim.orders) == 6
+    assert [o["quantity"] for o in sim.orders.values()][-2:] == ["2.0", "1.0"]
+    state = await t.db.get(BindingPositionProgress, (t.binding.id, "BTCUSDT", "LONG"))
+    assert state.review_reason is None
     async with get_session_factory()() as restarted:
         lead = await restarted.get(LeadSource, t.lead.id)
         from app.services.engine.router import CopyRouter
@@ -374,6 +381,6 @@ async def test_independent_late_earlier_reduce_after_later_applied(trading, monk
                 list(json.loads(lead.orders_store_json).values()), [], json.loads(lead.snapshot_json), [])
         blocked = (await restarted.scalars(select(ExecutionRecord).where(
             ExecutionRecord.status == "BLOCKED_SOURCE_ORDERING"))).all()
-        assert len(blocked) == 2
-        assert len((await restarted.scalars(select(OrderIntent))).all()) == 4
-    assert len(sim.orders) == 4
+        assert len(blocked) == 1
+        assert len((await restarted.scalars(select(OrderIntent))).all()) == 6
+    assert len(sim.orders) == 6

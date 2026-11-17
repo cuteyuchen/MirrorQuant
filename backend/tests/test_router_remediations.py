@@ -778,7 +778,10 @@ async def test_source_retry_marker_never_bypasses_prior_order_or_review_gates(tr
         delivery.exit_progress = "SOURCE_UNPROVEN"
     if outcome == "review":
         state = await t.db.get(BindingPositionProgress, (t.binding.id, "BTCUSDT", "LONG"))
-        state.review_reason = "Human review is still required"
+        # 审查结论是派生 verdict：用超前的顺序水位作证据让重算立起结论，
+        # 而不是直接种一个无证据的结论。
+        state.source_time_ms = NOW_MS + 4000
+        state.source_event_id = "seeded-watermark"
     await t.db.commit()
     await t.router.process_lead_events(t.db, t.lead, orders, [], snapshot, [t.proxy])
     assert len(exchange.orders) == 1 and delivery.state == "PENDING"

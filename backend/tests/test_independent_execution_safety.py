@@ -133,7 +133,9 @@ async def test_review_blocks_only_the_affected_instrument_and_side(workflow, sym
     source = {**opening_order(), 'orderId': 'unblocked-source', 'symbol': symbol,
         'positionSide': position_side, 'side': 'BUY' if position_side == 'LONG' else 'SELL'}
     workflow.db.add(BindingPositionProgress(binding_id=workflow.binding.id, symbol='BTCUSDT',
-        position_side='LONG', review_reason='Unproven causal ordering; human review required'))
+        position_side='LONG', source_time_ms=NOW_MS + 4000, source_event_id='seeded-watermark'))
+    # 审查结论是派生 verdict：用超前的顺序水位作证据让重算立起结论，
+    # 而不是直接种一个无证据的结论；结论只应冻结受影响的合约方向。
     workflow.lead.snapshot_json = json.dumps(snapshot)
     await workflow.db.commit()
     await workflow.router.process_lead_events(workflow.db, workflow.lead, [opening_order(), source], [], snapshot, [workflow.proxy])

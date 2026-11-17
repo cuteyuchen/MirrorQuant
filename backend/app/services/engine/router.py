@@ -84,6 +84,35 @@ class SourceExitUnproven(UnknownOrderOutcome):
 
 TERMINAL_STATES = {"filled", "canceled", "rejected", "expired"}
 
+# 交易所查无此单后，意图超龄多少才可转为 CANCELED（毫秒）：宽限期内
+# 刚提交的订单可能尚未可查，不得误杀。
+NOT_FOUND_CANCEL_GRACE_MS = 300_000
+
+# 开仓终态死意图最多重驱次数：超过则停手等人看，避免无限重试。
+MAX_OPEN_RETRY_ATTEMPTS = 3
+
+
+def _source_notional_conflicts(recorded, fresh) -> bool:
+    """名义金额冲突只认超出舍入抖动的差异。
+
+    数量是硬证据（调用处已精确比对）；名义金额由源端均价派生，
+    BAPI 在不同拉取中会对同一订单返回末位不同的均价，实测抖动
+    不超过名义金额的 0.05%。0.1% 容差只放行舍入噪声，真正的
+    价格重述仍会被拦截。
+    """
+    recorded, fresh = exact(recorded), exact(fresh)
+    tolerance = max(abs(recorded) * Decimal("0.001"), Decimal("0.01"))
+    return abs(fresh - recorded) > tolerance
+
+
+def _sequence_matches_interval(source_sequence, interval) -> bool:
+    """投递序号与区间终点允许 1ms 的端点约定差。
+
+    批次分组用左闭右开区间、投递序号取区间端点时，同一事件的
+    两个派生值会稳定相差 1ms；这是约定差，不是顺序矛盾。
+    """
+    return interval is not None and abs(int(source_sequence) - int(interval[1])) <= 1
+
 
 def lead_position_context(db) -> Optional[Dict[str, Any]]:
     """Recover pre/post lead inventory for a notification from the current delivery scope.
@@ -569,6 +598,24 @@ class CopyRouter:
                 exact(delivery.exit_filled_qty) == 0 and delivery.exit_progress != "REVIEW_REQUIRED"):
             delivery.exit_progress = "SOURCE_UNPROVEN"
 
+    @staticmethod
+    def _may_retry_terminal_attempts(order, attempts) -> bool:
+        """终态意图重驱条件：减仓沿用旧规则；开仓只重驱“从未上过
+        交易所”的死意图（全部 CANCELED + 零成交 + 无交易所订单号），
+        且最多重驱 MAX_OPEN_RETRY_ATTEMPTS 次。已成交/被拒的意图
+        绝不重驱，避免重复下单。
+        """
+        if order["reduce_only"]:
+            return True
+        if len(attempts) > MAX_OPEN_RETRY_ATTEMPTS:
+            return False
+        return all(
+            intent.state.lower() == "canceled"
+            and exact(intent.filled_qty) == 0
+            and not intent.exchange_order_id
+            for intent in attempts
+        )
+
     @serialized_execution
     async def _submit_confirmed(self, db, binding, account, adapter, spec,
                                 source_event_id, target_usd=0, source_time_ms=0, observed_at_ms=0,
@@ -577,7 +624,7 @@ class CopyRouter:
         db.info.pop("confirmed_execution", None)
         cid = "mq" + hashlib.sha256(material.encode()).hexdigest()[:30]
         delivery_event_id = None
-        if retry_terminal and order["reduce_only"]:
+        if retry_terminal:
             attempts = (await db.scalars(select(OrderIntent).where(
                 OrderIntent.account_id == account.id, OrderIntent.binding_id == binding.id,
                 or_(OrderIntent.source_event_id == source_event_id,
@@ -585,7 +632,7 @@ class CopyRouter:
             pending = [intent for intent in attempts if intent.state.lower() not in TERMINAL_STATES]
             if pending:
                 cid = pending[0].id
-            elif attempts:
+            elif attempts and self._may_retry_terminal_attempts(order, attempts):
                 cid = "mq" + hashlib.sha256(f"{material}:retry:{len(attempts)}".encode()).hexdigest()[:30]
                 delivery_event_id, source_event_id = source_event_id, "retry:" + cid
         order["cl_ord_id"] = cid
@@ -754,6 +801,8 @@ class CopyRouter:
                 await db.commit()
                 info = await adapter.get_order(intent.inst_id, cl_ord_id=intent.id)
                 if info is None:
+                    if await self._cancel_never_placed_intent(db, account, intent):
+                        continue
                     unresolved = True
                     continue
                 _, _, state = await self._apply_intent_info(db, intent, info, spec)
@@ -777,6 +826,56 @@ class CopyRouter:
                 logger.exception("Pending order remains unresolved: %s", intent_id)
                 unresolved = True
         return not unresolved
+
+    async def _cancel_never_placed_intent(self, db, account, intent) -> bool:
+        """交易所确认查无此单、且意图从未获得交易所订单号/成交时，
+        将超龄意图转为 CANCELED，让投递可以带新客户端订单号重驱。
+
+        宽限期内（创建后 5 分钟）不转：刚提交的订单可能尚未可查。
+        只有“查无此单 + 零成交 + 无交易所订单号”三者齐备才转，
+        绝不以此处理已成交或已确认存在的订单。
+        """
+        created = intent.created_at
+        if created is not None:
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            age_ms = (datetime.now(timezone.utc) - created).total_seconds() * 1000
+        else:
+            age_ms = int(time.time() * 1000) - int(intent.source_time_ms or 0)
+        if (intent.exchange_order_id or exact(intent.filled_qty) != 0
+                or age_ms <= NOT_FOUND_CANCEL_GRACE_MS):
+            return False
+        binding = await db.get(CopyBinding, intent.binding_id, populate_existing=True)
+        if binding is None:
+            return False
+        lead = await db.get(LeadSource, binding.lead_id, populate_existing=True)
+        if lead is None:
+            return False
+        intent.state = "CANCELED"
+        delivery = await db.get(BindingDelivery,
+            (intent.binding_id, intent.delivery_event_id or intent.source_event_id))
+        previous_delivery = db.info.get("delivery")
+        if delivery is not None:
+            db.info["delivery"] = delivery
+        try:
+            if intent.reduce_only:
+                record_side = "SELL" if intent.pos_side == "long" else "BUY"
+            else:
+                record_side = "BUY" if intent.pos_side == "long" else "SELL"
+            await self._record_execution(
+                db, binding, lead, account, intent.inst_id, intent.inst_id,
+                record_side, intent.pos_side.upper(), "RECONCILE_SOURCE", "CANCELED_ORDER_NOT_FOUND",
+                0.0, 0.0, 0.0, details=(
+                    f"Exchange confirms no such order for intent {intent.id} after grace window; "
+                    "zero fills and no exchange order id; intent canceled so the delivery can re-drive"),
+                complete_delivery=False)
+        finally:
+            if previous_delivery is None:
+                db.info.pop("delivery", None)
+            else:
+                db.info["delivery"] = previous_delivery
+        await db.commit()
+        return True
 
     async def _cancel_resting(self, db, intent, adapter, spec):
         """撤销在簿限价单并以交易所查单结果记账；返回订单最新状态。"""
@@ -1160,7 +1259,7 @@ class CopyRouter:
                 for delivery, payload in rows:
                     if delivery.state == "APPLIED":
                         interval = source_batch_interval(payload, source_bound)
-                        if interval is None or delivery.source_sequence != interval[1]:
+                        if not _sequence_matches_interval(delivery.source_sequence, interval):
                             state.review_reason = "Historical applied source ordering is unprovable"
                             continue
                         if is_open_leg(payload.get("side"), payload.get("positionSide")):
@@ -1170,6 +1269,11 @@ class CopyRouter:
                             state.review_reason = "Historical applied source ordering is unprovable"
                         elif timestamp > state.source_time_ms:
                             state.source_time_ms, state.source_event_id = timestamp, delivery.source_event_id
+            else:
+                # 审查结论是派生 verdict，每轮按当前证据重算：证据恢复后
+                # 自动解除，证据仍坏则下面的检查会重新立起。只清结论，
+                # 不动 source_time_ms 等持久化顺序水位。
+                state.review_reason = None
             if state.review_reason:
                 states[position] = state
                 continue
@@ -1178,7 +1282,7 @@ class CopyRouter:
             prior_by_source = {}
             for delivery, payload in sorted(rows, key=lambda row: row[0].source_sequence):
                 interval = source_batch_interval(payload, source_bound)
-                if interval is None or delivery.source_sequence != interval[1]:
+                if not _sequence_matches_interval(delivery.source_sequence, interval):
                     state.review_reason = "Missing, malformed, reversed or future source ordering evidence"
                     continue
                 source_key = payload.get("_source_key") or delivery.source_event_id.rsplit(":", 1)[0]
@@ -1264,6 +1368,138 @@ class CopyRouter:
         await db.commit()
         return states
 
+    async def _reconcile_review_deliveries(self, db, binding, lead, account, adapter, instruments,
+                                           deliveries, notify_cfg):
+        """把已证明完成的待审查平仓投递转为 APPLIED，不再靠人工清。
+
+        只处理同时满足四条的投递：①平仓事件（开仓与闭环事件绝不
+        自动 reconciled）；②关联意图全部终态（或无意图）；③本绑定
+        该合约所有权为零；④交易所当前也无该合约持仓（以本轮同步的
+        positions_json 为准）。任一不满足就留在 REVIEW 里等人看。
+        exit 账目按终态意图合计重建（无意图则全零空操作），每次转换
+        都写审计记录注明依据；部分成交（filled < target）不转，
+        避免把未完成的出场记成已完成。
+        """
+        try:
+            stored_positions = json.loads(account.positions_json or "[]")
+        except (ValueError, TypeError):
+            stored_positions = []
+        physical = {}
+        for entry in stored_positions if isinstance(stored_positions, list) else []:
+            if isinstance(entry, dict):
+                physical[(str(entry.get("instId")), str(entry.get("posSide") or "").upper())] = exact(
+                    entry.get("pos") or 0)
+        for delivery in deliveries:
+            if delivery.state != "PENDING" or delivery.exit_progress != "REVIEW_REQUIRED":
+                continue
+            try:
+                payload = json.loads(delivery.payload_json)
+            except (ValueError, TypeError):
+                continue
+            if "_closed" in payload:
+                continue
+            symbol = payload.get("symbol")
+            position_side = str(payload.get("positionSide") or "").upper()
+            if not symbol or position_side not in ("LONG", "SHORT"):
+                continue
+            if is_open_leg(payload.get("side"), payload.get("positionSide")):
+                continue
+            inst_id, supported = adapter.resolve_symbol(
+                symbol, instruments, json.loads(binding.symbol_map_json or "{}"))
+            if not supported:
+                continue
+            allocation = await db.scalar(select(PositionAllocation).where(
+                PositionAllocation.binding_id == binding.id,
+                PositionAllocation.account_id == account.id,
+                PositionAllocation.inst_id == inst_id,
+                PositionAllocation.pos_side == position_side.lower()))
+            if allocation is not None and self._owned_qty(allocation) != 0:
+                continue
+            if physical.get((inst_id, position_side), Decimal("0")) != 0:
+                continue
+            attempts = (await db.scalars(select(OrderIntent).where(
+                OrderIntent.binding_id == binding.id,
+                or_(OrderIntent.source_event_id == delivery.source_event_id,
+                    OrderIntent.delivery_event_id == delivery.source_event_id)))).all()
+            if any(intent.state.lower() not in TERMINAL_STATES for intent in attempts):
+                continue
+            target = sum((exact(intent.requested_qty) for intent in attempts), Decimal("0"))
+            filled = sum((exact(intent.filled_qty) for intent in attempts), Decimal("0"))
+            if filled != target:
+                continue
+            delivery.exit_account_id = account.id
+            delivery.exit_inst_id = inst_id
+            delivery.exit_pos_side = position_side.lower()
+            delivery.exit_allocation_id = allocation.id if allocation is not None else None
+            delivery.exit_generation = allocation.generation if allocation is not None else 0
+            delivery.exit_initial_owned_qty = format_exact(target)
+            delivery.exit_target_qty = format_exact(target)
+            delivery.exit_filled_qty = format_exact(filled)
+            delivery.exit_remaining_qty = "0"
+            delivery.exit_progress = "COMPLETE"
+            delivery.state = "APPLIED"
+            previous_delivery = db.info.get("delivery")
+            db.info["delivery"] = delivery
+            try:
+                basis = (f"{len(attempts)} terminal intent(s), requested {format_exact(target)}, "
+                         f"filled {format_exact(filled)}" if attempts else
+                         "no intents; no position held, close was a no-op")
+                await self._record_execution(
+                    db, binding, lead, account, symbol, inst_id,
+                    payload.get("side", ""), position_side, "RECONCILE_SOURCE", "RECONCILED_REVIEW",
+                    float(exact(payload.get("qtyExact", payload.get("qty")) or 0)),
+                    float(exact(payload.get("avgPrice") or 0)),
+                    float(exact(payload.get("notionalExact", payload.get("notional")) or 0)),
+                    my_qty=float(filled),
+                    details=(f"Review delivery {delivery.source_event_id} reconciled from durable evidence: "
+                             f"{basis}; allocation and exchange both flat"),
+                    notify_cfg=notify_cfg, complete_delivery=False)
+            finally:
+                if previous_delivery is None:
+                    db.info.pop("delivery", None)
+                else:
+                    db.info["delivery"] = previous_delivery
+        await db.commit()
+
+    async def _unpark_review_deliveries(self, db, binding, deliveries, ordering):
+        """审查结论已解除的仓位，把未执行过的待审查投递放回待处理，
+        让正常流程按因果顺序重新处理它们。
+
+        只放行同时满足的投递：①所属仓位本轮重算后无审查结论；
+        ②exit 目标从未算过（exit_target_qty 为空，即从未执行）；
+        ③没有任何关联意图（有意图的投递走 reconciled 或重驱，
+        绝不在此放行，避免重复下单）；④非闭环事件。
+        放行只是清掉 REVIEW 标记，不下单、不改账；重处理时证据
+        若仍坏，排序检查会再次立起结论并重新挂起。
+        """
+        for delivery in deliveries:
+            if delivery.state != "PENDING" or delivery.exit_progress != "REVIEW_REQUIRED":
+                continue
+            if delivery.exit_target_qty is not None:
+                continue
+            try:
+                payload = json.loads(delivery.payload_json)
+            except (ValueError, TypeError):
+                continue
+            if "_closed" in payload:
+                continue
+            symbol = payload.get("symbol")
+            position_side = str(payload.get("positionSide") or "").upper()
+            if not symbol or position_side not in ("LONG", "SHORT"):
+                continue
+            state = ordering.get((symbol, payload.get("positionSide"))) or ordering.get(
+                (symbol, position_side))
+            if state is None or state.review_reason:
+                continue
+            attempts = await db.scalar(select(OrderIntent.id).where(
+                OrderIntent.binding_id == binding.id,
+                or_(OrderIntent.source_event_id == delivery.source_event_id,
+                    OrderIntent.delivery_event_id == delivery.source_event_id)).limit(1))
+            if attempts is not None:
+                continue
+            delivery.exit_progress = None
+        await db.commit()
+
     @serialized_execution
     async def process_lead_events(
         self, db: AsyncSession, lead: LeadSource, raw_orders: List[Dict[str, Any]],
@@ -1312,9 +1548,17 @@ class CopyRouter:
                         continue
                 previous = exact(progress.cumulative_qty)
                 if source_fill_kind(order) == "individual":
-                    if previous not in (0, cumulative) or (previous > 0 and exact(progress.cumulative_notional) != notional):
+                    if previous not in (0, cumulative):
                         logger.error("Conflicting individual source fill %s; suspending source event", key)
                         continue
+                    if previous > 0 and _source_notional_conflicts(
+                            exact(progress.cumulative_notional), notional):
+                        logger.error("Conflicting individual source fill %s; suspending source event", key)
+                        continue
+                    if previous > 0 and exact(progress.cumulative_notional) != notional:
+                        # 源端均价的舍入抖动不构成冲突：采用最新名义金额，
+                        # 让账本收敛，而不是每轮重复挂起同一事件。
+                        progress.cumulative_notional = str(notional)
                 elif cumulative < previous:
                     logger.error("Regressing source fill %s; suspending source event", key)
                     continue
@@ -1424,6 +1668,9 @@ class CopyRouter:
                     BindingDelivery.binding_id == binding.id)
                     .order_by(BindingDelivery.source_sequence, BindingDelivery.source_event_id))).all()
                 ordering = await self._position_ordering(db, binding, all_deliveries, snapshot, active, received_at_ms)
+                await self._reconcile_review_deliveries(
+                    db, binding, lead, account, adapter, instruments, all_deliveries, notify_cfg)
+                await self._unpark_review_deliveries(db, binding, all_deliveries, ordering)
                 deliveries = [delivery for delivery in all_deliveries if delivery.state != "APPLIED"]
                 # Recover inventory immediately after each pending source event from
                 # the current snapshot and the chronological suffix of known events.
@@ -1983,7 +2230,8 @@ class CopyRouter:
                 observed_at_ms=batch.get("_freshness_at_ms", batch.get("_observed_at_ms", 0)), inst_id=inst_id,
                 side=order_side, pos_side=local_pos_side, ord_type=ord_type,
                 sz=format_decimal(capped_qty, spec.lot_sz), px=format_decimal(order_px, spec.tick_sz),
-                reduce_only=False, td_mode=account.margin_mode, expires_at_ms=expires_at_ms)
+                reduce_only=False, td_mode=account.margin_mode, expires_at_ms=expires_at_ms,
+                retry_terminal=True)
             fill_sz, fill_px = res.fill_sz, res.avg_px
             if res.state == "resting":
                 # 限价单已挂出但未全部成交：单独记录并通知，成交或失效时再各通知一次。

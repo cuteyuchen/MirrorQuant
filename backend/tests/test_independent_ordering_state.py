@@ -152,7 +152,9 @@ async def test_binding_ordering_state_is_isolated(workflow):
         account_id=second_account.id, baseline_seeded=True)
     workflow.db.add(second)
     workflow.db.add(BindingPositionProgress(binding_id=workflow.binding.id, symbol='BTCUSDT',
-        position_side='LONG', review_reason='Human review required for first binding'))
+        position_side='LONG', source_time_ms=NOW_MS + 4000, source_event_id='seeded-watermark'))
+    # 审查结论是派生 verdict：用超前的顺序水位作证据让重算立起结论，
+    # 而不是直接种一个无证据的结论；结论只应冻结本绑定本合约方向。
     await workflow.db.commit()
     await workflow.router.process_lead_events(workflow.db, workflow.lead, [opening_order()], [], snapshot, [workflow.proxy])
     workflow.adapter.place_order.assert_awaited_once()

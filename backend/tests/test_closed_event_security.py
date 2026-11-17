@@ -190,8 +190,21 @@ async def test_exit_evidence_rechecked_after_durable_submitting_commit(exit_deli
                     payload["_source_time_ms"] = True
                 delivery.payload_json = json.dumps(payload)
             elif mutation == "ordering":
-                state = await db.get(BindingPositionProgress, (workflow.binding_id, "BTCUSDT", "LONG"))
-                state.review_reason = "Concurrent evidence requires review"
+                # 审查结论是派生 verdict：并发证据变化须以证据形式注入，
+                # 重算只认有备份据的证据，不认直接改写的结论。
+                if kind == "explicit":
+                    overlapping = closure(workflow, id="concurrent-closure",
+                                          opened=workflow.source_time - 500)
+                    db.add(BindingDelivery(binding_id=workflow.binding_id,
+                        source_event_id="closed:concurrent-closure",
+                        source_sequence=workflow.source_time,
+                        payload_json=json.dumps({"_closed": overlapping,
+                                                 "_event_id": "closed:concurrent-closure"}),
+                        state="PENDING"))
+                else:
+                    state = await db.get(BindingPositionProgress, (workflow.binding_id, "BTCUSDT", "LONG"))
+                    state.source_time_ms = workflow.source_time + 1000
+                    state.source_event_id = "concurrent-newer-event"
             elif mutation == "generation":
                 allocation = await db.get(PositionAllocation, workflow.owned_id)
                 allocation.generation += 1
@@ -207,7 +220,10 @@ async def test_exit_evidence_rechecked_after_durable_submitting_commit(exit_deli
         assert changed
         intents = (await db.scalars(select(OrderIntent))).all()
         assert len(intents) == 1 and intents[0].state == "REJECTED"
-        delivery = await db.scalar(select(BindingDelivery))
+        query = select(BindingDelivery)
+        if kind == "explicit" and mutation == "ordering":
+            query = query.where(BindingDelivery.source_event_id == "closed:security-closure")
+        delivery = await db.scalar(query)
         assert delivery.state == "PENDING" and Decimal(delivery.exit_remaining_qty) == 4
     await assert_preserved(workflow)
 
