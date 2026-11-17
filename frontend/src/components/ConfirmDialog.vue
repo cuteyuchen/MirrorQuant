@@ -22,7 +22,7 @@ watch(() => ui.confirmation, () => { acknowledgement.value = false; typed.value 
 </script>
 
 <template>
-  <BaseModal :open="!!ui.confirmation" :title="ui.confirmation?.title || t('common.confirm')" :busy="ui.confirming" @close="ui.close">
+  <BaseModal :open="!!ui.confirmation" :level="10" :title="ui.confirmation?.title || t('common.confirm')" :busy="ui.confirming" @close="ui.close">
     <div class="space-y-4">
       <div class="flex items-start gap-3 rounded-xl border border-warning/35 bg-warning/10 p-3">
         <AlertTriangle class="mt-0.5 shrink-0 text-warning" :size="20" aria-hidden="true" />

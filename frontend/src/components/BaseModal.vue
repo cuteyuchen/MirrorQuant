@@ -8,7 +8,7 @@ import { nextTick, onBeforeUnmount, ref, useId, watch } from "vue";
 import { X } from "lucide-vue-next";
 import { useI18n } from "@/i18n";
 
-const props = withDefaults(defineProps<{ open: boolean; title: string; busy?: boolean; wide?: boolean; drawer?: boolean }>(), { busy: false });
+const props = withDefaults(defineProps<{ open: boolean; title: string; busy?: boolean; wide?: boolean; drawer?: boolean; level?: number }>(), { busy: false, level: 0 });
 const emit = defineEmits<{ close: [] }>();
 const { t } = useI18n();
 const titleId = useId();
@@ -22,9 +22,23 @@ function focusable() {
   ) || []).filter(el => !el.closest('[hidden], [inert], [aria-hidden="true"]')
     && getComputedStyle(el).display !== "none" && getComputedStyle(el).visibility !== "hidden");
 }
+function overlayZIndex(el: Element | null): number {
+  const z = el ? Number(getComputedStyle(el).zIndex) : NaN;
+  return Number.isFinite(z) ? z : 0;
+}
 function isTop() {
-  const dialogs = document.querySelectorAll('[role="dialog"]');
-  return dialogs[dialogs.length - 1] === panel.value;
+  // 最上层按绘制顺序判定：层级高的在上，同层级后挂载的在上。
+  // 只按 DOM 顺序会在页面弹窗后挂载时误判，确认框会被盖住、焦点被抢走。
+  const dialogs = Array.from(document.querySelectorAll('[role="dialog"]'));
+  const mine = panel.value;
+  if (!mine) return false;
+  const myZ = overlayZIndex(mine.parentElement);
+  const myIndex = dialogs.indexOf(mine);
+  return !dialogs.some((el, index) => {
+    if (el === mine) return false;
+    const z = overlayZIndex(el.parentElement);
+    return z > myZ || (z === myZ && index > myIndex);
+  });
 }
 function onFocus(event: FocusEvent) {
   if (isTop() && !panel.value?.contains(event.target as Node)) (focusable()[0] || panel.value)?.focus();
@@ -70,7 +84,7 @@ onBeforeUnmount(cleanup);
   <Teleport to="body">
     <!-- 详情抽屉沿用相同焦点与关闭规则，避免另一套弹层实现。 -->
     <!-- 遮罩使用独立的 scrim 色：亮色主题下也是深色半透明，弹层始终从页面中浮出来。 -->
-    <div v-if="open" class="fixed inset-0 z-50 flex bg-scrim/70 p-3 backdrop-blur-sm sm:p-6" :class="drawer ? 'items-start justify-end' : 'items-center justify-center'" @click.self="close">
+    <div v-if="open" class="fixed inset-0 flex bg-scrim/70 p-3 backdrop-blur-sm sm:p-6" :style="{ zIndex: 50 + level }" :class="drawer ? 'items-start justify-end' : 'items-center justify-center'" @click.self="close">
       <section ref="panel" role="dialog" aria-modal="true" :aria-labelledby="titleId" :aria-busy="busy"
         tabindex="-1" class="max-h-[90vh] w-full overflow-y-auto rounded-2xl border border-border/70 bg-surface p-4 shadow-pop sm:p-6"
         :class="drawer ? 'h-[90vh] max-w-2xl' : wide ? 'max-w-6xl' : 'max-w-xl'">
