@@ -5,7 +5,7 @@ import { timestampMs } from "@/utils/format";
 // 后端只接受单个精确状态；分类枚举同时供列表与统计使用。
 export const EXECUTION_GROUPS = {
   all: [],
-  success: ["EXECUTED", "FILLED", "SUCCESS"],
+  success: ["EXECUTED", "FILLED", "SUCCESS", "ADOPTED_POSITION"],
   failed: ["FAILED", "REJECTED", "UNFILLED"],
   skipped: ["SKIPPED", "SKIPPED_DISABLED", "SKIPPED_STALE", "SKIPPED_UNSUPPORTED", "SKIPPED_CLOSED_CYCLE", "SKIPPED_NO_LOCAL_POS", "SKIPPED_BELOW_MIN"],
   blocked: ["BLOCKED_RISK", "BLOCKED_KILL_SWITCH", "BLOCKED_SOURCE_ORDERING", "BLOCKED_COLLATERAL_BALANCE", "BLOCKED_FILTER",

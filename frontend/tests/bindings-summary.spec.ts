@@ -84,6 +84,19 @@ describe("绑定状态与页面摘要", () => {
     expect(bindingPresentation(binding(), current, [], false)).toMatchObject({ state: "UNKNOWN", tone: "warning", positionCount: null });
     expect(bindingSummary([binding()], current, [], false).unknown).toBe(1);
   });
+  it("隐藏仓位但重构证据已确认时按真实状态展示，不再永远未知", () => {
+    const aligned = { ...mockBoard.leads![0].positions![0],
+      mine: [{ ...mockBoard.leads![0].positions![0].mine![0], bindingId: 1, state: "aligned" as const, qty: 0.2, reason: null }] };
+    const current = board({ positionShow: false, positions: [aligned], orphans: [] });
+    expect(bindingPresentation(binding(), current, [], false)).toMatchObject({ state: "HEALTHY", tone: "neutral", positionCount: 1 });
+    expect(bindingPresentation(binding(), board({ positionShow: false, positions: null, orphans: null }), [], false))
+      .toMatchObject({ state: "UNKNOWN", reasons: ["POSITION_DATA_HIDDEN"] });
+    expect(bindingPresentation(binding(), board({ positionShow: false, positions: [], orphans: [] }), [], false))
+      .toMatchObject({ state: "UNKNOWN", reasons: ["POSITION_DATA_HIDDEN"] });
+    const partial = { ...aligned, mine: [{ ...aligned.mine[0], state: "partial" as const, reason: "数量偏离按比例应持仓量超过 5%" }] };
+    expect(bindingPresentation(binding(), board({ positionShow: false, positions: [partial], orphans: [] }), [], false))
+      .toMatchObject({ state: "PARTIAL", tone: "warning" });
+  });
   it("渲染一句话摘要和全局暂停横幅，异常行高亮", async () => {
     const current = { ...board(), globalKillSwitch: true };
     const items = [binding(), binding({ id: 2, circuitBreakerTripped: true }), binding({ id: 3, isEnabled: false })];
@@ -136,6 +149,14 @@ describe("真实今日执行统计", () => {
   it("响应缺失时间时统计失败关闭，而不是展示成功0/失败0", async () => {
     vi.mocked(api.get).mockResolvedValueOnce({ items: [{ ...execution(1), createdAt: null }], total: 1 });
     await expect(fetchTodayExecutionCounts(dayStart, cutoff)).rejects.toBeInstanceOf(ApiError);
+  });
+  it("无归属的历史记录跳过不计，认领记为成功，统计不再整列失败", async () => {
+    vi.mocked(api.get).mockResolvedValueOnce({ items: [
+      { ...execution(1), bindingId: null, status: "SKIPPED_UNSUPPORTED" },
+      execution(2, "ADOPTED_POSITION"),
+      execution(3, "EXECUTED"),
+    ], total: 3 });
+    expect(await fetchTodayExecutionCounts(dayStart, cutoff)).toEqual({ 1: { success: 2, failed: 0 } });
   });
   it("离开页面后取消在途统计，不再接受旧结果", async () => {
     let active = true;

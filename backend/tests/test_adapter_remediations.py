@@ -210,6 +210,15 @@ async def test_binance_requires_matching_leverage_readback():
     assert await venue.ensure_leverage("BTCUSDT", 10) is False
 
 
+async def test_binance_skips_leverage_post_when_already_set():
+    # 已是目标杠杆时只读确认、不重复设置，避免无谓写操作与瞬时失败。
+    venue = adapter(BinanceAdapter)
+    venue._request = AsyncMock(side_effect=[{"dualSidePosition": True}, {"multiAssetsMargin": False},
+                                            [{"marginType": "cross", "leverage": 10}]])
+    assert await venue.ensure_leverage("BTCUSDT", 10) is True
+    assert venue._request.await_count == 3
+
+
 async def test_binance_projected_notional_selects_actual_tier():
     venue = adapter(BinanceAdapter)
     venue._request = AsyncMock(return_value=[{"symbol": "BTCUSDT", "brackets": [

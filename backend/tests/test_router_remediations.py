@@ -15,7 +15,7 @@ from app.models.domain import (
 )
 from app.services.adapters.base import BalanceInfo, ExchangePosition, InstrumentSpec, OrderBook, OrderRejected, OrderResult
 from app.services.engine.risk import RiskEngine
-from app.services.engine.router import CopyRouter, UnknownOrderOutcome
+from app.services.engine.router import CopyRouter, UnknownOrderOutcome, _effective_open_leverage
 from app.services.engine.sizer import PositionSizer, exact, format_exact
 
 
@@ -41,6 +41,17 @@ def test_exact_persistence_text_rejects_nonfinite_values(value):
     # 文本规范化仍必须经过财务有限数门禁，不能只靠字符串清理。
     with pytest.raises(ValueError, match="Non-finite financial input"):
         format_exact(value)
+
+
+@pytest.mark.parametrize("existing,max_lvr,expected", [
+    (10, 100, 10), (10.0, 100, 10), (50, 20, 20),
+    (None, 100, 2), (0, 100, 2), (-5, 100, 2), (float("nan"), 100, 2),
+])
+def test_effective_open_leverage_keeps_existing_symbol_leverage(existing, max_lvr, expected):
+    # 已有仓位沿用交易所当前杠杆（认领仓与加仓一致）；档位上限是硬约束，高于上限才降；
+    # 无仓位或已有杠杆无效时回落动态计算（100/(1000*0.08) 向上取整为 2）。
+    assert _effective_open_leverage(existing, target_notional=100, equity=1000,
+                                    max_symbol_leverage=max_lvr) == expected
 
 
 class OfflineExchange:
@@ -408,6 +419,30 @@ async def test_fresh_snapshot_routes_150_second_delayed_fill_once(trading, monke
     await t.router.process_lead_events(t.db, t.lead, orders, [], snapshot, [t.proxy])
     assert len(exchange.orders) == 1
     assert len((await t.db.scalars(select(ExecutionRecord))).all()) == 1
+
+
+@pytest.mark.parametrize("existing_lever,tier_max,expected", [(10, 100, 10), (50, 20, 20), (None, 100, 2)])
+async def test_open_add_applies_effective_leverage(trading, existing_lever, tier_max, expected):
+    # 加仓沿用已有仓位的交易所杠杆（认领仓 10x 则加仓也 10x，不擅自改成动态值）；
+    # 档位上限不足时降到上限；无仓位时动态计算。
+    t = trading
+    exchange = OfflineExchange()
+    exchange.get_max_leverage = AsyncMock(return_value=tier_max)
+    positions = [] if existing_lever is None else [
+        ExchangePosition("BTCUSDT", "BTCUSDT", "long", "cross", 10, 10, 100, 0, 0, 1000, existing_lever)]
+    batch = {"symbol": "BTCUSDT", "side": "BUY", "positionSide": "LONG", "qty": "1",
+             "avgPrice": "100", "notional": "100", "_event_id": f"leverage-{existing_lever}-{tier_max}",
+             "startTime": NOW_MS - 150_000, "endTime": NOW_MS - 150_000}
+    await t.router._execute_batch_for_binding(
+        t.db, t.binding, t.lead, t.account, exchange, batch,
+        lead_margin_balance=1000, active_lead_positions={"BTCUSDT_LONG": 1}, my_equity=1000,
+        positions=positions, instruments={"BTCUSDT": t.spec}, global_kill=False,
+        notify_cfg={}, resilience_cfg=None,
+    )
+    await t.db.commit()
+    exchange.ensure_leverage.assert_awaited_once()
+    assert exchange.ensure_leverage.await_args.args[1] == expected
+    assert (await t.db.scalar(select(ExecutionRecord))).status == "EXECUTED"
 
 
 @pytest.mark.parametrize("remaining,expected_qty", [(0, "1.0"), (1, "0.5")])

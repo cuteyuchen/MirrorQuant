@@ -45,6 +45,19 @@ def _json(raw, kind=dict):
         return kind()
 
 
+def _evidence_confirmed(snapshot, source_valid, observed, now_ms):
+    # 持仓证据有两条合法来源：带单员公开仓位的权威快照，或隐藏仓位时由完整订单历史重构的持仓。
+    # 只认权威快照会让隐藏仓位带单员的跟单状态永远未知，掩盖真实的对齐/偏离信号。
+    positions_meta = snapshot.get("openPositionsMeta")
+    meta = snapshot.get("meta")
+    authoritative = (isinstance(positions_meta, dict) and positions_meta.get("authoritative") is True
+                     and positions_meta.get("complete") is True)
+    reconstructed = (isinstance(positions_meta, dict) and positions_meta.get("reconstructed") is True
+                     and isinstance(meta, dict) and meta.get("orderHistoryComplete") is True)
+    return ((authoritative or reconstructed) and source_valid
+            and observed is not None and observed <= now_ms)
+
+
 def _positions_valid(value):
     # 权威标记不能替代列表自身的结构、数量与唯一性校验。
     if not isinstance(value, list):
@@ -461,11 +474,7 @@ async def build_board(db, *, now=None):
                 reason = redact_error_urls(recent.details) or recent.status
             uncertain = ("存在未决订单意图" if (binding.id, inst_id, source["positionSide"]) in unresolved else
                          "带单员快照过期" if fresh["stale"] else
-                         "带单员持仓证据未确认" if not (
-                             (snapshot.get("openPositionsMeta") or {}).get("authoritative") is True and
-                             (snapshot.get("openPositionsMeta") or {}).get("complete") is True and
-                             source_valid and
-                             observed is not None and observed <= now_ms) else
+                         "带单员持仓证据未确认" if not _evidence_confirmed(snapshot, source_valid, observed, now_ms) else
                          "账户尚未成功同步" if not account.last_sync_at else
                          "账户同步失败，仓位数据可能已过期" if account.status == "error" else None)
             if not uncertain and recent and recent.status == "DEFERRED_SOURCE_UNPROVEN":
@@ -505,10 +514,8 @@ async def build_board(db, *, now=None):
                 "stopLossPrice": _common_price([price[1] for price in prices]), "mine": mine,
             })
         # 持仓列表未知时不能把所有本地仓位误报为孤儿仓。
-        source_known = (source_valid and not fresh["stale"] and
-                        (snapshot.get("openPositionsMeta") or {}).get("authoritative") is True and
-                        (snapshot.get("openPositionsMeta") or {}).get("complete") is True and
-                        observed is not None and observed <= now_ms)
+        source_known = (_evidence_confirmed(snapshot, source_valid, observed, now_ms)
+                        and not fresh["stale"])
         if source_known:
             for key, allocation in allocations.items():
                 binding = binding_map.get(allocation.binding_id)

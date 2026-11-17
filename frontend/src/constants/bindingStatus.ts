@@ -64,9 +64,15 @@ export function bindingPresentation(binding: Binding, board: DashboardBoard | nu
   if (incomplete.length) return result(incomplete.some(row => row.state === "partial") ? "PARTIAL" : "MISSING", incomplete.map(row => row.reason), "warning");
   if (binding.baselineSeeded === false) return result("BASELINE_PENDING", ["BASELINE_PENDING"], "warning");
   // 已对齐枚举不能替代真实数量，缺失数量仍必须显示待确认。
-  if (binding.baselineSeeded == null || positionCount == null || lead.stale == null || lead.enabled == null || lead.positions == null || lead.orphans == null ||
-    lead.positionShow !== true || (lead.positions.length > 0 && (mine.length < lead.positions.length || mine.some(row => row.state !== "aligned")))) {
-    return result("UNKNOWN", lead.positionShow === false ? ["POSITION_DATA_HIDDEN"] : mine.map(row => row.reason), "warning");
+  // 隐藏仓位带单员的重构证据由看板确认（positions/orphans 非空即已确认），
+  // 不能仅凭 positionShow 再判未知，否则隐藏仓位绑定永远显示未知。
+  const evidenceMissing = binding.baselineSeeded == null || positionCount == null || lead.stale == null ||
+    lead.enabled == null || lead.positions == null || lead.orphans == null ||
+    (lead.positions.length > 0 && (mine.length < lead.positions.length || mine.some(row => row.state !== "aligned")));
+  if (evidenceMissing) {
+    const hiddenWithoutEvidence = lead.positionShow === false &&
+      (lead.positions == null || lead.orphans == null || lead.positions.length === 0);
+    return result("UNKNOWN", hiddenWithoutEvidence ? ["POSITION_DATA_HIDDEN"] : mine.map(row => row.reason), "warning");
   }
   return result("HEALTHY", [], "neutral");
 }
@@ -104,7 +110,8 @@ export async function fetchTodayExecutionCounts(dayStart: number | null, cutoff:
     let reachedPreviousDay = false;
     for (const row of rows) {
       const time = timestampMs(row.createdAt);
-      if (time == null || row.id == null || row.bindingId == null || row.status == null) throw new ApiError(502, "INVALID_RESPONSE");
+      if (time == null || row.id == null || row.status == null) throw new ApiError(502, "INVALID_RESPONSE");
+      if (row.bindingId == null) continue; // 无归属的历史记录不计入任何绑定，不能因此让整列统计失败。
       if (time < dayStart) { reachedPreviousDay = true; continue; }
       if (time > cutoff || seen.has(row.id)) continue;
       seen.add(row.id);

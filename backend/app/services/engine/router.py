@@ -140,6 +140,23 @@ def _exposure_ratio_matches(lead_ratio, my_ratio, tolerance_pct) -> bool:
     return abs(mine - lead) <= lead * tol / 100
 
 
+def _effective_open_leverage(existing_leverage, target_notional, equity, max_symbol_leverage) -> int:
+    """开仓/加仓杠杆：品种已有仓位时沿用交易所当前杠杆，无仓位时动态计算。
+
+    杠杆是按品种设置的：每次加仓都重算并重设，会擅自改动整仓（含认领仓位）的杠杆。
+    已有仓位时沿用其杠杆，认领仓与后续加仓自然一致；档位上限是交易所硬约束，
+    已有杠杆高于档位上限时才降到上限。已有杠杆无效（空/零/负/NaN）时回落动态计算。
+    """
+    try:
+        current = float(existing_leverage) if existing_leverage is not None else 0.0
+    except (TypeError, ValueError):
+        current = 0.0
+    if current > 0:
+        return min(int(max_symbol_leverage), max(1, int(current)))
+    return PositionSizer.compute_dynamic_leverage(
+        target_notional=target_notional, equity=equity, max_symbol_leverage=max_symbol_leverage)
+
+
 def lead_position_context(db) -> Optional[Dict[str, Any]]:
     """Recover pre/post lead inventory for a notification from the current delivery scope.
 
@@ -2380,7 +2397,8 @@ class CopyRouter:
         max_allowed_lvr = int(min(spec.max_lvr, tier_max))
         if leverage_cap_enabled:
             max_allowed_lvr = min(max_allowed_lvr, binding.max_instrument_leverage)
-        target_lvr = PositionSizer.compute_dynamic_leverage(
+        target_lvr = _effective_open_leverage(
+            local_pos.lever if local_pos is not None and local_pos.pos > 0 else None,
             target_notional=capped_qty * exact(entry_px) * spec.ct_val,
             equity=my_equity, max_symbol_leverage=max_allowed_lvr,
         )

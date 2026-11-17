@@ -596,3 +596,40 @@ async def test_csv_filename_and_formula_fields_are_safe(board_state):
     rows = list(csv.reader(io.StringIO(response.text)))
     assert rows[1][2].startswith("'=") and rows[1][3].startswith("'+")
     assert rows[1][7] == "-2" and rows[1][9] == "-10"  # 真实数值不被当成公式。
+
+
+async def test_board_reconstructed_positions_with_complete_history_are_confirmed(board_state):
+    # 隐藏仓位带单员：订单历史完整 + 重构标记 + 新鲜快照，持仓证据即确认，状态按数量推导，孤儿仓可判定。
+    t = board_state
+    t.db.add(PositionAllocation(binding_id=t.binding.id, account_id=t.account.id, inst_id="ETHUSDT",
+        pos_side="short", owned_qty=2, entry_cost=400))
+    snapshot = json.loads(t.lead.snapshot_json)
+    snapshot["profile"]["positionShow"] = False
+    snapshot["openPositionsMeta"] = {"source": "derived-from-order-history", "reconstructed": True,
+                                     "derived": True, "positionShow": False, "asOf": NOW_MS,
+                                     "complete": False, "authoritative": False}
+    t.lead.snapshot_json = json.dumps(snapshot)
+    await t.db.commit()
+    lead = (await build_board(t.db, now=NOW))["leads"][0]
+    assert lead["positions"][0]["mine"][0]["state"] == "aligned"
+    assert lead["orphans"] is not None and len(lead["orphans"]) == 1
+
+
+@pytest.mark.parametrize("breakdown", ["no-reconstructed-flag", "incomplete-history", "stale"])
+async def test_board_reconstructed_positions_without_full_evidence_stay_unknown(board_state, breakdown):
+    # 重构证据缺任一环（无重构标记、订单历史不完整、快照过期），仍判未知，不伪装对齐。
+    t = board_state
+    snapshot = json.loads(t.lead.snapshot_json)
+    snapshot["profile"]["positionShow"] = False
+    snapshot["openPositionsMeta"] = {"reconstructed": True, "asOf": NOW_MS, "complete": False, "authoritative": False}
+    if breakdown == "no-reconstructed-flag":
+        snapshot["openPositionsMeta"]["reconstructed"] = False
+    elif breakdown == "incomplete-history":
+        snapshot["meta"]["orderHistoryComplete"] = False
+    else:
+        snapshot["openPositionsMeta"]["asOf"] = START_MS
+    t.lead.snapshot_json = json.dumps(snapshot)
+    await t.db.commit()
+    lead = (await build_board(t.db, now=NOW))["leads"][0]
+    assert lead["positions"][0]["mine"][0]["state"] == "unknown"
+    assert lead["orphans"] is None

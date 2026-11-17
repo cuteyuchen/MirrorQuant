@@ -351,6 +351,8 @@ class BinanceAdapter(BaseExchangeAdapter):
         rows = await self._request("GET", "/fapi/v2/positionRisk", params={"symbol": inst_id})
         if not rows or any(row.get("marginType") not in ("cross", "crossed") for row in rows):
             raise ExchangeAPIError(self.exchange, "UNSUPPORTED_MODE", "Binance symbol must already use cross margin")
+        if all(float(row.get("leverage") or 0) == lever for row in rows):
+            return True  # 已是目标杠杆：不重复设置，避免无谓写操作与瞬时失败。
         try:
             result = await self._request("POST", "/fapi/v1/leverage", params={"symbol": inst_id, "leverage": lever})
         except ExchangeAPIError:

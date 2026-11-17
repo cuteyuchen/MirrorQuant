@@ -43,21 +43,21 @@ const reason = computed(() => {
       </div>
       <StatusBadge :state="mine.state" />
     </div>
-    <dl class="mt-2.5 grid grid-cols-3 gap-2 text-xs">
+    <dl class="mt-2.5 grid grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)_minmax(0,0.9fr)] gap-2 text-xs">
       <div class="min-w-0">
         <dt class="text-muted">{{ showExpected ? t("board.partialQty") : t("common.quantity") }}</dt>
-        <dd class="mt-0.5 font-mono font-semibold tabular-nums">
+        <dd class="mt-0.5 whitespace-nowrap font-mono font-semibold tabular-nums">
           <template v-if="showExpected">{{ formatQty(mine.qty) }} / {{ formatQty(mine.expectedQty) }}</template>
           <template v-else>{{ formatQty(mine.qty) }}</template>
         </dd>
       </div>
       <div class="min-w-0">
         <dt class="text-muted">{{ t("board.entry") }}</dt>
-        <dd class="mt-0.5 font-mono font-semibold tabular-nums">{{ formatPrice(mine.entryPrice) }}</dd>
+        <dd class="mt-0.5 whitespace-nowrap font-mono font-semibold tabular-nums">{{ formatPrice(mine.entryPrice) }}</dd>
       </div>
       <div class="min-w-0 text-right">
         <dt class="text-muted">{{ t("common.pnl") }}</dt>
-        <dd class="mt-0.5 font-mono font-semibold tabular-nums" :class="pnlClass(mine.pnl)">{{ signedUsd(mine.pnl) }}</dd>
+        <dd class="mt-0.5 whitespace-nowrap font-mono font-semibold tabular-nums" :class="pnlClass(mine.pnl)">{{ signedUsd(mine.pnl) }}</dd>
       </div>
     </dl>
     <p v-if="reason" class="mt-2 flex items-start gap-1.5 text-xs font-medium" :class="tone === 'danger' ? 'text-danger' : 'text-warning'">
