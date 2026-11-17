@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.core.database import get_session_factory
 from app.models.domain import BindingDelivery, ExecutionRecord, NotificationOutbox, OrderIntent, PositionAllocation
@@ -50,7 +50,7 @@ def test_independent_lead_leg_precedes_different_follower_fill(side, direction, 
     ("EXECUTED", "✅"), ("SKIPPED_UNSUPPORTED", "⏭️"), ("SKIPPED_NO_LOCAL_POS", "⏭️"),
     ("SKIPPED_CLOSED_CYCLE", "⏭️"), ("SKIPPED_BELOW_MIN", "⏭️"),
     ("BLOCKED_CATCHUP_DRIFT", "🛑"), ("BLOCKED_SPREAD", "🛑"), ("BLOCKED_SLIPPAGE", "🛑"),
-    ("FAILED", "❌"), ("UNFILLED", "⚪"), ("UNKNOWN", "⚠️"), ("PARTIAL", "⚠️"),
+    ("FAILED", "❌"), ("UNFILLED", "⚪"), ("PARTIAL", "⚠️"),
     ("ACCUMULATED_DEBT", "⏳"),
 ])
 async def test_account_outcomes_are_enqueued_without_sending(monkeypatch, status, icon):
@@ -117,7 +117,7 @@ def test_reference_capital_line_only_for_opening_legs_with_known_margin(side, di
 def test_historical_close_does_not_use_peak_quantity_or_follower_amount():
     source = {"_closed": {"symbol": "ZECUSDT", "side": "SHORT", "avgClosePrice": "123.45", "maxQty": 99}}
     lead = trade_message(message_record(), SimpleNamespace(exchange="okx", environment="live"), source).split("\n\n")[0]
-    assert "平仓（历史持仓记录）" in lead and "🔴" in lead and "做空" in lead
+    assert "平空（历史持仓记录）" in lead and "🔴" in lead and "做空" in lead
     assert "均价 123.45 ｜ 数量 未知 ｜ 金额 未知" in lead
 
 
@@ -154,7 +154,7 @@ async def test_fanout_keeps_source_identity_and_does_not_duplicate_messages(monk
         assert len((await db.scalars(select(ExecutionRecord))).all()) == 3 * independent_fills
         assert all(d.state == "APPLIED" for d in (await db.scalars(select(BindingDelivery))).all())
         headers = [json.loads(r.payload)["message"].split("\n\n")[0] for r in rows]
-        assert len(set(headers)) == 1 and "加仓" in headers[0] and "BTCUSDT" in headers[0]
+        assert len(set(headers)) == 1 and "加多" in headers[0] and "BTCUSDT" in headers[0]
         assert "【原仓位】 9.9 → 【现仓位】 10" in headers[0]
         assert "数量 0.1 ｜ 金额 10.00 U" in headers[0]
         assert [json.loads(r.payload)["event_type"] for r in rows] == [o for o in outcomes for _ in range(independent_fills)]
@@ -183,7 +183,7 @@ async def test_actual_filled_unfilled_and_risk_paths_keep_terminal_states(workfl
     rows = (await t.db.scalars(select(NotificationOutbox))).all()
     assert len(rows) == 1
     msg = json.loads(rows[0].payload)["message"]
-    assert "新开仓" in msg and "均价 100 ｜ 数量 1 ｜ 金额 100.00 U" in msg
+    assert "开多" in msg and "均价 100 ｜ 数量 1 ｜ 金额 100.00 U" in msg
     assert ("✅" in msg) is (outcome == "EXECUTED")
     assert all(d.state == "APPLIED" for d in (await t.db.scalars(select(BindingDelivery))).all())
     if outcome.startswith(("BLOCKED", "SKIPPED")):
@@ -330,19 +330,21 @@ def test_lead_header_and_precise_action_use_position_context():
     msg = trade_message(rec, SimpleNamespace(exchange="binance", environment="live"), source,
                         355911.79, lead=lead, position=position)
     assert msg.split("\n")[0] == "【熬鹰资本 · 币安】"
-    assert "🟢 加仓 ｜ NVDAUSDT 永续 ｜ 做多" in msg
+    assert "🟢 加多 ｜ NVDAUSDT 永续 ｜ 做多" in msg
     assert "【原仓位】 3803.17 → 【现仓位】 4407.29" in msg
     assert "🕐 带单时间 2026/11/16 23:35:19（北京时间）" in msg
     assert "【持仓快照】 当前持仓 1 个 ｜ 账户保证金 355,911.79 U" in msg
 
 
 @pytest.mark.parametrize("previous,current,side,direction,expected", [
-    (0, 604.12, "BUY", "LONG", "新开仓"),
-    (3803.17, 4407.29, "BUY", "LONG", "加仓"),
-    (4407.29, 3803.17, "SELL", "LONG", "减仓"),
-    (604.12, 0, "SELL", "LONG", "平仓"),
-    (0, 10, "SELL", "SHORT", "新开仓"),
-    (10, 0, "BUY", "SHORT", "平仓"),
+    (0, 604.12, "BUY", "LONG", "开多"),
+    (3803.17, 4407.29, "BUY", "LONG", "加多"),
+    (4407.29, 3803.17, "SELL", "LONG", "减多"),
+    (604.12, 0, "SELL", "LONG", "平多"),
+    (0, 10, "SELL", "SHORT", "开空"),
+    (10, 20, "SELL", "SHORT", "加空"),
+    (20, 10, "BUY", "SHORT", "减空"),
+    (10, 0, "BUY", "SHORT", "平空"),
 ])
 def test_precise_action_labels(previous, current, side, direction, expected):
     source = dict(symbol="NVDAUSDT", side=side, positionSide=direction, qtyExact="1",
@@ -392,3 +394,133 @@ def test_lead_position_context_close_and_guards():
     empty = SimpleNamespace(info={"delivery": SimpleNamespace(payload_json=json.dumps(open_payload)),
                                   "snapshot_admission": (None, {"openPositions": []})})
     assert lead_position_context(empty) is None
+
+
+async def test_unknown_outcome_is_recorded_without_notification(monkeypatch):
+    # UNKNOWN 是未定结论：记账但不推送，下一轮评估出确定结论后再推，避免重启刷屏。
+    dispatch = AsyncMock()
+    monkeypatch.setattr(NotificationService, "dispatch", dispatch)
+    async with get_session_factory()() as db:
+        router, binding, lead, account = await record_execution(db)
+        rec = await router._record_execution(db, binding, lead, account, "BTCUSDT", "BTC-USDT-SWAP",
+            "BUY", "LONG", "ADD_LONG", "UNKNOWN", 2, 100, 200,
+            my_qty=0, my_price=101, my_notional=0, order_id=None,
+            details="Account has unresolved orders; increases suspended",
+            notify_cfg={"dingtalk_enabled": True})
+        assert rec.notification_state == "not_required"
+        assert await db.scalar(select(func.count()).select_from(NotificationOutbox)) == 0
+    dispatch.assert_not_awaited()
+
+
+async def _delivery_for(db, binding, event_id):
+    delivery = BindingDelivery(
+        binding_id=binding.id, source_event_id=event_id, source_sequence=1,
+        payload_json=json.dumps({"symbol": "NVDAUSDT", "side": "BUY", "positionSide": "LONG",
+                                 "qty": "604.12", "avgPrice": "160.5070381",
+                                 "notional": "96965.51", "_event_id": event_id,
+                                 "startTime": 1, "endTime": 1}),
+        state="PENDING")
+    db.add(delivery)
+    await db.flush()
+    db.info["delivery"] = delivery
+    return delivery
+
+
+async def _guard_record(router, db, binding, lead, account, status, details):
+    return await router._record_execution(db, binding, lead, account, "NVDAUSDT", "NVDAUSDT",
+        "BUY", "LONG", "ADD_LONG", status, 604.12, 160.5070381, 96965.51,
+        my_qty=0, my_price=157.0, my_notional=0, order_id=None,
+        details=details, notify_cfg={"dingtalk_enabled": True})
+
+
+async def test_guard_outcome_notifies_once_per_delivery_event(monkeypatch):
+    # 复现线上：同一陈旧投递在 1.1.3 周期判 UNKNOWN、1.1.4 周期判 BLOCKED，
+    # 两次重启各推一条内容几乎相同的消息。确定结论只应推送一次。
+    dispatch = AsyncMock()
+    monkeypatch.setattr(NotificationService, "dispatch", dispatch)
+    async with get_session_factory()() as db:
+        router, binding, lead, account = await record_execution(db)
+        await _delivery_for(db, binding, "evt-drift-1")
+        first = await _guard_record(router, db, binding, lead, account, "BLOCKED_SLIPPAGE",
+                                    "Slippage 1.72% > max 1.00%")
+        second = await _guard_record(router, db, binding, lead, account, "BLOCKED_CATCHUP_DRIFT",
+                                     "Catch-up price drift 1.72% > max 0.50% (age 39149s)")
+        assert first.notification_state == "pending" and second.notification_state == "not_required"
+        assert await db.scalar(select(func.count()).select_from(NotificationOutbox)) == 1
+        assert await db.scalar(select(func.count()).select_from(ExecutionRecord)) == 2
+    dispatch.assert_not_awaited()
+
+
+async def test_guard_dedup_does_not_block_later_execution_notice(monkeypatch):
+    dispatch = AsyncMock()
+    monkeypatch.setattr(NotificationService, "dispatch", dispatch)
+    async with get_session_factory()() as db:
+        router, binding, lead, account = await record_execution(db)
+        await _delivery_for(db, binding, "evt-drift-2")
+        await _guard_record(router, db, binding, lead, account, "BLOCKED_CATCHUP_DRIFT",
+                            "Catch-up price drift 1.72% > max 0.50% (age 39149s)")
+        filled = await router._record_execution(db, binding, lead, account, "NVDAUSDT", "NVDAUSDT",
+            "BUY", "LONG", "ADD_LONG", "EXECUTED", 604.12, 160.5070381, 96965.51,
+            my_qty=16.19, my_price=157.0, my_notional=2541.83, order_id="synthetic-order",
+            details="filled", notify_cfg={"dingtalk_enabled": True})
+        assert filled.notification_state == "pending"
+        assert await db.scalar(select(func.count()).select_from(NotificationOutbox)) == 2
+    dispatch.assert_not_awaited()
+
+
+async def test_guard_dedup_is_scoped_per_delivery_event(monkeypatch):
+    dispatch = AsyncMock()
+    monkeypatch.setattr(NotificationService, "dispatch", dispatch)
+    async with get_session_factory()() as db:
+        router, binding, lead, account = await record_execution(db)
+        await _delivery_for(db, binding, "evt-a")
+        await _guard_record(router, db, binding, lead, account, "BLOCKED_SLIPPAGE", "Slippage 2.00% > max 1.00%")
+        await _delivery_for(db, binding, "evt-b")
+        await _guard_record(router, db, binding, lead, account, "BLOCKED_SLIPPAGE", "Slippage 2.00% > max 1.00%")
+        assert await db.scalar(select(func.count()).select_from(NotificationOutbox)) == 2
+    dispatch.assert_not_awaited()
+
+
+def test_block_reason_line_is_bilingual_with_parsed_numbers():
+    rec = message_record()
+    rec.status, rec.details = "BLOCKED_CATCHUP_DRIFT", "Catch-up price drift 1.72% > max 0.50% (age 39149s)"
+    rec.my_qty, rec.order_id = 0, None
+    msg = trade_message(rec, SimpleNamespace(exchange="binance", environment="demo"))
+    assert "📋 原因：补跟价格漂移 1.72% 超过上限 0.50%（信号已过去 10 小时 52 分），未追单" in msg
+    assert "Catch-up price drift 1.72% exceeded the 0.50% limit (signal age 10h 52m); order not placed" in msg
+    assert "Catch-up price drift 1.72% > max 0.50% (age 39149s)" not in msg
+
+
+def test_block_reason_falls_back_without_numbers_when_details_unparseable():
+    rec = message_record()
+    rec.status, rec.details = "BLOCKED_CATCHUP_DRIFT", "something unexpected; do not leak"
+    rec.my_qty, rec.order_id = 0, None
+    msg = trade_message(rec, SimpleNamespace(exchange="binance", environment="demo"))
+    assert "补跟价格漂移超过上限，未追单" in msg and "something unexpected" not in msg
+
+
+def test_stale_missed_order_reason_is_bilingual():
+    rec = message_record()
+    rec.status, rec.details = "SKIPPED_STALE_MISSED_ORDER", "Missed order stale: age 3600s > max 900s"
+    rec.my_qty, rec.order_id = 0, None
+    msg = trade_message(rec, SimpleNamespace(exchange="binance", environment="demo"))
+    assert "欠单已过期，信号距今 1 小时 0 分，超过上限 15 分 0 秒" in msg
+    assert "Missed order stale: signal age 1h 0m exceeded the 15m 0s limit" in msg
+
+
+def test_slippage_block_reason_includes_measured_value():
+    rec = message_record()
+    rec.status, rec.details, rec.slippage_pct = "BLOCKED_SLIPPAGE", "Slippage 1.25% > max 1.00%", 1.25
+    rec.my_qty, rec.order_id = 0, None
+    msg = trade_message(rec, SimpleNamespace(exchange="binance", environment="demo"))
+    assert "滑点超出上限（实测 1.25%）" in msg and "Slippage exceeded the limit (measured 1.25%)" in msg
+
+
+def test_static_block_reason_and_no_reason_for_executions():
+    rec = message_record()
+    rec.status, rec.details = "BLOCKED_KILL_SWITCH", "kill switch engaged"
+    rec.my_qty, rec.order_id = 0, None
+    msg = trade_message(rec, SimpleNamespace(exchange="binance", environment="demo"))
+    assert "📋 原因：急停开关已开启 / Kill switch engaged" in msg
+    executed = trade_message(message_record(), SimpleNamespace(exchange="binance", environment="demo"))
+    assert "📋 原因" not in executed

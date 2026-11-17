@@ -56,6 +56,11 @@ export const settingsAdditions: Record<string, readonly [string, string]> = {
   "set.empty": ["尚无可用设置", "No settings are available"],
   "set.auditSummary": ["最近的管理操作", "Recent administrative actions"],
   "set.resCatchup": ["追单与资金不足", "Catch-up and insufficient margin"],
+  "set.catchupNote": ["追单是补跟带单信号，先过时效与偏离两道门；限价单挂单是偏离超限时的下单方式，在“默认风控 → 滑点超限处理”里设置。两者是先后环节，不是同一设置。", "Catching up means following a missed lead signal, gated by age and drift first; resting a limit order is how the order is placed when deviation is too large, set under Default Risk → Slippage action. They are sequential steps, not the same setting."],
+  "riskGroup.execution": ["执行与成交", "Execution & fills"],
+  "riskGroup.leverage": ["杠杆上限", "Leverage caps"],
+  "riskGroup.breaker": ["熔断保护", "Circuit breaker"],
+  "riskGroup.protection": ["止盈止损", "Take profit & stop loss"],
   "set.resReconcile": ["对账与失败熔断", "Reconciliation and failure breaker"],
   "set.resAdvanced": ["高级设置", "Advanced settings"],
 };

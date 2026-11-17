@@ -97,6 +97,92 @@ def _limit_lines(status: str, record, limit: dict) -> tuple[str, list[str]]:
 
 _LEAD_PLATFORMS = {"binance_bapi": "币安"}
 
+# 拦截/跳过原因只用状态码与严格解析的数字，绝不原样输出诊断自由文本。
+_BLOCK_DRIFT_RE = re.compile(
+    r"^Catch-up price drift ([0-9]+(?:\.[0-9]+)?)% > max ([0-9]+(?:\.[0-9]+)?)% \(age ([0-9]+(?:\.[0-9]+)?)s\)$")
+_BLOCK_STALE_RE = re.compile(
+    r"^Missed order stale: age ([0-9]+(?:\.[0-9]+)?)s > max ([0-9]+(?:\.[0-9]+)?)s$")
+_BLOCK_REASONS: dict[str, tuple[str, str]] = {
+    "BLOCKED_CATCHUP_PRICE": ("补跟价格缺失或无效，无法核对偏离，未跟单",
+                              "Catch-up reference or lead price missing or invalid; drift check impossible, order not placed"),
+    "BLOCKED_CATCHUP_CONFIG": ("补跟风控参数配置无效，未跟单",
+                               "Catch-up guard misconfigured; order not placed"),
+    "BLOCKED_CIRCUIT_BREAKER": ("熔断已触发，暂停开仓", "Circuit breaker tripped; opening suspended"),
+    "BLOCKED_KILL_SWITCH": ("急停开关已开启", "Kill switch engaged"),
+    "BLOCKED_DAILY_LOSS": ("触及单日亏损上限", "Daily loss limit reached"),
+    "BLOCKED_DRAWDOWN": ("触及回撤上限", "Drawdown limit reached"),
+    "BLOCKED_INSUFFICIENT_MARGIN": ("保证金不足", "Insufficient margin"),
+    "BLOCKED_COLLATERAL_BALANCE": ("抵押品余额不足或异常", "Collateral balance insufficient or abnormal"),
+    "BLOCKED_LEVERAGE": ("杠杆超出上限", "Leverage exceeds the limit"),
+    "BLOCKED_SLIPPAGE": ("滑点超出上限", "Slippage exceeded the limit"),
+    "BLOCKED_SPREAD": ("盘口价差过大", "Order-book spread too wide"),
+    "BLOCKED_FILTER": ("未通过订单过滤器（最小下单量或价格精度）",
+                       "Order filter rejected (minimum size or price precision)"),
+    "BLOCKED_RESTING_LIMIT": ("已有同方向限价单在簿等待，未重复下单",
+                              "A resting limit order for the same direction already exists; no duplicate order placed"),
+    "BLOCKED_SOURCE_ORDERING": ("带单员订单顺序证据不足，暂缓执行",
+                                "Source ordering evidence insufficient; execution deferred"),
+    "BLOCKED_ALLOCATION_DEFICIT": ("仓位分配账目不足，暂缓执行",
+                                   "Position allocation deficit; execution deferred"),
+    "BLOCKED_ALLOCATION_MISMATCH": ("仓位分配账目不一致，暂缓执行",
+                                    "Position allocation mismatch; execution deferred"),
+    "BLOCKED_ORPHAN_DETECTED": ("检测到孤儿仓位，暂缓执行", "Orphan position detected; execution deferred"),
+    "BLOCKED_ORPHAN_CLOSE_EVIDENCE": ("孤儿仓位平仓证据不足，暂缓执行",
+                                      "Orphan close evidence insufficient; execution deferred"),
+    "BLOCKED_PROTECTION_UNAVAILABLE": ("风控保护数据不可用，暂缓执行",
+                                       "Risk protection data unavailable; execution deferred"),
+    "SKIPPED_BELOW_MIN": ("数量低于最小下单量", "Quantity below the minimum order size"),
+    "SKIPPED_CLOSED_CYCLE": ("闭环事件已处理，无需重复执行", "Closed-cycle event already processed; nothing to execute"),
+    "SKIPPED_NO_LOCAL_POS": ("本地无对应仓位", "No local position to act on"),
+    "SKIPPED_UNSUPPORTED": ("不支持的品种或方向", "Unsupported instrument or side"),
+    "FAILED": ("执行失败，成交结果需核实", "Execution failed; fill result needs verification"),
+    "ACCUMULATED_DEBT": ("数量不足，累积待后续补足", "Quantity insufficient; accumulated for a later top-up"),
+}
+
+
+def _duration_text(seconds: float) -> tuple[str, str]:
+    total = int(seconds)
+    if total < 120:
+        return f"{total} 秒", f"{total}s"
+    if total < 3600:
+        return f"{total // 60} 分 {total % 60} 秒", f"{total // 60}m {total % 60}s"
+    if total < 86400:
+        return f"{total // 3600} 小时 {(total % 3600) // 60} 分", f"{total // 3600}h {(total % 3600) // 60}m"
+    return f"{total // 86400} 天 {(total % 86400) // 3600} 小时", f"{total // 86400}d {(total % 86400) // 3600}h"
+
+
+def _block_reason(status: str, record) -> Optional[str]:
+    """拦截/跳过原因的双语说明行；无已知解释的状态返回 None，不编造。"""
+    if status == "BLOCKED_CATCHUP_DRIFT":
+        match = _BLOCK_DRIFT_RE.fullmatch(str(getattr(record, "details", "") or ""))
+        if match is not None:
+            dev, maximum, age = match.groups()
+            zh_age, en_age = _duration_text(float(age))
+            return (f"📋 原因：补跟价格漂移 {dev}% 超过上限 {maximum}%（信号已过去 {zh_age}），未追单 / "
+                    f"Catch-up price drift {dev}% exceeded the {maximum}% limit "
+                    f"(signal age {en_age}); order not placed")
+        return "📋 原因：补跟价格漂移超过上限，未追单 / Catch-up price drift exceeded the limit; order not placed"
+    if status == "SKIPPED_STALE_MISSED_ORDER":
+        match = _BLOCK_STALE_RE.fullmatch(str(getattr(record, "details", "") or ""))
+        if match is not None:
+            age, maximum = match.groups()
+            zh_age, en_age = _duration_text(float(age))
+            zh_max, en_max = _duration_text(float(maximum))
+            return (f"📋 原因：欠单已过期，信号距今 {zh_age}，超过上限 {zh_max} / "
+                    f"Missed order stale: signal age {en_age} exceeded the {en_max} limit")
+        return "📋 原因：欠单已过期，超过追单时效上限 / Missed order stale: catch-up age limit exceeded"
+    reason = _BLOCK_REASONS.get(status)
+    if reason is None:
+        return None
+    zh, en = reason
+    if status in ("BLOCKED_SLIPPAGE", "BLOCKED_SPREAD"):
+        measured = _decimal(getattr(record, "slippage_pct", None))
+        if measured is not None:
+            shown = measured.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            zh = f"{zh}（实测 {shown}%）"
+            en = f"{en} (measured {shown}%)"
+    return f"📋 原因：{zh} / {en}"
+
 
 def _lead_header(lead: Any, record) -> str:
     """带单员身份行：名字只取单行截断后的文本，自由文本不得伪造换行或多行内容。"""
@@ -112,16 +198,27 @@ def _lead_header(lead: Any, record) -> str:
 
 
 def _precise_action(side: Any, direction: Any, position: Optional[dict]) -> Optional[str]:
-    """用仓位变化区分新开/加仓与减仓/平仓；缺仓位上下文时返回 None 走模糊口径。"""
+    """用仓位变化区分开/加仓与减/平仓，并写明多空：开多/加多/开空/加空/减多/平多/减空/平空。
+
+    缺仓位上下文或方向不明时返回 None，走模糊口径，不猜测。
+    """
     if not isinstance(position, dict):
         return None
     previous = _decimal(position.get("previous_qty"), allow_zero=True)
     current = _decimal(position.get("current_qty"), allow_zero=True)
     if previous is None or current is None:
         return None
+    side_key = str(direction).upper()
+    if side_key not in ("LONG", "SHORT"):
+        return None
+    long_side = side_key == "LONG"
     if _is_opening(side, direction):
-        return "新开仓" if previous <= 0 else "加仓"
-    return "平仓" if current <= 0 else "减仓"
+        if previous <= 0:
+            return "开多" if long_side else "开空"
+        return "加多" if long_side else "加空"
+    if current <= 0:
+        return "平多" if long_side else "平空"
+    return "减多" if long_side else "减空"
 
 
 def _position_line(position: Optional[dict]) -> Optional[str]:
@@ -174,7 +271,13 @@ def trade_message(record, account, source: Optional[dict] = None, lead_margin: A
     if "_closed" in source:
         closed = source["_closed"]
         symbol, direction = closed.get("symbol"), closed.get("side")
-        action = "平仓（历史持仓记录）"
+        closed_side = str(direction).upper()
+        if closed_side == "LONG":
+            action = "平多（历史持仓记录）"
+        elif closed_side == "SHORT":
+            action = "平空（历史持仓记录）"
+        else:
+            action = "平仓（历史持仓记录）"
         price, qty, notional = closed.get("avgClosePrice"), None, None
         # maxQty is peak inventory, not a confirmed independent closing fill.
     elif source:
@@ -259,6 +362,9 @@ def trade_message(record, account, source: Optional[dict] = None, lead_margin: A
     safe_status = status if re.fullmatch(r"[A-Z_]{1,64}", status) else "UNKNOWN"
     follower_symbol = _symbol(getattr(record, "inst_id", record.symbol))
     follower = f"{result}\n👤 跟单{tag}\n🏷️ {follower_symbol} ｜ {safe_status}"
+    reason_line = _block_reason(status, record)
+    if reason_line:
+        follower += f"\n{reason_line}"
     if status in ("EXECUTED", "PARTIAL", "UNFILLED"):
         follower += (f"\n📦 数量 {_number(record.my_qty, allow_zero=True)}"
                      f" ｜ 均价 {_number(record.my_price) if confirmed else '未知'}"

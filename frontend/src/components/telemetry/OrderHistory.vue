@@ -62,7 +62,7 @@ function leverageText(position: ClosedPosition) {
   return [leverage, mode].filter(Boolean).join(" · ") || null;
 }
 // 稳定业务键用于展开状态，翻页或排序不会把另一笔订单展开。
-const rows = computed<Row[]>(() => {
+const unsortedRows = computed<Row[]>(() => {
   if (view.value === "orders") return (props.snapshot.orders ?? []).map(orderRow);
   if (view.value === "batches") return (props.snapshot.orderBatches ?? []).map(batch => ({
     ...orderRow(batch), key: `batch:${orderKey(batch)}:${batch.startTime}:${batch.endTime}`,
@@ -89,6 +89,18 @@ const rows = computed<Row[]>(() => {
     counts: null, orderCount: null, leverage: leverageText(position), children: [],
   }));
 });
+// 操作流倒序展示：最新的在最上面；时间缺失的沉底，原顺序保持稳定。
+const rows = computed<Row[]>(() => unsortedRows.value
+  .map((row, index) => ({ row, index }))
+  .sort((a, b) => {
+    const ta = a.row.time, tb = b.row.time;
+    if (ta == null && tb == null) return a.index - b.index;
+    if (ta == null) return 1;
+    if (tb == null) return -1;
+    if (tb !== ta) return tb - ta;
+    return a.index - b.index;
+  })
+  .map(({ row }) => row));
 // 每个页签只列它真正有的字段，不再用一套列硬套四种数据。
 const columns = computed<TableColumn[]>(() => {
   const symbol = { key: "symbol", label: t("feed.colDirSym"), width: "23%", mobileWide: true };

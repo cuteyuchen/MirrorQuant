@@ -79,3 +79,18 @@ describe("深度分析的保留与安全呈现", () => {
     page.unmount();
   });
 });
+
+describe("操作流倒序展示", () => {
+  it("最新的批次在最上面，时间缺失的沉底", () => {
+    const batches = [
+      { symbol: "AAAUSDT", dir: "OPEN_LONG", endTime: 1_800_000_000_000, avgPrice: 10, qty: 1, orders: [] },
+      { symbol: "BBBUSDT", dir: "OPEN_LONG", endTime: 1_800_010_000_000, avgPrice: 10, qty: 1, orders: [] },
+      { symbol: "CCCUSDT", dir: "OPEN_LONG", endTime: 1_800_020_000_000, avgPrice: 10, qty: 1, orders: [] },
+      { symbol: "DDDUSDT", dir: "OPEN_LONG", endTime: null, startTime: null, time: null, avgPrice: 10, qty: 1, orders: [] },
+    ];
+    const page = mount(OrderHistory, { props: { snapshot: { orderBatches: batches } } });
+    const symbols = page.findAll("tbody tr").map(row => row.find("strong").text());
+    expect(symbols).toEqual(["CCCUSDT", "BBBUSDT", "AAAUSDT", "DDDUSDT"]);
+    page.unmount();
+  });
+});

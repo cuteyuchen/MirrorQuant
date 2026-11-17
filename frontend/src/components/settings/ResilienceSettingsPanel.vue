@@ -15,6 +15,7 @@ function update<K extends keyof ResilienceSettings>(key: K, value: ResilienceSet
   <section class="space-y-5">
     <fieldset class="space-y-4 border-b border-border/50 pb-5">
       <legend class="section-title mb-4">{{ t("set.resCatchup") }}</legend>
+      <p class="text-xs text-muted">{{ t("set.catchupNote") }}</p>
       <div class="grid gap-5 sm:grid-cols-2"><NumberField v-for="key in catchupKeys" :key="key" :rule="RESILIENCE_RULES[key]" :name="`resilience.${key}`" :model-value="modelValue[key]" :error="errors[`resilience.${key}`]" @update:model-value="update(key, $event)" /></div>
       <label class="field-label">{{ t("set.marginPolicy") }} *
         <select :value="modelValue.insufficient_margin_policy ?? ''" name="resilience.insufficient_margin_policy" class="form-input mt-1" :aria-invalid="!!errors['resilience.insufficient_margin_policy']" @change="update('insufficient_margin_policy', ($event.target as HTMLSelectElement).value)"><option disabled value="">{{ t("state.UNKNOWN") }}</option><option value="auto_scale_down">{{ t("resilience.auto_scale_down") }}</option><option value="skip_alert">{{ t("resilience.skip_alert") }}</option></select>

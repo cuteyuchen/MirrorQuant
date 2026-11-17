@@ -91,6 +91,15 @@ NOT_FOUND_CANCEL_GRACE_MS = 300_000
 # 开仓终态死意图最多重驱次数：超过则停手等人看，避免无限重试。
 MAX_OPEN_RETRY_ATTEMPTS = 3
 
+# 未动钱的风控结论（拦截/跳过/失败/累积待执行）：同一投递事件只推送一次。
+# 重启后重新评估同一待处理投递时，结论变化也不得重复推送；真正成交、
+# 部分成交、限价单挂出/失效属于资金动作，不受此限。
+_GUARD_NO_TRADE_STATUSES = ("FAILED", "ACCUMULATED_DEBT")
+
+
+def _is_guard_outcome(status: str) -> bool:
+    return status.startswith("BLOCKED") or status.startswith("SKIPPED") or status in _GUARD_NO_TRADE_STATUSES
+
 
 def _source_notional_conflicts(recorded, fresh) -> bool:
     """名义金额冲突只认超出舍入抖动的差异。
@@ -1139,14 +1148,29 @@ class CopyRouter:
         }
         if notify_cfg:
             should_notify = (
-                # 限价单的挂出与失效同属执行结果通知。
-                (status in ("EXECUTED", "UNFILLED", "UNKNOWN", "PARTIAL", "LIMIT_PLACED", "LIMIT_EXPIRED")
+                # 限价单的挂出与失效同属执行结果通知。UNKNOWN 是未定结论，
+                # 投递保持待处理、下一轮会再评估并推送确定结论，不单独推送。
+                (status in ("EXECUTED", "UNFILLED", "PARTIAL", "LIMIT_PLACED", "LIMIT_EXPIRED")
                  and notify_cfg.get("notify_on_execution", True))
                 or (
-                    (status.startswith("BLOCKED") or status in ("FAILED", "ACCUMULATED_DEBT") or status.startswith("SKIPPED"))
+                    _is_guard_outcome(status)
                     and notify_cfg.get("notify_on_risk_block", True)
                 )
             )
+            if (should_notify and delivery is not None and _is_guard_outcome(status)
+                    and exact(my_qty) == 0):
+                # 同一投递事件已有已推送/待推送的风控结论：只记账，不再推送。
+                # 回执失败（failed）的结论不在此列，重新评估仍可补推。
+                already_notified = await db.scalar(select(ExecutionRecord.id).where(
+                    ExecutionRecord.id != rec.id,
+                    ExecutionRecord.binding_id == binding.id, ExecutionRecord.account_id == account.id,
+                    ExecutionRecord.delivery_event_id == delivery.source_event_id,
+                    ExecutionRecord.inst_id == inst_id, ExecutionRecord.position_side == position_side,
+                    ExecutionRecord.notification_state.in_(("pending", "sent")),
+                    or_(ExecutionRecord.status.startswith("BLOCKED"), ExecutionRecord.status.startswith("SKIPPED"),
+                        ExecutionRecord.status.in_(_GUARD_NO_TRADE_STATUSES))))
+                if already_notified is not None:
+                    should_notify = False
             if should_notify:
                 source = json.loads(delivery.payload_json) if delivery is not None else None
                 msg = trade_message(rec, account, source, getattr(lead, "margin_balance", None), limit=limit,
