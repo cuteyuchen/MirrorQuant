@@ -111,6 +111,7 @@ export interface RiskSettings {
   order_mode: string | null; tp_sl_mode: string | null;
   // 滑点超限处理：block 拦截 / limit 改挂限价单；限价单超过有效期未成交自动撤单。
   slippage_action: string | null; limit_order_ttl_sec: number | null;
+  adopt_existing_positions: boolean | null; adopt_tolerance_pct: number | null;
   enable_stop_loss: boolean | null; stop_loss_pct: number | null;
   enable_take_profit: boolean | null; take_profit_pct: number | null;
   enable_trailing_stop: boolean | null; trailing_callback_pct: number | null;
@@ -125,6 +126,8 @@ export interface Binding {
   maxDrawdownPct: number | null; dailyMaxLossPct: number | null; maxSlippagePct: number | null;
   maxSpreadPct: number | null; iocOffsetPct: number | null; orderMode: string | null;
   slippageAction: string | null; limitOrderTtlSec: number | null;
+  adoptExistingPositions: boolean | null; adoptTolerancePct: number | null;
+  adoptionCompleted: boolean | null;
   tpSlMode: string | null; enableStopLoss: boolean | null; stopLossPct: number | null;
   enableTakeProfit: boolean | null; takeProfitPct: number | null;
   enableTrailingStop: boolean | null; trailingCallbackPct: number | null; hardStopLossPct: number | null;

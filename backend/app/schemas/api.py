@@ -170,6 +170,8 @@ class BindingCreate(CamelModel):
     # 滑点超限处理方式与限价单有效期（秒）。
     slippage_action: str = Field(default="block", pattern="^(block|limit)$")
     limit_order_ttl_sec: int = Field(default=120, ge=10, le=3600)
+    adopt_existing_positions: bool = True
+    adopt_tolerance_pct: float = Field(default=10.0, ge=0.0, le=100.0)
     tp_sl_mode: str = Field(default="follow_lead", pattern="^(follow_lead|independent|hybrid_guard)$")
     enable_stop_loss: bool = False
     stop_loss_pct: float = Field(default=5.0, gt=0.0, le=95.0)
@@ -200,6 +202,8 @@ class BindingUpdate(UpdateModel):
     order_mode: Optional[str] = Field(default=None, pattern="^(ioc_then_market|ioc_only|market_only)$")
     slippage_action: Optional[str] = Field(default=None, pattern="^(block|limit)$")
     limit_order_ttl_sec: Optional[int] = Field(default=None, ge=10, le=3600)
+    adopt_existing_positions: Optional[bool] = None
+    adopt_tolerance_pct: Optional[float] = Field(default=None, ge=0.0, le=100.0)
     tp_sl_mode: Optional[str] = Field(default=None, pattern="^(follow_lead|independent|hybrid_guard)$")
     enable_stop_loss: Optional[bool] = None
     stop_loss_pct: Optional[float] = Field(default=None, gt=0.0, le=95.0)
@@ -234,6 +238,8 @@ class RiskDefaults(CamelModel):
     order_mode: Literal["ioc_then_market", "ioc_only", "market_only"] = "ioc_then_market"
     slippage_action: Literal["block", "limit"] = "block"
     limit_order_ttl_sec: int = Field(default=120, ge=10, le=3600)
+    adopt_existing_positions: StrictBool = True
+    adopt_tolerance_pct: float = Field(default=10.0, ge=0.0, le=100.0)
     tp_sl_mode: Literal["follow_lead", "independent", "hybrid_guard"] = "follow_lead"
     enable_stop_loss: StrictBool = False
     stop_loss_pct: float = Field(default=5.0, gt=0.0, le=95.0)

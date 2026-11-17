@@ -524,3 +524,21 @@ def test_static_block_reason_and_no_reason_for_executions():
     assert "📋 原因：急停开关已开启 / Kill switch engaged" in msg
     executed = trade_message(message_record(), SimpleNamespace(exchange="binance", environment="demo"))
     assert "📋 原因" not in executed
+
+
+def test_spread_block_reason_includes_measured_and_guard_values():
+    rec = message_record()
+    rec.status, rec.details = "BLOCKED_SPREAD", "Orderbook spread 0.381% exceeds guard 0.300%"
+    rec.my_qty, rec.order_id = 0, None
+    msg = trade_message(rec, SimpleNamespace(exchange="binance", environment="demo"))
+    assert "盘口价差过大，实测 0.381%，上限 0.300%" in msg
+    assert "Order-book spread too wide (measured 0.381%, guard 0.300%)" in msg
+
+
+def test_slippage_block_reason_parses_guard_from_details():
+    rec = message_record()
+    rec.status, rec.details = "BLOCKED_SLIPPAGE", "Slippage 1.24% exceeds limit 1.00%"
+    rec.my_qty, rec.order_id = 0, None
+    msg = trade_message(rec, SimpleNamespace(exchange="binance", environment="demo"))
+    assert "滑点超出上限，实测 1.24%，上限 1.00%" in msg
+    assert "Slippage exceeded the limit (measured 1.24%, limit 1.00%)" in msg

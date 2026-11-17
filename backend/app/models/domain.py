@@ -204,6 +204,11 @@ class CopyBinding(Base):
     circuit_breaker_reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     consecutive_failures: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     baseline_seeded: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # 接入时认领与带单员持仓一致的已有仓位：敞口比率（名义金额/权益）相对差异在容差内即视为同一仓位。
+    adopt_existing_positions: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    adopt_tolerance_pct: Mapped[float] = mapped_column(Float, default=10.0, nullable=False)
+    # 认领评估只在基线期自动跑一次；评估失败（交易所不可达）时保持 False，下一轮重试。
+    adoption_completed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(

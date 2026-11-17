@@ -13,6 +13,7 @@ export const RISK_RULES = {
   max_spread_pct: { min: 0, max: 20, label: "set.maxSpread", unit: "pct", hint: "riskHelp.max_spread_pct" },
   ioc_offset_pct: { min: 0, max: 10, label: "set.iocOffset", unit: "pct", hint: "riskHelp.ioc_offset_pct" },
   limit_order_ttl_sec: { min: 10, max: 3600, integer: true, label: "set.limitTtl", unit: "seconds", hint: "riskHelp.limit_order_ttl_sec" },
+  adopt_tolerance_pct: { min: 0, max: 100, label: "set.adoptTolerance", unit: "pct", hint: "riskHelp.adopt_tolerance_pct" },
   stop_loss_pct: { min: 0, exclusive: true, max: 95, label: "set.slPct", unit: "pct", hint: "riskHelp.stop_loss_pct" },
   take_profit_pct: { min: 0, exclusive: true, max: 500, label: "set.tpPct", unit: "pct", hint: "riskHelp.take_profit_pct" },
   trailing_callback_pct: { min: 0, exclusive: true, max: 50, label: "set.tsCallback", unit: "pct", hint: "riskHelp.trailing_callback_pct" },
@@ -34,10 +35,11 @@ export const SLIPPAGE_ACTIONS = ["block", "limit"] as const;
 export const TP_SL_MODES = ["follow_lead", "independent", "hybrid_guard"] as const;
 export const RISK_SWITCHES = {
   enable_circuit_breaker: "risk.circuitBreaker", enable_leverage_cap: "risk.leverageCap",
+  adopt_existing_positions: "set.adoptExisting",
   enable_stop_loss: "set.enableSl", enable_take_profit: "set.enableTp", enable_trailing_stop: "set.enableTs",
 } as const;
 export const RISK_FIELD_GROUPS = {
-  execution: ["ioc_offset_pct", "limit_order_ttl_sec"],
+  execution: ["ioc_offset_pct", "limit_order_ttl_sec", "adopt_tolerance_pct"],
   risk: ["max_total_leverage", "max_single_leverage", "max_instrument_leverage", "max_drawdown_pct", "daily_max_loss_pct", "max_slippage_pct", "max_spread_pct"],
   protection: ["stop_loss_pct", "take_profit_pct", "trailing_callback_pct", "hard_stop_loss_pct"],
 } as const satisfies Record<string, readonly (keyof typeof RISK_RULES)[]>;
@@ -49,6 +51,7 @@ export const DEFAULT_RISK: RiskSettings = {
   max_single_leverage: 4, max_instrument_leverage: 20, max_drawdown_pct: 30,
   daily_max_loss_pct: 10, max_slippage_pct: 1, max_spread_pct: 0.3, ioc_offset_pct: 0.5,
   order_mode: "ioc_then_market", slippage_action: "block", limit_order_ttl_sec: 120,
+  adopt_existing_positions: true, adopt_tolerance_pct: 10,
   tp_sl_mode: "follow_lead", enable_stop_loss: false,
   stop_loss_pct: 5, enable_take_profit: false, take_profit_pct: 10,
   enable_trailing_stop: false, trailing_callback_pct: 2, hard_stop_loss_pct: 15,
@@ -65,6 +68,7 @@ export const BINDING_RISK_FIELDS = {
   daily_max_loss_pct: "dailyMaxLossPct", max_slippage_pct: "maxSlippagePct", max_spread_pct: "maxSpreadPct",
   ioc_offset_pct: "iocOffsetPct", order_mode: "orderMode", tp_sl_mode: "tpSlMode",
   slippage_action: "slippageAction", limit_order_ttl_sec: "limitOrderTtlSec",
+  adopt_existing_positions: "adoptExistingPositions", adopt_tolerance_pct: "adoptTolerancePct",
   enable_stop_loss: "enableStopLoss", stop_loss_pct: "stopLossPct", enable_take_profit: "enableTakeProfit",
   take_profit_pct: "takeProfitPct", enable_trailing_stop: "enableTrailingStop",
   trailing_callback_pct: "trailingCallbackPct", hard_stop_loss_pct: "hardStopLossPct",

@@ -36,6 +36,9 @@ export function reasonText(reason?: string | null): string {
 // 严格全匹配才转译为本地化原因行，格式稍有出入就保留原文，绝不猜测数字含义。
 const DRIFT_RE = /^Catch-up price drift ([0-9]+(?:\.[0-9]+)?)% > max ([0-9]+(?:\.[0-9]+)?)% \(age ([0-9]+(?:\.[0-9]+)?)s\)$/;
 const STALE_RE = /^Missed order stale: age ([0-9]+(?:\.[0-9]+)?)s > max ([0-9]+(?:\.[0-9]+)?)s$/;
+const ADOPT_RE = /^Adopted existing position: my exposure ([0-9]+(?:\.[0-9]+)?)x, lead exposure ([0-9]+(?:\.[0-9]+)?)x, tolerance ([0-9]+(?:\.[0-9]+)?)%$/;
+const SPREAD_RE = /^Orderbook spread ([0-9]+(?:\.[0-9]+)?)% exceeds guard ([0-9]+(?:\.[0-9]+)?)%$/;
+const SLIPPAGE_RE = /^Slippage ([0-9]+(?:\.[0-9]+)?)% exceeds limit ([0-9]+(?:\.[0-9]+)?)%$/;
 function durationText(seconds: number, t: ReturnType<typeof useI18n>["t"]): string {
   const total = Math.floor(seconds);
   if (total < 120) return t("duration.seconds", { n: total });
@@ -51,6 +54,18 @@ function parseGuardDetails(reason: string, t: ReturnType<typeof useI18n>["t"]): 
   const stale = STALE_RE.exec(reason);
   if (stale) {
     return t("reasonDetail.staleOrder", { age: durationText(Number(stale[1]), t), max: durationText(Number(stale[2]), t) });
+  }
+  const adopted = ADOPT_RE.exec(reason);
+  if (adopted) {
+    return t("reasonDetail.adoptedPosition", { mine: adopted[1], lead: adopted[2], tol: adopted[3] });
+  }
+  const spread = SPREAD_RE.exec(reason);
+  if (spread) {
+    return t("reasonDetail.spreadGuard", { measured: spread[1], guard: spread[2] });
+  }
+  const slippage = SLIPPAGE_RE.exec(reason);
+  if (slippage) {
+    return t("reasonDetail.slippageGuard", { measured: slippage[1], limit: slippage[2] });
   }
   return null;
 }

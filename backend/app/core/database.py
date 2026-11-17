@@ -123,6 +123,8 @@ DEFAULT_SYSTEM_CONFIG = {
         # 滑点超限：block=拦截；limit=挂限价单，limit_order_ttl_sec 秒内未成交自动撤单。
         "slippage_action": "block",
         "limit_order_ttl_sec": 120,
+        "adopt_existing_positions": True,
+        "adopt_tolerance_pct": 10.0,
         "tp_sl_mode": "follow_lead",
         "enable_stop_loss": False,
         "stop_loss_pct": 5.0,
@@ -213,6 +215,9 @@ SQLITE_MIGRATIONS: Dict[str, List[Tuple[str, str]]] = {
         # 旧绑定升级后保持原行为（拦截），需要挂限价单时在绑定里手动开启。
         ("slippage_action", "VARCHAR(16) NOT NULL DEFAULT 'block'"),
         ("limit_order_ttl_sec", "INTEGER NOT NULL DEFAULT 120"),
+        ("adopt_existing_positions", "BOOLEAN NOT NULL DEFAULT 1"),
+        ("adopt_tolerance_pct", "FLOAT NOT NULL DEFAULT 10.0"),
+        ("adoption_completed", "BOOLEAN NOT NULL DEFAULT 0"),
     ],
 }
 

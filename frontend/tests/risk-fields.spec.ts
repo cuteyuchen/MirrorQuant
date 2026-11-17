@@ -11,7 +11,7 @@ describe("默认风控页按功能分区", () => {
     expect(page.findAll("legend").map(el => el.text())).toEqual([
       t("riskGroup.execution"), t("riskGroup.leverage"), t("riskGroup.breaker"), t("riskGroup.protection"),
     ]);
-    expect(page.findAll("input[type='checkbox']")).toHaveLength(5);
+    expect(page.findAll("input[type='checkbox']")).toHaveLength(6);
     expect(page.findAll("select")).toHaveLength(3);
     page.unmount();
   });

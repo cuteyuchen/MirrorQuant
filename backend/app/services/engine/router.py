@@ -123,6 +123,23 @@ def _sequence_matches_interval(source_sequence, interval) -> bool:
     return interval is not None and abs(int(source_sequence) - int(interval[1])) <= 1
 
 
+def _exposure_ratio_matches(lead_ratio, my_ratio, tolerance_pct) -> bool:
+    """敞口比率（仓位名义金额 / 账户权益）相对差异在容差内即视为同一仓位。
+
+    与下单 sizing 同一口径：sizer 按“带单名义金额 / 带单保证金余额”
+    折算跟单目标，这里反向用同一比率判断已有仓位是否就是带单员
+    的那笔仓位。容差为 0 只认完全一致；任一比率无效或容差为负
+    都不匹配，绝不猜测。
+    """
+    try:
+        lead, mine, tol = exact(lead_ratio), exact(my_ratio), exact(tolerance_pct)
+    except (ValueError, InvalidOperation, TypeError, AttributeError):
+        return False
+    if lead <= 0 or mine <= 0 or tol < 0:
+        return False
+    return abs(mine - lead) <= lead * tol / 100
+
+
 def lead_position_context(db) -> Optional[Dict[str, Any]]:
     """Recover pre/post lead inventory for a notification from the current delivery scope.
 
@@ -1150,7 +1167,9 @@ class CopyRouter:
             should_notify = (
                 # 限价单的挂出与失效同属执行结果通知。UNKNOWN 是未定结论，
                 # 投递保持待处理、下一轮会再评估并推送确定结论，不单独推送。
-                (status in ("EXECUTED", "UNFILLED", "PARTIAL", "LIMIT_PLACED", "LIMIT_EXPIRED")
+                # 认领每个绑定基线期最多发生一次，值得单独通知一次。
+                (status in ("EXECUTED", "UNFILLED", "PARTIAL", "LIMIT_PLACED", "LIMIT_EXPIRED",
+                            "ADOPTED_POSITION")
                  and notify_cfg.get("notify_on_execution", True))
                 or (
                     _is_guard_outcome(status)
@@ -1529,6 +1548,154 @@ class CopyRouter:
             delivery.exit_progress = None
         await db.commit()
 
+    @staticmethod
+    async def _adoption_window_open(db: AsyncSession, binding: CopyBinding) -> bool:
+        """自动认领只在接入窗口内跑：绑定还没有任何归属账目与投递记录。
+
+        存量绑定（已有跟单账目或投递历史）不自动认领，改走手动端点；
+        这样自动认领绝不会在已有跟单历史的绑定上多一次 adapter 调用，
+        也不会在部署后悄悄改变存量绑定的账目。基线周期内即使带单员有
+        订单也不会产生投递（订单记为基线），所以新绑定的接入窗口不会被
+        首批订单关掉；认领若因余额读取失败而推迟，只要窗口未关就会重试。
+        """
+        has_allocation = await db.scalar(select(PositionAllocation.id).where(
+            PositionAllocation.binding_id == binding.id).limit(1))
+        if has_allocation is not None:
+            return False
+        has_delivery = await db.scalar(select(BindingDelivery.binding_id).where(
+            BindingDelivery.binding_id == binding.id).limit(1))
+        return has_delivery is None
+
+    async def _adopt_matching_positions(
+        self, db: AsyncSession, binding: CopyBinding, lead: LeadSource, account: TradingAccount,
+        adapter: BaseExchangeAdapter, instruments: Dict[str, Any], snapshot: Dict[str, Any],
+        lead_margin_balance: float, received_at_ms: int, notify_cfg: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """认领与带单员持仓一致的已有仓位：只认领未被任何绑定记账的余量。
+
+        匹配口径与下单 sizing 一致：仓位名义金额 / 账户权益（敞口比率），
+        相对差异在 adopt_tolerance_pct 内即视为同一仓位。认领只改账——
+        把余量记为本绑定的归属量、成本按交易所平均开仓价——不下单；
+        认领后带单员减仓/平仓会按归属量跟随处理。已有关联归属量的
+        品种跳过，避免中途混账；余额取不到的候选品种留到下一轮重试，
+        已认领的不重复认领。
+        """
+        if not binding.is_enabled or not account.is_enabled:
+            return []
+        try:
+            lead_equity = exact(lead_margin_balance)
+        except (ValueError, InvalidOperation, TypeError, AttributeError):
+            return []
+        if lead_equity <= 0:
+            return []
+        try:
+            tolerance = exact(getattr(binding, "adopt_tolerance_pct", 10.0))
+        except (ValueError, InvalidOperation, TypeError, AttributeError):
+            tolerance = Decimal("10.0")
+        symbol_map = json.loads(binding.symbol_map_json or "{}")
+        whitelist = json.loads(binding.symbol_whitelist_json or "[]")
+        blacklist = json.loads(binding.symbol_blacklist_json or "[]")
+        positions = await adapter.get_positions()
+        physical: Dict[tuple, ExchangePosition] = {}
+        for position in positions:
+            if position.pos > 0:
+                physical[(position.inst_id, position.pos_side)] = position
+        adopted: List[Dict[str, Any]] = []
+        deferred = False
+        for entry in snapshot.get("openPositions") or []:
+            if not isinstance(entry, dict):
+                continue
+            symbol = entry.get("symbol")
+            position_side = str(entry.get("positionSide") or "").upper()
+            if not symbol or position_side not in ("LONG", "SHORT"):
+                continue
+            if not RiskEngine.check_symbol_filter(symbol, whitelist, blacklist).allowed:
+                continue
+            inst_id, supported = adapter.resolve_symbol(symbol, instruments, symbol_map)
+            if not supported:
+                continue
+            local_pos_side = "long" if position_side == "LONG" else "short"
+            mine = physical.get((inst_id, local_pos_side))
+            if mine is None:
+                continue
+            existing = await db.scalar(select(PositionAllocation).where(
+                PositionAllocation.binding_id == binding.id,
+                PositionAllocation.inst_id == inst_id,
+                PositionAllocation.pos_side == local_pos_side))
+            if existing is not None and self._owned_qty(existing) > 0:
+                continue
+            others = (await db.scalars(select(PositionAllocation).where(
+                PositionAllocation.account_id == account.id,
+                PositionAllocation.inst_id == inst_id,
+                PositionAllocation.pos_side == local_pos_side,
+                PositionAllocation.binding_id != binding.id))).all()
+            claimed = sum((self._owned_qty(other) for other in others), Decimal("0"))
+            try:
+                adoptable = exact(mine.pos) - claimed
+                lead_qty = exact(entry.get("qtyExact", entry.get("qty")) or 0)
+            except (ValueError, InvalidOperation, TypeError, AttributeError):
+                continue
+            if adoptable <= 0 or lead_qty <= 0:
+                continue
+            price = Decimal("0")
+            for candidate in (mine.cur_px, entry.get("markPrice"), entry.get("currentPrice"),
+                              entry.get("lastPrice"), entry.get("avgEntry"), mine.avg_px):
+                try:
+                    value = exact(candidate)
+                except (ValueError, InvalidOperation, TypeError, AttributeError):
+                    continue
+                if value > 0:
+                    price = value
+                    break
+            if price <= 0:
+                continue
+            try:
+                balance = await get_collateral_balance(adapter, instruments.get(inst_id))
+                my_equity = exact(balance.eq)
+            except Exception:
+                logger.warning("Adoption balance unavailable for %s; will retry", inst_id)
+                deferred = True
+                continue
+            if my_equity <= 0:
+                continue
+            lead_ratio = lead_qty * price / lead_equity
+            my_ratio = adoptable * price / my_equity
+            if not _exposure_ratio_matches(lead_ratio, my_ratio, tolerance):
+                continue
+            try:
+                entry_px = exact(mine.avg_px)
+            except (ValueError, InvalidOperation, TypeError, AttributeError):
+                entry_px = Decimal("0")
+            if entry_px <= 0:
+                entry_px = price
+            entry_cost = adoptable * entry_px
+            allocation = await self._get_allocation(db, binding.id, account.id, inst_id, local_pos_side)
+            allocation.generation += 1
+            allocation.opened_at_ms = received_at_ms
+            await self._clear_guard(db, binding.id, inst_id, local_pos_side)
+            allocation.entry_cost_exact = format_exact(entry_cost)
+            allocation.entry_cost = float(allocation.entry_cost_exact)
+            allocation.owned_qty_exact = format_exact(adoptable)
+            allocation.owned_qty = float(allocation.owned_qty_exact)
+            await self._upsert_guard(db, binding.id, inst_id, local_pos_side,
+                                     float(entry_cost / adoptable))
+            details = (f"Adopted existing position: my exposure {my_ratio:.2f}x, "
+                       f"lead exposure {lead_ratio:.2f}x, tolerance {tolerance:.1f}%")
+            await self._record_execution(
+                db, binding, lead, account, symbol, inst_id,
+                "BUY" if local_pos_side == "long" else "SELL", position_side,
+                "ADOPT", "ADOPTED_POSITION",
+                float(lead_qty), float(price), float(lead_qty * price),
+                my_qty=float(adoptable), my_price=float(entry_px),
+                my_notional=float(entry_cost), details=details, notify_cfg=notify_cfg)
+            adopted.append({"symbol": symbol, "positionSide": position_side,
+                            "qty": float(adoptable), "myRatio": float(my_ratio),
+                            "leadRatio": float(lead_ratio)})
+        if not deferred:
+            binding.adoption_completed = True
+        await db.commit()
+        return adopted
+
     @serialized_execution
     async def process_lead_events(
         self, db: AsyncSession, lead: LeadSource, raw_orders: List[Dict[str, Any]],
@@ -1674,6 +1841,15 @@ class CopyRouter:
                 account.clock_offset_ms = await adapter.sync_time()
                 instruments = await adapter.get_instruments()
                 await self.reconcile_pending_orders(db, account, adapter, instruments)
+                if (binding.baseline_seeded and not binding.adoption_completed
+                        and binding.adopt_existing_positions
+                        and await self._adoption_window_open(db, binding)):
+                    try:
+                        await self._adopt_matching_positions(
+                            db, binding, lead, account, adapter, instruments, snapshot,
+                            lead_margin_balance, received_at_ms, notify_cfg)
+                    except Exception:
+                        logger.exception("Position adoption deferred for binding %s", binding.id)
                 completed = (await db.scalars(select(BindingDelivery).where(
                     BindingDelivery.binding_id == binding.id, BindingDelivery.state == "APPLIED"))).all()
                 for previous in completed:

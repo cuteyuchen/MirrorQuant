@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
@@ -8,19 +9,24 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_admin, get_current_user, record_audit
 from app.api.exposure import require_binding_flat
-from app.core.database import get_db
-from app.core.secret_mask import redact_error_urls
+from app.core.database import DEFAULT_SYSTEM_CONFIG, get_db
+from app.core.secret_mask import redact_error_urls, redact_proxy_userinfo
+from app.core.security import CredentialVault
 from app.models.domain import (
     BindingDebt,
     CopyBinding,
     LeadSource,
+    ProxyNode,
     SystemConfig,
     TradingAccount,
     User,
 )
 from app.schemas.api import BindingCreate, BindingUpdate, KillSwitchRequest
+from app.services.adapters.factory import create_exchange_adapter
+from app.services.engine.orchestrator import orchestrator
 from app.services.engine.risk import RiskEngine
 from app.services.engine.serialization import serialized_execution
+from app.services.proxy.manager import ProxyEgressError, ProxyManager
 
 router = APIRouter(prefix="/api/bindings", tags=["bindings"])
 
@@ -69,6 +75,9 @@ async def _binding_out(db: AsyncSession, b: CopyBinding) -> dict:
         "circuitBreakerReason": redact_error_urls(b.circuit_breaker_reason) if b.circuit_breaker_reason else None,
         "consecutiveFailures": getattr(b, "consecutive_failures", 0),
         "baselineSeeded": b.baseline_seeded,
+        "adoptExistingPositions": getattr(b, "adopt_existing_positions", True),
+        "adoptTolerancePct": getattr(b, "adopt_tolerance_pct", 10.0),
+        "adoptionCompleted": getattr(b, "adoption_completed", False),
         "pendingDebtUsd": round(total_debt, 2),
         "debts": [
             {"symbol": d.symbol, "positionSide": d.position_side, "pendingUsd": round(d.pending_usd, 2)}
@@ -129,6 +138,8 @@ async def create_binding(
         order_mode=payload.order_mode,
         slippage_action=payload.slippage_action,
         limit_order_ttl_sec=payload.limit_order_ttl_sec,
+        adopt_existing_positions=payload.adopt_existing_positions,
+        adopt_tolerance_pct=payload.adopt_tolerance_pct,
         tp_sl_mode=payload.tp_sl_mode,
         enable_stop_loss=payload.enable_stop_loss,
         stop_loss_pct=payload.stop_loss_pct,
@@ -266,6 +277,61 @@ async def reset_debt(
     await record_audit(db, "RESET_DEBT", "binding", str(binding.id), "Pending debt reset", current_user, request)
     await db.commit()
     return {"item": await _binding_out(db, binding)}
+
+
+@router.post("/{binding_id}/adopt-existing")
+@serialized_execution  # 与引擎下单共用锁，认领记账不与成交记账交错。
+async def adopt_existing_positions(
+    binding_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_admin),
+):
+    """手动认领：把账户里与带单员持仓一致的已有仓位记为跟单仓位，只改账，不下单。"""
+    binding = await db.get(CopyBinding, binding_id)
+    if not binding:
+        raise HTTPException(status_code=404, detail="Binding not found")
+    account = await db.get(TradingAccount, binding.account_id)
+    lead = await db.get(LeadSource, binding.lead_id)
+    if not account or not lead:
+        raise HTTPException(status_code=404, detail="Lead or TradingAccount not found")
+    if not binding.is_enabled or not account.is_enabled:
+        raise HTTPException(status_code=409, detail="Binding or account is disabled")
+    try:
+        snapshot = json.loads(lead.snapshot_json or "{}")
+    except (ValueError, TypeError):
+        snapshot = {}
+    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("openPositions"), list):
+        raise HTTPException(status_code=409, detail="Lead snapshot unavailable; wait for the next sync")
+    vault = CredentialVault()
+    creds = vault.decrypt_dict(account.encrypted_credentials)
+    proxies = list((await db.scalars(select(ProxyNode).order_by(ProxyNode.priority))).all())
+    try:
+        proxy_url = ProxyManager.select_proxy_url(proxies, account.proxy_id, exchange=account.exchange)
+    except ProxyEgressError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    adapter = create_exchange_adapter(
+        account_id=account.id,
+        exchange=account.exchange,
+        credentials=creds,
+        environment=account.environment,
+        proxy_url=proxy_url,
+        margin_mode=account.margin_mode,
+        position_mode=account.position_mode,
+    )
+    try:
+        instruments = await adapter.get_instruments()
+        notify_cfg = await orchestrator.router._get_config(db, "notifications", DEFAULT_SYSTEM_CONFIG["notifications"])
+        lead_margin_balance = (snapshot.get("profile") or {}).get("marginBalance") or lead.margin_balance or 0
+        adopted = await orchestrator.router._adopt_matching_positions(
+            db, binding, lead, account, adapter, instruments, snapshot,
+            lead_margin_balance, int(time.time() * 1000), notify_cfg)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=redact_proxy_userinfo(str(exc))[:400]) from exc
+    await record_audit(db, "ADOPT_EXISTING", "binding", str(binding.id),
+                       f"Adopted {len(adopted)} existing position(s)", current_user, request)
+    await db.commit()
+    return {"item": await _binding_out(db, binding), "adopted": adopted}
 
 
 @router.post("/kill-switch")

@@ -116,7 +116,7 @@ export const mockBindings = [1, 2, 3].map((accountId): Binding => ({
   accountExchange: mockAccounts[accountId - 1].exchange, accountEnvironment: mockAccounts[accountId - 1].environment,
   isEnabled: accountId === 1, riskScale: 1, symbolWhitelist: [], symbolBlacklist: ["SOLUSDT"], symbolMap: {},
   circuitBreakerTripped: accountId === 1, circuitBreakerReason: accountId === 1 ? "CIRCUIT_BREAKER" : null,
-  consecutiveFailures: 1, baselineSeeded: true, pendingDebtUsd: 12.4,
+  consecutiveFailures: 1, baselineSeeded: true, adoptionCompleted: false, pendingDebtUsd: 12.4,
 }));
 mockBindings[2] = { ...mockBindings[2], name: "Delta / Reserve", leadId: 2, leadName: "Delta Range",
   isEnabled: true, riskScale: 0.5, circuitBreakerTripped: false, circuitBreakerReason: null,

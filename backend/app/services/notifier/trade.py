@@ -102,6 +102,10 @@ _BLOCK_DRIFT_RE = re.compile(
     r"^Catch-up price drift ([0-9]+(?:\.[0-9]+)?)% > max ([0-9]+(?:\.[0-9]+)?)% \(age ([0-9]+(?:\.[0-9]+)?)s\)$")
 _BLOCK_STALE_RE = re.compile(
     r"^Missed order stale: age ([0-9]+(?:\.[0-9]+)?)s > max ([0-9]+(?:\.[0-9]+)?)s$")
+_BLOCK_SPREAD_RE = re.compile(
+    r"^Orderbook spread ([0-9]+(?:\.[0-9]+)?)% exceeds guard ([0-9]+(?:\.[0-9]+)?)%$")
+_BLOCK_SLIPPAGE_RE = re.compile(
+    r"^Slippage ([0-9]+(?:\.[0-9]+)?)% exceeds limit ([0-9]+(?:\.[0-9]+)?)%$")
 _BLOCK_REASONS: dict[str, tuple[str, str]] = {
     "BLOCKED_CATCHUP_PRICE": ("补跟价格缺失或无效，无法核对偏离，未跟单",
                               "Catch-up reference or lead price missing or invalid; drift check impossible, order not placed"),
@@ -135,6 +139,8 @@ _BLOCK_REASONS: dict[str, tuple[str, str]] = {
     "SKIPPED_CLOSED_CYCLE": ("闭环事件已处理，无需重复执行", "Closed-cycle event already processed; nothing to execute"),
     "SKIPPED_NO_LOCAL_POS": ("本地无对应仓位", "No local position to act on"),
     "SKIPPED_UNSUPPORTED": ("不支持的品种或方向", "Unsupported instrument or side"),
+    "ADOPTED_POSITION": ("现有仓位与带单员持仓一致（敞口比率差异在容差内），已认领为跟单仓位",
+                         "Existing position matches the lead's within the exposure tolerance; adopted as a followed position"),
     "FAILED": ("执行失败，成交结果需核实", "Execution failed; fill result needs verification"),
     "ACCUMULATED_DEBT": ("数量不足，累积待后续补足", "Quantity insufficient; accumulated for a later top-up"),
 }
@@ -171,6 +177,18 @@ def _block_reason(status: str, record) -> Optional[str]:
             return (f"📋 原因：欠单已过期，信号距今 {zh_age}，超过上限 {zh_max} / "
                     f"Missed order stale: signal age {en_age} exceeded the {en_max} limit")
         return "📋 原因：欠单已过期，超过追单时效上限 / Missed order stale: catch-up age limit exceeded"
+    if status == "BLOCKED_SPREAD":
+        match = _BLOCK_SPREAD_RE.fullmatch(str(getattr(record, "details", "") or ""))
+        if match is not None:
+            measured, guard = match.groups()
+            return (f"📋 原因：盘口价差过大，实测 {measured}%，上限 {guard}% / "
+                    f"Order-book spread too wide (measured {measured}%, guard {guard}%)")
+    if status == "BLOCKED_SLIPPAGE":
+        match = _BLOCK_SLIPPAGE_RE.fullmatch(str(getattr(record, "details", "") or ""))
+        if match is not None:
+            measured, limit = match.groups()
+            return (f"📋 原因：滑点超出上限，实测 {measured}%，上限 {limit}% / "
+                    f"Slippage exceeded the limit (measured {measured}%, limit {limit}%)")
     reason = _BLOCK_REASONS.get(status)
     if reason is None:
         return None
@@ -268,7 +286,13 @@ def trade_message(record, account, source: Optional[dict] = None, lead_margin: A
     """
     source = source or {}
     opening = False
-    if "_closed" in source:
+    adopted = getattr(record, "status", None) == "ADOPTED_POSITION"
+    if adopted:
+        # 认领没有独立的带单成交事件：动作与数字直接取记录上的带单员仓位口径。
+        symbol, direction = record.symbol, record.position_side
+        price, qty, notional = record.lead_price, record.lead_qty, record.lead_notional
+        action = "认领仓位"
+    elif "_closed" in source:
         closed = source["_closed"]
         symbol, direction = closed.get("symbol"), closed.get("side")
         closed_side = str(direction).upper()
@@ -302,6 +326,8 @@ def trade_message(record, account, source: Optional[dict] = None, lead_margin: A
                 action = precise
     # 第一行是带单员身份，第二行就是结论：图标 + 动作 + 币种 + 多空。
     icon, direction_text = {"LONG": ("🟢", "做多"), "SHORT": ("🔴", "做空")}.get(direction, ("❔", "方向未知"))
+    if adopted:
+        icon = "📥"
     lines = [
         _lead_header(lead, record),
         f"{icon} {action} ｜ {_symbol(symbol)} 永续 ｜ {direction_text}",
@@ -331,7 +357,7 @@ def trade_message(record, account, source: Optional[dict] = None, lead_margin: A
         str(account.environment).lower(), "环境未知")
     tag = f"账户 #{record.account_id} / 绑定 #{record.binding_id}（{exchange} {environment}）"
     status = record.status
-    confirmed = bool(record.order_id) and _number(record.my_qty) != "未知"
+    confirmed = _number(record.my_qty) != "未知" and (bool(record.order_id) or status == "ADOPTED_POSITION")
     limit_detail: list[str] = []
     if limit and status in ("LIMIT_PLACED", "LIMIT_EXPIRED") or (
             limit and confirmed and status in ("EXECUTED", "PARTIAL")):
@@ -344,6 +370,8 @@ def trade_message(record, account, source: Optional[dict] = None, lead_margin: A
         result = "✅ 已成交"
     elif status == "EXECUTED":
         result = "⚠️ 成交未确认"
+    elif status == "ADOPTED_POSITION":
+        result = "📥 已认领现有仓位为跟单仓位"
     elif status.startswith("BLOCKED"):
         result = "🛑 风控拦截"
     elif status.startswith("SKIPPED"):
@@ -365,7 +393,7 @@ def trade_message(record, account, source: Optional[dict] = None, lead_margin: A
     reason_line = _block_reason(status, record)
     if reason_line:
         follower += f"\n{reason_line}"
-    if status in ("EXECUTED", "PARTIAL", "UNFILLED"):
+    if status in ("EXECUTED", "PARTIAL", "UNFILLED", "ADOPTED_POSITION"):
         follower += (f"\n📦 数量 {_number(record.my_qty, allow_zero=True)}"
                      f" ｜ 均价 {_number(record.my_price) if confirmed else '未知'}"
                      f" ｜ 金额 {_money(record.my_notional) if confirmed else '未知'}")

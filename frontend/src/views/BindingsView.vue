@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onActivated, onDeactivated, onMounted, onUnmounted, ref, watch } from "vue";
-import { AlertTriangle, ArrowRight, ChevronDown, Pencil, Plus, RefreshCw, RotateCcw, Save, Trash2 } from "lucide-vue-next";
+import { AlertTriangle, ArrowRight, ChevronDown, Download, Pencil, Plus, RefreshCw, RotateCcw, Save, Trash2 } from "lucide-vue-next";
 import { api, isCancelled } from "@/api/client";
 import { useDataCacheStore } from "@/stores/dataCache";
 import { useAsyncAction } from "@/composables/useAsyncAction";
@@ -171,11 +171,11 @@ async function saveBinding() {
   });
   if (result.ok) { showModal.value = false; await load(true); }
 }
-async function operate(binding: Binding, kind: "toggle" | "delete" | "reset-breaker" | "reset-debt") {
+async function operate(binding: Binding, kind: "toggle" | "delete" | "reset-breaker" | "reset-debt" | "adopt-existing") {
   // 未知状态不能通过取反被解释为恢复交易。
   if (kind === "toggle" && binding.isEnabled == null) return;
-  const title = t(kind === "delete" ? "common.delete" : kind === "toggle" ? (binding.isEnabled ? "common.disable" : "common.enable") : kind === "reset-breaker" ? "bind.resetBreaker" : "bind.pendingDebt");
-  const messageKey = kind === "delete" ? "confirm.delete" : kind === "toggle" ? "confirm.toggle" : kind === "reset-breaker" ? "confirm.resetBreaker" : "confirm.resetDebt";
+  const title = t(kind === "delete" ? "common.delete" : kind === "toggle" ? (binding.isEnabled ? "common.disable" : "common.enable") : kind === "reset-breaker" ? "bind.resetBreaker" : kind === "adopt-existing" ? "bind.adoptExisting" : "bind.pendingDebt");
+  const messageKey = kind === "delete" ? "confirm.delete" : kind === "toggle" ? "confirm.toggle" : kind === "reset-breaker" ? "confirm.resetBreaker" : kind === "adopt-existing" ? "confirm.adoptExisting" : "confirm.resetDebt";
   const result = await run(async () => {
     // PUT 明确目标状态，避免旧页面上的 toggle 意外恢复交易。
     if (kind === "toggle") await api.put(`/api/bindings/${binding.id}`, { isEnabled: !binding.isEnabled });
@@ -215,7 +215,7 @@ onUnmounted(stop);
       <template #cell-status="{ row }"><StatusBadge :state="status(row).state" /><p v-for="reason in status(row).reasons" :key="reason" class="mt-1 break-words text-xs" :class="status(row).tone === 'danger' ? 'text-danger' : 'text-muted'">{{ reasonText(reason) }}</p><RouterLink v-if="status(row).pendingCount != null && status(row).pendingCount! > 0" to="/executions?tab=intents" class="mt-1 block text-xs text-warning">{{ t("bind.pendingCount", { n: status(row).pendingCount ?? t("common.unknown") }) }}</RouterLink></template>
       <template #cell-positions="{ row }"><p class="font-semibold">{{ t("bind.positionCount", { n: status(row).positionCount ?? t("common.unknown") }) }}</p><p class="mt-1 text-xs" :class="row.pendingDebtUsd != null && row.pendingDebtUsd > 0 ? 'text-warning' : 'text-muted'">{{ formatUsd(row.pendingDebtUsd) }}</p></template>
       <template #cell-executions="{ row }"><p class="text-xs" :class="(statistics?.[row.id]?.failed ?? 0) > 0 ? 'text-danger' : 'text-muted'">{{ statistics == null ? t("common.unknown") : t("bind.executionCounts", { success: statistics[row.id]?.success ?? 0, failed: statistics[row.id]?.failed ?? 0 }) }}</p></template>
-      <template #cell-actions="{ row }"><MoreMenu><button class="button-secondary justify-start" :disabled="pending" @click="open(row)"><Pencil :size="16" />{{ t("common.edit") }}</button><RouterLink :to="`/executions?binding_id=${row.id}`" class="button-secondary justify-start">{{ t("executions.title") }}</RouterLink><button v-if="row.circuitBreakerTripped === true" class="button-danger justify-start" :disabled="pending" @click="operate(row, 'reset-breaker')"><RotateCcw :size="16" />{{ t("bind.resetBreaker") }}</button><button v-if="row.pendingDebtUsd != null && row.pendingDebtUsd > 0" class="button-secondary justify-start text-warning" :disabled="pending" @click="operate(row, 'reset-debt')"><RotateCcw :size="16" />{{ t("bind.clearDebt", { amt: formatUsd(row.pendingDebtUsd) }) }}</button><button class="button-danger justify-start" :disabled="pending" @click="operate(row, 'delete')"><Trash2 :size="16" />{{ t("common.delete") }}</button></MoreMenu></template>
+      <template #cell-actions="{ row }"><MoreMenu><button class="button-secondary justify-start" :disabled="pending" @click="open(row)"><Pencil :size="16" />{{ t("common.edit") }}</button><RouterLink :to="`/executions?binding_id=${row.id}`" class="button-secondary justify-start">{{ t("executions.title") }}</RouterLink><button class="button-secondary justify-start" :disabled="pending" @click="operate(row, 'adopt-existing')"><Download :size="16" />{{ t("bind.adoptExisting") }}</button><button v-if="row.circuitBreakerTripped === true" class="button-danger justify-start" :disabled="pending" @click="operate(row, 'reset-breaker')"><RotateCcw :size="16" />{{ t("bind.resetBreaker") }}</button><button v-if="row.pendingDebtUsd != null && row.pendingDebtUsd > 0" class="button-secondary justify-start text-warning" :disabled="pending" @click="operate(row, 'reset-debt')"><RotateCcw :size="16" />{{ t("bind.clearDebt", { amt: formatUsd(row.pendingDebtUsd) }) }}</button><button class="button-danger justify-start" :disabled="pending" @click="operate(row, 'delete')"><Trash2 :size="16" />{{ t("common.delete") }}</button></MoreMenu></template>
     </DataTable>
     <footer v-if="bindings.length" class="flex flex-wrap items-center justify-between gap-2 text-xs text-muted">
       <span v-if="statisticsAsOf" class="inline-flex items-center gap-2">{{ t("bind.statsAsOf") }}<FreshnessStamp :timestamp="statisticsAsOf" /></span>

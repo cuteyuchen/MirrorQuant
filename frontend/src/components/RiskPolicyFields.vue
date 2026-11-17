@@ -15,8 +15,8 @@ type SelectKey = "order_mode" | "slippage_action" | "tp_sl_mode";
 type Group = { title: string | null; switches: (keyof typeof RISK_SWITCHES)[]; selects: SelectKey[]; numbers: (keyof typeof RISK_RULES)[] };
 // 默认风控页按功能分区展示；绑定表单的 section 模式保持原有单区内容不变。
 const ALL_GROUPS: Group[] = [
-  { title: "riskGroup.execution", switches: [], selects: ["order_mode", "slippage_action"],
-    numbers: ["max_slippage_pct", "max_spread_pct", "ioc_offset_pct", "limit_order_ttl_sec"] },
+  { title: "riskGroup.execution", switches: ["adopt_existing_positions"], selects: ["order_mode", "slippage_action"],
+    numbers: ["max_slippage_pct", "max_spread_pct", "ioc_offset_pct", "limit_order_ttl_sec", "adopt_tolerance_pct"] },
   { title: "riskGroup.leverage", switches: ["enable_leverage_cap"], selects: [],
     numbers: ["max_total_leverage", "max_single_leverage", "max_instrument_leverage"] },
   { title: "riskGroup.breaker", switches: ["enable_circuit_breaker"], selects: [],
@@ -27,7 +27,8 @@ const ALL_GROUPS: Group[] = [
 const groups = computed<Group[]>(() => {
   if (props.section === "all") return ALL_GROUPS;
   const switches = (Object.keys(RISK_SWITCHES) as (keyof typeof RISK_SWITCHES)[])
-    .filter(key => props.section === "risk" ? ["enable_circuit_breaker", "enable_leverage_cap"].includes(key) :
+    .filter(key => props.section === "execution" ? ["adopt_existing_positions"].includes(key) :
+      props.section === "risk" ? ["enable_circuit_breaker", "enable_leverage_cap"].includes(key) :
       props.section === "protection" && ["enable_stop_loss", "enable_take_profit", "enable_trailing_stop"].includes(key));
   const selects: SelectKey[] = props.section === "execution" ? ["order_mode", "slippage_action"] :
     props.section === "protection" ? ["tp_sl_mode"] : [];
@@ -44,6 +45,7 @@ const GATED_NUMBERS: Partial<Record<keyof typeof RISK_RULES, (value: RiskSetting
   take_profit_pct: value => value.enable_take_profit !== false,
   trailing_callback_pct: value => value.enable_trailing_stop !== false,
   limit_order_ttl_sec: value => value.slippage_action !== "block",
+  adopt_tolerance_pct: value => value.adopt_existing_positions !== false,
 };
 function visibleNumbers(group: Group) {
   return group.numbers.filter(key => {
