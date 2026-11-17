@@ -66,6 +66,9 @@ def test_dynamic_leverage_tracks_exposure_and_symbol_ceiling():
     assert PositionSizer.compute_dynamic_leverage("800", "100", 20) == 20
     assert PositionSizer.compute_dynamic_leverage("1", "100", 1) == 1
     assert PositionSizer.compute_dynamic_leverage("0", "100", 5) == 5
+    assert PositionSizer.compute_dynamic_leverage("1", "100", 100) == 10
+    assert PositionSizer.compute_dynamic_leverage("16", "100", 100) == 10
+    assert PositionSizer.compute_dynamic_leverage("1", "100", 5) == 5
     with pytest.raises(ValueError):
         PositionSizer.compute_dynamic_leverage("1", "100", 0)
     with pytest.raises(ValueError):

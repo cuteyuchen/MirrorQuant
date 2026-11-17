@@ -267,8 +267,17 @@ class EngineOrchestrator:
                         check.reason += f" [{currency}]"
                     checks.append(check)
         except Exception as exc:
-            binding.circuit_breaker_tripped = True
-            binding.circuit_breaker_reason = "Invalid exchange collateral balance; entries suspended"
+            # 抵押品检查失败只在熔断开关打开时闩锁：开关关闭即“全跟到底”，一次瞬时
+            # 余额失败不得永久停掉开仓；逐笔风控门仍会在数据确实无效时拦单。
+            # 失败原因记 warning（不记 traceback/ERROR），避免触发日志监控的硬异常，
+            # 同时下次再发生时日志里能找到原文。
+            logger.warning(
+                "Collateral balance check failed for binding %s: %s",
+                binding.id, redact_proxy_userinfo(str(exc))[:400],
+            )
+            if getattr(binding, "enable_circuit_breaker", True):
+                binding.circuit_breaker_tripped = True
+                binding.circuit_breaker_reason = "Invalid exchange collateral balance; entries suspended"
             account.status = "error"
             account.last_error = redact_proxy_userinfo(str(exc))[:400]
             await db.commit()

@@ -83,7 +83,11 @@ class PositionSizer:
         max_symbol_leverage: int = 100,
         target_im_fraction: float = 0.08,
     ) -> int:
-        """Choose cross-margin initial-margin leverage without changing exposure size."""
+        """Choose cross-margin initial-margin leverage without changing exposure size.
+
+        Small legs floor at 10x: a 2-3x leg locks most of the account as initial
+        margin and leaves nothing for the next symbol. The tier ceiling still caps.
+        """
         notional, eq, fraction = map(exact, (target_notional, equity, target_im_fraction))
         maximum = int(exact(max_symbol_leverage))
         if maximum < 1 or fraction <= 0 or fraction > 1:
@@ -91,7 +95,7 @@ class PositionSizer:
         if notional <= 0 or eq <= 0:
             return min(10, maximum)
         desired_lvr = math.ceil(notional / (eq * fraction))
-        return min(maximum, max(2, desired_lvr))
+        return min(maximum, max(10, desired_lvr))
 
     @staticmethod
     def size_open_order(

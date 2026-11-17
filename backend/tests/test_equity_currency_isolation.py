@@ -85,6 +85,33 @@ async def test_breaker_checks_usdc_loss_without_polluting_usdt_after_restart(tra
         assert collateral_available(restarted, "USDC") == 0
 
 
+async def test_collateral_check_failure_respects_disabled_breaker(trading):
+    # 熔断开关关闭时，抵押品检查失败不得闩锁：账户记 error、本轮返回 False，
+    # 但绑定不熔断；一次瞬时余额失败不得永久停掉开仓（2026-11-18 实盘事故）。
+    t = trading
+    t.binding.enable_circuit_breaker = False
+    await t.db.commit()
+    adapter = SimpleNamespace(get_usdt_balance=AsyncMock(side_effect=RuntimeError("synthetic balance unavailable")))
+    engine = EngineOrchestrator()
+    assert await engine._check_account_equity(t.db, t.binding, t.account, adapter) is False
+    assert t.binding.circuit_breaker_tripped is False
+    assert t.binding.circuit_breaker_reason is None
+    assert t.account.status == "error"
+    assert "synthetic balance unavailable" in (t.account.last_error or "")
+
+
+async def test_collateral_check_failure_trips_enabled_breaker(trading):
+    t = trading
+    t.binding.enable_circuit_breaker = True
+    await t.db.commit()
+    adapter = SimpleNamespace(get_usdt_balance=AsyncMock(side_effect=RuntimeError("synthetic balance unavailable")))
+    engine = EngineOrchestrator()
+    assert await engine._check_account_equity(t.db, t.binding, t.account, adapter) is False
+    assert t.binding.circuit_breaker_tripped is True
+    assert t.binding.circuit_breaker_reason == "Invalid exchange collateral balance; entries suspended"
+    assert t.account.status == "error"
+
+
 async def test_legacy_ambiguous_currency_quarantines_entries_but_allows_owned_exit(trading):
     account = trading.account
     account.risk_equity_json = None

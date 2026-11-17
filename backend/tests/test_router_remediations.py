@@ -45,11 +45,11 @@ def test_exact_persistence_text_rejects_nonfinite_values(value):
 
 @pytest.mark.parametrize("existing,max_lvr,expected", [
     (10, 100, 10), (10.0, 100, 10), (50, 20, 20),
-    (None, 100, 2), (0, 100, 2), (-5, 100, 2), (float("nan"), 100, 2),
+    (None, 100, 10), (0, 100, 10), (-5, 100, 10), (float("nan"), 100, 10),
 ])
 def test_effective_open_leverage_keeps_existing_symbol_leverage(existing, max_lvr, expected):
     # 已有仓位沿用交易所当前杠杆（认领仓与加仓一致）；档位上限是硬约束，高于上限才降；
-    # 无仓位或已有杠杆无效时回落动态计算（100/(1000*0.08) 向上取整为 2）。
+    # 无仓位或已有杠杆无效时回落动态计算（100/(1000*0.08) 向上取整为 2，但下限 10x，故为 10）。
     assert _effective_open_leverage(existing, target_notional=100, equity=1000,
                                     max_symbol_leverage=max_lvr) == expected
 
@@ -421,7 +421,7 @@ async def test_fresh_snapshot_routes_150_second_delayed_fill_once(trading, monke
     assert len((await t.db.scalars(select(ExecutionRecord))).all()) == 1
 
 
-@pytest.mark.parametrize("existing_lever,tier_max,expected", [(10, 100, 10), (50, 20, 20), (None, 100, 2)])
+@pytest.mark.parametrize("existing_lever,tier_max,expected", [(10, 100, 10), (50, 20, 20), (None, 100, 10)])
 async def test_open_add_applies_effective_leverage(trading, existing_lever, tier_max, expected):
     # 加仓沿用已有仓位的交易所杠杆（认领仓 10x 则加仓也 10x，不擅自改成动态值）；
     # 档位上限不足时降到上限；无仓位时动态计算。
@@ -568,7 +568,7 @@ async def test_leverage_is_dynamic_and_quantity_uses_equity_ratio(trading):
     assert len(exchange.orders) == 1 and Decimal(exchange.orders[0]["sz"]) == 1
     assert exchange.orders[0]["ord_type"] == "ioc"
     assert Decimal(exchange.orders[0]["px"]) <= Decimal("101")
-    assert exchange.ensure_leverage.await_args.args == ("BTCUSDT", 2)
+    assert exchange.ensure_leverage.await_args.args == ("BTCUSDT", 10)
     own = await t.db.scalar(select(PositionAllocation).where(PositionAllocation.binding_id == t.binding.id))
     assert own.owned_qty == 1
     exchange.place_tp_sl.assert_not_awaited()
