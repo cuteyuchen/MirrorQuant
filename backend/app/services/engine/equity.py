@@ -31,7 +31,14 @@ def risk_state(account):
 
 
 def observe_equity(account, balance):
-    """Persist currency-local baselines; ambiguous migrated history blocks entries."""
+    """Persist currency-local baselines.
+
+    Ambiguous migrated history blocks entries until a verified USDT baseline
+    supersedes it: the legacy snapshot is kept for audit, but its numbers are
+    never inherited into the fresh baseline, so once USDT is observed the
+    quarantine has served its purpose and lifts. A quarantine with no exit
+    would suspend entries forever even though verified data exists.
+    """
     for field in ("eq", "avail_eq", "cash_bal", "upl"):
         value = getattr(balance, field)
         if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)) or not math.isfinite(value) or (field != "upl" and value < 0):
@@ -59,6 +66,9 @@ def observe_equity(account, balance):
     account.risk_equity_json = json.dumps(state, allow_nan=False)
     if currency == "USDT":
         state["display_usdt_confirmed"] = True
+        # 新鲜 USDT 基线已建立且未继承任何 legacy 数字：隔离解除，
+        # legacy 快照保留在 state["legacy"] 中供审计。
+        state["legacy_unverified"] = False
         account.risk_equity_json = json.dumps(state, allow_nan=False)
         account.usdt_equity, account.avail_equity = balance.eq, balance.avail_eq
         account.hwm_equity = baseline["hwm"]

@@ -89,8 +89,8 @@ async def test_legacy_ambiguous_currency_quarantines_entries_but_allows_owned_ex
     account = trading.account
     account.risk_equity_json = None
     account.hwm_equity = account.day_start_equity = account.usdt_equity = 6000
+    # 只有 USDC 观测、尚无 USDT 观测时隔离成立：开仓被拦、平仓放行。
     observe_equity(account, balance("USDC", 5000))
-    observe_equity(account, balance("USDT", 1000))
     state = risk_state(account)
     assert state["legacy_unverified"] is True
     assert state["legacy"]["hwm_equity"] == 6000
@@ -128,6 +128,32 @@ async def test_legacy_ambiguous_currency_quarantines_entries_but_allows_owned_ex
     assert len(exchange.orders) == 1 and exchange.orders[0]["reduce_only"] is True
     assert allocation.owned_qty_exact == "0" and other.owned_qty_exact == "9"
     assert risk_state(account)["legacy_unverified"] is True
+
+
+async def test_verified_usdt_baseline_supersedes_legacy_quarantine(trading):
+    # 隔离不是永久的：新鲜 USDT 基线一旦建立（且未继承任何 legacy 数字），
+    # 隔离即解除——否则有已验证数据也永久拦开仓，且产品内无任何解除路径。
+    account = trading.account
+    account.risk_equity_json = None
+    account.hwm_equity = account.day_start_equity = account.usdt_equity = 6000
+    observe_equity(account, balance("USDC", 5000))
+    assert risk_state(account)["legacy_unverified"] is True
+    with pytest.raises(ValueError, match="Legacy collateral"):
+        equity_baseline(account, "USDT")
+    observe_equity(account, balance("USDT", 1000))
+    state = risk_state(account)
+    assert state["legacy_unverified"] is False
+    assert state["legacy"]["hwm_equity"] == 6000
+    assert state["legacy"]["day_start_equity"] == 6000
+    assert equity_baseline(account, "USDT") == (1000, 1000)
+    assert equity_baseline(account, "USDC") == (5000, 5000)
+    assert account.hwm_equity == 1000 and account.day_start_equity == 1000
+    await trading.db.commit()
+    async with get_session_factory()() as restarted_db:
+        restarted = await restarted_db.get(TradingAccount, account.id)
+        assert risk_state(restarted)["legacy_unverified"] is False
+        assert equity_baseline(restarted, "USDT") == (1000, 1000)
+        assert risk_state(restarted)["legacy"]["hwm_equity"] == 6000
 
 
 def test_sqlite_migration_marks_existing_risk_as_unverified_without_erasing_it():

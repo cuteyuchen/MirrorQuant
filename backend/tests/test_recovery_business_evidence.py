@@ -34,8 +34,8 @@ async def ambiguous_currency(trading):
     account = trading.account
     account.risk_equity_json = None
     account.hwm_equity = account.day_start_equity = account.usdt_equity = 6000
+    # 仅 USDC 观测：隔离成立（USDT 观测会解除隔离，见 supersede 测试）。
     observe_equity(account, balance("USDC", 5000))
-    observe_equity(account, balance("USDT", 1000))
     await trading.db.commit()
     with pytest.raises(ValueError, match="Legacy collateral"):
         equity_baseline(account, "USDT")
