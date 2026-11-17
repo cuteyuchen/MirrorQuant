@@ -27,8 +27,32 @@ const knownErrors: Record<string, string> = {
 export function reasonText(reason?: string | null): string {
   if (!reason) return useI18n().t("common.unknown");
   const { t } = useI18n();
+  const parsed = parseGuardDetails(reason, t);
+  if (parsed) return parsed;
   const key = knownErrors[reason] || `reason.${reason.toUpperCase()}`;
   return t(key) === key ? reason : t(key);
+}
+// 风控拦截的详情是 risk.py 固定格式的自由文本（如 "Catch-up price drift 1.72% > max 0.50% (age 39149s)"），
+// 严格全匹配才转译为本地化原因行，格式稍有出入就保留原文，绝不猜测数字含义。
+const DRIFT_RE = /^Catch-up price drift ([0-9]+(?:\.[0-9]+)?)% > max ([0-9]+(?:\.[0-9]+)?)% \(age ([0-9]+(?:\.[0-9]+)?)s\)$/;
+const STALE_RE = /^Missed order stale: age ([0-9]+(?:\.[0-9]+)?)s > max ([0-9]+(?:\.[0-9]+)?)s$/;
+function durationText(seconds: number, t: ReturnType<typeof useI18n>["t"]): string {
+  const total = Math.floor(seconds);
+  if (total < 120) return t("duration.seconds", { n: total });
+  if (total < 3600) return t("duration.minutes", { m: Math.floor(total / 60), s: total % 60 });
+  if (total < 86400) return t("duration.hours", { h: Math.floor(total / 3600), m: Math.floor((total % 3600) / 60) });
+  return t("duration.days", { d: Math.floor(total / 86400), h: Math.floor((total % 86400) / 3600) });
+}
+function parseGuardDetails(reason: string, t: ReturnType<typeof useI18n>["t"]): string | null {
+  const drift = DRIFT_RE.exec(reason);
+  if (drift) {
+    return t("reasonDetail.catchupDrift", { drift: drift[1], max: drift[2], age: durationText(Number(drift[3]), t) });
+  }
+  const stale = STALE_RE.exec(reason);
+  if (stale) {
+    return t("reasonDetail.staleOrder", { age: durationText(Number(stale[1]), t), max: durationText(Number(stale[2]), t) });
+  }
+  return null;
 }
 export function errorMessage(cause: unknown): string {
   const { t } = useI18n();
