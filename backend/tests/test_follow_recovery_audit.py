@@ -157,7 +157,10 @@ async def test_reporting_failure_cannot_commit_unreported_fill(trading, monkeypa
         assert len(exchange.orders) == 1
 
 
-async def test_legacy_terminal_reporting_gap_is_recovered_for_human_review_without_reapplying_fill(trading):
+async def test_legacy_terminal_reporting_gap_is_recovered_without_reapplying_fill_and_notification_gap_does_not_block(trading):
+    # 账本缺口补记后，终态意图不再因通知回执缺口阻断跟单：
+    # 通知缺口没有人工解除入口，永久停单是死胡同；缺口仍留
+    # 在记录详情里可见，但账本证实后审计即通过。
     t = trading
     delivery = await source_delivery(t)
     delivery.state = "APPLIED"
@@ -175,7 +178,7 @@ async def test_legacy_terminal_reporting_gap_is_recovered_for_human_review_witho
     assert record.my_qty == 1 and record.notification_state == "unknown"
     assert "human reconciliation required" in record.details
     assert len((await t.db.scalars(select(NotificationOutbox))).all()) == 0
-    assert not await t.router.reconcile_pending_orders(t.db, t.account, exchange, {"BTCUSDT": t.spec})
+    assert await t.router.reconcile_pending_orders(t.db, t.account, exchange, {"BTCUSDT": t.spec})
     assert len((await t.db.scalars(select(ExecutionRecord))).all()) == 1
     assert (await t.db.scalar(select(PositionAllocation))).owned_qty == 1
     assert exchange.orders == []

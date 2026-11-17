@@ -964,9 +964,14 @@ class CopyRouter:
                 return False
         reported = sum((exact(r.my_qty_exact if r.my_qty_exact is not None else r.my_qty) for r in records), Decimal("0"))
         if reported == cumulative:
+            # 账本已证实：通知回执只更新状态，不再阻断。通知缺口
+            # （如历史回执缺失、回执字段不全）没有人工解除入口，
+            # 绝不能因此永久停掉跟单；缺口仍留在记录详情与
+            # notification_state 里可见，修复路径也不受影响。
             proven_notifications = await self._notification_evidence(db, records)
-            return proven_notifications or (intent.state.lower() in TERMINAL_STATES and
-                                            (spec is None or not require_notifications))
+            if intent.state.lower() in TERMINAL_STATES:
+                return True
+            return proven_notifications
         if reported > cumulative or any(exact(r.my_price) <= 0 for r in records):
             return False
         cost = cumulative * exact(intent.avg_px) - sum(

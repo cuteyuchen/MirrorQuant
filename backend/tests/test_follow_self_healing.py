@@ -13,8 +13,8 @@ import pytest
 from sqlalchemy import select
 
 from app.models.domain import (
-    BindingDelivery, BindingPositionProgress, BindingSourceProgress, ExecutionRecord, OrderIntent,
-    PositionAllocation,
+    BindingDelivery, BindingPositionProgress, BindingSourceProgress, ExecutionRecord, NotificationOutbox,
+    OrderIntent, PositionAllocation,
 )
 from app.services.engine.router import (
     _sequence_matches_interval, _source_notional_conflicts,
@@ -409,3 +409,68 @@ async def test_review_open_never_reconciles(trading):
     await t.db.refresh(delivery)
     assert delivery.state == "PENDING"
     assert delivery.exit_progress == "REVIEW_REQUIRED"
+
+
+# ---- 1.1.4：通知回执缺口不再阻断跟单 ----
+# 线上实况：5 笔已成交意图的账本记录齐全，但通知回执缺失或字段不全
+# （回执 event_key 为空、或根本无回执行），审计每轮失败，账户开仓被
+# 永久挂起。账本证实后审计即应通过，通知缺口只留痕、不停单。
+
+def _filled_intent_with_record(t, intent_id, order_id, qty="1", price="100", state="FILLED",
+                               notification_state="unknown"):
+    t.db.add(OrderIntent(id=intent_id, binding_id=t.binding.id, account_id=t.account.id,
+        inst_id="BTCUSDT", pos_side="long", source_event_id="audit-case", state=state,
+        requested_qty=qty, filled_qty=qty, avg_px=price, reduce_only=False,
+        exchange_order_id=order_id))
+    record = ExecutionRecord(binding_id=t.binding.id, account_id=t.account.id, lead_id=t.lead.id,
+        account_name=t.account.name, lead_name=t.lead.name, inst_id="BTCUSDT", symbol="BTCUSDT",
+        side="BUY", position_side="LONG", action="OPEN_LONG", status="EXECUTED",
+        order_id=order_id, created_at=datetime.now(timezone.utc),
+        notification_state=notification_state, my_qty=float(qty), my_price=float(price),
+        details=f"Filled {qty} @ {price}")
+    t.db.add(record)
+    return record
+
+
+async def test_terminal_intent_with_ledger_proven_passes_audit_despite_notification_gap(trading):
+    t = trading
+    _filled_intent_with_record(t, "audit-terminal", "order-audit-1")
+    await t.db.commit()
+    intent = await t.db.get(OrderIntent, "audit-terminal")
+    assert await t.router._recover_intent_reporting(t.db, intent, t.spec, require_notifications=True)
+    assert await t.router._audit_completed_intents(t.db, t.account, {"BTCUSDT": t.spec})
+    assert (await t.db.get(OrderIntent, "audit-terminal")).reporting_complete is True
+    assert await t.router.reconcile_pending_orders(t.db, t.account, OfflineExchange(), {"BTCUSDT": t.spec})
+
+
+async def test_terminal_intent_with_legacy_outbox_receipt_passes_audit(trading):
+    t = trading
+    record = _filled_intent_with_record(t, "audit-legacy-receipt", "order-audit-2")
+    await t.db.flush()
+    t.db.add(NotificationOutbox(payload=json.dumps({"execution_id": record.id, "event_key": None,
+        "channels": ["outbox"], "delivered_channels": ["outbox"]}), status="sent",
+        execution_id=record.id))
+    await t.db.commit()
+    intent = await t.db.get(OrderIntent, "audit-legacy-receipt")
+    assert await t.router._recover_intent_reporting(t.db, intent, t.spec, require_notifications=True)
+    assert await t.router.reconcile_pending_orders(t.db, t.account, OfflineExchange(), {"BTCUSDT": t.spec})
+
+
+async def test_nonterminal_intent_with_notification_gap_still_blocks(trading):
+    t = trading
+    _filled_intent_with_record(t, "audit-nonterminal", "order-audit-3", state="UNKNOWN")
+    await t.db.commit()
+    intent = await t.db.get(OrderIntent, "audit-nonterminal")
+    assert not await t.router._recover_intent_reporting(t.db, intent, t.spec, require_notifications=True)
+
+
+async def test_terminal_intent_with_ledger_shortfall_still_blocks(trading):
+    t = trading
+    _filled_intent_with_record(t, "audit-shortfall", "order-audit-4", qty="1", price="100")
+    intent = await t.db.get(OrderIntent, "audit-shortfall")
+    await t.db.flush()
+    intent.filled_qty = "2"
+    await t.db.commit()
+    exchange = OfflineExchange()
+    assert not await t.router._recover_intent_reporting(t.db, intent, t.spec, require_notifications=True)
+    assert exchange.orders == []

@@ -211,10 +211,11 @@ async def test_record_without_outbox_never_infers_a_pending_notification(trading
     trading.db.add_all([intent, record])
     await trading.db.commit()
     exchange = OfflineExchange()
-    proven = notification_state in ('sent', 'not_required')
+    # 账本已证实：审计通过；通知状态不推断、不伪造——无回执的记录
+    # 标 unknown 留痕，不补一个 pending 通知。
     for router in (trading.router, CopyRouter(CredentialVault())):
-        assert await router.reconcile_pending_orders(trading.db, trading.account, exchange, {'BTCUSDT': trading.spec}) is proven
-    assert record.notification_state == (notification_state if proven else 'unknown')
+        assert await router.reconcile_pending_orders(trading.db, trading.account, exchange, {'BTCUSDT': trading.spec}) is True
+    assert record.notification_state == (notification_state if notification_state in ('sent', 'not_required') else 'unknown')
     assert not (await trading.db.scalars(select(NotificationOutbox))).all()
     assert len((await trading.db.scalars(select(ExecutionRecord))).all()) == 1
     assert exchange.orders == []

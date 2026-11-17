@@ -45,7 +45,9 @@ async def test_collection_start_cannot_refresh_at_submission(workflow, monkeypat
     workflow.adapter.place_order.assert_not_awaited()
 
 
-async def test_existing_legacy_execution_missing_outbox_requires_human_review(trading):
+async def test_existing_legacy_execution_missing_outbox_stays_visible_without_blocking(trading):
+    # 账本证实后，通知回执缺口只留痕（详情标记 + 状态 unknown），
+    # 不再永久阻断跟单；缺口没有人工解除入口，停单是死胡同。
     delivery = await source_delivery(trading)
     delivery.state = 'APPLIED'
     trading.db.add(OrderIntent(id='legacy-existing-report', binding_id=trading.binding.id, account_id=trading.account.id,
@@ -58,7 +60,7 @@ async def test_existing_legacy_execution_missing_outbox_requires_human_review(tr
     await trading.db.commit()
     exchange = OfflineExchange()
     for router in (trading.router, CopyRouter(CredentialVault())):
-        assert not await router.reconcile_pending_orders(trading.db, trading.account, exchange, {'BTCUSDT': trading.spec})
+        assert await router.reconcile_pending_orders(trading.db, trading.account, exchange, {'BTCUSDT': trading.spec})
     records = (await trading.db.scalars(select(ExecutionRecord))).all()
     assert len(records) == 1
     assert 'notification delivery unknown' in records[0].details.lower()
@@ -172,7 +174,7 @@ async def test_recovery_preserves_proven_notification_evidence(trading, delivery
     assert exchange.orders == []
 
 
-async def test_newly_reported_historical_terminal_fill_has_unknown_notification_state(trading):
+async def test_newly_reported_historical_terminal_fill_is_marked_unknown_then_passes_audit(trading):
     delivery = await source_delivery(trading)
     delivery.state = 'APPLIED'
     trading.db.add(OrderIntent(id='legacy-unreported', binding_id=trading.binding.id, account_id=trading.account.id,
@@ -180,8 +182,9 @@ async def test_newly_reported_historical_terminal_fill_has_unknown_notification_
         requested_qty='1', filled_qty='1', avg_px='100', reduce_only=False, exchange_order_id='old-fill'))
     await trading.db.commit()
     exchange = OfflineExchange()
-    for router in (trading.router, CopyRouter(CredentialVault())):
-        assert not await router.reconcile_pending_orders(trading.db, trading.account, exchange, {'BTCUSDT': trading.spec})
+    # 首轮补记账本记录，返回 False；次轮账本已证实，通知缺口不再阻断。
+    assert not await trading.router.reconcile_pending_orders(trading.db, trading.account, exchange, {'BTCUSDT': trading.spec})
+    assert await CopyRouter(CredentialVault()).reconcile_pending_orders(trading.db, trading.account, exchange, {'BTCUSDT': trading.spec})
     records = (await trading.db.scalars(select(ExecutionRecord))).all()
     assert len(records) == 1 and records[0].my_qty == 1 and records[0].notification_state == 'unknown'
     assert 'human reconciliation' in records[0].details.lower()

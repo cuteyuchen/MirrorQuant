@@ -168,7 +168,8 @@ async def test_unknown_historical_notification_does_not_block_confirmed_reductio
     trading.db.add_all([intent, record])
     await trading.db.commit()
     exchange = OfflineExchange()
-    assert not await trading.router.reconcile_pending_orders(trading.db, trading.account,
+    # 账本已证实：通知缺口只留痕（状态 unknown），审计通过，不阻断跟单。
+    assert await trading.router.reconcile_pending_orders(trading.db, trading.account,
         exchange, {"BTCUSDT": trading.spec})
     assert record.notification_state == "unknown"
     assert not (await trading.db.scalars(select(NotificationOutbox))).all()

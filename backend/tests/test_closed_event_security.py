@@ -276,7 +276,7 @@ async def test_direct_close_without_observation_fails_closed(trading, kind):
 
 
 @pytest.mark.parametrize("state", ["unsent", "unknown", "pending", "failed"])
-async def test_historical_unsent_proof_is_required_for_notification_recovery(trading, state):
+async def test_historical_notification_recovery_without_blocking_audit(trading, state):
     delivery = await source_delivery(trading)
     delivery.state = "APPLIED"
     intent = OrderIntent(id="historical-proof", binding_id=trading.binding.id, account_id=trading.account.id,
@@ -291,9 +291,10 @@ async def test_historical_unsent_proof_is_required_for_notification_recovery(tra
     config.value_json = json.dumps({"outbox_enabled": True, "notify_on_execution": True})
     await trading.db.commit()
     exchange = OfflineExchange()
+    # 账本已证实：审计通过；unsent 仍补发一条通知，其余状态标 unknown 留痕，均不阻断。
     for router in (trading.router, CopyRouter(CredentialVault())):
         assert await router.reconcile_pending_orders(trading.db, trading.account, exchange,
-            {"BTCUSDT": trading.spec}) is (state == "unsent")
+            {"BTCUSDT": trading.spec}) is True
     outboxes = (await trading.db.scalars(select(NotificationOutbox))).all()
     assert len(outboxes) == (1 if state == "unsent" else 0)
     assert record.notification_state == ("pending" if state == "unsent" else "unknown")
