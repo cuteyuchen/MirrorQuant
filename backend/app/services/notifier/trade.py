@@ -158,6 +158,7 @@ _BLOCK_REASONS: dict[str, tuple[str, str]] = {
     "BLOCKED_PROTECTION_UNAVAILABLE": ("风控保护数据不可用，暂缓执行",
                                        "Risk protection data unavailable; execution deferred"),
     "SKIPPED_BELOW_MIN": ("数量低于最小下单量", "Quantity below the minimum order size"),
+    "EXIT_DUST_ABSORBED": ("退出剩余量低于最小下单量，已核销完成", "Exit remainder below the minimum order size; absorbed to complete delivery"),
     "SKIPPED_CLOSED_CYCLE": ("闭环事件已处理，无需重复执行", "Closed-cycle event already processed; nothing to execute"),
     "SKIPPED_NO_LOCAL_POS": ("本地无对应仓位", "No local position to act on"),
     "SKIPPED_UNSUPPORTED": ("不支持的品种或方向", "Unsupported instrument or side"),

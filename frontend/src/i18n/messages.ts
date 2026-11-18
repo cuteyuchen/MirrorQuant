@@ -83,6 +83,7 @@ export const additions: Record<string, readonly [string, string]> = {
   "state.CANCELED": ["已撤销", "Canceled"],
   "state.ACCUMULATED_DEBT": ["已累计待补量", "Accumulated for catch-up"],
   "state.ADOPTED_POSITION": ["已认领", "Adopted"],
+  "state.EXIT_DUST_ABSORBED": ["零头已核销", "Dust absorbed"],
   "state.CONNECTED": ["连接正常", "Connected"],
   "state.HEALTHY": ["正常", "Healthy"],
   "state.ACTIVE": ["运行中", "Active"],

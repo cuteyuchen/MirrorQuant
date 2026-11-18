@@ -449,6 +449,32 @@ class CopyRouter:
             raise UnknownOrderOutcome("Exit cumulative fills conflict with delivery")
         return delivery
 
+    async def _absorb_exit_remainder(self, db, binding, lead, account, delivery, symbol, inst_id,
+                                     side, position_side, action, lead_qty, lead_price, lead_notional,
+                                     remaining, minimum) -> None:
+        """Complete an exit delivery whose remainder can never trade.
+
+        The remainder is a quantization residue: the exit target carries more
+        precision than the exchange lot step, so the last fill rounds down and
+        leaves dust below the exchange minimum. Parking on it stalls the
+        delivery forever and blocks every later event for the binding, so the
+        remainder is folded into the filled quantity and the delivery is
+        marked complete. The allocation is untouched: the dust never
+        corresponded to physical quantity, and the ledger already reflects
+        the fills exactly. The completion is recorded quietly (no push): the
+        substantive fill was already notified.
+        """
+        delivery.exit_filled_qty = format_exact(exact(delivery.exit_target_qty))
+        delivery.exit_remaining_qty = "0"
+        delivery.exit_progress = "COMPLETE"
+        delivery.state = "APPLIED"
+        await self._record_execution(
+            db, binding, lead, account, symbol, inst_id, side, position_side, action,
+            "EXIT_DUST_ABSORBED", lead_qty, lead_price, lead_notional,
+            details=(f"Exit remainder {format_exact(remaining)} below exchange minimum "
+                     f"{format_exact(minimum)}; absorbed to complete delivery"),
+            notify_cfg=None, complete_delivery=False)
+
     @staticmethod
     def _confirmed_fill(info: Optional[Dict[str, Any]], res: OrderResult) -> float:
         raw = info.get("accFillSz") if info is not None else None
@@ -2208,6 +2234,14 @@ class CopyRouter:
                     return
                 if local_pos is None:
                     if delivery is not None:
+                        dust = exact(delivery.exit_remaining_qty)
+                        dust_min = exact(spec.market_min_sz or spec.min_sz)
+                        if 0 < dust < dust_min:
+                            # 交易所已无仓位且剩余只是零头：核销完成，不再空等。
+                            await self._absorb_exit_remainder(
+                                db, binding, lead, account, delivery, symbol, inst_id, side, ps, action,
+                                lead_qty, lead_avg_px, lead_notional, dust, dust_min)
+                            return
                         delivery.exit_progress = "WAITING_HOLDINGS"
                     await self._record_execution(db, binding, lead, account, symbol, inst_id, side, ps, action,
                         "SKIPPED_NO_LOCAL_POS", lead_qty, lead_avg_px, lead_notional,
@@ -2612,6 +2646,15 @@ class CopyRouter:
             limit = min(limit, exact(maximum))
         qty = quantize_down(limit, step)
         if qty <= 0 or qty < exact(minimum):
+            remaining = exact(quantity)
+            if delivery is not None and 0 < remaining < exact(minimum):
+                # 剩余量本身就是零头：再等也成交不了，只会永久卡住本投递
+                # 并阻塞后续事件。直接核销完成，账本不动（见 _absorb_exit_remainder）。
+                await self._absorb_exit_remainder(
+                    db, binding, lead, account, delivery, pos.symbol, pos.inst_id,
+                    "SELL" if pos.pos_side == "long" else "BUY", pos.pos_side.upper(), action,
+                    lead_qty, lead_price, lead_notional, remaining, exact(minimum))
+                return False
             if delivery is not None:
                 delivery.exit_progress = "WAITING_AVAILABILITY" if exact(pos.avail_pos) <= 0 else "WAITING_MINIMUM"
             await self._record_execution(db, binding, lead, account, pos.symbol, pos.inst_id,
