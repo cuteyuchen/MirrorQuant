@@ -1,6 +1,6 @@
 [project]
 name = "mirror-quant-backend"
-version = "1.2.3"
+version = "1.2.4"
 description = "MirrorQuant multi-lead copy-trading & quantitative monitoring engine"
 requires-python = ">=3.12"
 dependencies = [

@@ -27,6 +27,11 @@ beforeEach(() => {
   vi.spyOn(cache, "fetchBindings").mockResolvedValue(cache.bindings.data);
   cache.board = { data: structuredClone(mockBoard), fetchedAt: Date.now() };
   vi.spyOn(useBoardStore(), "refresh").mockResolvedValue(undefined);
+  // 数量口径：账户验收断言数量文本与数量单位说明，显示单位固定为数量模式。
+  const settings = structuredClone(mockSettings);
+  settings.notifications!.display_unit = "quantity";
+  cache.settings = { data: settings, fetchedAt: Date.now() };
+  vi.spyOn(cache, "fetchSettings").mockResolvedValue(settings);
 });
 afterEach(() => { wrapper?.unmount(); wrapper = undefined; useUiStore().clear(); vi.restoreAllMocks(); document.body.innerHTML = ""; });
 async function render(component: typeof AccountsView | typeof ProxiesView) {

@@ -4,6 +4,7 @@ import { Archive, History, Repeat, ScrollText, Zap } from "lucide-vue-next";
 import type { ClosedPosition, LeadSnapshot, TelemetryOrder } from "@/types/api";
 import type { TableColumn } from "@/types/ui";
 import { useI18n } from "@/i18n";
+import { useDisplayUnit } from "@/composables/useDisplayUnit";
 import { finiteNumber, formatDateTime, formatPrice, formatQty, formatUsd, signedUsd } from "@/utils/format";
 import { normalizeSide, pnlClass, sideLabel, statusLabel } from "@/utils/status";
 import { telemetryDirectionLabel } from "@/constants/telemetry";
@@ -11,6 +12,7 @@ import DataTable from "@/components/DataTable.vue";
 
 const props = defineProps<{ snapshot: LeadSnapshot; ordersOnly?: boolean }>();
 const { t } = useI18n();
+const { unit, showQuantity, showNotional, sizeText } = useDisplayUnit();
 type Tab = "batches" | "cycles" | "closed" | "orders";
 // 默认先看操作批次：它最接近“带单员刚刚做了什么”。
 const tab = ref<Tab>("batches");
@@ -108,10 +110,11 @@ const columns = computed<TableColumn[]>(() => {
   if (view.value === "cycles") return [symbol, { key: "time", label: t("board.openedAt"), width: "20%" },
     { key: "prices", label: t("feed.cycleEntryExit"), numeric: true }, { key: "counts", label: t("feed.cycleCounts"), numeric: true }, pnl];
   if (view.value === "closed") return [symbol, { key: "time", label: t("feed.closedTime"), width: "19%" },
-    { key: "prices", label: t("feed.cycleEntryExit"), numeric: true }, { key: "qty", label: t("feed.closedMaxQty"), numeric: true },
+    { key: "prices", label: t("feed.cycleEntryExit"), numeric: true }, { key: "qty", label: unit.value === "notional" ? t("feed.colNotional") : t("feed.closedMaxQty"), numeric: true },
     { key: "leverage", label: t("feed.closedLev"), numeric: true }, { key: "pnl", label: t("feed.closedPnl"), numeric: true }];
-  const base = [symbol, { key: "time", label: t("feed.colTime"), width: "19%" }, { key: "price", label: t("feed.colAvgPx"), numeric: true },
-    { key: "qty", label: view.value === "batches" ? t("feed.colQty") : t("common.quantity"), numeric: true }, { key: "notional", label: t("feed.colNotional"), numeric: true }];
+  const base: TableColumn[] = [symbol, { key: "time", label: t("feed.colTime"), width: "19%" }, { key: "price", label: t("feed.colAvgPx"), numeric: true }];
+  if (showQuantity.value) base.push({ key: "qty", label: view.value === "batches" ? t("feed.colQty") : t("common.quantity"), numeric: true });
+  if (showNotional.value) base.push({ key: "notional", label: t("feed.colNotional"), numeric: true });
   return view.value === "batches" ? [...base, { key: "orders", label: t("feed.colOrders"), numeric: true }, pnl] : [...base, pnl];
 });
 const label = computed(() => tabs.value.find(item => item.value === view.value)?.label ?? t("telemetry.history"));
@@ -159,7 +162,7 @@ function childNotional(order: TelemetryOrder) {
         <!-- 还没平仓的轮次没有平仓均价，写“持仓中”而不是破折号。 -->
         <p class="mt-1 text-muted">→ {{ row.exit == null && row.status === "OPEN" ? t("feed.holding") : formatPrice(row.exit) }}</p>
       </template>
-      <template #cell-qty="{ row }">{{ formatQty(row.qty) }}</template>
+      <template #cell-qty="{ row }">{{ view === "closed" ? sizeText(row.qty, row.notional, row.entry) : formatQty(row.qty) }}</template>
       <template #cell-notional="{ row }">{{ formatUsd(row.notional) }}</template>
       <template #cell-orders="{ row }">{{ formatQty(row.orderCount) }}</template>
       <template #cell-counts="{ row }">{{ row.counts ?? t("common.unknown") }}</template>
@@ -171,8 +174,8 @@ function childNotional(order: TelemetryOrder) {
         <ul class="divide-y divide-border/40 font-mono text-xs tabular-nums">
           <li v-for="(order, index) in row.children" :key="`${orderKey(order)}:${index}`" class="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 py-1.5">
             <time class="text-muted">{{ formatDateTime(order.time ?? order.t) }}</time>
-            <span><strong class="font-semibold">{{ formatQty(order.qty ?? order.q) }}</strong> <span class="text-accent">@ {{ formatPrice(order.avgPrice ?? order.price ?? order.p) }}</span></span>
-            <span class="text-muted">{{ formatUsd(childNotional(order)) }}</span>
+            <span><strong class="font-semibold">{{ unit === "both" ? formatQty(order.qty ?? order.q) : sizeText(order.qty ?? order.q, childNotional(order), order.avgPrice ?? order.price ?? order.p) }}</strong> <span class="text-accent">@ {{ formatPrice(order.avgPrice ?? order.price ?? order.p) }}</span></span>
+            <span v-if="unit === 'both'" class="text-muted">{{ formatUsd(childNotional(order)) }}</span>
             <span :class="pnlClass(order.pnl)">{{ signedUsd(order.pnl) }}</span>
           </li>
         </ul>

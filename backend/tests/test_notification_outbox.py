@@ -186,6 +186,83 @@ async def test_restart_exhaustion_updates_only_proven_execution_receipt(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_sealed_group_sends_once_with_merged_message(monkeypatch):
+    # 同一带单事件已封口的多行只发一次：带单员部分一次，各账户结果在下方合并。
+    dispatch = AsyncMock(return_value={"webhook": {"ok": True}})
+    monkeypatch.setattr(NotificationService, "dispatch", dispatch)
+    async with get_session_factory()() as db:
+        await configure_sink(db)
+        router, binding, lead, account = await record_execution(db)
+        executions = []
+        for index in range(2):
+            execution = await router._record_execution(db, binding, lead, account,
+                "BTCUSDT", "BTC-USDT-SWAP", "BUY", "LONG", "OPEN_LONG", "EXECUTED",
+                1, 100, 100, my_qty=1, my_price=100, my_notional=100, order_id=f"synthetic-order-{index}")
+            execution.notification_state = "pending"
+            executions.append(execution)
+        await db.commit()
+        for execution in executions:
+            enqueue_notification(db, {"webhook_enabled": True}, "MirrorQuant", "single",
+                event_type="EXECUTED", execution_id=execution.id, event_key=f"execution:{execution.id}",
+                merge_key="event-1", lead_section="LEAD",
+                follower_section=f"FOLLOWER-{execution.id}")
+        await db.flush()
+        rows = (await db.scalars(select(NotificationOutbox))).all()
+        for row in rows:
+            payload = json.loads(row.payload)
+            payload["sealed"] = True
+            row.payload = json.dumps(payload)
+        await db.commit()
+        ids = [execution.id for execution in executions]
+    assert await NotificationOutboxDrainer().drain_once() == 2
+    dispatch.assert_awaited_once()
+    args = dispatch.await_args.args
+    assert args[1] == "MirrorQuant"
+    assert args[2] == f"LEAD\n\nFOLLOWER-{ids[0]}\n\nFOLLOWER-{ids[1]}"
+    async with get_session_factory()() as db:
+        states = [(await db.get(ExecutionRecord, execution_id)).notification_state for execution_id in ids]
+        assert states == ["sent", "sent"]
+
+
+@pytest.mark.asyncio
+async def test_unsealed_fresh_rows_wait_for_the_batch_to_finish(monkeypatch):
+    dispatch = AsyncMock(return_value={"webhook": {"ok": True}})
+    monkeypatch.setattr(NotificationService, "dispatch", dispatch)
+    async with get_session_factory()() as db:
+        await configure_sink(db)
+        enqueue_notification(db, {"webhook_enabled": True}, "MirrorQuant", "single",
+            event_type="EXECUTED", execution_id=1, event_key="execution:1",
+            merge_key="event-1", lead_section="LEAD", follower_section="FOLLOWER")
+        await db.commit()
+    assert await NotificationOutboxDrainer().drain_once() == 0
+    dispatch.assert_not_awaited()
+    async with get_session_factory()() as db:
+        row = await db.scalar(select(NotificationOutbox))
+        assert row.status == "pending" and row.attempts == 0 and row.claimed_until is None
+
+
+@pytest.mark.asyncio
+async def test_aged_unsealed_rows_send_grouped_after_crash(monkeypatch):
+    # 批次中途死亡没封口：超过宽限期的行照常按事件分组发出，不丢通知。
+    dispatch = AsyncMock(return_value={"webhook": {"ok": True}})
+    monkeypatch.setattr(NotificationService, "dispatch", dispatch)
+    async with get_session_factory()() as db:
+        await configure_sink(db)
+        for index in range(2):
+            enqueue_notification(db, {"webhook_enabled": True}, "MirrorQuant", "single",
+                event_type="EXECUTED", execution_id=index + 1, event_key=f"execution:{index + 1}",
+                merge_key="event-1", lead_section="LEAD", follower_section=f"FOLLOWER-{index + 1}")
+        await db.flush()
+        rows = (await db.scalars(select(NotificationOutbox))).all()
+        for row in rows:
+            row.created_at = datetime.now(timezone.utc) - timedelta(seconds=300)
+        await db.commit()
+    assert await NotificationOutboxDrainer().drain_once() == 2
+    dispatch.assert_awaited_once()
+    assert dispatch.await_args.args[2] == "LEAD\n\nFOLLOWER-1\n\nFOLLOWER-2"
+
+
+@pytest.mark.asyncio
 async def test_workers_cannot_claim_the_same_pending_row(tmp_path, monkeypatch):
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'outbox.sqlite'}")
     monkeypatch.setattr(database, "_engine", engine)

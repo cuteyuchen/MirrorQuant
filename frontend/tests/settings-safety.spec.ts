@@ -64,6 +64,17 @@ describe("设置资金安全", () => {
     expect(payload).not.toHaveProperty("security");
   });
 
+  it("显示单位切换随通知页签一起保存", async () => {
+    const put = vi.spyOn(api, "put").mockResolvedValue(fixture());
+    const rendered = await view();
+    await rendered.find('select[name="notifications.display_unit"]').setValue("quantity");
+    await rendered.find("form").trigger("submit");
+    await flushPromises();
+    expect(put).toHaveBeenCalledOnce();
+    const payload = put.mock.calls[0][1] as Partial<SettingsResponse>;
+    expect(payload.notifications?.display_unit).toBe("quantity");
+  });
+
   it("422的detail数组落到对应风控字段", async () => {
     vi.spyOn(api, "put").mockRejectedValue(new ApiError(422, "HTTP 422", {
       detail: [{ loc: ["body", "risk_defaults", "maxDrawdownPct"], type: "less_than_equal", msg: "invalid", ctx: { le: 100 } }],

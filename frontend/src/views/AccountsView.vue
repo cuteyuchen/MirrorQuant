@@ -7,6 +7,7 @@ import { useBoardStore } from "@/stores/board";
 import { useAsyncAction } from "@/composables/useAsyncAction";
 import { useNow } from "@/composables/useNow";
 import { useI18n } from "@/i18n";
+import { useDisplayUnit } from "@/composables/useDisplayUnit";
 import type { Account, AccountTestResult } from "@/types/api";
 import { finiteNumber, formatDateTime, formatPct, formatPrice, formatQty, formatUsd, signedUsd, timestampMs } from "@/utils/format";
 import { pnlClass, sideLabel } from "@/utils/status";
@@ -25,6 +26,8 @@ const cache = useDataCacheStore();
 const board = useBoardStore();
 const now = useNow();
 const { t } = useI18n();
+const { unit, showQuantity, sizeText } = useDisplayUnit();
+const sizeLabel = computed(() => unit.value === "notional" ? t("board.notional") : unit.value === "quantity" ? t("common.quantity") : `${t("common.quantity")} / ${t("board.notional")}`);
 const { pending, error, run } = useAsyncAction();
 const accounts = computed(() => cache.accounts?.data || []);
 const proxies = computed(() => cache.proxies?.data || []);
@@ -151,12 +154,12 @@ onActivated(() => { void load(); });
       <template #details="{ row }">
         <div class="space-y-4">
           <p v-if="row.riskEquityLegacyUnverified || accountBoard(row)?.riskLegacyUnverified" class="border-l-2 border-warning bg-warning/5 p-3 text-sm text-warning" role="alert">{{ t("accts.legacy") }}</p>
-          <div class="flex flex-wrap items-center justify-between gap-3"><h2 class="section-title">{{ t("accts.positions") }}</h2><p class="text-xs text-muted">{{ row.exchange === "okx" ? t("accts.contractQty") : t("accts.baseQty") }}</p></div>
+          <div class="flex flex-wrap items-center justify-between gap-3"><h2 class="section-title">{{ t("accts.positions") }}</h2><p v-if="showQuantity" class="text-xs text-muted">{{ row.exchange === "okx" ? t("accts.contractQty") : t("accts.baseQty") }}</p></div>
           <EmptyState v-if="!row.positions?.length" :title="t(row.positions == null ? 'accts.positionsUnknown' : 'accts.positionsEmpty')" />
           <div v-else class="divide-y divide-border/50">
             <article v-for="position in positionRows(row)" :key="position.key" class="grid items-center gap-3 py-3 md:grid-cols-[minmax(0,1.2fr)_repeat(4,minmax(0,1fr))]">
               <div class="min-w-0"><h3 class="break-words text-sm font-semibold">{{ position.symbol ?? t("common.unknown") }}</h3><p class="text-xs text-muted">{{ position.side }} · {{ t("unit.leverage", { n: formatQty(position.leverage) }) }}</p></div>
-              <dl class="number"><dt class="text-xs text-muted">{{ t("common.quantity") }}</dt><dd>{{ formatQty(position.qty) }}</dd></dl>
+              <dl class="number"><dt class="text-xs text-muted">{{ sizeLabel }}</dt><dd>{{ sizeText(position.qty, null, position.price) }}</dd></dl>
               <dl class="number"><dt class="text-xs text-muted">{{ t("board.entry") }}</dt><dd>{{ formatPrice(position.entry) }}</dd></dl>
               <dl class="number"><dt class="text-xs text-muted">{{ t("board.mark") }}</dt><dd class="font-semibold">{{ formatPrice(position.price) }}</dd><dd v-if="position.priceSource === 'estimated' || position.priceSource === 'entry'" class="text-xs text-warning">{{ t(`accts.price_${position.priceSource}`) }}</dd></dl>
               <dl class="number"><dt class="text-xs text-muted">{{ t("common.pnl") }}</dt><dd :class="pnlClass(position.pnl)">{{ signedUsd(position.pnl) }} <span class="text-xs">{{ formatPct(position.pnlPct) }}</span></dd></dl>

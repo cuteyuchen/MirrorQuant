@@ -3,7 +3,8 @@ import { mount, type VueWrapper } from "@vue/test-utils";
 import { createPinia, setActivePinia } from "pinia";
 import LeadComparison from "@/components/board/LeadComparison.vue";
 import AccountSummary from "@/components/board/AccountSummary.vue";
-import { mockBoard, mockResponse } from "@/mocks/board";
+import { useDataCacheStore } from "@/stores/dataCache";
+import { mockBoard, mockResponse, mockSettings } from "@/mocks/board";
 import { normalizeSide } from "@/utils/status";
 import { baseAsset, formatQty } from "@/utils/format";
 import { publicBoardLead } from "@/utils/publicBoard";
@@ -11,7 +12,13 @@ import type { PublicDashboardResponse } from "@/types/api";
 
 // 看板验收直接使用同一份样例，不另造只适用于测试的状态。
 const wrappers: VueWrapper[] = [];
-beforeEach(() => setActivePinia(createPinia()));
+beforeEach(() => {
+  setActivePinia(createPinia());
+  // 数量口径：看板验收断言数量文本，显示单位固定为数量模式。
+  const settings = structuredClone(mockSettings);
+  settings.notifications!.display_unit = "quantity";
+  useDataCacheStore().settings = { data: settings, fetchedAt: Date.now() };
+});
 afterEach(() => wrappers.splice(0).forEach(wrapper => wrapper.unmount()));
 function comparison() {
   const wrapper = mount(LeadComparison, {

@@ -6,10 +6,11 @@ import { isCancelled } from "@/api/client";
 import { useDataCacheStore } from "@/stores/dataCache";
 import { useSocketStore } from "@/stores/socket";
 import { useI18n } from "@/i18n";
+import { useDisplayUnit } from "@/composables/useDisplayUnit";
 import type { ExecutionRecord } from "@/types/api";
 import { errorMessage, reasonText } from "@/utils/errors";
 import { actionLabel, sideLabel, statusLabel } from "@/utils/status";
-import { formatDateTime, formatPct, formatPrice, formatQty, timestampMs } from "@/utils/format";
+import { formatDateTime, formatPct, formatPrice, timestampMs } from "@/utils/format";
 import { EXECUTION_FILTERS, executionGroup, readExecutionCounts, readExecutionPage, type ExecutionCounts, type ExecutionFilter } from "@/utils/executions";
 import PageHeader from "@/components/PageHeader.vue";
 import DataTable from "@/components/DataTable.vue";
@@ -26,6 +27,8 @@ const socket = useSocketStore();
 const route = useRoute();
 const router = useRouter();
 const { t } = useI18n();
+const { unit, sizeText } = useDisplayUnit();
+const sizeLabel = computed(() => unit.value === "notional" ? t("board.notional") : unit.value === "quantity" ? t("common.quantity") : `${t("common.quantity")} / ${t("board.notional")}`);
 const tab = computed(() => route.query.tab === "intents" ? "intents" : "history");
 const bindingId = ref("");
 const filter = ref<ExecutionFilter>("all");
@@ -218,8 +221,8 @@ onMounted(start); onActivated(start); onDeactivated(stop); onUnmounted(stop);
           <strong>{{ row.leadName ?? t("common.unknown") }}</strong><p class="mt-1 text-xs text-muted">{{ bindingName(row) }}</p>
           <div class="mt-1.5 flex flex-wrap items-center gap-2"><span class="text-xs text-muted">{{ accountName(row) }}</span><EnvBadge :environment="environment(row)" /></div>
         </template>
-        <template #cell-lead="{ row }"><span>{{ formatQty(row.leadQty) }}</span><p class="mt-1 text-xs text-muted">{{ formatPrice(row.leadPrice) }}</p></template>
-        <template #cell-fill="{ row }"><strong>{{ formatQty(row.myQty) }}</strong><p class="mt-1 text-xs text-muted">{{ formatPrice(row.myPrice) }}</p></template>
+        <template #cell-lead="{ row }"><span>{{ sizeText(row.leadQty, row.leadNotional, row.leadPrice) }}</span><p class="mt-1 text-xs text-muted">{{ formatPrice(row.leadPrice) }}</p></template>
+        <template #cell-fill="{ row }"><strong>{{ sizeText(row.myQty, row.myNotional, row.myPrice) }}</strong><p class="mt-1 text-xs text-muted">{{ formatPrice(row.myPrice) }}</p></template>
         <template #cell-slippage="{ row }"><span>{{ formatPct(row.slippagePct, 4) }}</span></template>
         <template #cell-time="{ row }"><span class="text-xs tabular-nums">{{ formatDateTime(row.createdAt) }}</span></template>
         <template #select-label>{{ t("executions.expand") }}</template>
@@ -245,9 +248,9 @@ onMounted(start); onActivated(start); onDeactivated(stop); onUnmounted(stop);
         </header>
         <p v-if="executionGroup(selected.status) !== 'success'" class="warning-banner">{{ resultReason(selected) }}</p>
         <dl class="grid grid-cols-2 gap-4">
-          <div class="number"><dt class="text-xs text-muted">{{ t("executions.leadReference") }} · {{ t("common.quantity") }}</dt><dd class="mt-1 font-semibold">{{ formatQty(selected.leadQty) }}</dd></div>
+          <div class="number"><dt class="text-xs text-muted">{{ t("executions.leadReference") }} · {{ sizeLabel }}</dt><dd class="mt-1 font-semibold">{{ sizeText(selected.leadQty, selected.leadNotional, selected.leadPrice) }}</dd></div>
           <div class="number"><dt class="text-xs text-muted">{{ t("executions.leadReference") }} · {{ t("common.price") }}</dt><dd class="mt-1 font-semibold">{{ formatPrice(selected.leadPrice) }}</dd></div>
-          <div class="number"><dt class="text-xs text-muted">{{ t("executions.fill") }} · {{ t("common.quantity") }}</dt><dd class="mt-1 font-semibold">{{ formatQty(selected.myQty) }}</dd></div>
+          <div class="number"><dt class="text-xs text-muted">{{ t("executions.fill") }} · {{ sizeLabel }}</dt><dd class="mt-1 font-semibold">{{ sizeText(selected.myQty, selected.myNotional, selected.myPrice) }}</dd></div>
           <div class="number"><dt class="text-xs text-muted">{{ t("executions.fill") }} · {{ t("common.price") }}</dt><dd class="mt-1 font-semibold">{{ formatPrice(selected.myPrice) }}</dd></div>
           <div class="number"><dt class="text-xs text-muted">{{ t("executions.slippage") }}</dt><dd class="mt-1">{{ formatPct(selected.slippagePct, 4) }}</dd></div>
           <div class="number"><dt class="text-xs text-muted">{{ t("common.time") }}</dt><dd class="mt-1 text-xs">{{ formatDateTime(selected.createdAt) }}</dd></div>

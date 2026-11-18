@@ -278,4 +278,4 @@ def test_adoption_notification_names_the_adoption():
     assert "📥 认领仓位 ｜ BTCUSDT 永续 ｜ 做多" in lead
     assert "📥 已认领现有仓位为跟单仓位" in follower
     assert "📋 原因：现有仓位与带单员持仓一致" in follower
-    assert "📦 数量 1 ｜ 均价 100 ｜ 金额 100.00 U" in follower
+    assert "📦 均价 100 ｜ 金额 100.00 U" in follower

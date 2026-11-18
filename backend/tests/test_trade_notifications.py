@@ -12,7 +12,7 @@ from app.core.database import get_session_factory
 from app.models.domain import BindingDelivery, ExecutionRecord, NotificationOutbox, OrderIntent, PositionAllocation
 from app.services.notifier.outbox import NotificationOutboxDrainer
 from app.services.notifier.service import NotificationService
-from app.services.notifier.trade import trade_message
+from app.services.notifier.trade import merged_trade_message, resolve_display_unit, trade_message, trade_sections
 from app.services.engine.router import lead_position_context
 from test_notification_outbox import configure_sink, record_execution
 from test_routing_deliveries import make_workflow, order, route
@@ -35,7 +35,8 @@ def test_independent_lead_leg_precedes_different_follower_fill(side, direction, 
     rec = message_record()
     source = dict(symbol="ZECUSDT", side=side, positionSide=direction, qtyExact="0.123456789123456789",
                   avgPrice="123.45", notionalExact="15.24148161729148160205")
-    msg = trade_message(rec, SimpleNamespace(exchange="binance", environment="live"), source)
+    msg = trade_message(rec, SimpleNamespace(exchange="binance", environment="live"), source,
+                        display_unit="both")  # 精度校验走两者都显示的口径，数量段才出现。
     lead, follower = msg.split("\n\n")
     assert label in lead and "ZECUSDT" in lead and {"LONG": "做多", "SHORT": "做空"}[direction] in lead
     assert "0.123456789123456789" in lead and "123.45" in lead
@@ -44,6 +45,87 @@ def test_independent_lead_leg_precedes_different_follower_fill(side, direction, 
     assert "✅ 已成交" in follower and "账户 #1 / 绑定 #2" in follower
     assert "📦 数量 1 ｜ 均价 101 ｜ 金额 101.00 U" in follower
     assert "张" not in msg  # Lead units and follower contracts are not interchangeable.
+
+
+@pytest.mark.parametrize("unit,lead_line,position_line,follower_line,absent", [
+    ("notional", "💰 本次均价 100 ｜ 金额 200.00 U",
+     "【原仓位】 990.00 U → 【现仓位】 1,000.00 U", "📦 均价 101 ｜ 金额 101.00 U", "数量"),
+    ("quantity", "💰 本次均价 100 ｜ 数量 2",
+     "【原仓位】 9.9 → 【现仓位】 10", "📦 数量 1 ｜ 均价 101", "金额"),
+    ("both", "💰 本次均价 100 ｜ 数量 2 ｜ 金额 200.00 U",
+     "【原仓位】 9.9 → 【现仓位】 10", "📦 数量 1 ｜ 均价 101 ｜ 金额 101.00 U", None),
+])
+def test_display_unit_modes_filter_quantity_and_notional(unit, lead_line, position_line, follower_line, absent):
+    rec = message_record()
+    source = {"symbol": "BTCUSDT", "side": "BUY", "positionSide": "LONG",
+              "qty": "2", "avgPrice": "100", "notional": "200"}
+    position = {"previous_qty": Decimal("9.9"), "current_qty": Decimal("10"), "open_count": 1}
+    msg = trade_message(rec, SimpleNamespace(exchange="binance", environment="live"), source,
+                        1000, position=position, display_unit=unit)
+    assert lead_line in msg and position_line in msg and follower_line in msg
+    if absent is not None:
+        assert absent not in msg
+
+
+def test_display_unit_defaults_to_notional_and_rejects_unknown_values():
+    assert resolve_display_unit(None) == "notional"
+    assert resolve_display_unit("bogus") == "notional"
+    assert resolve_display_unit("quantity") == "quantity"
+    msg = trade_message(message_record(), SimpleNamespace(exchange="binance", environment="live"),
+                        {"symbol": "BTCUSDT", "side": "BUY", "positionSide": "LONG",
+                         "qty": "2", "avgPrice": "100", "notional": "200"},
+                        1000, display_unit="bogus")
+    assert "💰 本次均价 100 ｜ 金额 200.00 U" in msg and "数量" not in msg
+
+
+def test_display_unit_modes_apply_to_limit_lines():
+    rec = message_record()
+    limit = {"px": "100.5", "requested": "0.9", "filled": "0.4"}
+    account = SimpleNamespace(exchange="binance", environment="live")
+    source = {"symbol": "BTCUSDT", "side": "BUY", "positionSide": "LONG",
+              "qty": "2", "avgPrice": "100", "notional": "200"}
+    notional = trade_message(rec, account, source, 1000, limit=limit, display_unit="notional")
+    assert "已成交 40.20 U / 委托 90.45 U" in notional
+    quantity = trade_message(rec, account, source, 1000, limit=limit, display_unit="quantity")
+    assert "已成交 0.4 / 委托 0.9" in quantity
+
+
+def test_position_line_without_price_keeps_quantity_in_notional_mode():
+    position = {"previous_qty": Decimal("9.9"), "current_qty": Decimal("10"), "open_count": 1}
+    msg = trade_message(message_record(), SimpleNamespace(exchange="binance", environment="live"),
+                        {"symbol": "BTCUSDT", "side": "BUY", "positionSide": "LONG", "qty": "2"},
+                        1000, position=position, display_unit="notional")
+    assert "【原仓位】 9.9 → 【现仓位】 10" in msg
+
+
+async def test_configured_display_unit_flows_into_routed_notifications(workflow):
+    t = workflow
+    await configure_sink(t.db, dingtalk_enabled=True, display_unit="quantity")
+    snapshot = hidden_snapshot()
+    t.lead.snapshot_json = json.dumps(snapshot)
+    await t.db.commit()
+    await t.router.process_lead_events(t.db, t.lead, [opening_order()], [], snapshot, [t.proxy])
+    await t.router.process_lead_events(t.db, t.lead, [opening_order()], [], snapshot, [t.proxy])
+    rows = (await t.db.scalars(select(NotificationOutbox))).all()
+    assert len(rows) == 1
+    msg = json.loads(rows[0].payload)["message"]
+    assert "均价 100 ｜ 数量 1" in msg and "📦 数量" in msg
+
+
+def test_merged_message_shows_lead_once_with_each_account_outcome_below():
+    source = dict(symbol="BTCUSDT", side="BUY", positionSide="LONG", qtyExact="0.1",
+                  avgPrice="100", notionalExact="10")
+    first = message_record()
+    second = message_record()
+    second.account_id, second.binding_id, second.my_qty, second.my_price = 2, 3, 2, 102
+    lead, first_follower = trade_sections(first, SimpleNamespace(exchange="okx", environment="demo"), source)
+    same_lead, second_follower = trade_sections(second, SimpleNamespace(exchange="binance", environment="live"), source)
+    assert lead == same_lead
+    assert trade_message(first, SimpleNamespace(exchange="okx", environment="demo"), source) == f"{lead}\n\n{first_follower}"
+    merged = merged_trade_message(lead, [first_follower, second_follower])
+    assert merged == f"{lead}\n\n{first_follower}\n\n{second_follower}"
+    assert merged.count("本次均价") == 1
+    assert "账户 #1 / 绑定 #2" in merged and "账户 #2 / 绑定 #3" in merged
 
 
 @pytest.mark.parametrize("status,icon", [
@@ -87,14 +169,14 @@ def test_unknown_lead_values_and_autonomous_follower_exit_are_not_fabricated():
     rec.action, rec.lead_qty, rec.lead_price, rec.lead_notional = "TP_CLOSE", 0, 0, 0
     msg = trade_message(rec, SimpleNamespace(exchange="okx", environment="live"))
     assert "❔ 未知 ｜ 未知 永续 ｜ 方向未知" in msg
-    assert "均价 未知 ｜ 数量 未知 ｜ 金额 未知" in msg
+    assert "均价 未知 ｜ 金额 未知" in msg
     header, follower = msg.split("\n\n")
     assert "BTCUSDT" not in header and "方向未知" in header and "1000U" not in header
     assert "BTCUSDT" in follower and "跟单账户 #1" in follower
     assert "✅ 已成交" in msg  # The follower's confirmed fill remains accurately reported.
     source = dict(symbol="ZECUSDT", side="SELL", positionSide="LONG", qty="2", avgPrice=None)
     lead = trade_message(rec, SimpleNamespace(exchange="okx", environment="live"), source).split("\n\n")[0]
-    assert "平多/减多" in lead and "均价 未知 ｜ 数量 2 ｜ 金额 未知" in lead
+    assert "平多/减多" in lead and "均价 未知 ｜ 金额 未知" in lead
 
 
 @pytest.mark.parametrize("side,direction,margin,expected", [
@@ -118,7 +200,7 @@ def test_historical_close_does_not_use_peak_quantity_or_follower_amount():
     source = {"_closed": {"symbol": "ZECUSDT", "side": "SHORT", "avgClosePrice": "123.45", "maxQty": 99}}
     lead = trade_message(message_record(), SimpleNamespace(exchange="okx", environment="live"), source).split("\n\n")[0]
     assert "平空（历史持仓记录）" in lead and "🔴" in lead and "做空" in lead
-    assert "均价 123.45 ｜ 数量 未知 ｜ 金额 未知" in lead
+    assert "均价 123.45 ｜ 金额 未知" in lead
 
 
 def test_trade_payload_excludes_names_errors_urls_and_order_ids():
@@ -155,9 +237,14 @@ async def test_fanout_keeps_source_identity_and_does_not_duplicate_messages(monk
         assert all(d.state == "APPLIED" for d in (await db.scalars(select(BindingDelivery))).all())
         headers = [json.loads(r.payload)["message"].split("\n\n")[0] for r in rows]
         assert len(set(headers)) == 1 and "加多" in headers[0] and "BTCUSDT" in headers[0]
-        assert "【原仓位】 9.9 → 【现仓位】 10" in headers[0]
-        assert "数量 0.1 ｜ 金额 10.00 U" in headers[0]
+        assert "【原仓位】 990.00 U → 【现仓位】 1,000.00 U" in headers[0]
+        assert "金额 10.00 U" in headers[0]
         assert [json.loads(r.payload)["event_type"] for r in rows] == [o for o in outcomes for _ in range(independent_fills)]
+        # 记账行仍每条独立，但都已封口并带同一事件键，发送时合并为一条。
+        assert all(json.loads(r.payload).get("sealed") is True for r in rows)
+        assert len({json.loads(r.payload)["merge_key"] for r in rows}) == independent_fills
+        assert all(json.loads(r.payload).get("lead_section") and json.loads(r.payload).get("follower_section")
+                   for r in rows)
 
 
 @pytest.mark.parametrize("outcome", ["EXECUTED", "UNFILLED", "BLOCKED_CATCHUP_DRIFT", "BLOCKED_SPREAD", "SKIPPED_UNSUPPORTED"])
@@ -183,7 +270,7 @@ async def test_actual_filled_unfilled_and_risk_paths_keep_terminal_states(workfl
     rows = (await t.db.scalars(select(NotificationOutbox))).all()
     assert len(rows) == 1
     msg = json.loads(rows[0].payload)["message"]
-    assert "开多" in msg and "均价 100 ｜ 数量 1 ｜ 金额 100.00 U" in msg
+    assert "开多" in msg and "均价 100 ｜ 金额 100.00 U" in msg
     assert ("✅" in msg) is (outcome == "EXECUTED")
     assert all(d.state == "APPLIED" for d in (await t.db.scalars(select(BindingDelivery))).all())
     if outcome.startswith(("BLOCKED", "SKIPPED")):
@@ -205,7 +292,7 @@ async def test_partial_fill_and_later_failure_never_claim_full_success(workflow)
     rows = (await t.db.scalars(select(NotificationOutbox).order_by(NotificationOutbox.id))).all()
     assert [json.loads(r.payload)["event_type"] for r in rows] == ["PARTIAL", "FAILED"]
     partial = json.loads(rows[0].payload)["message"]
-    assert "⚠️ 部分成交" in partial and "📦 数量 0.5" in partial
+    assert "⚠️ 部分成交" in partial and "📦 均价 100.0 ｜ 金额 50.00 U" in partial
     assert all("✅" not in json.loads(r.payload)["message"] for r in rows)
     assert (await t.db.scalar(select(BindingDelivery))).state == "PENDING"
     assert (await t.db.scalar(select(OrderIntent))).state == "UNKNOWN"
@@ -331,7 +418,7 @@ def test_lead_header_and_precise_action_use_position_context():
                         355911.79, lead=lead, position=position)
     assert msg.split("\n")[0] == "【熬鹰资本 · 币安】"
     assert "🟢 加多 ｜ NVDAUSDT 永续 ｜ 做多" in msg
-    assert "【原仓位】 3803.17 → 【现仓位】 4407.29" in msg
+    assert "【原仓位】 610,446.82 U → 【现仓位】 707,414.12 U" in msg
     assert "🕐 带单时间 2026/11/16 23:35:19（北京时间）" in msg
     assert "【持仓快照】 当前持仓 1 个 ｜ 账户保证金 355,911.79 U" in msg
 

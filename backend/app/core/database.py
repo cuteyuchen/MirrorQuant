@@ -91,6 +91,7 @@ DEFAULT_SYSTEM_CONFIG = {
     "global_kill_switch": False,
     "public_monitoring_enabled": False,  # 新部署必须显式开启公开看板。
     "notifications": {
+        "display_unit": "notional",
         "webhook_enabled": False,
         "webhook_url": "",
         "telegram_enabled": False,

@@ -142,7 +142,9 @@ export interface ResilienceSettings {
   insufficient_margin_policy: string | null; flip_close_first: boolean | null;
   clock_sync_interval_sec: number | null; max_consecutive_failures: number | null;
 }
+export type DisplayUnit = "notional" | "quantity" | "both";
 export interface NotificationSettings {
+  display_unit: DisplayUnit | null;
   webhook_enabled: boolean | null; webhook_url: string | null;
   telegram_enabled: boolean | null; telegram_bot_token: string | null; telegram_chat_id: string | null;
   wecom_enabled: boolean | null; wecom_webhook_url: string | null;

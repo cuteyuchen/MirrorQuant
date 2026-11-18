@@ -77,6 +77,7 @@ export const mockBoard: DashboardBoard = {
   ],
 };
 const notifications: NotificationSettings = {
+  display_unit: "notional",
   webhook_enabled: true, webhook_url: "", webhook_url_configured: true,
   telegram_enabled: false, telegram_bot_token: "", telegram_chat_id: "",
   wecom_enabled: false, wecom_webhook_url: "", dingtalk_enabled: false, dingtalk_webhook_url: "", dingtalk_secret: "",

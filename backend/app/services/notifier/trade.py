@@ -13,6 +13,20 @@ from app.core.time_util import BEIJING_TZ
 # 折算基准本金；与前端仓位测算器的口径一致。
 REFERENCE_CAPITAL = Decimal("1000")
 
+# 全局显示单位：通知与页面共用同一设置。notional 只显示金额，quantity 只显示
+# 数量，both 两者都显示（历史版式）。默认值与 system_configs 的 notifications
+# 字典默认值保持一致。
+DISPLAY_UNIT_NOTIONAL = "notional"
+DISPLAY_UNIT_QUANTITY = "quantity"
+DISPLAY_UNIT_BOTH = "both"
+DISPLAY_UNITS = (DISPLAY_UNIT_NOTIONAL, DISPLAY_UNIT_QUANTITY, DISPLAY_UNIT_BOTH)
+DEFAULT_DISPLAY_UNIT = DISPLAY_UNIT_NOTIONAL
+
+
+def resolve_display_unit(value: Any) -> str:
+    """Normalize a stored display-unit value; unknown or missing values fall back to the default."""
+    return value if value in DISPLAY_UNITS else DEFAULT_DISPLAY_UNIT
+
 
 def _decimal(value: Any, *, allow_zero: bool = False) -> Optional[Decimal]:
     if value is None or isinstance(value, bool):
@@ -32,9 +46,9 @@ def _number(value: Any, *, allow_zero: bool = False) -> str:
     return "未知" if number is None else format(number, "f")
 
 
-def _money(value: Any) -> str:
+def _money(value: Any, *, allow_zero: bool = False) -> str:
     # 金额只看量级，统一保留两位小数，手机上一眼能读完。
-    number = _decimal(value)
+    number = _decimal(value, allow_zero=allow_zero)
     return "未知" if number is None else f"{number.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):,f} U"
 
 
@@ -71,15 +85,23 @@ def _latency_line(source: dict, record) -> Optional[str]:
     return f"⏱ 距带单成交 {text}"
 
 
-def _limit_lines(status: str, record, limit: dict) -> tuple[str, list[str]]:
+def _limit_lines(status: str, record, limit: dict, display_unit: str = DEFAULT_DISPLAY_UNIT) -> tuple[str, list[str]]:
     """滑点超限改挂限价单的结论行与明细行；只用数字字段，不输出自由文本。"""
     px = _number(limit.get("px"))
     requested, filled = _decimal(limit.get("requested")), _decimal(limit.get("filled"), allow_zero=True)
-    progress = f"已成交 {_number(filled, allow_zero=True)} / 委托 {_number(requested)}"
+    px_value = _decimal(limit.get("px"))
+    if display_unit == DISPLAY_UNIT_NOTIONAL and px_value is not None and requested is not None and filled is not None:
+        progress = f"已成交 {_money(filled * px_value, allow_zero=True)} / 委托 {_money(requested * px_value, allow_zero=True)}"
+    else:
+        progress = f"已成交 {_number(filled, allow_zero=True)} / 委托 {_number(requested)}"
     ttl = limit.get("ttl_sec")
     if status == "LIMIT_PLACED":
         expiry = f"{int(ttl)} 秒内未成交自动撤单" if isinstance(ttl, int) and ttl > 0 else "超时未成交自动撤单"
-        detail = [f"📌 限价 {px} ｜ 数量 {_number(requested)} ｜ {expiry}"]
+        if display_unit == DISPLAY_UNIT_NOTIONAL and px_value is not None and requested is not None:
+            size = f"金额 {_money(requested * px_value, allow_zero=True)}"
+        else:
+            size = f"数量 {_number(requested)}"
+        detail = [f"📌 限价 {px} ｜ {size} ｜ {expiry}"]
         drift = _decimal(getattr(record, "slippage_pct", None))
         if drift is not None:
             detail.append(f"📉 当前价偏离带单均价 {drift.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)}%")
@@ -239,13 +261,19 @@ def _precise_action(side: Any, direction: Any, position: Optional[dict]) -> Opti
     return "减多" if long_side else "减空"
 
 
-def _position_line(position: Optional[dict]) -> Optional[str]:
+def _position_line(position: Optional[dict], display_unit: str = DEFAULT_DISPLAY_UNIT,
+                   price: Any = None) -> Optional[str]:
     if not isinstance(position, dict):
         return None
     previous = _decimal(position.get("previous_qty"), allow_zero=True)
     current = _decimal(position.get("current_qty"), allow_zero=True)
     if previous is None or current is None:
         return None
+    px = _decimal(price)
+    if display_unit == DISPLAY_UNIT_NOTIONAL and px is not None:
+        # 原/现仓位只有数量：按本笔带单均价折算为金额（近似值，与本笔均价同一口径）。
+        # 零仓位折算为 0.00 U，不是未知。
+        return f"【原仓位】 {_money(previous * px, allow_zero=True)} → 【现仓位】 {_money(current * px, allow_zero=True)}"
     return f"【原仓位】 {format(previous, 'f')} → 【现仓位】 {format(current, 'f')}"
 
 
@@ -275,10 +303,9 @@ def _snapshot_line(position: Optional[dict], lead_margin: Any) -> Optional[str]:
     return line
 
 
-def trade_message(record, account, source: Optional[dict] = None, lead_margin: Any = None,
-                  limit: Optional[dict] = None, lead: Any = None,
-                  position: Optional[dict] = None) -> str:
-    """One durable message per account outcome, with the independent lead leg first.
+def _lead_section(record, source: dict, lead_margin: Any = None, lead: Any = None,
+                  position: Optional[dict] = None, display_unit: str = DEFAULT_DISPLAY_UNIT) -> str:
+    """The lead leg of a trade message: identity, action, price, position, snapshot.
 
     Follower close/guard actions cannot establish the lead's action. A source
     delivery supplies the original symbol/side/amount even if the follower uses
@@ -328,12 +355,17 @@ def trade_message(record, account, source: Optional[dict] = None, lead_margin: A
     icon, direction_text = {"LONG": ("🟢", "做多"), "SHORT": ("🔴", "做空")}.get(direction, ("❔", "方向未知"))
     if adopted:
         icon = "📥"
+    size_line = f"💰 本次均价 {_number(price)}"
+    if display_unit != DISPLAY_UNIT_NOTIONAL:
+        size_line += f" ｜ 数量 {_number(qty)}"
+    if display_unit != DISPLAY_UNIT_QUANTITY:
+        size_line += f" ｜ 金额 {_money(notional)}"
     lines = [
         _lead_header(lead, record),
         f"{icon} {action} ｜ {_symbol(symbol)} 永续 ｜ {direction_text}",
-        f"💰 本次均价 {_number(price)} ｜ 数量 {_number(qty)} ｜ 金额 {_money(notional)}",
+        size_line,
     ]
-    position_line = _position_line(position)
+    position_line = _position_line(position, display_unit, price)
     if position_line:
         lines.append(position_line)
     # 折算仓位只对开仓/加仓有意义，平仓不给“建议杠杆”。
@@ -349,8 +381,12 @@ def trade_message(record, account, source: Optional[dict] = None, lead_margin: A
     snapshot = _snapshot_line(position, lead_margin)
     if snapshot:
         lines.append(snapshot)
-    lead = "\n".join(lines)
+    return "\n".join(lines)
 
+
+def _follower_section(record, account, limit: Optional[dict] = None,
+                      display_unit: str = DEFAULT_DISPLAY_UNIT) -> str:
+    """One bound account's outcome: result, account tag, reason, fill."""
     exchange = {"okx": "欧易", "binance": "Binance", "bybit": "Bybit", "bitget": "Bitget"}.get(
         str(account.exchange).lower(), "交易所未知")
     environment = {"demo": "模拟盘", "simulated": "模拟盘", "live": "实盘"}.get(
@@ -361,7 +397,7 @@ def trade_message(record, account, source: Optional[dict] = None, lead_margin: A
     limit_detail: list[str] = []
     if limit and status in ("LIMIT_PLACED", "LIMIT_EXPIRED") or (
             limit and confirmed and status in ("EXECUTED", "PARTIAL")):
-        result, limit_detail = _limit_lines(status, record, limit)
+        result, limit_detail = _limit_lines(status, record, limit, display_unit)
     elif status == "LIMIT_PLACED":
         result = "⏳ 滑点超限，已改挂限价单（尚未成交）"
     elif status == "LIMIT_EXPIRED":
@@ -394,12 +430,41 @@ def trade_message(record, account, source: Optional[dict] = None, lead_margin: A
     if reason_line:
         follower += f"\n{reason_line}"
     if status in ("EXECUTED", "PARTIAL", "UNFILLED", "ADOPTED_POSITION"):
-        follower += (f"\n📦 数量 {_number(record.my_qty, allow_zero=True)}"
-                     f" ｜ 均价 {_number(record.my_price) if confirmed else '未知'}"
-                     f" ｜ 金额 {_money(record.my_notional) if confirmed else '未知'}")
+        parts = []
+        if display_unit != DISPLAY_UNIT_NOTIONAL:
+            parts.append(f"数量 {_number(record.my_qty, allow_zero=True)}")
+        parts.append(f"均价 {_number(record.my_price) if confirmed else '未知'}")
+        if display_unit != DISPLAY_UNIT_QUANTITY:
+            parts.append(f"金额 {_money(record.my_notional) if confirmed else '未知'}")
+        follower += "\n📦 " + " ｜ ".join(parts)
     if limit_detail:
         follower += "".join(f"\n{line}" for line in limit_detail)
+    return follower
+
+
+def trade_sections(record, account, source: Optional[dict] = None, lead_margin: Any = None,
+                   limit: Optional[dict] = None, lead: Any = None,
+                   position: Optional[dict] = None,
+                   display_unit: str = DEFAULT_DISPLAY_UNIT) -> tuple[str, str]:
+    """Render the lead leg and one account's outcome separately for merged delivery."""
+    source = source or {}
+    display_unit = resolve_display_unit(display_unit)
+    return (_lead_section(record, source, lead_margin, lead, position, display_unit),
+            _follower_section(record, account, limit, display_unit))
+
+
+def trade_message(record, account, source: Optional[dict] = None, lead_margin: Any = None,
+                  limit: Optional[dict] = None, lead: Any = None,
+                  position: Optional[dict] = None,
+                  display_unit: str = DEFAULT_DISPLAY_UNIT) -> str:
+    """One durable message per account outcome, with the independent lead leg first."""
+    lead, follower = trade_sections(record, account, source, lead_margin, limit, lead, position, display_unit)
     return f"{lead}\n\n{follower}"
+
+
+def merged_trade_message(lead: str, followers: list) -> str:
+    """One message per lead event: the lead leg once, then every bound account's outcome below."""
+    return "\n\n".join([lead, *followers])
 
 
 def _is_opening(side: Any, direction: Any) -> bool:

@@ -66,7 +66,7 @@ from app.services.lead_collector.snapshot_clock import (
     closed_interval, event_interval, event_timestamp, snapshot_is_current,
     snapshot_observed_ms, snapshot_source_bound_ms, snapshot_times, source_batch_interval,
 )
-from app.services.notifier.trade import trade_message
+from app.services.notifier.trade import resolve_display_unit, trade_message, trade_sections
 from app.services.proxy.manager import ProxyManager
 
 logger = logging.getLogger("mirrorquant.router")
@@ -1065,7 +1065,8 @@ class CopyRouter:
                     source_lead = await db.get(LeadSource, record.lead_id)
                     outbox = enqueue_notification(db, config, "MirrorQuant",
                         trade_message(record, account, source, getattr(source_lead, "margin_balance", None),
-                                      lead=source_lead),
+                                      lead=source_lead,
+                                      display_unit=resolve_display_unit(config.get("display_unit"))),
                         event_type=record.status, execution_id=record.id, event_key=f"execution:{record.id}")
                     outboxes.append(outbox)
                     record.notification_state = "pending"
@@ -1209,15 +1210,63 @@ class CopyRouter:
                     should_notify = False
             if should_notify:
                 source = json.loads(delivery.payload_json) if delivery is not None else None
+                unit = resolve_display_unit(notify_cfg.get("display_unit"))
                 msg = trade_message(rec, account, source, getattr(lead, "margin_balance", None), limit=limit,
-                                    lead=lead, position=lead_position_context(db))
-                event_key = f"execution:{rec.id}"
-                enqueue_notification(db, notify_cfg, "MirrorQuant", msg, event_type=status,
-                                     execution_id=rec.id, event_key=event_key)
+                                    lead=lead, position=lead_position_context(db), display_unit=unit)
+                merge_registry = db.info.get("merge_row_ids")
+                if (merge_registry is not None and delivery is not None
+                        and status != "ADOPTED_POSITION"):
+                    # 记账行立即落盘（与执行记录同事务），只在发送时合并：
+                    # 行上带分段文本与事件键，整批处理完后封口，drainer
+                    # 按事件键分组一次发出，带单员部分只出现一次。
+                    lead_text, follower_text = trade_sections(
+                        rec, account, source, getattr(lead, "margin_balance", None),
+                        limit=limit, lead=lead, position=lead_position_context(db), display_unit=unit)
+                    row = enqueue_notification(db, notify_cfg, "MirrorQuant", msg, event_type=status,
+                                               execution_id=rec.id, event_key=f"execution:{rec.id}",
+                                               merge_key=delivery.source_event_id,
+                                               lead_section=lead_text, follower_section=follower_text)
+                    await db.flush()
+                    merge_registry.setdefault(delivery.source_event_id, []).append(row.id)
+                else:
+                    event_key = f"execution:{rec.id}"
+                    enqueue_notification(db, notify_cfg, "MirrorQuant", msg, event_type=status,
+                                         execution_id=rec.id, event_key=event_key)
                 rec.notification_state = "pending"
         await db.commit()  # The execution and notification become visible together.
         await self._emit(payload)
         return rec
+
+    async def _seal_merged_notifications(self, db: AsyncSession) -> None:
+        """Seal this batch's mergeable notification rows so the drainer may send them grouped.
+
+        Rows stay individually durable; sealing only marks the batch complete.
+        A failed seal leaves rows unsealed and the drainer sends them grouped
+        once they age past the seal grace period, so no notification is lost.
+        """
+        registry = db.info.pop("merge_row_ids", None)
+        if not registry:
+            return
+        try:
+            row_ids = [row_id for ids in registry.values() for row_id in ids]
+            rows = (await db.scalars(select(NotificationOutbox).where(
+                NotificationOutbox.id.in_(row_ids),
+                NotificationOutbox.status == "pending"))).all()
+            for row in rows:
+                try:
+                    payload = json.loads(row.payload)
+                except (ValueError, TypeError):
+                    continue
+                if payload.get("merge_key") is None:
+                    continue
+                payload["sealed"] = True
+                row.payload = json.dumps(payload, ensure_ascii=False)
+            await db.commit()
+        except Exception:
+            # 封口失败不影响已落盘的执行结果与通知行；只留 warning，不写 traceback，
+            # 避免链路监控把一次通知缺口当成系统异常。
+            logger.warning("Merged notification seal failed; rows will send grouped after the seal grace period")
+            await db.rollback()
 
     def _source_interval(self, order):
         start, end = event_timestamp(order.get("orderTime")), event_timestamp(order.get("orderUpdateTime"))
@@ -1841,213 +1890,218 @@ class CopyRouter:
         lead_margin_balance = (snapshot.get("profile") or {}).get("marginBalance") or lead.margin_balance or 0
         active = {f"{p['symbol']}_{p['positionSide']}": exact(p.get("qtyExact", p.get("qty")) or 0)
                   for p in snapshot.get("openPositions") or []}
-        for binding in bindings:
-            await db.refresh(binding)
-            await db.refresh(lead)
-            account = await db.get(TradingAccount, binding.account_id, populate_existing=True)
-            if account is None:
-                continue
-            try:
-                adapter = create_exchange_adapter(exchange=account.exchange, account_id=account.id,
-                    credentials=self.vault.decrypt_dict(account.encrypted_credentials),
-                    environment=account.environment,
-                    proxy_url=ProxyManager.select_proxy_url(proxies, account.proxy_id, exchange=account.exchange),
-                    margin_mode=account.margin_mode, position_mode=account.position_mode)
-                adapter._time_offset_ms = int(account.clock_offset_ms or 0)
-                await db.commit()
-                account.clock_offset_ms = await adapter.sync_time()
-                instruments = await adapter.get_instruments()
-                await self.reconcile_pending_orders(db, account, adapter, instruments)
-                if (binding.baseline_seeded and not binding.adoption_completed
-                        and binding.adopt_existing_positions
-                        and await self._adoption_window_open(db, binding)):
-                    try:
-                        await self._adopt_matching_positions(
-                            db, binding, lead, account, adapter, instruments, snapshot,
-                            lead_margin_balance, received_at_ms, notify_cfg)
-                    except Exception:
-                        logger.exception("Position adoption deferred for binding %s", binding.id)
-                completed = (await db.scalars(select(BindingDelivery).where(
-                    BindingDelivery.binding_id == binding.id, BindingDelivery.state == "APPLIED"))).all()
-                for previous in completed:
-                    closed = json.loads(previous.payload_json).get("_closed")
-                    if not closed:
-                        continue
-                    symbol, pos_side = str(closed.get("symbol") or ""), str(closed.get("side") or "").lower()
-                    if pos_side not in ("long", "short") or active.get(f"{symbol}_{pos_side.upper()}", 0) > 0:
-                        continue
-                    inst_id, supported = adapter.resolve_symbol(symbol, instruments, json.loads(binding.symbol_map_json or "{}"))
-                    allocation = await db.scalar(select(PositionAllocation).where(
-                        PositionAllocation.binding_id == binding.id, PositionAllocation.account_id == account.id,
-                        PositionAllocation.inst_id == inst_id, PositionAllocation.pos_side == pos_side))
-                    observed = snapshot_observed_ms(snapshot)
-                    interval = closed_interval(closed, observed) if observed is not None else None
-                    closed_at = interval[1] if interval is not None else 0
-                    if (previous.exit_target_qty is None and allocation is not None and
-                            self._owned_qty(allocation) > 0 and closed_at > allocation.opened_at_ms):
-                        previous.state = "PENDING"
-                all_deliveries = (await db.scalars(select(BindingDelivery).where(
-                    BindingDelivery.binding_id == binding.id)
-                    .order_by(BindingDelivery.source_sequence, BindingDelivery.source_event_id))).all()
-                ordering = await self._position_ordering(db, binding, all_deliveries, snapshot, active, received_at_ms)
-                await self._reconcile_review_deliveries(
-                    db, binding, lead, account, adapter, instruments, all_deliveries, notify_cfg)
-                await self._unpark_review_deliveries(db, binding, all_deliveries, ordering)
-                deliveries = [delivery for delivery in all_deliveries if delivery.state != "APPLIED"]
-                # Recover inventory immediately after each pending source event from
-                # the current snapshot and the chronological suffix of known events.
-                remaining_by_event = {}
-                inventory = dict(active)
-                for pending in reversed(deliveries):
-                    payload = json.loads(pending.payload_json)
-                    if "_closed" in payload:
-                        continue
-                    leg = f"{payload['symbol']}_{payload['positionSide']}"
-                    quantity = exact(payload.get("qtyExact", payload.get("qty")) or 0)
-                    remaining_by_event[pending.source_event_id] = inventory.get(leg, Decimal("0"))
-                    if is_open_leg(payload.get("side"), payload.get("positionSide")):
-                        inventory[leg] = max(Decimal("0"), inventory.get(leg, Decimal("0")) - quantity)
-                    else:
-                        inventory[leg] = inventory.get(leg, Decimal("0")) + quantity
-                for delivery in deliveries:
-                    if not is_routable_snapshot(snapshot):
-                        break
+        # 本批次产生的可合并通知行先登记，整批处理完后封口，drainer 再按事件分组发送。
+        db.info["merge_row_ids"] = {}
+        try:
+            for binding in bindings:
+                await db.refresh(binding)
+                await db.refresh(lead)
+                account = await db.get(TradingAccount, binding.account_id, populate_existing=True)
+                if account is None:
+                    continue
+                try:
+                    adapter = create_exchange_adapter(exchange=account.exchange, account_id=account.id,
+                        credentials=self.vault.decrypt_dict(account.encrypted_credentials),
+                        environment=account.environment,
+                        proxy_url=ProxyManager.select_proxy_url(proxies, account.proxy_id, exchange=account.exchange),
+                        margin_mode=account.margin_mode, position_mode=account.position_mode)
+                    adapter._time_offset_ms = int(account.clock_offset_ms or 0)
                     await db.commit()
-                    batch = json.loads(delivery.payload_json)
-                    source = batch.get("_closed") or batch
-                    symbol_map = json.loads(binding.symbol_map_json or "{}")
-                    inst_id, supported = adapter.resolve_symbol(source["symbol"], instruments, symbol_map)
-                    source_position = (source.get("symbol"), source.get("positionSide") or str(source.get("side") or "").upper())
-                    state = ordering.get(source_position)
-                    if supported and state is not None and state.review_reason:
-                        review_price = 0.0
-                        if ("_closed" not in batch and is_open_leg(source.get("side"), source.get("positionSide"))
-                                and snapshot_observed_ms(snapshot) is None
-                                and source_batch_interval(batch, received_at_ms) is not None):
-                            try:
-                                book = await adapter.get_orderbook(inst_id, depth=5)
-                                levels = book.asks if source.get("positionSide") == "LONG" else book.bids
-                                price = float(levels[0][0]) if levels else 0.0
-                                if math.isfinite(price) and price > 0:
-                                    review_price = price
-                            except Exception:
-                                review_price = 0.0
-                        delivery.exit_progress = "REVIEW_REQUIRED"
-                        db.info["delivery"] = delivery
-                        await self._record_execution(db, binding, lead, account, source["symbol"], source["symbol"],
-                            source.get("side", ""), source.get("positionSide", ""), "RECONCILE_SOURCE", "BLOCKED_SOURCE_ORDERING",
-                            source.get("qty", 0), source.get("avgPrice", 0), source.get("notional", 0),
-                            my_price=review_price,
-                            details=state.review_reason + "; human reconciliation required", notify_cfg=notify_cfg,
-                            complete_delivery=False)
-                        db.info.pop("delivery", None)
-                        continue
-                    if delivery.exit_target_qty is not None and exact(delivery.exit_remaining_qty) > 0:
-                        later = [candidate for candidate in deliveries if candidate.source_sequence > delivery.source_sequence
-                                 and (json.loads(candidate.payload_json).get("symbol"),
-                                      json.loads(candidate.payload_json).get("positionSide")) ==
-                                 (source.get("symbol"), source.get("positionSide"))]
-                        if not later and state is not None and state.cycle_tracked:
-                            attempts = (await db.scalars(select(OrderIntent).where(
-                                OrderIntent.binding_id == binding.id,
-                                or_(OrderIntent.source_event_id == delivery.source_event_id,
-                                    OrderIntent.delivery_event_id == delivery.source_event_id)))).all()
-                            source_retry = (delivery.exit_progress == "SOURCE_UNPROVEN" and
-                                exact(delivery.exit_filled_qty) == 0 and attempts and
-                                all(intent.reduce_only and intent.state.lower() == "rejected" and
-                                    intent.exchange_order_id is None and exact(intent.filled_qty) == 0
-                                    for intent in attempts))
-                            # 明确未提交的零成交延期可重试，已成交余量仍等待新的源事件。
-                            if (attempts and not source_retry and
-                                    all(intent.state.lower() in TERMINAL_STATES for intent in attempts)):
-                                delivery.exit_progress = "WAITING_SOURCE"
-                                await db.commit()
-                                break
-                        elif delivery.exit_progress == "WAITING_SOURCE":
-                            successor = later[-1]
-                            successor_payload = json.loads(successor.payload_json)
-                            if (not is_open_leg(successor_payload.get("side"), successor_payload.get("positionSide"))
-                                    and remaining_by_event.get(successor.source_event_id) == 0):
-                                delivery.state, delivery.exit_progress = "APPLIED", "SUPERSEDED"
-                                delivery.exit_superseded_by = successor.source_event_id
-                                await db.commit()
-                                continue
-                    if supported and state is not None and "_closed" not in batch:
-                        state.source_time_ms = batch.get("_source_time_ms", batch.get("startTime"))
-                        state.source_event_id = delivery.source_event_id
-                        state.source_remaining_qty = str(remaining_by_event[delivery.source_event_id])
-                        if is_open_leg(batch.get("side"), batch.get("positionSide")):
-                            state.cycle_tracked = True
-                        await db.commit()
-                    try:
-                        bal = await get_collateral_balance(adapter, instruments.get(inst_id))
-                    except Exception as exc:
-                        account.status, account.last_error = "error", redact_proxy_userinfo(str(exc))[:400]
-                        position_side = source.get("positionSide") or str(source.get("side", "")).upper()
-                        side = source.get("side") if "_closed" not in batch else ("SELL" if position_side == "LONG" else "BUY")
-                        delivery.state = "PENDING"
-                        db.info["delivery"] = delivery
-                        await self._record_execution(
-                            db, binding, lead, account, source["symbol"], inst_id, side, position_side,
-                            direction_label(side, position_side, not is_open_leg(side, position_side)),
-                            "BLOCKED_COLLATERAL_BALANCE", source.get("qty", 0), source.get("avgPrice", 0),
-                            source.get("notional", 0), details=account.last_error, notify_cfg=notify_cfg,
-                            complete_delivery=False,
-                        )
-                        db.info.pop("delivery", None)
-                        break
-                    positions = await adapter.get_positions()
-                    await persist_equity(db, account, bal)
-                    account.total_notional = sum(p.notional_usd for p in positions)
-                    account.positions_json = json.dumps([p.to_dict() for p in positions])
-                    account.status, account.last_error = "connected", None
-                    batch["_freshness_at_ms"] = min(snapshot_times(snapshot).values())
-                    observed = snapshot_observed_ms(snapshot)
-                    if observed is not None:
-                        batch["_observed_at_ms"] = observed
-                    batch["_lead_remaining_qty"] = remaining_by_event.get(delivery.source_event_id, 0)
-                    # Historical openings inside a known completed lead cycle must not
-                    # attach to the same symbol's currently reopened position.
-                    if "_closed" not in batch and is_open_leg(batch.get("side"), batch.get("positionSide")):
-                        timestamp = int(batch.get("startTime") or 0)
-                        for closed in raw_closed:
-                            interval = closed_interval(closed, observed) if observed is not None else None
-                            if (closed.get("symbol") == batch.get("symbol") and
-                                str(closed.get("side") or "").upper() == batch.get("positionSide") and
-                                interval is not None and interval[0] <= timestamp <= interval[1]):
-                                batch["_closed_cycle"] = True
-                    db.info["delivery"] = delivery
-                    db.info["snapshot_admission"] = (lead, snapshot)
-                    if "_closed" in batch:
-                        c = batch["_closed"]
-                        if active.get(f"{c.get('symbol')}_{str(c.get('side', '')).upper()}", 0) <= 0:
-                            complete = await self._reconcile_closed_position(db, binding, lead, account, adapter, c, positions, instruments, notify_cfg)
-                            delivery.state = "APPLIED" if complete else "PENDING"
+                    account.clock_offset_ms = await adapter.sync_time()
+                    instruments = await adapter.get_instruments()
+                    await self.reconcile_pending_orders(db, account, adapter, instruments)
+                    if (binding.baseline_seeded and not binding.adoption_completed
+                            and binding.adopt_existing_positions
+                            and await self._adoption_window_open(db, binding)):
+                        try:
+                            await self._adopt_matching_positions(
+                                db, binding, lead, account, adapter, instruments, snapshot,
+                                lead_margin_balance, received_at_ms, notify_cfg)
+                        except Exception:
+                            logger.exception("Position adoption deferred for binding %s", binding.id)
+                    completed = (await db.scalars(select(BindingDelivery).where(
+                        BindingDelivery.binding_id == binding.id, BindingDelivery.state == "APPLIED"))).all()
+                    for previous in completed:
+                        closed = json.loads(previous.payload_json).get("_closed")
+                        if not closed:
+                            continue
+                        symbol, pos_side = str(closed.get("symbol") or ""), str(closed.get("side") or "").lower()
+                        if pos_side not in ("long", "short") or active.get(f"{symbol}_{pos_side.upper()}", 0) > 0:
+                            continue
+                        inst_id, supported = adapter.resolve_symbol(symbol, instruments, json.loads(binding.symbol_map_json or "{}"))
+                        allocation = await db.scalar(select(PositionAllocation).where(
+                            PositionAllocation.binding_id == binding.id, PositionAllocation.account_id == account.id,
+                            PositionAllocation.inst_id == inst_id, PositionAllocation.pos_side == pos_side))
+                        observed = snapshot_observed_ms(snapshot)
+                        interval = closed_interval(closed, observed) if observed is not None else None
+                        closed_at = interval[1] if interval is not None else 0
+                        if (previous.exit_target_qty is None and allocation is not None and
+                                self._owned_qty(allocation) > 0 and closed_at > allocation.opened_at_ms):
+                            previous.state = "PENDING"
+                    all_deliveries = (await db.scalars(select(BindingDelivery).where(
+                        BindingDelivery.binding_id == binding.id)
+                        .order_by(BindingDelivery.source_sequence, BindingDelivery.source_event_id))).all()
+                    ordering = await self._position_ordering(db, binding, all_deliveries, snapshot, active, received_at_ms)
+                    await self._reconcile_review_deliveries(
+                        db, binding, lead, account, adapter, instruments, all_deliveries, notify_cfg)
+                    await self._unpark_review_deliveries(db, binding, all_deliveries, ordering)
+                    deliveries = [delivery for delivery in all_deliveries if delivery.state != "APPLIED"]
+                    # Recover inventory immediately after each pending source event from
+                    # the current snapshot and the chronological suffix of known events.
+                    remaining_by_event = {}
+                    inventory = dict(active)
+                    for pending in reversed(deliveries):
+                        payload = json.loads(pending.payload_json)
+                        if "_closed" in payload:
+                            continue
+                        leg = f"{payload['symbol']}_{payload['positionSide']}"
+                        quantity = exact(payload.get("qtyExact", payload.get("qty")) or 0)
+                        remaining_by_event[pending.source_event_id] = inventory.get(leg, Decimal("0"))
+                        if is_open_leg(payload.get("side"), payload.get("positionSide")):
+                            inventory[leg] = max(Decimal("0"), inventory.get(leg, Decimal("0")) - quantity)
                         else:
-                            delivery.state = "APPLIED"
-                    else:
-                        await self._execute_batch_for_binding(db, binding, lead, account, adapter,
-                            batch, lead_margin_balance, active, bal.eq, positions, instruments,
-                            bool(await self._get_config(db, "global_kill_switch", False)), notify_cfg, resilience_cfg)
+                            inventory[leg] = inventory.get(leg, Decimal("0")) + quantity
+                    for delivery in deliveries:
+                        if not is_routable_snapshot(snapshot):
+                            break
+                        await db.commit()
+                        batch = json.loads(delivery.payload_json)
+                        source = batch.get("_closed") or batch
+                        symbol_map = json.loads(binding.symbol_map_json or "{}")
+                        inst_id, supported = adapter.resolve_symbol(source["symbol"], instruments, symbol_map)
+                        source_position = (source.get("symbol"), source.get("positionSide") or str(source.get("side") or "").upper())
+                        state = ordering.get(source_position)
+                        if supported and state is not None and state.review_reason:
+                            review_price = 0.0
+                            if ("_closed" not in batch and is_open_leg(source.get("side"), source.get("positionSide"))
+                                    and snapshot_observed_ms(snapshot) is None
+                                    and source_batch_interval(batch, received_at_ms) is not None):
+                                try:
+                                    book = await adapter.get_orderbook(inst_id, depth=5)
+                                    levels = book.asks if source.get("positionSide") == "LONG" else book.bids
+                                    price = float(levels[0][0]) if levels else 0.0
+                                    if math.isfinite(price) and price > 0:
+                                        review_price = price
+                                except Exception:
+                                    review_price = 0.0
+                            delivery.exit_progress = "REVIEW_REQUIRED"
+                            db.info["delivery"] = delivery
+                            await self._record_execution(db, binding, lead, account, source["symbol"], source["symbol"],
+                                source.get("side", ""), source.get("positionSide", ""), "RECONCILE_SOURCE", "BLOCKED_SOURCE_ORDERING",
+                                source.get("qty", 0), source.get("avgPrice", 0), source.get("notional", 0),
+                                my_price=review_price,
+                                details=state.review_reason + "; human reconciliation required", notify_cfg=notify_cfg,
+                                complete_delivery=False)
+                            db.info.pop("delivery", None)
+                            continue
+                        if delivery.exit_target_qty is not None and exact(delivery.exit_remaining_qty) > 0:
+                            later = [candidate for candidate in deliveries if candidate.source_sequence > delivery.source_sequence
+                                     and (json.loads(candidate.payload_json).get("symbol"),
+                                          json.loads(candidate.payload_json).get("positionSide")) ==
+                                     (source.get("symbol"), source.get("positionSide"))]
+                            if not later and state is not None and state.cycle_tracked:
+                                attempts = (await db.scalars(select(OrderIntent).where(
+                                    OrderIntent.binding_id == binding.id,
+                                    or_(OrderIntent.source_event_id == delivery.source_event_id,
+                                        OrderIntent.delivery_event_id == delivery.source_event_id)))).all()
+                                source_retry = (delivery.exit_progress == "SOURCE_UNPROVEN" and
+                                    exact(delivery.exit_filled_qty) == 0 and attempts and
+                                    all(intent.reduce_only and intent.state.lower() == "rejected" and
+                                        intent.exchange_order_id is None and exact(intent.filled_qty) == 0
+                                        for intent in attempts))
+                                # 明确未提交的零成交延期可重试，已成交余量仍等待新的源事件。
+                                if (attempts and not source_retry and
+                                        all(intent.state.lower() in TERMINAL_STATES for intent in attempts)):
+                                    delivery.exit_progress = "WAITING_SOURCE"
+                                    await db.commit()
+                                    break
+                            elif delivery.exit_progress == "WAITING_SOURCE":
+                                successor = later[-1]
+                                successor_payload = json.loads(successor.payload_json)
+                                if (not is_open_leg(successor_payload.get("side"), successor_payload.get("positionSide"))
+                                        and remaining_by_event.get(successor.source_event_id) == 0):
+                                    delivery.state, delivery.exit_progress = "APPLIED", "SUPERSEDED"
+                                    delivery.exit_superseded_by = successor.source_event_id
+                                    await db.commit()
+                                    continue
+                        if supported and state is not None and "_closed" not in batch:
+                            state.source_time_ms = batch.get("_source_time_ms", batch.get("startTime"))
+                            state.source_event_id = delivery.source_event_id
+                            state.source_remaining_qty = str(remaining_by_event[delivery.source_event_id])
+                            if is_open_leg(batch.get("side"), batch.get("positionSide")):
+                                state.cycle_tracked = True
+                            await db.commit()
+                        try:
+                            bal = await get_collateral_balance(adapter, instruments.get(inst_id))
+                        except Exception as exc:
+                            account.status, account.last_error = "error", redact_proxy_userinfo(str(exc))[:400]
+                            position_side = source.get("positionSide") or str(source.get("side", "")).upper()
+                            side = source.get("side") if "_closed" not in batch else ("SELL" if position_side == "LONG" else "BUY")
+                            delivery.state = "PENDING"
+                            db.info["delivery"] = delivery
+                            await self._record_execution(
+                                db, binding, lead, account, source["symbol"], inst_id, side, position_side,
+                                direction_label(side, position_side, not is_open_leg(side, position_side)),
+                                "BLOCKED_COLLATERAL_BALANCE", source.get("qty", 0), source.get("avgPrice", 0),
+                                source.get("notional", 0), details=account.last_error, notify_cfg=notify_cfg,
+                                complete_delivery=False,
+                            )
+                            db.info.pop("delivery", None)
+                            break
+                        positions = await adapter.get_positions()
+                        await persist_equity(db, account, bal)
+                        account.total_notional = sum(p.notional_usd for p in positions)
+                        account.positions_json = json.dumps([p.to_dict() for p in positions])
+                        account.status, account.last_error = "connected", None
+                        batch["_freshness_at_ms"] = min(snapshot_times(snapshot).values())
+                        observed = snapshot_observed_ms(snapshot)
+                        if observed is not None:
+                            batch["_observed_at_ms"] = observed
+                        batch["_lead_remaining_qty"] = remaining_by_event.get(delivery.source_event_id, 0)
+                        # Historical openings inside a known completed lead cycle must not
+                        # attach to the same symbol's currently reopened position.
+                        if "_closed" not in batch and is_open_leg(batch.get("side"), batch.get("positionSide")):
+                            timestamp = int(batch.get("startTime") or 0)
+                            for closed in raw_closed:
+                                interval = closed_interval(closed, observed) if observed is not None else None
+                                if (closed.get("symbol") == batch.get("symbol") and
+                                    str(closed.get("side") or "").upper() == batch.get("positionSide") and
+                                    interval is not None and interval[0] <= timestamp <= interval[1]):
+                                    batch["_closed_cycle"] = True
+                        db.info["delivery"] = delivery
+                        db.info["snapshot_admission"] = (lead, snapshot)
+                        if "_closed" in batch:
+                            c = batch["_closed"]
+                            if active.get(f"{c.get('symbol')}_{str(c.get('side', '')).upper()}", 0) <= 0:
+                                complete = await self._reconcile_closed_position(db, binding, lead, account, adapter, c, positions, instruments, notify_cfg)
+                                delivery.state = "APPLIED" if complete else "PENDING"
+                            else:
+                                delivery.state = "APPLIED"
+                        else:
+                            await self._execute_batch_for_binding(db, binding, lead, account, adapter,
+                                batch, lead_margin_balance, active, bal.eq, positions, instruments,
+                                bool(await self._get_config(db, "global_kill_switch", False)), notify_cfg, resilience_cfg)
+                        db.info.pop("delivery", None)
+                        db.info.pop("snapshot_admission", None)
+                        await db.commit()
+                        if not await self.reconcile_pending_orders(db, account, adapter, instruments):
+                            break
+                        if delivery.state != "APPLIED":
+                            break
+                except Exception as exc:
                     db.info.pop("delivery", None)
                     db.info.pop("snapshot_admission", None)
+                    logger.exception("Follower delivery deferred")
+                    if isinstance(exc, SQLAlchemyError) or not db.is_active:
+                        await db.rollback()
+                        await db.refresh(account)
+                        await db.refresh(lead)
+                        for stale_binding in bindings:
+                            await db.refresh(stale_binding)
+                    account.status, account.last_error = "error", redact_proxy_userinfo(str(exc))[:400]
                     await db.commit()
-                    if not await self.reconcile_pending_orders(db, account, adapter, instruments):
-                        break
-                    if delivery.state != "APPLIED":
-                        break
-            except Exception as exc:
-                db.info.pop("delivery", None)
-                db.info.pop("snapshot_admission", None)
-                logger.exception("Follower delivery deferred")
-                if isinstance(exc, SQLAlchemyError) or not db.is_active:
-                    await db.rollback()
-                    await db.refresh(account)
-                    await db.refresh(lead)
-                    for stale_binding in bindings:
-                        await db.refresh(stale_binding)
-                account.status, account.last_error = "error", redact_proxy_userinfo(str(exc))[:400]
-                await db.commit()
+        finally:
+            await self._seal_merged_notifications(db)
 
     async def _execute_batch_for_binding(
         self,

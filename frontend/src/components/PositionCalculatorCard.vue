@@ -2,6 +2,7 @@
 import { computed, ref, useId } from "vue";
 import { Calculator, ChevronDown, Copy } from "lucide-vue-next";
 import { useI18n } from "@/i18n";
+import { useDisplayUnit } from "@/composables/useDisplayUnit";
 import { useUiStore } from "@/stores/ui";
 import { useCopyCapital } from "@/composables/useCopyCapital";
 import { calculateSizing } from "@/utils/sizing";
@@ -13,6 +14,7 @@ import StatTile from "@/components/StatTile.vue";
 
 const props = defineProps<{ snapshot?: LeadSnapshot | null; displayName?: string | null; compact?: boolean }>();
 const { t } = useI18n();
+const { showQuantity, showNotional } = useDisplayUnit();
 const ui = useUiStore();
 const bodyId = useId();
 const capitalId = useId();
@@ -134,8 +136,8 @@ async function copyPlan() {
               <th scope="col" class="text-left">{{ t("calc.colSymbol") }}</th>
               <th scope="col" class="number">{{ t("calc.colPrice") }}</th>
               <th scope="col" class="number">{{ t("calc.colRatio") }}</th>
-              <th scope="col" class="number">{{ t("calc.colTargetNotional") }}</th>
-              <th scope="col" class="number">{{ t("calc.colTargetQty") }}</th>
+              <th v-if="showNotional" scope="col" class="number">{{ t("calc.colTargetNotional") }}</th>
+              <th v-if="showQuantity" scope="col" class="number">{{ t("calc.colTargetQty") }}</th>
               <th scope="col" class="number">{{ t("calc.colOptLev") }}</th>
               <th scope="col" class="number">{{ t("calc.colMarginReq") }}</th>
               <th scope="col" class="number">{{ t("calc.colEstLiq") }}</th>
@@ -148,8 +150,8 @@ async function copyPlan() {
                 </td>
                 <td class="number"><p>{{ formatPrice(row.entry) }}</p><p class="text-xs text-muted">{{ t("board.mark") }} {{ formatPrice(row.mark) }}</p></td>
                 <td class="number"><p>{{ formatPct(row.ratio == null ? null : row.ratio * 100, 1, false) }}</p><p class="text-xs text-muted">{{ ratioText(row) }}</p></td>
-                <td class="number font-semibold">{{ formatUsd(row.targetNotional) }}</td>
-                <td class="number"><strong class="text-accent">{{ formatQty(row.targetQty) }}</strong><p class="text-xs text-muted">{{ baseAsset(row.symbol) }}</p></td>
+                <td v-if="showNotional" class="number font-semibold">{{ formatUsd(row.targetNotional) }}</td>
+                <td v-if="showQuantity" class="number"><strong class="text-accent">{{ formatQty(row.targetQty) }}</strong><p class="text-xs text-muted">{{ baseAsset(row.symbol) }}</p></td>
                 <td class="number"><span v-if="row.leverage != null" class="pill tone-accent font-mono font-semibold">{{ t("unit.leverage", { n: formatQty(row.leverage) }) }}</span><template v-else>{{ t("common.unknown") }}</template></td>
                 <td class="number"><p>{{ formatUsd(row.initialMargin) }}</p><p class="text-xs text-muted">{{ shareText(row.initialMargin) }}</p></td>
                 <td class="number"><p class="font-semibold text-warning">{{ formatPrice(row.liquidation) }}</p><p class="text-xs text-muted">{{ liqText(row) }}</p></td>
@@ -166,8 +168,8 @@ async function copyPlan() {
             </div>
             <p v-if="rowIssue(row)" class="mt-1 text-xs font-medium text-warning">{{ rowIssue(row) }}</p>
             <dl class="mt-2.5 grid grid-cols-2 gap-x-3 gap-y-2.5">
-              <StatTile :boxed="false" :label="t('calc.colTargetQty')" :value="formatQty(row.targetQty)" :sub="baseAsset(row.symbol)" value-class="text-accent" />
-              <StatTile :boxed="false" :label="t('calc.colTargetNotional')" :value="formatUsd(row.targetNotional)" :sub="ratioText(row)" />
+              <StatTile v-if="showQuantity" :boxed="false" :label="t('calc.colTargetQty')" :value="formatQty(row.targetQty)" :sub="baseAsset(row.symbol)" value-class="text-accent" />
+              <StatTile v-if="showNotional" :boxed="false" :label="t('calc.colTargetNotional')" :value="formatUsd(row.targetNotional)" :sub="ratioText(row)" />
               <StatTile :boxed="false" :label="t('calc.colPrice')" :value="formatPrice(row.entry)" :sub="`${t('board.mark')} ${formatPrice(row.mark)}`" />
               <StatTile :boxed="false" :label="t('calc.colMarginReq')" :value="formatUsd(row.initialMargin)" :sub="shareText(row.initialMargin)" />
               <StatTile :boxed="false" class="col-span-2" :label="t('calc.colEstLiq')" :value="formatPrice(row.liquidation)" :sub="liqText(row)" value-class="text-warning" />

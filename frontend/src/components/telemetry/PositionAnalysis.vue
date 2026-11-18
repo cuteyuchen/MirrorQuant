@@ -5,6 +5,7 @@ import type { LeadSnapshot, LegacyPosition, TelemetryOrder } from "@/types/api";
 import { useNow } from "@/composables/useNow";
 import { useAgo } from "@/composables/useAgo";
 import { useI18n } from "@/i18n";
+import { useDisplayUnit } from "@/composables/useDisplayUnit";
 import { baseAsset, finiteNumber, formatDateTime, formatLeverage, formatPct, formatPrice, formatQty, formatUsd, signedUsd } from "@/utils/format";
 import { normalizeSide, pnlClass, sideLabel } from "@/utils/status";
 import { beijingDayStart, positionsConfirmed } from "@/utils/positions";
@@ -16,6 +17,7 @@ import PriceActionPanel from "./PriceActionPanel.vue";
 
 const props = defineProps<{ snapshot: LeadSnapshot }>();
 const { t } = useI18n();
+const { unit, showQuantity, showNotional, sizeText } = useDisplayUnit();
 const now = useNow();
 const ago = useAgo();
 const summary = computed(() => props.snapshot.openPositionsSummary ?? null);
@@ -109,7 +111,7 @@ function fundingText(rate: number) { return `${(rate * 100).toFixed(4)}%`; }
 function positionTiles(position: LegacyPosition) {
   const entryCount = position.entryOrdersCount ?? position.entryOrders?.length ?? null;
   const lastAdd = ago(position.lastAddTime);
-  return [
+  const tiles = [
     { key: "entry", label: t("pos.avgEntry"), value: formatPrice(position.avgEntry), sub: known(position.entryValue, value => t("pos.entryVal", { val: formatUsd(value) })) },
     { key: "qty", label: t("common.quantity"), value: formatQty(position.qty ?? position.pos), sub: position.symbol ? baseAsset(position.symbol) : "" },
     { key: "value", label: t("pos.markVal"), value: formatUsd(position.markValue ?? position.notional), sub: known(position.sharePct, value => t("pos.share", { pct: formatPct(value, 1, false) })) },
@@ -121,6 +123,7 @@ function positionTiles(position: LegacyPosition) {
     { key: "held", label: t("pos.heldDur"), value: held(position.openTime, position.heldMs), sub: lastAdd ? t("pos.lastAdd", { ago: lastAdd }) : "" },
     { key: "opened", label: t("board.openedAt"), value: formatDateTime(position.openTime, { short: true, withSeconds: false }), sub: entryCount == null ? "" : t("pos.entryOrdersCount", { n: entryCount }) },
   ];
+  return tiles.filter(tile => (tile.key !== "qty" || showQuantity.value) && (tile.key !== "value" || showNotional.value));
 }
 // 建仓明细缺少方向时按持仓方向补“开多 / 开空”，方向也未知就保留破折号。
 function entryDirection(order: TelemetryOrder, position: LegacyPosition) {
@@ -183,8 +186,8 @@ function orderNotional(order: TelemetryOrder) {
                   <li v-for="order in position.entryOrders" :key="orderKey(order)" class="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 py-1.5">
                     <time class="text-muted">{{ formatDateTime(order.t ?? order.time, { short: true }) }}</time>
                     <span class="font-sans">{{ entryDirection(order, position) }}</span>
-                    <span><strong class="font-semibold">{{ formatQty(order.q ?? order.qty) }}</strong> <span class="text-accent">@ {{ formatPrice(order.p ?? order.price ?? order.avgPrice) }}</span></span>
-                    <span class="text-muted">{{ formatUsd(orderNotional(order)) }}</span>
+                    <span><strong class="font-semibold">{{ unit === "both" ? formatQty(order.q ?? order.qty) : sizeText(order.q ?? order.qty, orderNotional(order), order.p ?? order.price ?? order.avgPrice) }}</strong> <span class="text-accent">@ {{ formatPrice(order.p ?? order.price ?? order.avgPrice) }}</span></span>
+                    <span v-if="unit === 'both'" class="text-muted">{{ formatUsd(orderNotional(order)) }}</span>
                   </li>
                 </ul>
               </details>

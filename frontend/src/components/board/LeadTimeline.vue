@@ -3,7 +3,8 @@ import { computed, ref } from "vue";
 import { ChevronDown, ChevronUp } from "lucide-vue-next";
 import type { BoardAccount, BoardEvent, BoardPosition } from "@/types/api";
 import { useI18n } from "@/i18n";
-import { formatClock, formatDateTime, formatPct, formatPrice, formatQty, signedUsd } from "@/utils/format";
+import { useDisplayUnit } from "@/composables/useDisplayUnit";
+import { formatClock, formatDateTime, formatPct, formatPrice, signedUsd } from "@/utils/format";
 import { actionLabel, normalizeSide, pnlClass, sideLabel } from "@/utils/status";
 import { reasonText } from "@/utils/errors";
 import StatusBadge from "@/components/StatusBadge.vue";
@@ -12,6 +13,7 @@ const props = withDefaults(defineProps<{
   events: BoardEvent[] | null; positions: BoardPosition[] | null; accounts: BoardAccount[] | null; readOnly?: boolean;
 }>(), { readOnly: false });
 const { t } = useI18n();
+const { sizeText } = useDisplayUnit();
 // 默认只展开最近几条，卡片高度不被一整天的动态撑开；其余一键展开。
 const PREVIEW = 6;
 const expanded = ref(false);
@@ -52,7 +54,7 @@ function sideClass(side: string | null) {
           <time class="font-mono text-xs tabular-nums text-muted" :title="formatDateTime(event.time)">{{ formatClock(event.time) }}</time>
         </div>
         <p class="mt-1 font-mono text-xs tabular-nums text-muted">
-          {{ formatQty(event.qty) }} @ {{ formatPrice(event.price) }}
+          {{ sizeText(event.qty, null, event.price) }} @ {{ formatPrice(event.price) }}
           <span v-if="event.realizedPnl != null" class="ml-1 font-semibold" :class="pnlClass(event.realizedPnl)">{{ signedUsd(event.realizedPnl) }}</span>
         </p>
         <p v-if="!readOnly && !event.mine?.length" class="mt-1.5 text-xs font-medium text-warning">{{ t("board.noExecution") }}</p>
@@ -64,7 +66,7 @@ function sideClass(side: string | null) {
               <EnvBadge :environment="environment(execution.bindingId, execution.accountName)" />
               <StatusBadge class="ml-auto" :state="execution.status" />
             </div>
-            <p class="mt-1 font-mono tabular-nums text-muted">{{ formatQty(execution.qty) }} @ {{ formatPrice(execution.price) }} · {{ t("board.slippage") }} {{ formatPct(execution.slippagePct) }}</p>
+            <p class="mt-1 font-mono tabular-nums text-muted">{{ sizeText(execution.qty, null, execution.price) }} @ {{ formatPrice(execution.price) }} · {{ t("board.slippage") }} {{ formatPct(execution.slippagePct) }}</p>
             <p v-if="execution.details" class="mt-1 break-words font-medium text-warning">{{ reasonText(execution.details) }}</p>
           </div>
         </template>

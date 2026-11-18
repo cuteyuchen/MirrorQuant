@@ -22,18 +22,30 @@ from app.core.database import DEFAULT_SYSTEM_CONFIG, get_session_factory
 from app.core.secret_mask import redact_proxy_userinfo
 from app.models.domain import ExecutionRecord, NotificationOutbox, SystemConfig
 from app.services.notifier.service import NotificationService
+from app.services.notifier.trade import merged_trade_message
 
 logger = logging.getLogger("mirrorquant.notification_outbox")
 CHANNELS = ("outbox", "webhook", "telegram", "wecom", "dingtalk")
 DELIVERY_TIMEOUT_SEC = 45.0
 CLAIM_LEASE_SEC = 60.0
+# 批次封口后 drainer 才按事件分组发送；未封口的行超过此时限视为批次已死，照常分组发出。
+MERGE_SEAL_GRACE_SEC = 120.0
+MERGE_TOPUP_LIMIT = 200
 
 
 def enqueue_notification(db, config: Dict[str, Any], title: str, message: str,
                          event_type: str = "info", execution_id: Optional[int] = None,
-                         event_key: Optional[str] = None) -> NotificationOutbox:
-    """Join the caller's transaction; never commit or start external I/O here."""
-    row = NotificationOutbox(payload=json.dumps({
+                         event_key: Optional[str] = None, merge_key: Optional[str] = None,
+                         lead_section: Optional[str] = None,
+                         follower_section: Optional[str] = None) -> NotificationOutbox:
+    """Join the caller's transaction; never commit or start external I/O here.
+
+    A mergeable row carries its lead-event key plus the rendered lead and
+    follower sections; the drainer groups sealed rows by merge_key and sends
+    one message per lead event. The row itself stays one durable record per
+    execution outcome, so fill reporting atomicity is unchanged.
+    """
+    payload = {
         "title": redact_proxy_userinfo(title),
         "message": redact_proxy_userinfo(message),
         "event_type": event_type,
@@ -41,7 +53,13 @@ def enqueue_notification(db, config: Dict[str, Any], title: str, message: str,
         "execution_id": execution_id,
         "channels": [channel for channel in CHANNELS if config.get(f"{channel}_enabled")],
         "delivered_channels": [],
-    }, ensure_ascii=False), status="pending", attempts=0)
+    }
+    if merge_key is not None:
+        payload["merge_key"] = merge_key
+        payload["lead_section"] = lead_section
+        payload["follower_section"] = follower_section
+        payload["sealed"] = False
+    row = NotificationOutbox(payload=json.dumps(payload, ensure_ascii=False), status="pending", attempts=0)
     db.add(row)
     return row
 
@@ -54,6 +72,23 @@ async def _acknowledge_execution(db, payload, status: str) -> None:
             ExecutionRecord.id == payload["execution_id"],
             ExecutionRecord.notification_state == "pending",
         ).values(notification_state=status))
+
+
+def _payload_sections(payload: Dict[str, Any]) -> Optional[tuple]:
+    lead, follower = payload.get("lead_section"), payload.get("follower_section")
+    if isinstance(lead, str) and lead and isinstance(follower, str) and follower:
+        return lead, follower
+    return None
+
+
+def _row_is_mergeable(payload: Dict[str, Any]) -> bool:
+    return isinstance(payload.get("merge_key"), str) and bool(payload.get("merge_key"))
+
+
+def _row_created_utc(created: datetime) -> datetime:
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)  # 数据库存的是不带时区的 UTC 时间
+    return created
 
 
 class NotificationOutboxDrainer:
@@ -97,6 +132,90 @@ class NotificationOutboxDrainer:
             except asyncio.TimeoutError:
                 pass
 
+    async def _claim_row(self, row_id, conditions):
+        async with get_session_factory()() as db:
+            claim = await db.execute(update(NotificationOutbox).where(
+                NotificationOutbox.id == row_id, *conditions,
+                NotificationOutbox.attempts < self.max_attempts,
+            ).values(attempts=NotificationOutbox.attempts + 1,
+                     claimed_until=datetime.now(timezone.utc) + timedelta(seconds=CLAIM_LEASE_SEC)))
+            if not claim.rowcount:
+                await db.rollback()
+                return None
+            row = await db.get(NotificationOutbox, row_id)
+            entry = {"row_id": row_id, "attempt": row.attempts, "payload_text": row.payload,
+                     "created_at": row.created_at}
+            config_row = await db.get(SystemConfig, "notifications")
+            entry["config_text"] = config_row.value_json if config_row else "{}"
+            await db.commit()
+            return entry
+
+    async def _release_claim(self, entry) -> None:
+        """Give back an unsealed row untouched: no attempt consumed, no error recorded."""
+        async with get_session_factory()() as db:
+            await db.execute(update(NotificationOutbox).where(
+                NotificationOutbox.id == entry["row_id"], NotificationOutbox.status == "pending",
+                NotificationOutbox.attempts == entry["attempt"],
+            ).values(attempts=entry["attempt"] - 1, claimed_until=None))
+            await db.commit()
+
+    async def _finalize_row(self, entry, error, payload) -> None:
+        async with get_session_factory()() as db:
+            final_status = "sent" if error is None else ("failed" if entry["attempt"] >= self.max_attempts else "pending")
+            acknowledged = await db.execute(update(NotificationOutbox).where(
+                NotificationOutbox.id == entry["row_id"], NotificationOutbox.status == "pending",
+                NotificationOutbox.attempts == entry["attempt"],
+            ).values(
+                status=final_status,
+                last_error=error, claimed_until=None,
+                payload=json.dumps(payload, ensure_ascii=False) if payload is not None else entry["payload_text"],
+                # 10/20/40/80/160/300 秒退避，保留成功渠道，不重复通知。
+                next_attempt_at=datetime.now(timezone.utc) + timedelta(seconds=min(300, 10 * 2 ** (entry["attempt"] - 1))) if error else None,
+            ))
+            # 通知回执和执行投影一起落盘，防止终态记录一直被当作 pending。
+            if acknowledged.rowcount:
+                await _acknowledge_execution(db, payload, final_status)
+            await db.commit()
+
+    async def _deliver(self, entries, message: str, title: str, event_type: str) -> int:
+        """Send one dispatch shared by entries (a single row, or one merged group)."""
+        first = entries[0]
+        try:
+            parsed = []
+            remaining_union = set()
+            for entry in entries:
+                payload = entry.get("payload")
+                if payload is None:
+                    raise ValueError("Invalid notification payload")
+                parsed.append(payload)
+                remaining_union |= set(payload["channels"]) - set(payload.get("delivered_channels", []))
+            config = {**DEFAULT_SYSTEM_CONFIG["notifications"], **json.loads(first["config_text"])}
+            for channel in CHANNELS:
+                config[f"{channel}_enabled"] = channel in remaining_union and bool(config.get(f"{channel}_enabled"))
+            results = await asyncio.wait_for(NotificationService.dispatch(
+                config, title, message, event_type=event_type,
+            ), timeout=DELIVERY_TIMEOUT_SEC) if remaining_union else {}
+            delivered = {channel for channel in remaining_union if results.get(channel, {}).get("ok") is True}
+            for entry, payload in zip(entries, parsed):
+                remaining = set(payload["channels"]) - set(payload.get("delivered_channels", []))
+                payload["delivered_channels"] = sorted(set(payload.get("delivered_channels", [])) | (delivered & remaining))
+                missing = remaining - delivered
+                error = None
+                if missing:
+                    # Sink exceptions can embed tokens or credential-bearing
+                    # URLs. Persist only the channel names, never raw errors.
+                    error = "Delivery failed for channels: " + ", ".join(sorted(missing))
+                await self._finalize_row(entry, error, payload)
+        except Exception as exc:
+            error = "Delivery failed: " + type(exc).__name__
+            for entry in entries:
+                await self._finalize_row(entry, error, entry.get("payload"))
+        return len(entries)
+
+    def _group_message(self, entries) -> str:
+        sections = [_payload_sections(entry["payload"]) for entry in entries]
+        return merged_trade_message(sections[0][0], [pair[1] for pair in sections])
+
     async def drain_once(self, *, ignore_backoff: bool = False) -> int:
         async with self._lock:
             now = datetime.now(timezone.utc)
@@ -134,63 +253,86 @@ class NotificationOutboxDrainer:
                 ).order_by(NotificationOutbox.id).limit(100))).all())
                 await db.commit()
 
-            processed = 0
+            claimed = []
             for row_id in ids:
                 if self._stopping.is_set():
                     break  # 停机只等待当前一条通知，不遍历整批。
-                async with get_session_factory()() as db:
-                    # Atomic claims serialize multiple workers without holding a
-                    # database write transaction open during sink I/O.
-                    claim = await db.execute(update(NotificationOutbox).where(
-                        NotificationOutbox.id == row_id, *conditions,
-                        NotificationOutbox.attempts < self.max_attempts,
-                    ).values(attempts=NotificationOutbox.attempts + 1,
-                             claimed_until=datetime.now(timezone.utc) + timedelta(seconds=CLAIM_LEASE_SEC)))
-                    if not claim.rowcount:
-                        await db.rollback()
-                        continue
-                    row = await db.get(NotificationOutbox, row_id)
-                    payload_text, attempt = row.payload, row.attempts
-                    config_row = await db.get(SystemConfig, "notifications")
-                    config_text = config_row.value_json if config_row else "{}"
-                    await db.commit()
-                processed += 1
-                error = None
-                payload = None
+                entry = await self._claim_row(row_id, conditions)
+                if entry is not None:
+                    claimed.append(entry)
+
+            # 同一事件的分组若被领取窗口切开，把同键的其余行也领进来，避免拆成两条消息。
+            merge_keys = set()
+            for entry in claimed:
                 try:
-                    payload = json.loads(payload_text)
-                    config = {**DEFAULT_SYSTEM_CONFIG["notifications"], **json.loads(config_text)}
-                    remaining = set(payload["channels"]) - set(payload.get("delivered_channels", []))
-                    for channel in CHANNELS:
-                        config[f"{channel}_enabled"] = channel in remaining and bool(config.get(f"{channel}_enabled"))
-                    results = await asyncio.wait_for(NotificationService.dispatch(
-                        config, payload["title"], payload["message"], event_type=payload["event_type"],
-                    ), timeout=DELIVERY_TIMEOUT_SEC) if remaining else {}
-                    delivered = {channel for channel in remaining if results.get(channel, {}).get("ok") is True}
-                    payload["delivered_channels"] = sorted(set(payload.get("delivered_channels", [])) | delivered)
-                    missing = remaining - delivered
-                    if missing:
-                        # Sink exceptions can embed tokens or credential-bearing
-                        # URLs. Persist only the channel names, never raw errors.
-                        error = "Delivery failed for channels: " + ", ".join(sorted(missing))
-                except Exception as exc:
-                    error = "Delivery failed: " + type(exc).__name__
+                    payload = json.loads(entry["payload_text"])
+                except (ValueError, TypeError):
+                    continue
+                if _row_is_mergeable(payload):
+                    merge_keys.add(payload["merge_key"])
+            if merge_keys:
+                claimed_ids = {entry["row_id"] for entry in claimed}
                 async with get_session_factory()() as db:
-                    final_status = "sent" if error is None else ("failed" if attempt >= self.max_attempts else "pending")
-                    acknowledged = await db.execute(update(NotificationOutbox).where(
-                        NotificationOutbox.id == row_id, NotificationOutbox.status == "pending",
-                        NotificationOutbox.attempts == attempt,
-                    ).values(
-                        status=final_status,
-                        last_error=error, claimed_until=None,
-                        payload=json.dumps(payload, ensure_ascii=False) if payload is not None else payload_text,
-                        # 10/20/40/80/160/300 秒退避，保留成功渠道，不重复通知。
-                        next_attempt_at=datetime.now(timezone.utc) + timedelta(seconds=min(300, 10 * 2 ** (attempt - 1))) if error else None,
-                    ))
-                    # 通知回执和执行投影一起落盘，防止终态记录一直被当作 pending。
-                    if acknowledged.rowcount:
-                        await _acknowledge_execution(db, payload, final_status)
+                    rows = (await db.scalars(select(NotificationOutbox).where(
+                        *conditions, NotificationOutbox.attempts < self.max_attempts,
+                        NotificationOutbox.id.not_in(claimed_ids),
+                    ).order_by(NotificationOutbox.id).limit(MERGE_TOPUP_LIMIT))).all()
+                    candidates = [(row.id, row.payload) for row in rows]
                     await db.commit()
+                for candidate_id, candidate_payload in candidates:
+                    try:
+                        payload = json.loads(candidate_payload)
+                    except (ValueError, TypeError):
+                        continue
+                    if payload.get("merge_key") not in merge_keys:
+                        continue
+                    entry = await self._claim_row(candidate_id, conditions)
+                    if entry is not None:
+                        claimed.append(entry)
+                claimed.sort(key=lambda entry: entry["row_id"])
+
+            now = datetime.now(timezone.utc)
+            singles = []
+            groups = {}
+            for entry in claimed:
+                try:
+                    payload = json.loads(entry["payload_text"])
+                except (ValueError, TypeError):
+                    singles.append(entry)
+                    continue
+                entry["payload"] = payload
+                if not _row_is_mergeable(payload):
+                    singles.append(entry)
+                    continue
+                sealed = payload.get("sealed") is True
+                aged = now - _row_created_utc(entry["created_at"]) >= timedelta(seconds=MERGE_SEAL_GRACE_SEC)
+                if sealed or aged:
+                    groups.setdefault(payload["merge_key"], []).append(entry)
+                else:
+                    # 批次还没处理完：不发、不计次，下次轮询再看。
+                    await self._release_claim(entry)
+            for key, members in list(groups.items()):
+                if any(_payload_sections(member["payload"]) is None for member in members):
+                    # 分段缺失无法拼合，退回单条发送，不丢通知。
+                    singles.extend(members)
+                    del groups[key]
+
+            processed = 0
+            for entry in singles:
+                if self._stopping.is_set():
+                    break
+                payload = entry.get("payload")
+                if payload is None:
+                    processed += await self._deliver([entry], "", "", "info")
+                else:
+                    processed += await self._deliver(
+                        [entry], payload["message"], payload["title"], payload["event_type"])
+            for members in groups.values():
+                if self._stopping.is_set():
+                    break
+                first_payload = members[0]["payload"]
+                processed += await self._deliver(
+                    members, self._group_message(members), first_payload["title"], first_payload["event_type"])
             return processed
 
 

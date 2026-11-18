@@ -42,6 +42,15 @@ async function test() {
 </script>
 <template>
   <section class="space-y-4" :aria-label="t('settingsTab.notifications')">
+    <label class="field-label block max-w-sm">{{ t("set.displayUnit") }}
+      <select :value="modelValue.display_unit ?? 'notional'" name="notifications.display_unit" class="form-input mt-1" :aria-invalid="!!errors['notifications.display_unit']" @change="update('display_unit', ($event.target as HTMLSelectElement).value as NotificationSettings['display_unit'])">
+        <option value="notional">{{ t("set.displayUnitNotional") }}</option>
+        <option value="quantity">{{ t("set.displayUnitQuantity") }}</option>
+        <option value="both">{{ t("set.displayUnitBoth") }}</option>
+      </select>
+      <span class="mt-1 block text-xs font-normal text-muted">{{ t("set.displayUnitHint") }}</span>
+      <span v-if="errors['notifications.display_unit']" class="field-error block">{{ errors["notifications.display_unit"] }}</span>
+    </label>
     <div class="grid gap-2 sm:grid-cols-2">
       <label v-for="(label, key) in events" :key="key" class="flex min-h-11 items-start gap-3 py-2">
         <input type="checkbox" :checked="modelValue[key] === true" @change="update(key, ($event.target as HTMLInputElement).checked)" />

@@ -3,6 +3,7 @@ import { computed, ref } from "vue";
 import { AlertTriangle, ArrowRight, Calculator } from "lucide-vue-next";
 import type { BoardAccount, BoardLead, BoardPosition } from "@/types/api";
 import { useI18n } from "@/i18n";
+import { useDisplayUnit } from "@/composables/useDisplayUnit";
 import { finiteNumber, formatDateTime, formatPct, formatPrice, formatQty, formatUsd, signedUsd, type NumericValue } from "@/utils/format";
 import { normalizeSide, pnlClass, sideLabel, statusTone } from "@/utils/status";
 import { reasonText } from "@/utils/errors";
@@ -20,6 +21,7 @@ const props = withDefaults(defineProps<{
   readOnly?: boolean; showDetails?: boolean;
 }>(), { readOnly: false, showDetails: true });
 const { t } = useI18n();
+const { showQuantity, showNotional } = useDisplayUnit();
 // 看板里就地测算跟单仓位，不必跳到详情页；未展开时不请求快照。
 const calcOpen = ref(false);
 // 今日新仓优先；未知开仓时间放在最后，不改变后端持仓状态。
@@ -126,10 +128,10 @@ const showToday = computed(() => !props.readOnly
                       <p class="mt-1.5 font-mono text-xs font-semibold tabular-nums" :class="pnlClass(position.pnl)">{{ signedUsd(position.pnl) }}</p>
                     </div>
                   </div>
-                  <dl class="mt-3 grid grid-cols-3 gap-2 text-xs">
+                  <dl class="mt-3 grid gap-2 text-xs" :class="showQuantity && showNotional ? 'grid-cols-3' : 'grid-cols-2'">
                     <div class="min-w-0"><dt class="text-muted">{{ t("board.entry") }}</dt><dd class="mt-0.5 font-mono font-semibold tabular-nums">{{ formatPrice(position.entryPrice) }}</dd></div>
-                    <div class="min-w-0"><dt class="text-muted">{{ t("common.quantity") }}</dt><dd class="mt-0.5 font-mono font-semibold tabular-nums">{{ formatQty(position.qty) }}</dd></div>
-                    <div class="min-w-0 text-right"><dt class="text-muted">{{ t("board.notional") }}</dt><dd class="mt-0.5 font-mono font-semibold tabular-nums">{{ formatUsd(position.notional, 0) }}</dd></div>
+                    <div v-if="showQuantity" class="min-w-0"><dt class="text-muted">{{ t("common.quantity") }}</dt><dd class="mt-0.5 font-mono font-semibold tabular-nums">{{ formatQty(position.qty) }}</dd></div>
+                    <div v-if="showNotional" class="min-w-0 text-right"><dt class="text-muted">{{ t("board.notional") }}</dt><dd class="mt-0.5 font-mono font-semibold tabular-nums">{{ formatUsd(position.notional, 0) }}</dd></div>
                   </dl>
                   <!-- 止损在左、止盈在右，中间的位置条标出现价落在两者之间的哪里。 -->
                   <div v-if="showLevels(position)" class="mt-3 rounded-lg border border-border/40 bg-surface/70 p-2.5">

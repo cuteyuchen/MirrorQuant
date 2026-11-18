@@ -264,6 +264,7 @@ class ResilienceSettings(CamelModel):
 
 class NotificationSettings(CamelModel):
     model_config = ConfigDict(extra="forbid")
+    display_unit: Literal["notional", "quantity", "both"] = "notional"
     webhook_enabled: StrictBool = False
     webhook_url: str = ""
     telegram_enabled: StrictBool = False

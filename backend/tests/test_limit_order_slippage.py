@@ -103,7 +103,7 @@ async def test_resting_limit_fill_is_accounted_and_notified(trading, monkeypatch
     assert intent.state == "FILLED" and allocation.owned_qty_exact == "0.9"
     statuses, rows = await records(t)
     assert statuses == ["LIMIT_PLACED", "EXECUTED"] and rows[1].my_qty == 0.9
-    assert len(sent) == 1 and "✅ 限价单已成交" in sent[0] and "已成交 0.9 / 委托 0.9" in sent[0]
+    assert len(sent) == 1 and "✅ 限价单已成交" in sent[0] and "已成交 90.45 U / 委托 90.45 U" in sent[0]
 
 
 async def test_resting_limit_is_cancelled_after_ttl(trading, monkeypatch):
@@ -143,7 +143,7 @@ async def test_partial_fill_then_expiry_keeps_fill_and_drops_remainder(trading, 
     # 已成交部分照常记账；未成交部分失效，不结转为待补金额。
     assert intent.state == "CANCELED" and allocation.owned_qty_exact == "0.4" and debt.pending_usd == 0
     assert "限价单部分成交，剩余继续挂单" in sent[0]
-    assert "限价单剩余部分已自动撤单（超时）" in sent[1] and "已成交 0.4 / 委托 0.9" in sent[1]
+    assert "限价单剩余部分已自动撤单（超时）" in sent[1] and "已成交 40.20 U / 委托 90.45 U" in sent[1]
 
 
 async def test_cancel_rejected_because_order_filled_is_recorded_as_fill(trading, monkeypatch):
@@ -222,7 +222,7 @@ def test_limit_placed_message_states_price_quantity_and_expiry():
     text = trade_message(_record("LIMIT_PLACED"), ACCOUNT, SOURCE, 1000,
                          limit={"px": "100.5", "requested": "0.9", "filled": "0", "ttl_sec": 120})
     assert "⏳ 滑点超限，已改挂限价单（尚未成交）" in text
-    assert "📌 限价 100.5 ｜ 数量 0.9 ｜ 120 秒内未成交自动撤单" in text
+    assert "📌 限价 100.5 ｜ 金额 90.45 U ｜ 120 秒内未成交自动撤单" in text
     assert "📉 当前价偏离带单均价 3.00%" in text
     assert "⏱ 距带单成交 42 秒" in text and "LIMIT_PLACED" in text
 
@@ -245,5 +245,5 @@ def test_ordinary_fill_message_is_unchanged_apart_from_latency_line():
 def test_limit_fill_shortfall_is_reported_as_partial_with_remainder_cancelled():
     text = trade_message(_record("EXECUTED", my_qty=0.4, my_price=100.5, my_notional=40.2), ACCOUNT, SOURCE,
                          limit={"px": "100.5", "requested": "0.9", "filled": "0.4"})
-    assert "⚠️ 限价单部分成交，剩余已撤单" in text and "已成交 0.4 / 委托 0.9" in text
+    assert "⚠️ 限价单部分成交，剩余已撤单" in text and "已成交 40.20 U / 委托 90.45 U" in text
     assert Decimal("0.4") < Decimal("0.9")

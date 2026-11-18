@@ -3,7 +3,8 @@ import { computed } from "vue";
 import { Info } from "lucide-vue-next";
 import type { BoardMine } from "@/types/api";
 import { useI18n } from "@/i18n";
-import { formatPrice, formatQty, signedUsd } from "@/utils/format";
+import { useDisplayUnit } from "@/composables/useDisplayUnit";
+import { formatPrice, signedUsd } from "@/utils/format";
 import { pnlClass, statusTone } from "@/utils/status";
 import { reasonText } from "@/utils/errors";
 import EnvBadge from "@/components/EnvBadge.vue";
@@ -13,9 +14,11 @@ import StatusBadge from "@/components/StatusBadge.vue";
 // 不需要在“我的持仓”和“状态”两列之间来回对照。
 const props = defineProps<{ mine: BoardMine | null }>();
 const { t } = useI18n();
+const { unit, sizeText } = useDisplayUnit();
 const tone = computed(() => statusTone(props.mine?.state));
 // 没跟上时直接摆出“我的量 / 应有量”，差多少一眼可见。
 const showExpected = computed(() => props.mine != null && props.mine.state !== "aligned" && props.mine.expectedQty != null);
+const qtyLabel = computed(() => showExpected.value ? t("board.partialQty") : unit.value === "notional" ? t("board.notional") : unit.value === "quantity" ? t("common.quantity") : `${t("common.quantity")} / ${t("board.notional")}`);
 // 后端给了原因就原样翻译；未跟或被拦截却没有原因时明确写“原因未知”，不留空白。
 const reason = computed(() => {
   const mine = props.mine;
@@ -45,10 +48,10 @@ const reason = computed(() => {
     </div>
     <dl class="mt-2.5 grid grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)_minmax(0,0.9fr)] gap-2 text-xs">
       <div class="min-w-0">
-        <dt class="text-muted">{{ showExpected ? t("board.partialQty") : t("common.quantity") }}</dt>
-        <dd class="mt-0.5 whitespace-nowrap font-mono font-semibold tabular-nums">
-          <template v-if="showExpected">{{ formatQty(mine.qty) }} / {{ formatQty(mine.expectedQty) }}</template>
-          <template v-else>{{ formatQty(mine.qty) }}</template>
+        <dt class="text-muted">{{ qtyLabel }}</dt>
+        <dd class="mt-0.5 font-mono font-semibold tabular-nums" :class="unit === 'both' ? '' : 'whitespace-nowrap'">
+          <template v-if="showExpected">{{ sizeText(mine.qty, null, mine.entryPrice) }} / {{ sizeText(mine.expectedQty, null, mine.entryPrice) }}</template>
+          <template v-else>{{ sizeText(mine.qty, null, mine.entryPrice) }}</template>
         </dd>
       </div>
       <div class="min-w-0">

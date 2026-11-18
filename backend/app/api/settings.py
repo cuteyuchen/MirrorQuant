@@ -18,6 +18,7 @@ from app.core.secret_mask import NOTIFICATION_SECRET_FIELDS, mask_sensitive_payl
 from app.models.domain import AuditLog, CopyBinding, LoginAttemptGuard, SystemConfig, User
 from app.schemas.api import RiskDefaults, SettingsUpdate
 from app.services.notifier.service import NotificationService
+from app.services.notifier.trade import resolve_display_unit
 from app.services.engine.risk import RiskEngine
 from app.services.engine.serialization import serialized_execution
 
@@ -145,12 +146,18 @@ async def test_notification(
     _user: User = Depends(get_current_admin),
 ):
     cfg = await _load_cfg(db, "notifications") or {}
+    unit = resolve_display_unit(cfg.get("display_unit"))
+    size_line = "💰 均价 100000"
+    if unit != "notional":
+        size_line += " ｜ 数量 0.05"
+    if unit != "quantity":
+        size_line += " ｜ 金额 5,000.00 U"
     res = await NotificationService.dispatch(
         cfg,
         # 测试消息沿用真实成交通知的版式（数值为示例），收到即可确认渠道与排版。
         title="MirrorQuant 测试",
         message=("🟢 带单 开多/加多 ｜ BTCUSDT ｜ 做多\n"
-                 "💰 均价 100000 ｜ 数量 0.05 ｜ 金额 5,000.00 U\n"
+                 f"{size_line}\n"
                  "🧮 1000U 本金 ≈ 开 100.00 U ｜ 建议杠杆 2x\n\n"
                  "✅ 通知渠道连接正常（以上为示例数据，非真实成交）"),
         event_type="test",
