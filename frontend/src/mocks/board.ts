@@ -15,7 +15,7 @@ function event(id: number, action: BoardEvent["action"], offset: number, status:
     qty: 0.2, price: 68420.5, realizedPnl: action === "CLOSE" ? 146.8 : null,
     mine: [{ bindingId: 11, accountName: "Paper Alpha", status,
       qty: status === "EXECUTED" ? 0.02 : null, price: status === "EXECUTED" ? 68425 : null,
-      slippagePct: status === "EXECUTED" ? 0.0066 : null, details }] };
+      slippagePct: status === "EXECUTED" ? 0.0066 : null, spreadPct: status === "EXECUTED" ? 0.0012 : null, details }] };
 }
 export const mockBoard: DashboardBoard = {
   serverTime: now, dayStart, globalKillSwitch: false,
@@ -259,6 +259,7 @@ export const mockExecutions: ExecutionRecord[] = Array.from({ length: 47 }, (_, 
   myQty: index % executionStates.length < 2 ? 0.02 : null,
   myPrice: index % executionStates.length < 2 ? 68425 : null, myNotional: index % executionStates.length < 2 ? 1368.5 : null,
   slippagePct: index % executionStates.length < 2 ? 0.0066 : null,
+  spreadPct: index % executionStates.length < 2 ? 0.0012 : null,
   orderId: index % executionStates.length < 2 ? `sample-order-${index}` : null,
   details: [null, null, "INSUFFICIENT_MARGIN", "BINDING_DISABLED", "CIRCUIT_BREAKER", "WAITING_EXECUTION", "INSUFFICIENT_MARGIN", "LEAD_STALE"][index % executionStates.length] ?? null,
   createdAt: now - index * 60000,

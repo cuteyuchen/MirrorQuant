@@ -160,6 +160,7 @@ SQLITE_MIGRATIONS: Dict[str, List[Tuple[str, str]]] = {
         ("my_qty_exact", "VARCHAR(100)"),
         ("my_price_exact", "VARCHAR(100)"),
         ("delivery_event_id", "VARCHAR(100)"),
+        ("spread_pct", "FLOAT"),
     ],
     "binding_deliveries": [
         ("exit_superseded_by", "VARCHAR(100)"),
@@ -184,7 +185,8 @@ SQLITE_MIGRATIONS: Dict[str, List[Tuple[str, str]]] = {
                       ("delivery_event_id", "VARCHAR(100)"),
                       ("reporting_complete", "BOOLEAN NOT NULL DEFAULT 0"),
                       ("expires_at_ms", "BIGINT"),
-                      ("limit_px", "VARCHAR(100)")],
+                      ("limit_px", "VARCHAR(100)"),
+                      ("sizing_px", "VARCHAR(100)")],
     "notification_outbox": [("execution_id", "INTEGER"), ("event_key", "VARCHAR(160)")],
     "binding_debts": [("pending_usd_exact", "VARCHAR(100)")],
     "users": [

@@ -310,6 +310,8 @@ class OrderIntent(Base):
     # 仅“滑点超限改挂限价单”使用：到期时间（毫秒）与委托价；为空表示普通即时订单。
     expires_at_ms: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     limit_px: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    # 下单定价（开仓 sizing 用的参考价）；待补金额按此结算，旧意图为空时回退成交均价。
+    sizing_px: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     # 终态账本及通知证据确认后不再逐轮扫描，历史缺口仍阻断投递。
     reporting_complete: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
@@ -388,6 +390,8 @@ class ExecutionRecord(Base):
     my_price_exact: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     my_notional: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     slippage_pct: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    # 下单时实测的盘口价差（%）；平仓与历史记录不测，NULL 表示未知而非零价差。
+    spread_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     order_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     delivery_event_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     # NULL means not yet reconciled, not a fabricated zero cash flow.

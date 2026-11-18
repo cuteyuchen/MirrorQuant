@@ -13,6 +13,7 @@ export const executionsAdditions: Record<string, readonly [string, string]> = {
   "executions.leadReference": ["带单员参考", "Lead reference"],
   "executions.fill": ["我的成交", "My fill"],
   "executions.slippage": ["滑点", "Slippage"],
+  "executions.spread": ["价差", "Spread"],
   "executions.updated": ["记录更新于", "Records updated"],
   "executions.countError": ["状态计数暂时不可用", "Status counts are unavailable"],
   "executions.pendingSummary": ["{n} 笔订单等待交易所确认", "{n} orders await exchange confirmation"],

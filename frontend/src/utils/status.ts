@@ -15,7 +15,7 @@ export function sideLabel(side?: string | null, qty?: number | string | null) {
 }
 export function statusTone(state?: string | null): "success" | "danger" | "warning" | "neutral" {
   const s = state?.toUpperCase() || "";
-  if (["ALIGNED", "EXECUTED", "FILLED", "CONNECTED", "HEALTHY", "ACTIVE", "ENABLED", "SUCCESS", "ADOPTED_POSITION"].includes(s)) return "success";
+  if (["ALIGNED", "EXECUTED", "FILLED", "CONNECTED", "HEALTHY", "ACTIVE", "RUNNING", "ENABLED", "SUCCESS", "ADOPTED_POSITION"].includes(s)) return "success";
   if (s.startsWith("BLOCKED") || ["FAILED", "ERROR", "REJECTED", "UNFILLED", "CRITICAL", "CIRCUIT_BREAKER", "KILL_SWITCH"].includes(s)) return "danger";
   if (["PARTIAL", "MISSING", "UNKNOWN", "SUBMITTING", "STALE", "WARNING", "ACCUMULATED_DEBT", "PARTIALLY_FILLED", "PENDING_ORDERS", "BASELINE_PENDING", "LIMIT_PLACED", "RESTING"].includes(s)) return "warning";
   return "neutral";

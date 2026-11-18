@@ -87,6 +87,7 @@ export const additions: Record<string, readonly [string, string]> = {
   "state.CONNECTED": ["连接正常", "Connected"],
   "state.HEALTHY": ["正常", "Healthy"],
   "state.ACTIVE": ["运行中", "Active"],
+  "state.RUNNING": ["运行中", "Running"],
   "state.ENABLED": ["已启用", "Enabled"],
   "state.SUCCESS": ["成功", "Successful"],
   "state.DISABLED": ["已停用", "Disabled"],

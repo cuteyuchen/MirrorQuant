@@ -204,13 +204,14 @@ onMounted(start); onActivated(start); onDeactivated(stop); onUnmounted(stop);
       <ErrorState v-if="countsError" :message="`${t('executions.countError')}: ${countsError}`" :busy="countsLoading" @retry="loadCounts" />
       <DataTable :rows="items" :row-key="recordKey" :row-tone="rowTone" :loading="loading" :error="error" :empty="t('executions.empty')"
         :label="t('executions.title')" selectable @select="selected = $event" @retry="loadHistory(true)" :columns="[
-          { key: 'result', label: t('executions.result'), width: '22%', mobileWide: true },
-          { key: 'symbol', label: t('feed.colDirSym'), width: '13%' },
-          { key: 'binding', label: t('executions.binding'), width: '18%', mobileWide: true },
-          { key: 'lead', label: t('executions.leadReference'), width: '13%', numeric: true },
-          { key: 'fill', label: t('executions.fill'), width: '13%', numeric: true },
-          { key: 'slippage', label: t('executions.slippage'), width: '9%', numeric: true },
-          { key: 'time', label: t('common.time'), width: '12%', numeric: true },
+          { key: 'result', label: t('executions.result'), width: '21%', mobileWide: true },
+          { key: 'symbol', label: t('feed.colDirSym'), width: '12%' },
+          { key: 'binding', label: t('executions.binding'), width: '17%', mobileWide: true },
+          { key: 'lead', label: t('executions.leadReference'), width: '12%', numeric: true },
+          { key: 'fill', label: t('executions.fill'), width: '12%', numeric: true },
+          { key: 'slippage', label: t('executions.slippage'), width: '8%', numeric: true },
+          { key: 'spread', label: t('executions.spread'), width: '8%', numeric: true },
+          { key: 'time', label: t('common.time'), width: '10%', numeric: true },
         ]">
         <template #cell-result="{ row }">
           <StatusBadge :state="displayStatus(row)" />
@@ -224,6 +225,7 @@ onMounted(start); onActivated(start); onDeactivated(stop); onUnmounted(stop);
         <template #cell-lead="{ row }"><span>{{ sizeText(row.leadQty, row.leadNotional, row.leadPrice) }}</span><p class="mt-1 text-xs text-muted">{{ formatPrice(row.leadPrice) }}</p></template>
         <template #cell-fill="{ row }"><strong>{{ sizeText(row.myQty, row.myNotional, row.myPrice) }}</strong><p class="mt-1 text-xs text-muted">{{ formatPrice(row.myPrice) }}</p></template>
         <template #cell-slippage="{ row }"><span>{{ formatPct(row.slippagePct, 4) }}</span></template>
+        <template #cell-spread="{ row }"><span>{{ formatPct(row.spreadPct, 4) }}</span></template>
         <template #cell-time="{ row }"><span class="text-xs tabular-nums">{{ formatDateTime(row.createdAt) }}</span></template>
         <template #select-label>{{ t("executions.expand") }}</template>
       </DataTable>
@@ -253,6 +255,7 @@ onMounted(start); onActivated(start); onDeactivated(stop); onUnmounted(stop);
           <div class="number"><dt class="text-xs text-muted">{{ t("executions.fill") }} · {{ sizeLabel }}</dt><dd class="mt-1 font-semibold">{{ sizeText(selected.myQty, selected.myNotional, selected.myPrice) }}</dd></div>
           <div class="number"><dt class="text-xs text-muted">{{ t("executions.fill") }} · {{ t("common.price") }}</dt><dd class="mt-1 font-semibold">{{ formatPrice(selected.myPrice) }}</dd></div>
           <div class="number"><dt class="text-xs text-muted">{{ t("executions.slippage") }}</dt><dd class="mt-1">{{ formatPct(selected.slippagePct, 4) }}</dd></div>
+          <div class="number"><dt class="text-xs text-muted">{{ t("executions.spread") }}</dt><dd class="mt-1">{{ formatPct(selected.spreadPct, 4) }}</dd></div>
           <div class="number"><dt class="text-xs text-muted">{{ t("common.time") }}</dt><dd class="mt-1 text-xs">{{ formatDateTime(selected.createdAt) }}</dd></div>
           <div class="col-span-2 min-w-0"><dt class="text-xs text-muted">{{ t("executions.orderId") }}</dt><dd class="mt-1 break-all font-mono text-sm">{{ selected.orderId ?? t("common.unknown") }}</dd></div>
           <div class="col-span-2 min-w-0"><dt class="text-xs text-muted">{{ t("executions.details") }}</dt><dd class="mt-1 whitespace-pre-wrap break-words text-sm leading-relaxed">{{ reasonText(selected.details) }}</dd></div>

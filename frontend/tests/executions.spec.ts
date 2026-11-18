@@ -6,6 +6,7 @@ import { api } from "@/api/client";
 import { useI18n } from "@/i18n";
 import { mockExecutions, mockIntents, mockResponse } from "@/mocks/board";
 import { reasonText } from "@/utils/errors";
+import { statusLabel, statusTone } from "@/utils/status";
 import { executionGroup, executionOrder, readExecutionCounts, readExecutionPage } from "@/utils/executions";
 import type { ExecutionRecord, ExecutionsResponse } from "@/types/api";
 import ExecutionsView from "@/views/ExecutionsView.vue";
@@ -168,5 +169,14 @@ describe("执行记录页面", () => {
     slowPage.resolve(strictResponse("/api/dashboard/executions?limit=20&offset=0"));
     await flushPromises();
     expect(wrapper.findAll("tbody > tr")).toHaveLength(mockIntents.length);
+  });
+  it("执行记录表显示价差列", async () => {
+    const { wrapper } = await render();
+    expect(wrapper.text()).toContain(t("executions.spread"));
+    expect(wrapper.text()).toContain("0.0012%");
+  });
+  it("运行中的带单员状态显示为运行中而非未知", () => {
+    expect(statusLabel("running")).toBe("运行中");
+    expect(statusTone("running")).toBe("success");
   });
 });

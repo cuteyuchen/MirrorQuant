@@ -424,6 +424,34 @@ async def test_board_events_classify_open_add_reduce_close_and_correlate_executi
     assert lead["todayEvents"][0]["mine"][0]["details"] == "Confirmed"
 
 
+@pytest.mark.parametrize("history_complete,known", [(True, True), (False, False)])
+async def test_board_reconstructed_snapshot_today_stats_follow_history_completeness(board_state, history_complete, known):
+    t = board_state
+    snapshot = json.loads(t.lead.snapshot_json)
+    snapshot["openPositions"] = []
+    snapshot["meta"]["orderHistoryComplete"] = history_complete
+    snapshot["profile"]["positionShow"] = False
+    snapshot["openPositionsMeta"] = {"reconstructed": True, "derived": True, "authoritative": False,
+                                     "complete": False, "positionShow": False, "asOf": NOW_MS}
+    t.lead.snapshot_json = json.dumps(snapshot)
+    raw = {}
+    for i, (side, qty, pnl) in enumerate([("BUY", 1, 0), ("BUY", 1, 0), ("SELL", 0.5, 5), ("SELL", 1.5, 15)], 1):
+        raw[str(i)] = {"sym": "BTCUSDT", "ps": "LONG", "side": side, "q": qty, "p": 100,
+                       "t": START_MS + i * 1000, "pnl": pnl, "pnlKnown": True}
+    raw["old"] = {"sym": "ETHUSDT", "ps": "LONG", "side": "BUY", "q": 1, "p": 100, "t": START_MS - 1000}
+    t.lead.orders_store_json = json.dumps(raw)
+    await t.db.commit()
+    lead = (await build_board(t.db, now=NOW))["leads"][0]
+    if known:
+        assert [e["action"] for e in lead["todayEvents"]] == ["CLOSE", "REDUCE", "ADD", "OPEN"]
+        assert lead["todayOpenCount"] == lead["todayCloseCount"] == 1
+        assert lead["todayRealizedPnl"] == 20
+    else:
+        assert lead["todayEvents"] == []
+        assert lead["todayOpenCount"] is None and lead["todayCloseCount"] is None
+        assert lead["todayRealizedPnl"] is None
+
+
 async def test_board_display_snapshot_fallback_does_not_duplicate_deliveries(board_state):
     # 缺失稳定来源键的展示快照不能再与投递兜底重复生成同一笔 OPEN。
     t = board_state

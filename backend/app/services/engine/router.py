@@ -484,7 +484,7 @@ class CopyRouter:
         return float(value)
 
     @serialized_execution
-    async def _apply_intent_info(self, db, intent, info, spec, source_time_ms=0):
+    async def _apply_intent_info(self, db, intent, info, spec, source_time_ms=0, spread_pct=None):
         await db.refresh(intent)
         binding = await db.get(CopyBinding, intent.binding_id, populate_existing=True)
         account = await db.get(TradingAccount, intent.account_id)
@@ -580,9 +580,15 @@ class CopyRouter:
                 allocation.entry_cost = float(allocation.entry_cost_exact)
                 allocation.owned_qty_exact = format_exact(owned + delta)
                 allocation.owned_qty = float(allocation.owned_qty_exact)
+                # 待补金额按“下单定价”结算：已成交量按定价折算，只有未成交量与量化零头才结转。
+                # 按成交均价结算会把成交价与定价之间的价差噪声记成待补金额（顺价成交凭空产生
+                # 欠单、逆价成交又把合法零头清零）；旧意图无定价记录时沿用成交均价。
+                sizing_raw = intent.sizing_px
+                sizing_px = exact(sizing_raw) if sizing_raw else None
+                residue_px = sizing_px if sizing_px is not None and sizing_px > 0 else avg_px
                 # 限价单未成交部分到期即失效，不结转为待补金额，避免与后续加仓重复下单。
                 self._set_debt(debt, Decimal("0") if intent.expires_at_ms is not None else max(
-                    Decimal("0"), exact(intent.target_usd) - cumulative * avg_px * spec.ct_val))
+                    Decimal("0"), exact(intent.target_usd) - cumulative * residue_px * spec.ct_val))
                 await self._upsert_guard(db, intent.binding_id, intent.inst_id, intent.pos_side,
                     float(self._entry_cost(allocation) / self._owned_qty(allocation)))
         intent.filled_qty = format_exact(cumulative)
@@ -608,12 +614,12 @@ class CopyRouter:
         if delta > 0 or (state in TERMINAL_STATES and previous_state not in TERMINAL_STATES):
             # One transaction owns fill accounting, delivery, execution and outbox.
             # A crash before this commit rolls everything back to the durable intent.
-            await self._record_intent_outcome(db, intent, spec, delta, price, state)
+            await self._record_intent_outcome(db, intent, spec, delta, price, state, spread_pct=spread_pct)
         else:
             await db.commit()
         return float(delta), float(price), state
 
-    async def _record_intent_outcome(self, db, intent, spec, quantity, price, state, historical=False):
+    async def _record_intent_outcome(self, db, intent, spec, quantity, price, state, historical=False, spread_pct=None):
         binding = await db.get(CopyBinding, intent.binding_id)
         account = await db.get(TradingAccount, intent.account_id)
         lead = await db.get(LeadSource, binding.lead_id)
@@ -636,11 +642,19 @@ class CopyRouter:
         try:
             # 与成交、执行记录和 outbox 同一事务确认，历史补账仍需人工审计。
             intent.reporting_complete = state in TERMINAL_STATES and not historical
+            # 实际滑点 = 成交均价相对带单均价的绝对偏离（与滑点门同一口径）；无成交时不记。
+            lead_avg_px = source.get("avgPrice") or 0
+            realized_slip = 0.0
+            if quantity > 0 and price and lead_avg_px:
+                try:
+                    realized_slip = round(abs(float(price) - float(lead_avg_px)) / float(lead_avg_px) * 100.0, 4)
+                except (TypeError, ValueError, ZeroDivisionError):
+                    realized_slip = 0.0
             record = await self._record_execution(db, binding, lead, account,
                 source.get("symbol") or intent.inst_id, intent.inst_id, side, intent.pos_side.upper(),
                 ("CLOSE_" if intent.reduce_only else "OPEN_") + intent.pos_side.upper(), status,
-                source.get("qty") or 0, source.get("avgPrice") or 0, source.get("notional") or 0,
-                my_qty=quantity, my_price=price,
+                source.get("qty") or 0, lead_avg_px, source.get("notional") or 0,
+                my_qty=quantity, my_price=price, slippage_pct=realized_slip, spread_pct=spread_pct,
                 my_notional=float(quantity * price * spec.ct_val), order_id=intent.exchange_order_id,
                 details=f"Confirmed cumulative {intent.filled_qty} of {intent.requested_qty}; "
                     f"remaining {exact(intent.requested_qty) - exact(intent.filled_qty)}; order {state}. "
@@ -688,7 +702,8 @@ class CopyRouter:
     @serialized_execution
     async def _submit_confirmed(self, db, binding, account, adapter, spec,
                                 source_event_id, target_usd=0, source_time_ms=0, observed_at_ms=0,
-                                retry_terminal=False, source_evidence=None, expires_at_ms=None, **order):
+                                retry_terminal=False, source_evidence=None, expires_at_ms=None,
+                                spread_pct=None, sizing_px=None, **order):
         material = f"{account.id}:{binding.id}:{source_event_id}"
         db.info.pop("confirmed_execution", None)
         cid = "mq" + hashlib.sha256(material.encode()).hexdigest()[:30]
@@ -740,7 +755,8 @@ class CopyRouter:
                 state="SUBMITTING", requested_qty=order["sz"],
                 filled_qty="0", avg_px="0", reduce_only=order["reduce_only"], target_usd=format_exact(target_usd), source_time_ms=source_time_ms,
                 # 只有“滑点超限改挂限价单”带到期时间，到期后由对账流程撤单。
-                expires_at_ms=expires_at_ms, limit_px=order.get("px") if expires_at_ms is not None else None)
+                expires_at_ms=expires_at_ms, limit_px=order.get("px") if expires_at_ms is not None else None,
+                sizing_px=format_exact(sizing_px) if sizing_px is not None else None)
             db.add(intent)
             await db.commit()  # Durable before POST; restart can only query this client ID.
             if source_evidence is not None:
@@ -815,7 +831,7 @@ class CopyRouter:
                         exact(info.get("accFillSz") or 0) == exact(res.fill_sz or 0)):
                     info["avgPx"] = res.avg_px
                 try:
-                    delta, price, state = await self._apply_intent_info(db, intent, info, spec, source_time_ms)
+                    delta, price, state = await self._apply_intent_info(db, intent, info, spec, source_time_ms, spread_pct=spread_pct)
                 except BaseException:
                     # Do not let a later failure record commit tentative accounting.
                     await db.rollback()
@@ -1126,6 +1142,7 @@ class CopyRouter:
         my_price: float = 0.0,
         my_notional: float = 0.0,
         slippage_pct: float = 0.0,
+        spread_pct: Optional[float] = None,
         order_id: Optional[str] = None,
         details: str = "",
         notify_cfg: Optional[Dict[str, Any]] = None,
@@ -1178,6 +1195,7 @@ class CopyRouter:
             my_price_exact=format_exact(my_price),
             my_notional=my_notional,
             slippage_pct=slippage_pct,
+            spread_pct=spread_pct,
             order_id=order_id,
             delivery_event_id=delivery.source_event_id if delivery is not None else None,
             details=details,
@@ -2402,7 +2420,7 @@ class CopyRouter:
             await self._record_execution(
                 db, binding, lead, account, symbol, inst_id, side, ps, action,
                 "BLOCKED_SPREAD", lead_qty, lead_avg_px, lead_notional,
-                my_price=ref_px, slippage_pct=spread_res.value,
+                my_price=ref_px, slippage_pct=spread_res.value, spread_pct=spread_res.value or None,
                 details=spread_res.reason or "Spread guard triggered", notify_cfg=notify_cfg,
             )
             return
@@ -2413,7 +2431,7 @@ class CopyRouter:
             await self._record_execution(
                 db, binding, lead, account, symbol, inst_id, side, ps, action,
                 "BLOCKED_SLIPPAGE", lead_qty, lead_avg_px, lead_notional,
-                my_price=ref_px, slippage_pct=slip_res.value,
+                my_price=ref_px, slippage_pct=slip_res.value, spread_pct=spread_res.value or None,
                 details=slip_res.reason or "Slippage limit exceeded", notify_cfg=notify_cfg,
             )
             return
@@ -2542,7 +2560,7 @@ class CopyRouter:
                 side=order_side, pos_side=local_pos_side, ord_type=ord_type,
                 sz=format_decimal(capped_qty, spec.lot_sz), px=format_decimal(order_px, spec.tick_sz),
                 reduce_only=False, td_mode=account.margin_mode, expires_at_ms=expires_at_ms,
-                retry_terminal=True)
+                spread_pct=spread_res.value or None, sizing_px=entry_px, retry_terminal=True)
             fill_sz, fill_px = res.fill_sz, res.avg_px
             if res.state == "resting":
                 # 限价单已挂出但未全部成交：单独记录并通知，成交或失效时再各通知一次。
@@ -2550,7 +2568,7 @@ class CopyRouter:
                 resting = await db.get(OrderIntent, res.cl_ord_id)
                 await self._record_execution(db, binding, lead, account, symbol, inst_id, side, ps, action,
                     "LIMIT_PLACED", lead_qty, lead_avg_px, lead_notional,
-                    my_price=float(limit_px_dec), slippage_pct=slip_res.value, order_id=res.ord_id,
+                    my_price=float(limit_px_dec), slippage_pct=slip_res.value, spread_pct=spread_res.value or None, order_id=res.ord_id,
                     details=f"Price drift {slip_res.value}% over limit; resting limit "
                         f"{format_decimal(limit_px_dec, spec.tick_sz)} x {format_decimal(capped_qty, spec.lot_sz)}, "
                         f"auto-cancel after {limit_ttl_sec}s",

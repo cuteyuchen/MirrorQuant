@@ -32,7 +32,7 @@ export type BoardPosition = NullableFields<{
 }>;
 export type BoardExecution = NullableFields<{
   bindingId: number; accountName: string; status: string; qty: number; price: number;
-  slippagePct: number; details: string;
+  slippagePct: number; spreadPct: number; details: string;
 }>;
 export type BoardEvent = NullableFields<{
   id: number | string; time: number; symbol: string; side: PositionSide; action: TradeAction;
@@ -60,7 +60,7 @@ export type ExecutionRecord = NullableFields<{
   leadName: string; accountName: string; symbol: string; instId: string; side: string;
   positionSide: string; action: string; status: string; leadQty: number; leadPrice: number;
   leadNotional: number; myQty: number; myPrice: number; myNotional: number;
-  slippagePct: number; orderId: string; details: string; createdAt: Timestamp;
+  slippagePct: number; spreadPct: number; orderId: string; details: string; createdAt: Timestamp;
 }> & { environment?: Environment | null };
 export type ExecutionsResponse = ListResponse<ExecutionRecord> & { total: number | null };
 export type SocketMessage = { type?: string; data?: ExecutionRecord | null };

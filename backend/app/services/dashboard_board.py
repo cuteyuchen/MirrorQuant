@@ -282,7 +282,12 @@ def _events(lead, snapshot, deliveries, records, day_start, now):
         # 同一来源在多个绑定出现不重复计数；不合并无法证明的增量成交。
     observed_positions = snapshot.get("openPositions")
     meta = snapshot.get("openPositionsMeta") or {}
-    known = _positions_valid(observed_positions) and meta.get("authoritative") is True and meta.get("complete") is True
+    # 隐藏仓位带单员的持仓由完整订单历史重构，永远拿不到权威/完整标记；只认权威快照会让
+    # 今日统计与动态永远空白。与 _evidence_confirmed 同一口径：重构证据 + 完整订单历史即确认。
+    evidence = ((meta.get("authoritative") is True and meta.get("complete") is True) or
+                (meta.get("reconstructed") is True and
+                 (snapshot.get("meta") or {}).get("orderHistoryComplete") is True))
+    known = _positions_valid(observed_positions) and evidence
     known &= (snapshot.get("meta") or {}).get("orderHistoryComplete") is True
     observed_at = milliseconds(meta.get("asOf"))
     known &= (observed_at is not None and 0 <= now - observed_at <= get_settings().lead_snapshot_stale_sec * 1000
@@ -304,6 +309,7 @@ def _events(lead, snapshot, deliveries, records, day_start, now):
                 "bindingId": record.binding_id, "accountName": record.account_name,
                 "status": record.status, "qty": number(record.my_qty), "price": number(record.my_price) or None,
                 "slippagePct": number(record.slippage_pct) if record.my_qty > 0 else None,
+                "spreadPct": number(record.spread_pct) if record.my_qty > 0 else None,
                 "details": redact_error_urls(record.details),
             })
     result = []
