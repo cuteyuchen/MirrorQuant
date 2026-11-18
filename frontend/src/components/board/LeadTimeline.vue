@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import { ChevronDown, ChevronUp } from "lucide-vue-next";
-import type { BoardAccount, BoardEvent, BoardPosition } from "@/types/api";
+import type { BoardAccount, BoardEvent, BoardExecution, BoardPosition } from "@/types/api";
 import { useI18n } from "@/i18n";
 import { useDisplayUnit } from "@/composables/useDisplayUnit";
 import { formatClock, formatDateTime, formatPct, formatPrice, signedUsd } from "@/utils/format";
@@ -32,6 +32,13 @@ function sideClass(side: string | null) {
   const normalized = normalizeSide(side);
   return normalized === "LONG" ? "side-long" : normalized === "SHORT" ? "side-short" : "side-unknown";
 }
+// 成交确认的 details 是后端对账审计串（含 Intent accounting key），只供执行记录抽屉与日志查账，
+// 在动态里原样展示会把卡片撑开；拦截/跳过等原因照常经 reasonText 本地化显示。
+function executionDetail(execution: BoardExecution): string | null {
+  const details = execution.details;
+  if (!details || details.includes("Intent accounting key")) return null;
+  return reasonText(details);
+}
 // 每条带单事件紧挨自己的执行结果，保留失败和跳过的详情。
 </script>
 <template>
@@ -42,7 +49,9 @@ function sideClass(side: string | null) {
     </div>
     <p v-if="readOnly" class="mb-3 text-xs text-muted">{{ t("pub.knownEvents") }}</p>
     <p v-if="!sorted.length" class="rounded-xl border border-dashed border-border/60 px-3 py-6 text-center text-xs text-muted">{{ events == null ? t("common.unknown") : t("board.noEvents") }}</p>
-    <ol v-else class="relative space-y-4 before:absolute before:bottom-2 before:left-[5px] before:top-2 before:w-px before:bg-border/70">
+    <!-- 动态列表高度封顶、内部滚动，不把整页撑开；时间轴竖线留在可滚动的 ol 上。 -->
+    <div v-else class="max-h-[calc(100vh-8rem)] overflow-y-auto overscroll-contain pr-1">
+    <ol class="relative space-y-4 before:absolute before:bottom-2 before:left-[5px] before:top-2 before:w-px before:bg-border/70">
       <li v-for="event in visible" :key="event.id || `${event.time}:${event.symbol}:${event.action}`" class="relative min-w-0 pl-6">
         <span class="absolute left-0 top-1.5 h-[11px] w-[11px] rounded-full border-2 border-surface bg-accent" aria-hidden="true" />
         <div class="flex flex-wrap items-center justify-between gap-x-2 gap-y-1">
@@ -67,11 +76,12 @@ function sideClass(side: string | null) {
               <StatusBadge class="ml-auto" :state="execution.status" />
             </div>
             <p class="mt-1 font-mono tabular-nums text-muted">{{ sizeText(execution.qty, null, execution.price) }} @ {{ formatPrice(execution.price) }} · {{ t("board.slippage") }} {{ formatPct(execution.slippagePct) }}</p>
-            <p v-if="execution.details" class="mt-1 break-words font-medium text-warning">{{ reasonText(execution.details) }}</p>
+            <p v-if="executionDetail(execution)" class="mt-1 break-words font-medium text-warning">{{ executionDetail(execution) }}</p>
           </div>
         </template>
       </li>
     </ol>
+    </div>
     <button v-if="sorted.length > PREVIEW" type="button" class="button-ghost mt-2 w-full text-xs" :aria-expanded="expanded" @click="expanded = !expanded">
       <component :is="expanded ? ChevronUp : ChevronDown" :size="15" aria-hidden="true" />
       {{ expanded ? t("feed.showLess") : t("feed.showMore", { shown: visible.length, total: sorted.length }) }}

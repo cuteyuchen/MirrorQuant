@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mount, type VueWrapper } from "@vue/test-utils";
 import { createPinia, setActivePinia } from "pinia";
 import LeadComparison from "@/components/board/LeadComparison.vue";
+import LeadTimeline from "@/components/board/LeadTimeline.vue";
 import AccountSummary from "@/components/board/AccountSummary.vue";
 import { useDataCacheStore } from "@/stores/dataCache";
 import { mockBoard, mockResponse, mockSettings } from "@/mocks/board";
@@ -9,6 +10,7 @@ import { normalizeSide } from "@/utils/status";
 import { baseAsset, formatQty } from "@/utils/format";
 import { publicBoardLead } from "@/utils/publicBoard";
 import type { PublicDashboardResponse } from "@/types/api";
+import type { BoardEvent } from "@/types/api";
 
 // 看板验收直接使用同一份样例，不另造只适用于测试的状态。
 const wrappers: VueWrapper[] = [];
@@ -130,5 +132,34 @@ describe("方向与未知数值", () => {
     expect(formatQty(null)).toBe("—");
     expect(baseAsset("BTC-USDC-SWAP")).toBe("BTC");
     expect(baseAsset("ETHUSDT")).toBe("ETH");
+  });
+});
+
+// 今日动态：成交确认的对账审计串不进动态卡片，拦截原因照常显示，列表高度封顶内部滚动。
+describe("今日动态", () => {
+  const AUDIT_DETAILS = "Confirmed cumulative 0.024 of 0.024; remaining 0.000; order filled. Event remaining None; replacement only after terminal reconciliation. Intent accounting key mqd1c68aecbc0418edbe897225496bca; Filled 0.024 @ 64146.3";
+  function timeline(events: BoardEvent[]) {
+    const wrapper = mount(LeadTimeline, { props: { events, positions: [], accounts: [] } });
+    wrappers.push(wrapper);
+    return wrapper;
+  }
+  it("不展示对账审计串，拦截原因本地化显示", () => {
+    const wrapper = timeline([
+      { id: 1, time: Date.now(), symbol: "BTCUSDT", side: "SHORT", action: "ADD", qty: 8.011, price: 64377.98, realizedPnl: null,
+        mine: [{ bindingId: 3, accountName: "Paper Alpha", status: "EXECUTED", qty: 0.024, price: 64146.3, slippagePct: 0.36, spreadPct: 0.0012, details: AUDIT_DETAILS }] },
+      { id: 2, time: Date.now() - 1000, symbol: "BTCUSDT", side: "SHORT", action: "ADD", qty: 9.22, price: 64522.24, realizedPnl: null,
+        mine: [{ bindingId: 2, accountName: "Paper Alpha", status: "BLOCKED_SPREAD", qty: null, price: null, slippagePct: null, spreadPct: null, details: "Orderbook spread 0.381% exceeds guard 0.300%" }] },
+    ]);
+    expect(wrapper.text()).not.toContain("Intent accounting key");
+    expect(wrapper.text()).not.toContain("Confirmed cumulative");
+    expect(wrapper.text()).toContain("盘口价差过大，实测 0.381%，上限 0.300%");
+  });
+  it("动态列表高度封顶、内部滚动", () => {
+    const wrapper = timeline([
+      { id: 1, time: Date.now(), symbol: "BTCUSDT", side: "SHORT", action: "OPEN", qty: 8.491, price: 64345.39, realizedPnl: null, mine: [] },
+    ]);
+    const scroller = wrapper.find("ol").element.parentElement;
+    expect(scroller?.className).toContain("overflow-y-auto");
+    expect(scroller?.className).toContain("max-h-");
   });
 });
