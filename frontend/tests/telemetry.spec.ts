@@ -78,6 +78,22 @@ describe("深度分析的保留与安全呈现", () => {
     expect(page.get("header button").attributes("disabled")).toBeDefined();
     page.unmount();
   });
+  it("直连接口已确认空仓时不报数据不可用", () => {
+    setActivePinia(createPinia());
+    const { t } = useI18n();
+    const snapshot = {
+      openPositions: null,
+      openPositionsMeta: { source: "api", authoritative: true, complete: true, emptyVerified: true },
+    };
+    const analysis = mount(PositionAnalysis, { props: { snapshot } });
+    expect(analysis.text()).toContain(t("tel.noOpenPositions"));
+    expect(analysis.text()).not.toContain(t("board.unknownPositions"));
+    analysis.unmount();
+    const calculator = mount(PositionCalculatorCard, { props: { snapshot } });
+    expect(calculator.text()).toContain(t("calc.flatNotice"));
+    expect(calculator.text()).not.toContain(t("calc.unknownPositions"));
+    calculator.unmount();
+  });
 });
 
 describe("操作流倒序展示", () => {

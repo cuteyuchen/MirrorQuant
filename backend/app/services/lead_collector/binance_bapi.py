@@ -938,17 +938,31 @@ class BinanceBapiCollector(BaseLeadCollector):
         )
 
     async def fetch_holdings(self, portfolio_id: str, proxy_url: Optional[str] = None) -> List[Dict[str, Any]]:
-        data = await self._http_json(
-            f"{PUBLIC_COPY}/lead-data/positions?portfolioId={quote(portfolio_id)}",
-            portfolio_id=portfolio_id,
-            proxy_url=proxy_url,
-            retries=3,
-            retry_backoff_cap=4.0,
-            retry_jitter=0.2,
-        )
-        if not isinstance(data, list):
-            raise RuntimeError("Malformed direct holdings response")
-        return data
+        # The public holdings endpoint returns an empty list for some public
+        # leaders (e.g. portfolio 5305355976370339073) while the friendly
+        # endpoint — the one Binance's own web frontend uses — returns their
+        # real positions. Prefer friendly; fall back to public only when the
+        # friendly call fails or returns a malformed payload. An empty list
+        # is a legitimate answer (flat leader) and does not trigger fallback.
+        last_error: Optional[Exception] = None
+        for base in (FRIENDLY_COPY, PUBLIC_COPY):
+            try:
+                data = await self._http_json(
+                    f"{base}/lead-data/positions?portfolioId={quote(portfolio_id)}",
+                    portfolio_id=portfolio_id,
+                    proxy_url=proxy_url,
+                    retries=3,
+                    retry_backoff_cap=4.0,
+                    retry_jitter=0.2,
+                )
+            except Exception as exc:
+                last_error = exc
+                continue
+            if not isinstance(data, list):
+                last_error = RuntimeError("Malformed direct holdings response")
+                continue
+            return data
+        raise RuntimeError("Malformed direct holdings response") from last_error
 
     async def fetch_roi_chart(
         self, portfolio_id: str, time_range: str = "365D", proxy_url: Optional[str] = None

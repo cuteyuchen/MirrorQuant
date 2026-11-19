@@ -424,7 +424,7 @@ export const messages: Record<Locale, Record<string, string>> = {
     "tel.formulaNote": "口径：名义杠杆 = 持有金额 ÷ 保证金余额（{mb}）· 维持保证金按币安官方阶梯档位精确计算（{src}）· 实际设置杠杆在隐藏持仓模式下不可见",
     "tel.mmrOfficial": "官方档位精确值",
     "tel.mmrFallback": "保守 5% 估算",
-    "tel.noOpenPositions": "当前无未平仓头寸",
+    "tel.noOpenPositions": "当前带单员暂未开仓",
 
     // Position Card
     "pos.short": "做空 SHORT",
@@ -968,7 +968,7 @@ export const messages: Record<Locale, Record<string, string>> = {
     "tel.formulaNote": "Methodology: Notional Lev = Mark Value ÷ Margin Balance ({mb}) · Maint Margin via Binance Official Tiers ({src}) · Actual leverage is hidden when positionShow=false",
     "tel.mmrOfficial": "Binance Official Brackets",
     "tel.mmrFallback": "5% Conservative Fallback",
-    "tel.noOpenPositions": "No active open positions reconstructed.",
+    "tel.noOpenPositions": "This leader has no open positions yet",
 
     "pos.short": "SHORT",
     "pos.long": "LONG",

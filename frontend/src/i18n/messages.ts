@@ -146,7 +146,7 @@ export const additions: Record<string, readonly [string, string]> = {
   "board.noMine": ["尚无对应绑定或跟单数据", "No corresponding binding or copy data"],
   "board.orphans": ["带单员已平仓，我仍持有", "Lead closed, I still hold"],
   "board.orphanWarning": ["残留仓位需处理", "Residual position needs attention"],
-  "board.noPositions": ["带单员当前无持仓", "This lead has no open positions"],
+  "board.noPositions": ["当前带单员暂未开仓", "This leader has no open positions yet"],
   "board.unknownPositions": ["持仓数据尚不可用", "Position data is unavailable"],
   "board.timeline": ["今日动态", "Today's activity"],
   "board.noEvents": ["今天暂无开 / 加 / 减 / 平动态", "No opens, adds, reductions or closes today"],

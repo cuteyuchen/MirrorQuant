@@ -281,7 +281,7 @@ export interface LeadSnapshot {
     generatedAt?: number | null; priceUpdatedAt?: number | null; portfolioId?: string | null;
     fetchMs?: number | null; orderStoreSize?: number | null; stale?: boolean | null; snapshotAgeSec?: number | null;
   } | null;
-  openPositionsSummary?: PositionSummary | null; openPositionsMeta?: { source?: string | null } | null;
+  openPositionsSummary?: PositionSummary | null; openPositionsMeta?: { source?: string | null; authoritative?: boolean | null; complete?: boolean | null; emptyVerified?: boolean | null; partial?: boolean | null } | null;
   openPositions?: LegacyPosition[] | null; roiChart365D?: { t: number | null; v: number | null }[] | null;
   allocation?: { updateTime?: number | null; items?: { asset: string | null; volume: number | null }[] | null } | null;
   orderBatches?: OrderBatch[] | null; tradeCycles?: TradeCycle[] | null;

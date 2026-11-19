@@ -143,8 +143,49 @@ async def test_fetch_holdings_exhausts_three_attempts_and_preserves_retryable_ca
     calls, sleep = mock_http(monkeypatch, [failure])
     with pytest.raises(RuntimeError) as caught:
         await BinanceBapiCollector().fetch_holdings("lead")
-    assert len(calls) == 3 and sleep.await_count == 2
+    # Friendly exhausts three attempts, then the public fallback exhausts three.
+    assert len(calls) == 6 and sleep.await_count == 4
     assert is_retryable_exception(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_fetch_holdings_prefers_friendly_endpoint(monkeypatch):
+    calls, _ = mock_http(monkeypatch, [httpx.Response(200, json={"code": "000000", "data": [HOLDING]})])
+    assert await BinanceBapiCollector().fetch_holdings("lead") == [HOLDING]
+    assert len(calls) == 1
+    assert "friendly" in str(calls[0].url)
+
+
+@pytest.mark.asyncio
+async def test_fetch_holdings_empty_friendly_does_not_fall_back(monkeypatch):
+    # An empty list is a legitimate answer (flat leader), not a failure.
+    calls, _ = mock_http(monkeypatch, [httpx.Response(200, json={"code": "000000", "data": []})])
+    assert await BinanceBapiCollector().fetch_holdings("lead") == []
+    assert len(calls) == 1
+    assert "friendly" in str(calls[0].url)
+
+
+@pytest.mark.asyncio
+async def test_fetch_holdings_falls_back_to_public_when_friendly_fails(monkeypatch):
+    calls, sleep = mock_http(monkeypatch, [httpx.ReadTimeout(""), httpx.ReadTimeout(""), httpx.ReadTimeout(""),
+        httpx.Response(200, json={"code": "000000", "data": [HOLDING]})])
+    assert await BinanceBapiCollector().fetch_holdings("lead") == [HOLDING]
+    assert len(calls) == 4
+    assert "friendly" in str(calls[0].url)
+    assert "public" in str(calls[3].url)
+    assert [call.args[0] for call in sleep.await_args_list] == pytest.approx([0.9, 1.7])
+
+
+@pytest.mark.asyncio
+async def test_fetch_holdings_falls_back_to_public_when_friendly_malformed(monkeypatch):
+    calls, _ = mock_http(monkeypatch, [
+        httpx.Response(200, json={"code": "000000", "data": {"positions": []}}),
+        httpx.Response(200, json={"code": "000000", "data": [HOLDING]}),
+    ])
+    assert await BinanceBapiCollector().fetch_holdings("lead") == [HOLDING]
+    assert len(calls) == 2
+    assert "friendly" in str(calls[0].url)
+    assert "public" in str(calls[1].url)
 
 
 @pytest.mark.asyncio

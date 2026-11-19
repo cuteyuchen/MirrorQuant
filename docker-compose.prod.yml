@@ -4,7 +4,7 @@
 # （交易服务器上 ubuntu 用户为 1000:1001；换机器部署时按数据目录属主调整）。
 services:
   mirrorquant:
-    image: ghcr.io/cuteyuchen/mirrorquant:1.2.7
+    image: ghcr.io/cuteyuchen/mirrorquant:1.2.8
     container_name: mirrorquant-app
     restart: unless-stopped
     network_mode: host

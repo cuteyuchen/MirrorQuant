@@ -58,9 +58,9 @@ describe("跟单看板", () => {
   it("空仓和未知仓位分别表达", async () => {
     const wrapper = comparison();
     await wrapper.setProps({ lead: mockBoard.leads![1] });
-    expect(wrapper.find('[data-testid="empty-positions"]').text()).toContain("当前无持仓");
+    expect(wrapper.find('[data-testid="empty-positions"]').text()).toContain("当前带单员暂未开仓");
     await wrapper.setProps({ lead: mockBoard.leads![2] });
-    expect(wrapper.find('[data-testid="empty-positions"]').text()).not.toContain("当前无持仓");
+    expect(wrapper.find('[data-testid="empty-positions"]').text()).not.toContain("当前带单员暂未开仓");
   });
 
   // 隐藏持仓返回空数组时仍然没有证据证明已平仓。
@@ -69,7 +69,7 @@ describe("跟单看板", () => {
     for (const positionShow of [false, null]) {
       await wrapper.setProps({ lead: { ...mockBoard.leads![1], positionShow, positions: [] } });
       expect(wrapper.find('[data-testid="empty-positions"]').text()).toContain("持仓数据尚不可用");
-      expect(wrapper.find('[data-testid="empty-positions"]').text()).not.toContain("当前无持仓");
+      expect(wrapper.find('[data-testid="empty-positions"]').text()).not.toContain("当前带单员暂未开仓");
     }
   });
 
