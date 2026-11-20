@@ -131,6 +131,7 @@ async def get_user_subscriptions(
 
     user_bindings = list((await db.scalars(
         select(CopyBinding).where(
+            CopyBinding.deleted_at.is_(None),
             CopyBinding.is_enabled.is_(True),
             (CopyBinding.owner_user_id == current_user.id) if current_user.role != "admin" else True
         )

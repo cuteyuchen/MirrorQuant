@@ -380,8 +380,10 @@ async def build_board(db, *, now=None):
     start = local.replace(hour=0, minute=0, second=0, microsecond=0)
     now_ms, start_ms = milliseconds(now), milliseconds(start)
     leads = list((await db.scalars(select(LeadSource).order_by(LeadSource.id))).all())
-    accounts = {a.id: a for a in (await db.scalars(select(TradingAccount).order_by(TradingAccount.id))).all()}
-    bindings = list((await db.scalars(select(CopyBinding).order_by(CopyBinding.id))).all())
+    accounts = {a.id: a for a in (await db.scalars(select(TradingAccount).where(
+        TradingAccount.deleted_at.is_(None)).order_by(TradingAccount.id))).all()}
+    bindings = list((await db.scalars(select(CopyBinding).where(
+        CopyBinding.deleted_at.is_(None)).order_by(CopyBinding.id))).all())
     allocations = {(a.binding_id, a.inst_id, a.pos_side.upper()): a for a in
                    (await db.scalars(select(PositionAllocation))).all()}
     guards = {(g.binding_id, g.inst_id, g.pos_side.upper()): g for g in

@@ -31,10 +31,12 @@ async def require_binding_flat(db: AsyncSession, binding: CopyBinding, *, deleti
         raise HTTPException(status_code=409, detail=detail)
 
 
-async def require_account_flat(db: AsyncSession, account: TradingAccount, *, deleting: bool = False) -> None:
-    bindings = list((await db.scalars(select(CopyBinding).where(CopyBinding.account_id == account.id))).all())
-    for binding in bindings:
-        await require_binding_flat(db, binding, deleting=deleting)
+async def _verify_account_flat_on_exchange(db: AsyncSession, account: TradingAccount) -> None:
+    """Confirm the account holds no physical positions and no open orders on the exchange.
+
+    Shared by the hard-delete flat check and the soft-delete check; a verification
+    failure is fail-closed (409) in both cases.
+    """
     try:
         credentials = CredentialVault().decrypt_dict(account.encrypted_credentials)
         proxies = list((await db.scalars(select(ProxyNode).order_by(ProxyNode.priority))).all())
@@ -55,3 +57,43 @@ async def require_account_flat(db: AsyncSession, account: TradingAccount, *, del
         raise HTTPException(status_code=409, detail="Cannot verify a flat account; keep it disabled until reconciliation succeeds") from exc
     if any(abs(position.pos) > 0 for position in positions) or orders:
         raise HTTPException(status_code=409, detail="Drain physical positions and pending orders before changing or deleting the account")
+
+
+async def require_account_flat(db: AsyncSession, account: TradingAccount, *, deleting: bool = False) -> None:
+    bindings = list((await db.scalars(select(CopyBinding).where(
+        CopyBinding.account_id == account.id, CopyBinding.deleted_at.is_(None)))).all())
+    for binding in bindings:
+        await require_binding_flat(db, binding, deleting=deleting)
+    await _verify_account_flat_on_exchange(db, account)
+
+
+async def require_binding_soft_deletable(db: AsyncSession, binding: CopyBinding) -> None:
+    """Gate for logical delete: the binding must be drained, but its terminal order
+    history is the retained ledger and does NOT block deletion."""
+    allocation = await db.scalar(select(PositionAllocation.id).where(
+        PositionAllocation.binding_id == binding.id, PositionAllocation.owned_qty > 0,
+    ).limit(1))
+    guard = await db.scalar(select(PositionGuardState.id).where(PositionGuardState.binding_id == binding.id).limit(1))
+    intent = await db.scalar(select(OrderIntent.id).where(
+        OrderIntent.binding_id == binding.id, OrderIntent.state.not_in(TERMINAL_ORDER_STATES),
+    ).limit(1))
+    if allocation is not None or guard is not None or intent is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Binding has live exposure, protection, or non-terminal order history; drain it before deletion",
+        )
+
+
+async def require_account_soft_deletable(db: AsyncSession, account: TradingAccount) -> None:
+    """Gate for logical delete of an account: every live (non-deleted) binding must be
+    disabled and soft-deletable, and the account must be physically flat on the exchange."""
+    bindings = list((await db.scalars(select(CopyBinding).where(
+        CopyBinding.account_id == account.id, CopyBinding.deleted_at.is_(None)))).all())
+    for binding in bindings:
+        if binding.is_enabled:
+            raise HTTPException(
+                status_code=409,
+                detail="Disable all bindings before deleting the account",
+            )
+        await require_binding_soft_deletable(db, binding)
+    await _verify_account_flat_on_exchange(db, account)

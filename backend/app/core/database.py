@@ -211,6 +211,7 @@ SQLITE_MIGRATIONS: Dict[str, List[Tuple[str, str]]] = {
         ("day_start_date", "VARCHAR(16)"),
         ("clock_offset_ms", "INTEGER NOT NULL DEFAULT 0"),
         ("owner_user_id", "INTEGER"),
+        ("deleted_at", "DATETIME"),
     ],
     "copy_bindings": [
         ("enable_circuit_breaker", "BOOLEAN NOT NULL DEFAULT 1"),
@@ -233,6 +234,7 @@ SQLITE_MIGRATIONS: Dict[str, List[Tuple[str, str]]] = {
         ("adopt_tolerance_pct", "FLOAT NOT NULL DEFAULT 10.0"),
         ("adoption_completed", "BOOLEAN NOT NULL DEFAULT 0"),
         ("owner_user_id", "INTEGER"),
+        ("deleted_at", "DATETIME"),
     ],
 }
 

@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_admin, get_current_user, record_audit
-from app.api.exposure import require_binding_flat
+from app.api.exposure import require_binding_flat, require_binding_soft_deletable
 from app.core.database import DEFAULT_SYSTEM_CONFIG, get_db
 from app.core.secret_mask import redact_error_urls, redact_proxy_userinfo
 from app.core.security import CredentialVault
@@ -20,6 +20,7 @@ from app.models.domain import (
     SystemConfig,
     TradingAccount,
     User,
+    utcnow,
 )
 from app.schemas.api import BindingCreate, BindingUpdate, KillSwitchRequest
 from app.services.adapters.factory import create_exchange_adapter
@@ -89,7 +90,8 @@ async def _binding_out(db: AsyncSession, b: CopyBinding) -> dict:
 
 @router.get("")
 async def list_bindings(db: AsyncSession = Depends(get_db), _user: User = Depends(get_current_user)):
-    rows = list((await db.scalars(select(CopyBinding).order_by(CopyBinding.id))).all())
+    rows = list((await db.scalars(select(CopyBinding).where(
+        CopyBinding.deleted_at.is_(None)).order_by(CopyBinding.id))).all())
     items = [await _binding_out(db, b) for b in rows]
     ks = await db.scalar(select(SystemConfig).where(SystemConfig.key == "global_kill_switch"))
     return {
@@ -114,6 +116,8 @@ async def create_binding(
         select(CopyBinding).where(
             CopyBinding.lead_id == payload.lead_id,
             CopyBinding.account_id == payload.account_id,
+            # A soft-deleted binding no longer occupies the lead+account pair.
+            CopyBinding.deleted_at.is_(None),
         )
     )
     if dup:
@@ -213,10 +217,12 @@ async def delete_binding(
         raise HTTPException(status_code=404, detail="Binding not found")
     if binding.is_enabled:
         raise HTTPException(status_code=409, detail="Disable the binding and drain exposure before deletion")
-    await require_binding_flat(db, binding, deleting=True)
+    await require_binding_soft_deletable(db, binding)
     name = binding.name
-    await db.delete(binding)
-    await record_audit(db, "DELETE_BINDING", "binding", str(binding_id), f"Deleted binding {name}", current_user, request)
+    # Logical delete: stamp deleted_at instead of removing the row, so the audit
+    # ledger (intents, executions, allocations) stays queryable.
+    binding.deleted_at = utcnow()
+    await record_audit(db, "DELETE_BINDING", "binding", str(binding_id), f"Soft-deleted binding {name}", current_user, request)
     await db.commit()
     return {"ok": True}
 

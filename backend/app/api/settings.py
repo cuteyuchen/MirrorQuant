@@ -117,7 +117,8 @@ async def apply_defaults_to_bindings(
         defaults = RiskDefaults.model_validate(await _load_cfg(db, "risk_defaults") or {}).model_dump()
     except (ValidationError, ValueError, TypeError) as exc:
         raise HTTPException(status_code=422, detail="Invalid stored risk defaults; correct settings before applying") from exc
-    bindings = list((await db.scalars(select(CopyBinding))).all())
+    bindings = list((await db.scalars(select(CopyBinding).where(
+        CopyBinding.deleted_at.is_(None)))).all())
     for b in bindings:
         protection_fields = ("tp_sl_mode", "enable_stop_loss", "stop_loss_pct", "enable_take_profit",
                              "take_profit_pct", "enable_trailing_stop", "trailing_callback_pct", "hard_stop_loss_pct")

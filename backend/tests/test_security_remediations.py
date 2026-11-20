@@ -304,5 +304,12 @@ async def test_lifecycle_changes_preserve_owned_and_unknown_exposure(async_clien
     assert (await async_client.put(f"/api/accounts/{account_id}", json={"environment": "live"})).status_code == 409
     adapter.get_open_orders.return_value = []
     assert (await async_client.put(f"/api/accounts/{account_id}", json={"environment": "live"})).status_code == 200
-    # Filled-order evidence is retained even after the account is flat.
-    assert (await async_client.delete(f"/api/bindings/{binding_id}")).status_code == 409
+    # Filled-order evidence is retained even after the account is flat. Since
+    # 1.3.1 the binding is soft-deleted (200) instead of blocked (409): the row
+    # and its FILLED intent stay in the database as the audit ledger.
+    assert (await async_client.delete(f"/api/bindings/{binding_id}")).status_code == 200
+    async with get_session_factory()() as db:
+        intent = await db.get(OrderIntent, "test-unknown")
+        assert intent is not None and intent.state == "FILLED"
+        binding = await db.get(CopyBinding, binding_id)
+        assert binding is not None and binding.deleted_at is not None

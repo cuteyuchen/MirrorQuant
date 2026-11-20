@@ -169,7 +169,9 @@ class EngineOrchestrator:
                 (await db.scalars(select(LeadSource).where(LeadSource.is_enabled == True))).all()  # noqa: E712
             )
             accounts = list(
-                (await db.scalars(select(TradingAccount).where(TradingAccount.is_enabled == True))).all()  # noqa: E712
+                (await db.scalars(select(TradingAccount).where(
+                    TradingAccount.is_enabled == True,  # noqa: E712
+                    TradingAccount.deleted_at.is_(None)))).all()
             )
             resilience_cfg = await self.router._get_config(
                 db, "resilience", DEFAULT_SYSTEM_CONFIG["resilience"]
@@ -194,7 +196,8 @@ class EngineOrchestrator:
         """Protect owned exposure even while ingestion fails or entry controls are disabled."""
         factory = get_session_factory()
         async with factory() as db:
-            binding_ids = list((await db.scalars(select(CopyBinding.id))).all())
+            binding_ids = list((await db.scalars(select(CopyBinding.id).where(
+                CopyBinding.deleted_at.is_(None)))).all())
         semaphore = asyncio.Semaphore(4)
 
         async def check_binding(binding_id: int) -> None:

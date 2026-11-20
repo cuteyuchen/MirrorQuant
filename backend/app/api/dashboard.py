@@ -65,8 +65,10 @@ async def dashboard_overview(
     _user: User = Depends(get_current_user),
 ):
     leads = list((await db.scalars(select(LeadSource).order_by(LeadSource.id))).all())
-    accounts = list((await db.scalars(select(TradingAccount).order_by(TradingAccount.id))).all())
-    bindings = list((await db.scalars(select(CopyBinding).order_by(CopyBinding.id))).all())
+    accounts = list((await db.scalars(select(TradingAccount).where(
+        TradingAccount.deleted_at.is_(None)).order_by(TradingAccount.id))).all())
+    bindings = list((await db.scalars(select(CopyBinding).where(
+        CopyBinding.deleted_at.is_(None)).order_by(CopyBinding.id))).all())
     recent_execs = list(
         (await db.scalars(select(ExecutionRecord).order_by(desc(ExecutionRecord.created_at)).limit(30))).all()
     )

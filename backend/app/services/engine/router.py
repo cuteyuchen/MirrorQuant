@@ -1974,8 +1974,9 @@ class CopyRouter:
         new_source_events: Dict[str, Dict[str, Any]] = {}
         expanded_orders = sorted([expand_slim_order(o) for o in raw_orders],
             key=lambda o: (self._source_timestamp(o), order_dedup_key(o)))
-        bindings = (await db.scalars(select(CopyBinding).where(CopyBinding.lead_id == lead.id)
-                    .execution_options(populate_existing=True))).all()
+        bindings = (await db.scalars(select(CopyBinding).where(
+            CopyBinding.lead_id == lead.id, CopyBinding.deleted_at.is_(None))
+            .execution_options(populate_existing=True))).all()
         for binding in bindings:
             baseline = not binding.baseline_seeded
             for order in expanded_orders:

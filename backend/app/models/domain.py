@@ -162,6 +162,8 @@ class TradingAccount(Base):
         Integer, ForeignKey("proxy_nodes.id", ondelete="SET NULL"), nullable=True
     )
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # Logical delete: set instead of removing the row so the audit ledger survives.
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     margin_mode: Mapped[str] = mapped_column(String(16), default="cross", nullable=False)
     position_mode: Mapped[str] = mapped_column(String(16), default="hedge", nullable=False)
 
@@ -206,6 +208,8 @@ class CopyBinding(Base):
         Integer, ForeignKey("trading_accounts.id", ondelete="CASCADE"), nullable=False
     )
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # Logical delete: set instead of removing the row so the audit ledger survives.
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     enable_circuit_breaker: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     enable_leverage_cap: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)

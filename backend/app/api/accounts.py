@@ -10,11 +10,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_admin, get_current_user, record_audit
-from app.api.exposure import require_account_flat
+from app.api.exposure import require_account_flat, require_account_soft_deletable
 from app.core.database import get_db
 from app.core.security import CredentialVault
 from app.core.secret_mask import mask_sensitive_payload, redact_error_urls, redact_proxy_userinfo
-from app.models.domain import ProxyNode, TradingAccount, User
+from app.models.domain import CopyBinding, ProxyNode, TradingAccount, User, utcnow
 from app.schemas.api import AccountCreate, AccountUpdate
 from app.services.adapters.factory import create_exchange_adapter, invalidate_account_adapter
 from app.services.positions import with_current_price
@@ -60,7 +60,8 @@ def _account_out(a: TradingAccount) -> dict:
 
 @router.get("")
 async def list_accounts(db: AsyncSession = Depends(get_db), _user: User = Depends(get_current_user)):
-    rows = list((await db.scalars(select(TradingAccount).order_by(TradingAccount.id))).all())
+    rows = list((await db.scalars(select(TradingAccount).where(
+        TradingAccount.deleted_at.is_(None)).order_by(TradingAccount.id))).all())
     return {"items": [_account_out(a) for a in rows]}
 
 
@@ -169,10 +170,18 @@ async def delete_account(
         raise HTTPException(status_code=404, detail="Account not found")
     if acct.is_enabled:
         raise HTTPException(status_code=409, detail="Disable the account and drain exposure before deletion")
-    await require_account_flat(db, acct, deleting=True)
+    await require_account_soft_deletable(db, acct)
     name = acct.name
-    await db.delete(acct)
-    await record_audit(db, "DELETE_ACCOUNT", "account", str(account_id), f"Deleted account {name}", current_user, request)
+    # Logical delete: stamp deleted_at instead of removing the row, so the audit
+    # ledger (intents, executions, allocations) stays queryable. Setting the
+    # timestamp does not trigger the bindings cascade (no row is deleted).
+    now = utcnow()
+    acct.deleted_at = now
+    bindings = list((await db.scalars(select(CopyBinding).where(
+        CopyBinding.account_id == account_id, CopyBinding.deleted_at.is_(None)))).all())
+    for binding in bindings:
+        binding.deleted_at = now
+    await record_audit(db, "DELETE_ACCOUNT", "account", str(account_id), f"Soft-deleted account {name}", current_user, request)
     await db.commit()
     await invalidate_account_adapter(account_id)
     return {"ok": True}
