@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onActivated, onDeactivated, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { ChevronDown, Pencil, Plus, RefreshCw, Save, Trash2 } from "lucide-vue-next";
+import { ChevronDown, Pencil, Plus, RefreshCw, Save, Send, Trash2 } from "lucide-vue-next";
 import { api, ApiError, isCancelled } from "@/api/client";
 import { useDataCacheStore } from "@/stores/dataCache";
 import { useAsyncAction } from "@/composables/useAsyncAction";
@@ -90,7 +90,33 @@ function openDetail(lead: Lead) { void router.push(`/leads/${lead.id}`); }
 const showModal = ref(false);
 const editing = ref<Lead | null>(null);
 const errors = ref<Record<string, string>>({});
-const form = ref({ name: "", portfolioId: "", description: "", pollIntervalSec: 15 as number | null, proxyId: null as number | null, isPublicDashboard: false });
+const form = ref({
+  name: "",
+  portfolioId: "",
+  description: "",
+  pollIntervalSec: 15 as number | null,
+  proxyId: null as number | null,
+  isPublicDashboard: false,
+  notificationEnabled: false,
+  notificationDingtalkUrl: "",
+  notificationWebhookUrl: "",
+});
+const testPending = ref(false);
+const testResult = ref<string | null>(null);
+
+async function testLeadNotify() {
+  if (!editing.value) return;
+  testPending.value = true;
+  testResult.value = null;
+  try {
+    const res = await api.post<{ ok: boolean }>(`/api/leads/${editing.value.id}/test-notify`);
+    testResult.value = res.ok ? t("state.SUCCESS") : t("state.FAILED");
+  } catch (err: unknown) {
+    testResult.value = errorMessage(err);
+  } finally {
+    testPending.value = false;
+  }
+}
 const tableError = computed(() => loadError.value || (!showModal.value ? actionError.value : ""));
 let loadSequence = 0;
 let pollTimer: ReturnType<typeof setInterval> | undefined;
@@ -120,9 +146,19 @@ async function load(force = false) {
 }
 function environments(lead: Lead) { return (cache.bindings?.data.items || []).filter(binding => binding.leadId === lead.id).map(binding => binding.accountEnvironment); }
 function edit(lead: Lead | null) {
-  editing.value = lead; errors.value = {}; actionError.value = "";
-  form.value = { name: lead?.name || "", portfolioId: lead?.portfolioId || "", description: lead?.description || "",
-    pollIntervalSec: lead ? lead.pollIntervalSec ?? null : 15, proxyId: lead?.proxyId ?? null, isPublicDashboard: lead?.isPublicDashboard === true };
+  editing.value = lead; errors.value = {}; actionError.value = ""; testResult.value = null;
+  const nc = lead?.notificationConfig;
+  form.value = {
+    name: lead?.name || "",
+    portfolioId: lead?.portfolioId || "",
+    description: lead?.description || "",
+    pollIntervalSec: lead ? lead.pollIntervalSec ?? null : 15,
+    proxyId: lead?.proxyId ?? null,
+    isPublicDashboard: lead?.isPublicDashboard === true,
+    notificationEnabled: !!(nc?.dingtalk_enabled || nc?.webhook_enabled),
+    notificationDingtalkUrl: nc?.dingtalk_webhook_url || "",
+    notificationWebhookUrl: nc?.webhook_url || "",
+  };
   showModal.value = true;
 }
 async function save() {
@@ -134,9 +170,21 @@ async function save() {
   if (!editing.value && form.value.portfolioId.trim().length < 3) errors.value.portfolio_id = t("validation.minLength", { n: 3 });
   else if (!editing.value && form.value.portfolioId.trim().length > 100) errors.value.portfolio_id = t("validation.maxLength", { n: 100 });
   if (Object.keys(errors.value).length) { await focusError(); return; }
-  const { portfolioId, ...other } = form.value;
-  const result = await run(() => editing.value ? api.put(`/api/leads/${editing.value.id}`, { ...other, name: other.name.trim() })
-    : api.post("/api/leads", { ...form.value, name: form.value.name.trim(), portfolioId: portfolioId.trim(), platform: "binance_bapi" }), {
+  const { portfolioId, notificationEnabled, notificationDingtalkUrl, notificationWebhookUrl, ...other } = form.value;
+  const notification_config = notificationEnabled ? {
+    dingtalk_enabled: !!notificationDingtalkUrl,
+    dingtalk_webhook_url: notificationDingtalkUrl || "",
+    webhook_enabled: !!notificationWebhookUrl,
+    webhook_url: notificationWebhookUrl || "",
+    notify_on_lead_order: true,
+  } : null;
+  const payload = {
+    ...other,
+    name: other.name.trim(),
+    notification_config,
+  };
+  const result = await run(() => editing.value ? api.put(`/api/leads/${editing.value.id}`, payload)
+    : api.post("/api/leads", { ...payload, portfolioId: portfolioId.trim(), platform: "binance_bapi" }), {
     confirm: editing.value ? { title: t("common.save"), message: t("confirm.edit", { name: form.value.name }), environments: environments(editing.value),
       strong: !cache.bindings || environments(editing.value).some(environment => environment == null) } : undefined,
     onError: cause => { errors.value = fieldErrors(cause); void focusError(); },
@@ -226,6 +274,35 @@ onUnmounted(stop);
           <label class="field-label">{{ t("leads.description") }}<textarea v-model="form.description" class="form-input mt-1" rows="2" /></label>
           <label class="flex min-h-11 items-center gap-3 text-sm"><input v-model="form.isPublicDashboard" type="checkbox" />{{ t("leads.public") }}</label>
         </div></details>
+        <details class="border-y border-border/50 py-2">
+          <summary class="flex min-h-11 cursor-pointer items-center justify-between gap-2 text-sm font-semibold">
+            {{ t("set.leadNotifyTitle") }}
+            <ChevronDown :size="17" />
+          </summary>
+          <div class="mt-3 space-y-4">
+            <p class="text-xs text-muted">{{ t("set.leadNotifyHint") }}</p>
+            <label class="flex min-h-11 items-center gap-3 text-sm">
+              <input v-model="form.notificationEnabled" type="checkbox" />
+              {{ t("set.enableChannel") }}
+            </label>
+            <div v-if="form.notificationEnabled" class="space-y-3">
+              <label class="field-label">
+                {{ t("set.dingtalk") }} Webhook
+                <input v-model="form.notificationDingtalkUrl" type="password" class="form-input mt-1" placeholder="https://oapi.dingtalk.com/robot/send?access_token=..." autocomplete="off" />
+              </label>
+              <label class="field-label">
+                {{ t("set.webhook") }} URL
+                <input v-model="form.notificationWebhookUrl" type="password" class="form-input mt-1" placeholder="https://..." autocomplete="off" />
+              </label>
+              <div v-if="editing" class="flex items-center gap-3 pt-1">
+                <button type="button" class="button-secondary" :disabled="testPending" @click="testLeadNotify">
+                  <Send :size="16" />{{ t("set.sendTest") }}
+                </button>
+                <span v-if="testResult" class="text-xs text-muted">{{ testResult }}</span>
+              </div>
+            </div>
+          </div>
+        </details>
         <footer class="flex justify-end gap-3"><button type="button" class="button-secondary" @click="showModal = false">{{ t("common.cancel") }}</button><button type="submit" class="button-primary"><Save :size="17" />{{ t(pending ? "common.working" : "common.save") }}</button></footer>
       </fieldset></form>
     </BaseModal>

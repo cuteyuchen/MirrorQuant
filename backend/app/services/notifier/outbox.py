@@ -20,7 +20,7 @@ from sqlalchemy import or_, select, update
 from app.core.config import get_settings
 from app.core.database import DEFAULT_SYSTEM_CONFIG, get_session_factory
 from app.core.secret_mask import redact_proxy_userinfo
-from app.models.domain import ExecutionRecord, NotificationOutbox, SystemConfig
+from app.models.domain import ExecutionRecord, LeadSource, NotificationOutbox, SystemConfig, UserPreference
 from app.services.notifier.service import NotificationService
 from app.services.notifier.trade import merged_trade_message
 
@@ -37,7 +37,10 @@ def enqueue_notification(db, config: Dict[str, Any], title: str, message: str,
                          event_type: str = "info", execution_id: Optional[int] = None,
                          event_key: Optional[str] = None, merge_key: Optional[str] = None,
                          lead_section: Optional[str] = None,
-                         follower_section: Optional[str] = None) -> NotificationOutbox:
+                         follower_section: Optional[str] = None,
+                         owner_user_id: Optional[int] = None,
+                         lead_id: Optional[int] = None,
+                         destination_type: str = "system") -> NotificationOutbox:
     """Join the caller's transaction; never commit or start external I/O here.
 
     A mergeable row carries its lead-event key plus the rendered lead and
@@ -51,6 +54,9 @@ def enqueue_notification(db, config: Dict[str, Any], title: str, message: str,
         "event_type": event_type,
         "event_key": redact_proxy_userinfo(event_key) if event_key is not None else None,
         "execution_id": execution_id,
+        "owner_user_id": owner_user_id,
+        "lead_id": lead_id,
+        "destination_type": destination_type,
         "channels": [channel for channel in CHANNELS if config.get(f"{channel}_enabled")],
         "delivered_channels": [],
     }
@@ -59,7 +65,14 @@ def enqueue_notification(db, config: Dict[str, Any], title: str, message: str,
         payload["lead_section"] = lead_section
         payload["follower_section"] = follower_section
         payload["sealed"] = False
-    row = NotificationOutbox(payload=json.dumps(payload, ensure_ascii=False), status="pending", attempts=0)
+    row = NotificationOutbox(
+        payload=json.dumps(payload, ensure_ascii=False),
+        status="pending",
+        attempts=0,
+        owner_user_id=owner_user_id,
+        lead_id=lead_id,
+        destination_type=destination_type,
+    )
     db.add(row)
     return row
 
@@ -75,9 +88,10 @@ async def _acknowledge_execution(db, payload, status: str) -> None:
 
 
 def _payload_sections(payload: Dict[str, Any]) -> Optional[tuple]:
-    lead, follower = payload.get("lead_section"), payload.get("follower_section")
-    if isinstance(lead, str) and lead and isinstance(follower, str) and follower:
-        return lead, follower
+    lead = payload.get("lead_section")
+    follower = payload.get("follower_section")
+    if isinstance(lead, str) and lead:
+        return lead, (follower if isinstance(follower, str) and follower else None)
     return None
 
 
@@ -143,10 +157,40 @@ class NotificationOutboxDrainer:
                 await db.rollback()
                 return None
             row = await db.get(NotificationOutbox, row_id)
-            entry = {"row_id": row_id, "attempt": row.attempts, "payload_text": row.payload,
-                     "created_at": row.created_at}
-            config_row = await db.get(SystemConfig, "notifications")
-            entry["config_text"] = config_row.value_json if config_row else "{}"
+            entry = {
+                "row_id": row_id,
+                "attempt": row.attempts,
+                "payload_text": row.payload,
+                "created_at": row.created_at,
+                "owner_user_id": row.owner_user_id,
+                "lead_id": row.lead_id,
+                "destination_type": row.destination_type,
+            }
+            config_text = "{}"
+            try:
+                payload = json.loads(row.payload)
+            except (ValueError, TypeError):
+                payload = {}
+            dest_type = row.destination_type or payload.get("destination_type") or "system"
+            owner_id = row.owner_user_id if row.owner_user_id is not None else payload.get("owner_user_id")
+            lead_id = row.lead_id if row.lead_id is not None else payload.get("lead_id")
+
+            if dest_type == "lead" and lead_id:
+                lead = await db.get(LeadSource, lead_id)
+                if lead and lead.notification_config_json:
+                    config_text = lead.notification_config_json
+            elif dest_type == "user" and owner_id:
+                pref = await db.get(UserPreference, owner_id)
+                if pref and pref.notifications_json:
+                    config_text = pref.notifications_json
+                else:
+                    config_row = await db.get(SystemConfig, "notifications")
+                    config_text = config_row.value_json if config_row else "{}"
+            else:
+                config_row = await db.get(SystemConfig, "notifications")
+                config_text = config_row.value_json if config_row else "{}"
+
+            entry["config_text"] = config_text
             await db.commit()
             return entry
 
@@ -214,7 +258,9 @@ class NotificationOutboxDrainer:
 
     def _group_message(self, entries) -> str:
         sections = [_payload_sections(entry["payload"]) for entry in entries]
-        return merged_trade_message(sections[0][0], [pair[1] for pair in sections])
+        lead = sections[0][0]
+        followers = [pair[1] for pair in sections if pair and pair[1]]
+        return merged_trade_message(lead, followers)
 
     async def drain_once(self, *, ignore_backoff: bool = False) -> int:
         async with self._lock:
@@ -307,7 +353,14 @@ class NotificationOutboxDrainer:
                 sealed = payload.get("sealed") is True
                 aged = now - _row_created_utc(entry["created_at"]) >= timedelta(seconds=MERGE_SEAL_GRACE_SEC)
                 if sealed or aged:
-                    groups.setdefault(payload["merge_key"], []).append(entry)
+                    dest_type = entry.get("destination_type") or payload.get("destination_type") or "system"
+                    dest_id = (
+                        entry.get("owner_user_id")
+                        if dest_type == "user"
+                        else (entry.get("lead_id") if dest_type == "lead" else "system")
+                    )
+                    group_key = f"{dest_type}:{dest_id}:{payload['merge_key']}"
+                    groups.setdefault(group_key, []).append(entry)
                 else:
                     # 批次还没处理完：不发、不计次，下次轮询再看。
                     await self._release_claim(entry)

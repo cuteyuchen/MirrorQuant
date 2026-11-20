@@ -96,6 +96,56 @@ class ProxyUpdate(UpdateModel):
         return MASK_SENTINEL if value == "" else value
 
 
+class NotificationSettings(CamelModel):
+    model_config = ConfigDict(extra="forbid")
+    display_unit: Literal["notional", "quantity", "both"] = "notional"
+    webhook_enabled: StrictBool = False
+    webhook_url: str = ""
+    telegram_enabled: StrictBool = False
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+    wecom_enabled: StrictBool = False
+    wecom_webhook_url: str = ""
+    dingtalk_enabled: StrictBool = False
+    dingtalk_webhook_url: str = ""
+    # 钉钉“加签”密钥，可选；留空表示机器人用关键词或 IP 白名单。
+    dingtalk_secret: str = ""
+    # Read-only hints are accepted on a GET/PUT round trip and never persisted.
+    telegram_bot_token_configured: Optional[StrictBool] = Field(default=None, exclude=True)
+    webhook_url_configured: Optional[StrictBool] = Field(default=None, exclude=True)
+    wecom_webhook_url_configured: Optional[StrictBool] = Field(default=None, exclude=True)
+    dingtalk_webhook_url_configured: Optional[StrictBool] = Field(default=None, exclude=True)
+    dingtalk_secret_configured: Optional[StrictBool] = Field(default=None, exclude=True)
+    outbox_enabled: StrictBool = False
+    outbox_path: str = ""
+    notify_on_execution: StrictBool = True
+    notify_on_lead_order: StrictBool = True
+    notify_on_risk_block: StrictBool = True
+    notify_on_security_alert: StrictBool = True
+
+    @field_validator("webhook_url", "wecom_webhook_url", "dingtalk_webhook_url")
+    @classmethod
+    def validate_webhook(cls, value, info):
+        # GET 返回的固定掩码在 PUT 中表示保留，真正发送前仍再次验证 HTTPS。
+        if is_mask_sentinel(value):
+            return value
+        checked = https_notification_url(value)
+        # 渠道 webhook 只能发往本平台域名：钉钉 URL 一旦存进企业微信字段（或反之），
+        # 发送时会静默走错渠道且界面显示与实际不符，保存时直接拦下。
+        expected_host = {"wecom_webhook_url": "qyapi.weixin.qq.com",
+                         "dingtalk_webhook_url": "oapi.dingtalk.com"}.get(info.field_name)
+        if expected_host and checked and urlsplit(checked).hostname != expected_host:
+            raise ValueError(f"Webhook URL must use host {expected_host}")
+        return checked
+
+    @field_validator("outbox_path")
+    @classmethod
+    def validate_outbox(cls, value):
+        if value:
+            notification_outbox_path(value)
+        return value
+
+
 class LeadCreate(CamelModel):
     name: str = Field(min_length=1, max_length=120)
     platform: str = Field(default="binance_bapi", pattern="^(binance_bapi)$")
@@ -105,16 +155,18 @@ class LeadCreate(CamelModel):
     proxy_id: Optional[int] = None
     is_enabled: bool = True
     is_public_dashboard: bool = False
+    notification_config: Optional[NotificationSettings] = None
 
 
 class LeadUpdate(UpdateModel):
-    nullable_fields = frozenset({"description", "proxy_id"})
+    nullable_fields = frozenset({"description", "proxy_id", "notification_config"})
     name: Optional[str] = Field(default=None, min_length=1, max_length=120)
     description: Optional[str] = None
     poll_interval_sec: Optional[int] = Field(default=None, ge=5, le=3600)
     proxy_id: Optional[int] = None
     is_enabled: Optional[bool] = None
     is_public_dashboard: Optional[bool] = None
+    notification_config: Optional[NotificationSettings] = None
 
 
 class AccountCreate(CamelModel):
@@ -262,54 +314,35 @@ class ResilienceSettings(CamelModel):
     max_consecutive_failures: int = Field(default=5, ge=1, le=100)
 
 
-class NotificationSettings(CamelModel):
-    model_config = ConfigDict(extra="forbid")
-    display_unit: Literal["notional", "quantity", "both"] = "notional"
-    webhook_enabled: StrictBool = False
-    webhook_url: str = ""
-    telegram_enabled: StrictBool = False
-    telegram_bot_token: str = ""
-    telegram_chat_id: str = ""
-    wecom_enabled: StrictBool = False
-    wecom_webhook_url: str = ""
-    dingtalk_enabled: StrictBool = False
-    dingtalk_webhook_url: str = ""
-    # 钉钉“加签”密钥，可选；留空表示机器人用关键词或 IP 白名单。
-    dingtalk_secret: str = ""
-    # Read-only hints are accepted on a GET/PUT round trip and never persisted.
-    telegram_bot_token_configured: Optional[StrictBool] = Field(default=None, exclude=True)
-    webhook_url_configured: Optional[StrictBool] = Field(default=None, exclude=True)
-    wecom_webhook_url_configured: Optional[StrictBool] = Field(default=None, exclude=True)
-    dingtalk_webhook_url_configured: Optional[StrictBool] = Field(default=None, exclude=True)
-    dingtalk_secret_configured: Optional[StrictBool] = Field(default=None, exclude=True)
-    outbox_enabled: StrictBool = False
-    outbox_path: str = ""
-    notify_on_execution: StrictBool = True
-    notify_on_lead_order: StrictBool = True
-    notify_on_risk_block: StrictBool = True
-    notify_on_security_alert: StrictBool = True
+class LeadSubscriptionItem(CamelModel):
+    lead_id: int
+    is_enabled: bool = True
+    channels: Optional[list[str]] = None
 
-    @field_validator("webhook_url", "wecom_webhook_url", "dingtalk_webhook_url")
-    @classmethod
-    def validate_webhook(cls, value, info):
-        # GET 返回的固定掩码在 PUT 中表示保留，真正发送前仍再次验证 HTTPS。
-        if is_mask_sentinel(value):
-            return value
-        checked = https_notification_url(value)
-        # 渠道 webhook 只能发往本平台域名：钉钉 URL 一旦存进企业微信字段（或反之），
-        # 发送时会静默走错渠道且界面显示与实际不符，保存时直接拦下。
-        expected_host = {"wecom_webhook_url": "qyapi.weixin.qq.com",
-                         "dingtalk_webhook_url": "oapi.dingtalk.com"}.get(info.field_name)
-        if expected_host and checked and urlsplit(checked).hostname != expected_host:
-            raise ValueError(f"Webhook URL must use host {expected_host}")
-        return checked
 
-    @field_validator("outbox_path")
-    @classmethod
-    def validate_outbox(cls, value):
-        if value:
-            notification_outbox_path(value)
-        return value
+class LeadSubscriptionsUpdate(CamelModel):
+    subscriptions: list[LeadSubscriptionItem]
+
+
+class LeadSubscriptionResponse(CamelModel):
+    id: Optional[int] = None
+    lead_id: int
+    lead_name: str
+    lead_platform: str
+    is_enabled: bool
+    channels: Optional[list[str]] = None
+    has_binding: bool = False
+    binding_count: int = 0
+
+
+class UserPreferencesUpdate(CamelModel):
+    notifications: Optional[NotificationSettings] = None
+    risk_defaults: Optional[RiskDefaults] = None
+
+
+class UserPreferencesResponse(CamelModel):
+    notifications: Optional[NotificationSettings] = None
+    risk_defaults: Optional[RiskDefaults] = None
 
 
 class SettingsUpdate(CamelModel):

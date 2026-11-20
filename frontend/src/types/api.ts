@@ -86,6 +86,7 @@ export interface Lead {
   status?: string | null; openPositionsCount?: number | null; openUnrealizedPnl?: number | null;
   stale?: boolean | null; snapshotAgeSec?: number | null; snapshot?: LeadSnapshot | null;
   positionsKnown?: boolean | null; snapshotIncomplete?: boolean | null;
+  notificationConfig?: NotificationSettings | null;
 }
 export interface PublicDashboardResponse {
   enabled: boolean | null;
@@ -190,6 +191,22 @@ export interface TotpSetup { secret: string; otpauthUri: string; qrSvgDataUri: s
 export interface NotificationTestResponse {
   ok: boolean | null;
   results: Record<string, { ok: boolean | null; error?: string | null; status?: number | null; errcode?: number | null }> | null;
+}
+export interface LeadSubscription {
+  id?: number | null;
+  leadId: number;
+  leadName: string;
+  leadPlatform?: string | null;
+  isEnabled: boolean;
+  channels?: string[] | null;
+  hasBinding: boolean;
+  bindingCount: number;
+}
+export interface UserPreferences {
+  notifications: NotificationSettings | null;
+  riskDefaults?: RiskSettings | null;
+  hasCustomNotifications: boolean;
+  displayUnit: DisplayUnit;
 }
 export interface ValidationIssue {
   loc: (string | number)[]; msg: string; type: string; ctx?: Record<string, string | number>;

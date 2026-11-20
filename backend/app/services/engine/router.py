@@ -35,6 +35,8 @@ from app.models.domain import (
     SystemConfig,
     TradingAccount,
     NotificationOutbox,
+    UserLeadSubscription,
+    UserPreference,
 )
 from app.services.adapters.base import (
     BaseExchangeAdapter,
@@ -61,12 +63,12 @@ from app.services.lead_collector.binance_bapi import (
     source_fill_kind,
     validate_source_fill,
 )
-from app.services.notifier.outbox import enqueue_notification
+from app.services.notifier.outbox import CHANNELS, enqueue_notification
 from app.services.lead_collector.snapshot_clock import (
     closed_interval, event_interval, event_timestamp, snapshot_is_current,
     snapshot_observed_ms, snapshot_source_bound_ms, snapshot_times, source_batch_interval,
 )
-from app.services.notifier.trade import resolve_display_unit, trade_message, trade_sections
+from app.services.notifier.trade import _lead_section, lead_only_message, resolve_display_unit, trade_message, trade_sections
 from app.services.proxy.manager import ProxyManager
 
 logger = logging.getLogger("mirrorquant.router")
@@ -1105,11 +1107,14 @@ class CopyRouter:
                     source = json.loads(delivery.payload_json) if delivery is not None else None
                     # 带单员保证金余额用于把本笔折算到 1000U 本金。
                     source_lead = await db.get(LeadSource, record.lead_id)
+                    rec_owner = getattr(account, "owner_user_id", None)
                     outbox = enqueue_notification(db, config, "MirrorQuant",
                         trade_message(record, account, source, getattr(source_lead, "margin_balance", None),
                                       lead=source_lead,
                                       display_unit=resolve_display_unit(config.get("display_unit"))),
-                        event_type=record.status, execution_id=record.id, event_key=f"execution:{record.id}")
+                        event_type=record.status, execution_id=record.id, event_key=f"execution:{record.id}",
+                        owner_user_id=rec_owner, lead_id=record.lead_id,
+                        destination_type="user" if rec_owner else "system")
                     outboxes.append(outbox)
                     record.notification_state = "pending"
                 else:
@@ -1226,16 +1231,25 @@ class CopyRouter:
             },
         }
         if notify_cfg:
+            owner_user_id = getattr(binding, "owner_user_id", None) or getattr(account, "owner_user_id", None)
+            target_cfg = notify_cfg
+            if owner_user_id:
+                pref = await db.get(UserPreference, owner_user_id)
+                if pref and pref.notifications_json:
+                    try:
+                        target_cfg = {**DEFAULT_SYSTEM_CONFIG["notifications"], **json.loads(pref.notifications_json)}
+                    except (ValueError, TypeError):
+                        target_cfg = notify_cfg
             should_notify = (
                 # 限价单的挂出与失效同属执行结果通知。UNKNOWN 是未定结论，
                 # 投递保持待处理、下一轮会再评估并推送确定结论，不单独推送。
                 # 认领每个绑定基线期最多发生一次，值得单独通知一次。
                 (status in ("EXECUTED", "UNFILLED", "PARTIAL", "LIMIT_PLACED", "LIMIT_EXPIRED",
                             "ADOPTED_POSITION")
-                 and notify_cfg.get("notify_on_execution", True))
+                 and target_cfg.get("notify_on_execution", True))
                 or (
                     _is_guard_outcome(status)
-                    and notify_cfg.get("notify_on_risk_block", True)
+                    and target_cfg.get("notify_on_risk_block", True)
                 )
             )
             if (should_notify and delivery is not None and _is_guard_outcome(status)
@@ -1254,10 +1268,12 @@ class CopyRouter:
                     should_notify = False
             if should_notify:
                 source = json.loads(delivery.payload_json) if delivery is not None else None
-                unit = resolve_display_unit(notify_cfg.get("display_unit"))
+                unit = resolve_display_unit(target_cfg.get("display_unit"))
                 msg = trade_message(rec, account, source, getattr(lead, "margin_balance", None), limit=limit,
                                     lead=lead, position=lead_position_context(db), display_unit=unit)
                 merge_registry = db.info.get("merge_row_ids")
+                dest_type = "user" if owner_user_id else "system"
+                lead_ref_id = lead.id if lead else None
                 if (merge_registry is not None and delivery is not None
                         and status != "ADOPTED_POSITION"):
                     # 记账行立即落盘（与执行记录同事务），只在发送时合并：
@@ -1266,17 +1282,26 @@ class CopyRouter:
                     lead_text, follower_text = trade_sections(
                         rec, account, source, getattr(lead, "margin_balance", None),
                         limit=limit, lead=lead, position=lead_position_context(db), display_unit=unit)
-                    row = enqueue_notification(db, notify_cfg, "MirrorQuant", msg, event_type=status,
+                    row = enqueue_notification(db, target_cfg, "MirrorQuant", msg, event_type=status,
                                                execution_id=rec.id, event_key=f"execution:{rec.id}",
                                                merge_key=delivery.source_event_id,
-                                               lead_section=lead_text, follower_section=follower_text)
+                                               lead_section=lead_text, follower_section=follower_text,
+                                               owner_user_id=owner_user_id,
+                                               lead_id=lead_ref_id,
+                                               destination_type=dest_type)
                     await db.flush()
                     merge_registry.setdefault(delivery.source_event_id, []).append(row.id)
                 else:
                     event_key = f"execution:{rec.id}"
-                    enqueue_notification(db, notify_cfg, "MirrorQuant", msg, event_type=status,
-                                         execution_id=rec.id, event_key=event_key)
+                    enqueue_notification(db, target_cfg, "MirrorQuant", msg, event_type=status,
+                                         execution_id=rec.id, event_key=event_key,
+                                         owner_user_id=owner_user_id,
+                                         lead_id=lead_ref_id,
+                                         destination_type=dest_type)
                 rec.notification_state = "pending"
+                if delivery is not None and delivery.source_event_id:
+                    executed_users = db.info.setdefault("executed_source_users", {})
+                    executed_users.setdefault(delivery.source_event_id, set()).add(owner_user_id)
         await db.commit()  # The execution and notification become visible together.
         await self._emit(payload)
         return rec
@@ -1311,6 +1336,126 @@ class CopyRouter:
             # 避免链路监控把一次通知缺口当成系统异常。
             logger.warning("Merged notification seal failed; rows will send grouped after the seal grace period")
             await db.rollback()
+
+    async def _dispatch_lead_activity_notifications(
+        self,
+        db: AsyncSession,
+        lead: LeadSource,
+        new_source_events: Dict[str, Dict[str, Any]],
+        lead_margin_balance: Any,
+        notify_cfg: Dict[str, Any],
+    ) -> None:
+        """Dispatch notifications triggered by lead activity (the lead's own trades).
+
+        1. If the lead has its own notification config (lead.notification_config_json),
+           send a lead-only notification to the lead's route/webhook.
+        2. If users have subscriptions to this lead (UserLeadSubscription):
+           - For subscribers who had an execution recorded for this event, their notification
+             already includes lead + follower execution sections.
+           - For subscribers who did NOT have an execution recorded, send a lead-only notification
+             via their configured channels.
+        3. If no executions occurred for any follower and no lead channel is configured,
+           send a lead-only notification to the system notification route if notify_on_lead_order is enabled.
+        """
+        if not new_source_events:
+            return
+
+        executed_users_by_event = db.info.get("executed_source_users", {})
+        merge_registry = db.info.setdefault("merge_row_ids", {})
+
+        # 1. Lead's own notification configuration
+        lead_cfg = None
+        if lead.notification_config_json:
+            try:
+                lead_cfg = json.loads(lead.notification_config_json)
+            except (ValueError, TypeError):
+                lead_cfg = None
+
+        has_lead_channel = (
+            lead_cfg is not None
+            and any(bool(lead_cfg.get(f"{ch}_enabled")) for ch in CHANNELS)
+            and lead_cfg.get("notify_on_lead_order", True)
+        )
+
+        # 2. Query active user subscriptions for this lead
+        subs = (await db.scalars(
+            select(UserLeadSubscription).where(
+                UserLeadSubscription.lead_id == lead.id,
+                UserLeadSubscription.is_enabled.is_(True),
+            )
+        )).all()
+
+        for event_id, source in new_source_events.items():
+            executed_users = executed_users_by_event.get(event_id, set())
+
+            # Destination A: Lead's own channel
+            if has_lead_channel:
+                unit = resolve_display_unit(lead_cfg.get("display_unit"))
+                lead_text = lead_only_message(source, lead_margin_balance, lead=lead, display_unit=unit)
+                row = enqueue_notification(
+                    db, lead_cfg, "MirrorQuant", lead_text,
+                    event_type="LEAD_ACTIVITY",
+                    event_key=f"lead:{lead.id}:{event_id}",
+                    merge_key=event_id,
+                    lead_section=lead_text,
+                    follower_section=None,
+                    owner_user_id=None,
+                    lead_id=lead.id,
+                    destination_type="lead",
+                )
+                await db.flush()
+                merge_registry.setdefault(event_id, []).append(row.id)
+
+            # Destination B: User subscriptions
+            for sub in subs:
+                user_id = sub.user_id
+                if user_id in executed_users:
+                    # Follower execution was already recorded and enqueued for this user
+                    continue
+
+                pref = await db.get(UserPreference, user_id)
+                user_cfg = dict(DEFAULT_SYSTEM_CONFIG["notifications"])
+                if pref and pref.notifications_json:
+                    try:
+                        user_cfg.update(json.loads(pref.notifications_json))
+                    except (ValueError, TypeError):
+                        pass
+
+                # Overlay channel-specific subscription overrides if present
+                if sub.channels_json:
+                    try:
+                        sub_ch = json.loads(sub.channels_json)
+                        if isinstance(sub_ch, list):
+                            for ch in CHANNELS:
+                                user_cfg[f"{ch}_enabled"] = (ch in sub_ch) and bool(user_cfg.get(f"{ch}_enabled"))
+                        elif isinstance(sub_ch, dict):
+                            for ch_k, ch_v in sub_ch.items():
+                                if isinstance(ch_v, dict) and ch_k in user_cfg:
+                                    user_cfg[ch_k] = {**user_cfg[ch_k], **ch_v}
+                                else:
+                                    user_cfg[ch_k] = ch_v
+                    except (ValueError, TypeError):
+                        pass
+
+                has_user_channel = any(bool(user_cfg.get(f"{ch}_enabled")) for ch in CHANNELS)
+                if not has_user_channel or not user_cfg.get("notify_on_lead_order", True):
+                    continue
+
+                unit = resolve_display_unit(user_cfg.get("display_unit"))
+                lead_text = lead_only_message(source, lead_margin_balance, lead=lead, display_unit=unit)
+                row = enqueue_notification(
+                    db, user_cfg, "MirrorQuant", lead_text,
+                    event_type="LEAD_ACTIVITY",
+                    event_key=f"user_sub:{user_id}:{lead.id}:{event_id}",
+                    merge_key=event_id,
+                    lead_section=lead_text,
+                    follower_section=None,
+                    owner_user_id=user_id,
+                    lead_id=lead.id,
+                    destination_type="user",
+                )
+                await db.flush()
+                merge_registry.setdefault(event_id, []).append(row.id)
 
     def _source_interval(self, order):
         start, end = event_timestamp(order.get("orderTime")), event_timestamp(order.get("orderUpdateTime"))
@@ -1822,9 +1967,11 @@ class CopyRouter:
             return
         if not snapshot_is_current(snapshot, latest):
             return
+        is_initial_sync = (lead.seen_order_keys_json is None)
         seen_keys = list(json.loads(lead.seen_order_keys_json or "[]"))
         seen_closed = list(json.loads(lead.seen_closed_ids_json or "[]"))
         old_seen = set(seen_keys)
+        new_source_events: Dict[str, Dict[str, Any]] = {}
         expanded_orders = sorted([expand_slim_order(o) for o in raw_orders],
             key=lambda o: (self._source_timestamp(o), order_dedup_key(o)))
         bindings = (await db.scalars(select(CopyBinding).where(CopyBinding.lead_id == lead.id)
@@ -1905,6 +2052,7 @@ class CopyRouter:
                     batch["_source_key"] = key
                     db.add(BindingDelivery(binding_id=binding.id, source_event_id=event_id,
                         source_sequence=max(start, sequence), payload_json=json.dumps(batch), state="PENDING"))
+                    new_source_events[event_id] = batch
                 progress.cumulative_qty, progress.cumulative_notional = str(cumulative), str(notional)
             # Historical closures cannot authorize closing a subsequently reopened cycle.
             if not baseline:
@@ -1912,11 +2060,41 @@ class CopyRouter:
                     cid = str(closed.get("id") or closed.get("positionId") or "")
                     if cid and cid not in seen_closed:
                         event_id = "closed:" + cid
+                        payload_closed = {"_closed": closed, "_event_id": event_id}
                         if await db.get(BindingDelivery, (binding.id, event_id)) is None:
                             db.add(BindingDelivery(binding_id=binding.id, source_event_id=event_id,
                                 source_sequence=event_timestamp(closed.get("closed")) or 0,
-                                payload_json=json.dumps({"_closed": closed, "_event_id": event_id}), state="PENDING"))
+                                payload_json=json.dumps(payload_closed), state="PENDING"))
+                        new_source_events[event_id] = payload_closed
             binding.baseline_seeded = True
+        if not is_initial_sync:
+            for order in expanded_orders:
+                key = order_dedup_key(order)
+                if key not in old_seen:
+                    try:
+                        cumulative, price = validate_source_fill(order.get("executedQty"), order.get("avgPrice"))
+                        event_id = key + ":" + str(cumulative)
+                        if event_id not in new_source_events:
+                            start, sequence = self._source_interval(order)
+                            notional = cumulative * price
+                            updated = {**order, "orderTime": start, "orderUpdateTime": sequence,
+                                       "executedQty": str(cumulative), "avgPrice": str(price)}
+                            batches = sorted(group_orders_into_batches([updated]),
+                                             key=lambda b: (b.get("startTime", 0), b.get("endTime", 0), b.get("key", "")))
+                            for batch in batches:
+                                batch.update(qty=str(cumulative), qtyExact=str(cumulative),
+                                             notional=str(notional), notionalExact=str(notional),
+                                             avgPrice=str(price), _event_id=event_id,
+                                             _source_time_ms=sequence, _source_start_ms=start, _source_key=key)
+                                new_source_events[event_id] = batch
+                    except Exception:
+                        pass
+            for closed in raw_closed:
+                cid = str(closed.get("id") or closed.get("positionId") or "")
+                if cid and cid not in seen_closed:
+                    event_id = "closed:" + cid
+                    if event_id not in new_source_events:
+                        new_source_events[event_id] = {"_closed": closed, "_event_id": event_id}
         for order in expanded_orders:
             key = order_dedup_key(order)
             if key not in old_seen:
@@ -2145,6 +2323,12 @@ class CopyRouter:
                     account.status, account.last_error = "error", redact_proxy_userinfo(str(exc))[:400]
                     await db.commit()
         finally:
+            try:
+                await self._dispatch_lead_activity_notifications(
+                    db, lead, new_source_events, lead_margin_balance, notify_cfg
+                )
+            except Exception:
+                logger.exception("Failed to dispatch lead activity notifications for lead %s", getattr(lead, "id", None))
             await self._seal_merged_notifications(db)
 
     async def _execute_batch_for_binding(

@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select, text
 
-from app.api import accounts, auth, bindings, dashboard, leads, proxies, settings as settings_api, ws
+from app.api import accounts, auth, bindings, dashboard, leads, notifications, proxies, settings as settings_api, ws
 from app.core.config import get_settings
 from app.core.database import get_session_factory, init_db
 from app.core.version import get_app_version
@@ -102,6 +102,7 @@ def create_app() -> FastAPI:
     app.include_router(bindings.router)
     app.include_router(proxies.router)
     app.include_router(settings_api.router)
+    app.include_router(notifications.router)
     app.include_router(ws.router)
 
     @app.get("/api/health")

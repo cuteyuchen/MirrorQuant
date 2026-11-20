@@ -446,12 +446,33 @@ def _follower_section(record, account, limit: Optional[dict] = None,
 def trade_sections(record, account, source: Optional[dict] = None, lead_margin: Any = None,
                    limit: Optional[dict] = None, lead: Any = None,
                    position: Optional[dict] = None,
-                   display_unit: str = DEFAULT_DISPLAY_UNIT) -> tuple[str, str]:
+                   display_unit: str = DEFAULT_DISPLAY_UNIT) -> tuple[str, Optional[str]]:
     """Render the lead leg and one account's outcome separately for merged delivery."""
     source = source or {}
     display_unit = resolve_display_unit(display_unit)
-    return (_lead_section(record, source, lead_margin, lead, position, display_unit),
-            _follower_section(record, account, limit, display_unit))
+    lead_part = _lead_section(record, source, lead_margin, lead, position, display_unit)
+    follower_part = (
+        _follower_section(record, account, limit, display_unit)
+        if record is not None and account is not None
+        else None
+    )
+    return lead_part, follower_part
+
+
+def lead_only_message(source: Any = None, lead_margin: Any = None, lead: Any = None,
+                      position: Optional[dict] = None,
+                      display_unit: str = DEFAULT_DISPLAY_UNIT) -> str:
+    """Render only the lead trader's activity with no follower or order-following info.
+
+    Accepts either (source, lead_margin, lead=lead, ...) or (lead, source, lead_margin, ...).
+    """
+    if isinstance(source, (dict, type(None))) and not isinstance(lead_margin, dict):
+        pass  # called as (source, lead_margin, lead=..., ...)
+    elif isinstance(lead_margin, dict):
+        # called as (lead, source, lead_margin, ...)
+        lead, source, lead_margin = source, lead_margin, lead
+    display_unit = resolve_display_unit(display_unit)
+    return _lead_section(None, source, lead_margin=lead_margin, lead=lead, position=position, display_unit=display_unit)
 
 
 def trade_message(record, account, source: Optional[dict] = None, lead_margin: Any = None,
@@ -459,13 +480,18 @@ def trade_message(record, account, source: Optional[dict] = None, lead_margin: A
                   position: Optional[dict] = None,
                   display_unit: str = DEFAULT_DISPLAY_UNIT) -> str:
     """One durable message per account outcome, with the independent lead leg first."""
-    lead, follower = trade_sections(record, account, source, lead_margin, limit, lead, position, display_unit)
-    return f"{lead}\n\n{follower}"
+    lead_text, follower = trade_sections(record, account, source, lead_margin, limit, lead, position, display_unit)
+    if follower is None:
+        return lead_text
+    return f"{lead_text}\n\n{follower}"
 
 
 def merged_trade_message(lead: str, followers: list) -> str:
     """One message per lead event: the lead leg once, then every bound account's outcome below."""
-    return "\n\n".join([lead, *followers])
+    valid_followers = [f for f in followers if isinstance(f, str) and f.strip()]
+    if not valid_followers:
+        return lead
+    return "\n\n".join([lead, *valid_followers])
 
 
 def _is_opening(side: Any, direction: Any) -> bool:

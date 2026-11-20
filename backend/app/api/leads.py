@@ -15,12 +15,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_current_admin, get_current_user, record_audit
 from app.api.exposure import require_binding_flat
 from app.core.database import get_db
-from app.core.secret_mask import mask_sensitive_payload, redact_error_urls
+from app.core.secret_mask import NOTIFICATION_SECRET_FIELDS, mask_sensitive_payload, merge_secrets, redact_error_urls
 from app.models.domain import CopyBinding, LeadSource, ProxyNode, User
 from app.schemas.api import LeadCreate, LeadUpdate
 from app.services.engine.orchestrator import orchestrator
 from app.services.engine.serialization import serialized_execution
 from app.services.lead_collector.binance_bapi import BinanceBapiCollector
+from app.services.notifier.service import NotificationService
+from app.services.notifier.trade import resolve_display_unit
 from app.services.proxy.manager import ProxyEgressError, ProxyManager
 
 router = APIRouter(prefix="/api/leads", tags=["leads"])
@@ -36,6 +38,13 @@ def _lead_summary(lead: LeadSource) -> dict:
             open_pos = snap.get("openPositions") or []
             open_count = len(open_pos)
             total_upnl = float((snap.get("openPositionsSummary") or {}).get("totalUnrealizedPnl") or 0.0)
+        except Exception:
+            pass
+    notify_cfg = None
+    if lead.notification_config_json:
+        try:
+            raw_cfg = json.loads(lead.notification_config_json)
+            notify_cfg = mask_sensitive_payload(raw_cfg)
         except Exception:
             pass
     return {
@@ -58,6 +67,7 @@ def _lead_summary(lead: LeadSource) -> dict:
         "status": lead.status,
         "openPositionsCount": open_count,
         "openUnrealizedPnl": round(total_upnl, 2),
+        "notificationConfig": notify_cfg,
     }
 
 
@@ -83,6 +93,10 @@ async def create_lead(
     if existing:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Portfolio ID already registered")
 
+    notify_json = None
+    if payload.notification_config is not None:
+        notify_json = json.dumps(payload.notification_config.model_dump())
+
     lead = LeadSource(
         name=payload.name.strip(),
         platform=payload.platform,
@@ -92,6 +106,8 @@ async def create_lead(
         proxy_id=payload.proxy_id,
         is_enabled=payload.is_enabled,
         is_public_dashboard=payload.is_public_dashboard,
+        notification_config_json=notify_json,
+        created_by_user_id=current_user.id,
     )
     db.add(lead)
     await db.flush()
@@ -117,6 +133,20 @@ async def update_lead(
         raise HTTPException(status_code=404, detail="Lead not found")
 
     data = payload.model_dump(exclude_unset=True)
+    if "notification_config" in data:
+        cfg = data.pop("notification_config")
+        if cfg is not None:
+            existing = {}
+            if lead.notification_config_json:
+                try:
+                    existing = json.loads(lead.notification_config_json)
+                except Exception:
+                    pass
+            new_cfg = merge_secrets(existing, cfg, NOTIFICATION_SECRET_FIELDS)
+            lead.notification_config_json = json.dumps(new_cfg)
+        else:
+            lead.notification_config_json = None
+
     previous_proxy_id = lead.proxy_id
     for k, v in data.items():
         setattr(lead, k, v)
@@ -128,6 +158,40 @@ async def update_lead(
         await BinanceBapiCollector.close_proxy_clients(previous_proxy.url if previous_proxy else None)
     await db.refresh(lead)
     return {"item": _lead_summary(lead)}
+
+
+@router.post("/{lead_id}/test-notify")
+async def test_lead_notification(
+    lead_id: int,
+    db: AsyncSession = Depends(get_db),
+    _user: User = Depends(get_current_admin),
+):
+    lead = await db.get(LeadSource, lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    if not lead.notification_config_json:
+        raise HTTPException(status_code=400, detail="Lead has no notification configuration")
+    try:
+        cfg = json.loads(lead.notification_config_json)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid notification configuration")
+    unit = resolve_display_unit(cfg.get("display_unit"))
+    size_line = "💰 均价 100000"
+    if unit != "notional":
+        size_line += " ｜ 数量 0.05"
+    if unit != "quantity":
+        size_line += " ｜ 金额 5,000.00 U"
+    res = await NotificationService.dispatch(
+        cfg,
+        title=f"MirrorQuant - {lead.name} 测试",
+        message=(f"【{lead.name}】\n"
+                 f"🟢 带单 开多/加多 ｜ BTCUSDT ｜ 做多\n"
+                 f"{size_line}\n"
+                 "🧮 1000U 本金 ≈ 开 100.00 U ｜ 建议杠杆 2x\n\n"
+                 f"✅ 带单员【{lead.name}】专属通知渠道连接正常（以上为示例数据）"),
+        event_type="test",
+    )
+    return {"ok": True, "results": res}
 
 
 @router.delete("/{lead_id}")

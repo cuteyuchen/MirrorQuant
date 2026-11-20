@@ -1,7 +1,7 @@
 import { defineStore } from "pinia";
 import { shallowRef } from "vue";
 import { api, ApiError, CancelledRequestError } from "@/api/client";
-import type { Account, AuditLog, BindingsResponse, DashboardBoard, IntentsResponse, Lead, LeadSnapshot, ListResponse, OrderIntent, ProxyNode, SecurityGuard, SettingsResponse } from "@/types/api";
+import type { Account, AuditLog, BindingsResponse, DashboardBoard, IntentsResponse, Lead, LeadSnapshot, LeadSubscription, ListResponse, OrderIntent, ProxyNode, SecurityGuard, SettingsResponse, UserPreferences } from "@/types/api";
 
 interface CacheEntry<T> { data: T; fetchedAt: number }
 // 列表缺失与真实空列表不同，失败时保留上次缓存并让页面显示错误态。
@@ -20,6 +20,8 @@ export const useDataCacheStore = defineStore("dataCache", () => {
   const settings = shallowRef<CacheEntry<SettingsResponse> | null>(null);
   const auditLogs = shallowRef<CacheEntry<AuditLog[]> | null>(null);
   const securityGuards = shallowRef<CacheEntry<SecurityGuard[]> | null>(null);
+  const subscriptions = shallowRef<CacheEntry<LeadSubscription[]> | null>(null);
+  const userPreferences = shallowRef<CacheEntry<UserPreferences> | null>(null);
   const inflight = new Map<string, Promise<unknown>>();
   const sequences = new Map<string, number>();
   let generation = 0;
@@ -71,6 +73,8 @@ export const useDataCacheStore = defineStore("dataCache", () => {
   const fetchAuditLogs = (force = false, ttlMs = 20000) => load("auditLogs", () => auditLogs.value, value => { auditLogs.value = value; }, async () => requireItems(await api.get<ListResponse<AuditLog>>("/api/settings/audit-logs?limit=50")), force, ttlMs);
   const fetchSecurityGuards = (force = false, ttlMs = 15000) => load("securityGuards", () => securityGuards.value, value => { securityGuards.value = value; }, async () => requireItems(await api.get<ListResponse<SecurityGuard>>("/api/settings/security-guards")), force, ttlMs);
   const fetchLeadSnapshot = (id: number, force = false, ttlMs = 10000) => load(`lead_${id}`, () => leadSnapshots.value[id], value => { leadSnapshots.value = { ...leadSnapshots.value, [id]: value }; }, async () => (await api.get<{ snapshot: LeadSnapshot | null }>(`/api/leads/${id}/snapshot`)).snapshot, force, ttlMs);
+  const fetchSubscriptions = (force = false, ttlMs = 12000) => load("subscriptions", () => subscriptions.value, value => { subscriptions.value = value; }, async () => requireItems(await api.get<ListResponse<LeadSubscription>>("/api/notifications/subscriptions")), force, ttlMs);
+  const fetchUserPreferences = (force = false, ttlMs = 20000) => load("userPreferences", () => userPreferences.value, value => { userPreferences.value = value; }, () => api.get<UserPreferences>("/api/notifications/preferences"), force, ttlMs);
   function clearAll() {
     // 登出作废全部在途结果，不允许已退出账户的数据重新进入缓存。
     generation++;
@@ -78,6 +82,7 @@ export const useDataCacheStore = defineStore("dataCache", () => {
     board.value = null; intents.value = null; leads.value = null; leadSnapshots.value = {}; accounts.value = null;
     bindings.value = null; proxies.value = null; settings.value = null;
     auditLogs.value = null; securityGuards.value = null;
+    subscriptions.value = null; userPreferences.value = null;
   }
-  return { board, intents, leads, leadSnapshots, accounts, bindings, proxies, settings, auditLogs, securityGuards, isFresh, fetchBoard, fetchIntents, fetchLeads, fetchLeadSnapshot, fetchAccounts, fetchBindings, fetchProxies, fetchSettings, fetchAuditLogs, fetchSecurityGuards, clearAll };
+  return { board, intents, leads, leadSnapshots, accounts, bindings, proxies, settings, auditLogs, securityGuards, subscriptions, userPreferences, isFresh, fetchBoard, fetchIntents, fetchLeads, fetchLeadSnapshot, fetchAccounts, fetchBindings, fetchProxies, fetchSettings, fetchAuditLogs, fetchSecurityGuards, fetchSubscriptions, fetchUserPreferences, clearAll };
 });

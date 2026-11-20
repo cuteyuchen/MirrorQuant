@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { ref, watch } from "vue";
+import { onMounted, ref, watch } from "vue";
 import { Send } from "lucide-vue-next";
-import type { NotificationSettings, NotificationTestResponse } from "@/types/api";
+import type { LeadSubscription, NotificationSettings, NotificationTestResponse } from "@/types/api";
 import { api } from "@/api/client";
 import { useAsyncAction } from "@/composables/useAsyncAction";
 import { useI18n } from "@/i18n";
@@ -11,6 +11,42 @@ const emit = defineEmits<{ "update:modelValue": [value: NotificationSettings] }>
 const { t } = useI18n();
 const { pending, error, run } = useAsyncAction();
 const results = ref<NotificationTestResponse["results"]>(null);
+
+const subscriptions = ref<LeadSubscription[]>([]);
+const subscriptionsLoading = ref(false);
+const subPending = ref(false);
+
+async function loadSubscriptions() {
+  subscriptionsLoading.value = true;
+  try {
+    const res = await api.get<{ items: LeadSubscription[] }>("/api/notifications/subscriptions");
+    subscriptions.value = res.items || [];
+  } catch {
+    // Keep empty on error
+  } finally {
+    subscriptionsLoading.value = false;
+  }
+}
+
+async function toggleSubscription(sub: LeadSubscription, enabled: boolean) {
+  subPending.value = true;
+  const original = sub.isEnabled;
+  sub.isEnabled = enabled;
+  try {
+    const res = await api.put<{ items: LeadSubscription[] }>("/api/notifications/subscriptions", {
+      subscriptions: [{ leadId: sub.leadId, isEnabled: enabled }],
+    });
+    subscriptions.value = res.items || [];
+  } catch {
+    sub.isEnabled = original;
+  } finally {
+    subPending.value = false;
+  }
+}
+
+onMounted(() => {
+  void loadSubscriptions();
+});
 // 修改配置后清掉旧测试结果，避免把上一份配置的成功当成当前状态。
 watch(() => props.modelValue, () => { results.value = null; error.value = ""; }, { deep: true });
 // optional 的字段可以留空（如钉钉加签密钥）；hint 说明该渠道怎样才收得到消息。
@@ -81,5 +117,39 @@ async function test() {
         </div>
       </div>
     </details>
+
+    <div class="mt-6 rounded-lg border border-border/60 bg-surface p-4 space-y-4">
+      <div>
+        <h3 class="text-sm font-semibold text-foreground">{{ t("set.subscriptionsTitle") }}</h3>
+        <p class="text-xs text-muted mt-1">{{ t("set.subscriptionsHint") }}</p>
+      </div>
+      <div v-if="subscriptionsLoading" class="text-xs text-muted">{{ t("common.loading") }}</div>
+      <div v-else-if="!subscriptions.length" class="text-xs text-muted">{{ t("set.subEmpty") }}</div>
+      <div v-else class="divide-y divide-border/40">
+        <div v-for="sub in subscriptions" :key="sub.leadId" class="flex items-center justify-between py-2.5">
+          <div class="min-w-0 pr-3">
+            <div class="flex items-center gap-2">
+              <span class="text-sm font-medium text-foreground truncate">{{ sub.leadName }}</span>
+              <span
+                class="inline-flex items-center px-1.5 py-0.5 rounded text-[11px] font-normal"
+                :class="sub.hasBinding ? 'bg-success/15 text-success' : 'bg-surface-elevated text-muted'"
+              >
+                {{ t(sub.hasBinding ? "set.subCopying" : "set.subWatching") }}
+              </span>
+            </div>
+            <div v-if="sub.leadPlatform" class="text-xs text-muted mt-0.5">{{ sub.leadPlatform }}</div>
+          </div>
+          <label class="flex items-center gap-2 cursor-pointer text-sm">
+            <input
+              type="checkbox"
+              :checked="sub.isEnabled"
+              :disabled="subPending"
+              @change="toggleSubscription(sub, ($event.target as HTMLInputElement).checked)"
+            />
+            <span class="text-xs text-muted">{{ t(sub.isEnabled ? "common.enable" : "common.disable") }}</span>
+          </label>
+        </div>
+      </div>
+    </div>
   </section>
 </template>

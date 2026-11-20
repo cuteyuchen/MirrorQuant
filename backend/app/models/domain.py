@@ -41,6 +41,32 @@ class User(Base):
     last_login_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class UserPreference(Base):
+    __tablename__ = "user_preferences"
+
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    notifications_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    risk_defaults_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+
+class UserLeadSubscription(Base):
+    __tablename__ = "user_lead_subscriptions"
+    __table_args__ = (UniqueConstraint("user_id", "lead_id", name="uq_user_lead_subscription"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    lead_id: Mapped[int] = mapped_column(Integer, ForeignKey("lead_sources.id", ondelete="CASCADE"), nullable=False, index=True)
+    channels_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+
 class LoginAttemptGuard(Base):
     __tablename__ = "login_attempt_guards"
 
@@ -105,6 +131,10 @@ class LeadSource(Base):
     closed_cache_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     seen_order_keys_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     seen_closed_ids_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    notification_config_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_by_user_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
@@ -120,6 +150,9 @@ class TradingAccount(Base):
     __tablename__ = "trading_accounts"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_user_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
     name: Mapped[str] = mapped_column(String(120), nullable=False)
     exchange: Mapped[str] = mapped_column(String(32), nullable=False)  # okx | binance | bybit | bitget
     environment: Mapped[str] = mapped_column(String(16), default="demo", nullable=False)  # demo | live
@@ -162,6 +195,9 @@ class CopyBinding(Base):
     __table_args__ = (UniqueConstraint("lead_id", "account_id", name="uq_binding_lead_account"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_user_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
     name: Mapped[str] = mapped_column(String(120), nullable=False)
     lead_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("lead_sources.id", ondelete="CASCADE"), nullable=False
@@ -415,6 +451,9 @@ class NotificationOutbox(Base):
     event_key: Mapped[Optional[str]] = mapped_column(String(160), nullable=True, index=True)
     status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False, index=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    owner_user_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    lead_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    destination_type: Mapped[Optional[str]] = mapped_column(String(32), default="system", nullable=True, index=True)
     last_error: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     next_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     # Expiring claims permit recovery after a worker dies during delivery.
@@ -429,6 +468,12 @@ def _index_notification_payload(_mapper, _connection, row) -> None:
         payload = json.loads(row.payload)
         row.execution_id = payload.get("execution_id") if type(payload.get("execution_id")) is int else None
         row.event_key = payload.get("event_key") if isinstance(payload.get("event_key"), str) else None
+        if row.owner_user_id is None and type(payload.get("owner_user_id")) is int:
+            row.owner_user_id = payload["owner_user_id"]
+        if row.lead_id is None and type(payload.get("lead_id")) is int:
+            row.lead_id = payload["lead_id"]
+        if row.destination_type is None and isinstance(payload.get("destination_type"), str):
+            row.destination_type = payload["destination_type"]
     except (ValueError, TypeError, AttributeError):
         row.execution_id = row.event_key = None
 

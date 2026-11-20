@@ -15,7 +15,7 @@ from app.api.exposure import require_binding_flat
 from app.core.config import get_settings
 from app.core.database import DEFAULT_SYSTEM_CONFIG, get_db
 from app.core.secret_mask import NOTIFICATION_SECRET_FIELDS, mask_sensitive_payload, merge_secrets, redact_error_urls
-from app.models.domain import AuditLog, CopyBinding, LoginAttemptGuard, SystemConfig, User
+from app.models.domain import AuditLog, CopyBinding, LoginAttemptGuard, SystemConfig, User, UserPreference
 from app.schemas.api import RiskDefaults, SettingsUpdate
 from app.services.notifier.service import NotificationService
 from app.services.notifier.trade import resolve_display_unit
@@ -145,7 +145,14 @@ async def test_notification(
     db: AsyncSession = Depends(get_db),
     _user: User = Depends(get_current_admin),
 ):
-    cfg = await _load_cfg(db, "notifications") or {}
+    pref = await db.get(UserPreference, _user.id)
+    if pref and pref.notifications_json:
+        try:
+            cfg = json.loads(pref.notifications_json)
+        except Exception:
+            cfg = await _load_cfg(db, "notifications") or {}
+    else:
+        cfg = await _load_cfg(db, "notifications") or {}
     unit = resolve_display_unit(cfg.get("display_unit"))
     size_line = "💰 均价 100000"
     if unit != "notional":

@@ -4,7 +4,7 @@ import json
 import logging
 from typing import AsyncGenerator, Dict, List, Tuple
 
-from sqlalchemy import event, select, text
+from sqlalchemy import event, select, text, update
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -187,7 +187,17 @@ SQLITE_MIGRATIONS: Dict[str, List[Tuple[str, str]]] = {
                       ("expires_at_ms", "BIGINT"),
                       ("limit_px", "VARCHAR(100)"),
                       ("sizing_px", "VARCHAR(100)")],
-    "notification_outbox": [("execution_id", "INTEGER"), ("event_key", "VARCHAR(160)")],
+    "lead_sources": [
+        ("notification_config_json", "TEXT"),
+        ("created_by_user_id", "INTEGER"),
+    ],
+    "notification_outbox": [
+        ("execution_id", "INTEGER"),
+        ("event_key", "VARCHAR(160)"),
+        ("owner_user_id", "INTEGER"),
+        ("lead_id", "INTEGER"),
+        ("destination_type", "VARCHAR(32)"),
+    ],
     "binding_debts": [("pending_usd_exact", "VARCHAR(100)")],
     "users": [
         ("session_version", "INTEGER NOT NULL DEFAULT 0"),
@@ -200,6 +210,7 @@ SQLITE_MIGRATIONS: Dict[str, List[Tuple[str, str]]] = {
         ("day_start_equity", "FLOAT NOT NULL DEFAULT 0.0"),
         ("day_start_date", "VARCHAR(16)"),
         ("clock_offset_ms", "INTEGER NOT NULL DEFAULT 0"),
+        ("owner_user_id", "INTEGER"),
     ],
     "copy_bindings": [
         ("enable_circuit_breaker", "BOOLEAN NOT NULL DEFAULT 1"),
@@ -221,6 +232,7 @@ SQLITE_MIGRATIONS: Dict[str, List[Tuple[str, str]]] = {
         ("adopt_existing_positions", "BOOLEAN NOT NULL DEFAULT 1"),
         ("adopt_tolerance_pct", "FLOAT NOT NULL DEFAULT 10.0"),
         ("adoption_completed", "BOOLEAN NOT NULL DEFAULT 0"),
+        ("owner_user_id", "INTEGER"),
     ],
 }
 
@@ -270,6 +282,9 @@ def _apply_sqlite_migrations(sync_conn) -> None:
     # create_all 不会为既有表补索引，升级时显式且幂等创建。
     for table, column in (("order_intents", "reporting_complete"),
                           ("notification_outbox", "execution_id"), ("notification_outbox", "event_key"),
+                          ("notification_outbox", "owner_user_id"), ("notification_outbox", "lead_id"),
+                          ("notification_outbox", "destination_type"),
+                          ("trading_accounts", "owner_user_id"), ("copy_bindings", "owner_user_id"),
                           ("notification_outbox", "created_at"), ("login_attempt_guards", "updated_at")):
         if column in {row[1] for row in sync_conn.execute(text(f"PRAGMA table_info({table})"))}:
             sync_conn.execute(text(f"CREATE INDEX IF NOT EXISTS ix_{table}_{column} ON {table} ({column})"))
@@ -308,4 +323,31 @@ async def init_db() -> None:
                             existing.value_json = json.dumps(merged, ensure_ascii=False)
                 except Exception:
                     pass
+
+        # Backfill default admin's ownership and preferences if admin exists
+        first_admin = await session.scalar(
+            select(domain.User).where(domain.User.role == "admin").order_by(domain.User.id)
+        )
+        if first_admin is not None:
+            await session.execute(
+                update(domain.TradingAccount)
+                .where(domain.TradingAccount.owner_user_id.is_(None))
+                .values(owner_user_id=first_admin.id)
+            )
+            await session.execute(
+                update(domain.CopyBinding)
+                .where(domain.CopyBinding.owner_user_id.is_(None))
+                .values(owner_user_id=first_admin.id)
+            )
+            admin_pref = await session.get(domain.UserPreference, first_admin.id)
+            if admin_pref is None:
+                notify_cfg = await session.scalar(
+                    select(domain.SystemConfig).where(domain.SystemConfig.key == "notifications")
+                )
+                session.add(
+                    domain.UserPreference(
+                        user_id=first_admin.id,
+                        notifications_json=notify_cfg.value_json if notify_cfg else "{}",
+                    )
+                )
         await session.commit()
