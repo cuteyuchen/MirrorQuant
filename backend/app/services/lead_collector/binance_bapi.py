@@ -375,6 +375,27 @@ def snapshot_positions_observed_ms(snapshot: Dict[str, Any]) -> Optional[float]:
     return event_timestamp(observed) if type(observed) in (int, float) else None
 
 
+def _closed_row_identifies_position(row: Dict[str, Any], position: Dict[str, Any], qty: Decimal) -> bool:
+    """A closed-history row identifies the very cycle that held a vanished leg.
+
+    The holdings endpoint can lag a real close: the last snapshot still shows
+    the leg after it closed, so the close predates the observation cutoff and
+    the time window alone rejects it. In that case the row's average cost
+    identifies the cycle — it must match the leg's average entry to within
+    float noise and its peak quantity must cover the leg. An old cycle reopened
+    at a different price cannot match, and a row without an average cost or a
+    peak quantity cannot identify the leg at all.
+    """
+    entry = fnum(position.get("avgEntry"))
+    cost = fnum(row.get("avgCost"))
+    peak = fnum(row.get("maxQty"))
+    if entry is None or cost is None or peak is None:
+        return False
+    if not math.isclose(cost, entry, rel_tol=1e-6, abs_tol=1e-9):
+        return False
+    return exact(peak) >= qty
+
+
 def positions_have_close_evidence(
     positions: Sequence[Dict[str, Any]],
     orders: Sequence[Dict[str, Any]],
@@ -385,7 +406,9 @@ def positions_have_close_evidence(
 
     Old cycles, partial reductions and another symbol's close cannot explain an
     empty account. Use order creation time so a cumulative partial close updated
-    after the snapshot cannot count its previously executed quantity again.
+    after the snapshot cannot count its previously executed quantity again. A
+    closed row may also identify the leg by average cost when the holdings
+    endpoint lagged the real close (see _closed_row_identifies_position).
     """
     if not positions:
         return False
@@ -402,8 +425,9 @@ def positions_have_close_evidence(
         if any(
             row.get("symbol") == symbol
             and str(row.get("side") or row.get("positionSide") or "").upper() == side
-            and (interval := closed_interval(row)) is not None and interval[1] > cutoff
+            and (interval := closed_interval(row)) is not None
             and (opened is None or interval[0] <= opened)
+            and (interval[1] > cutoff or _closed_row_identifies_position(row, position, qty))
             for row in closed_rows
         ):
             continue

@@ -324,6 +324,36 @@ async def test_old_closed_cycle_cannot_explain_reopened_position(collector):
 
 
 @pytest.mark.asyncio
+async def test_lagged_close_identified_by_average_cost_verifies_empty(collector):
+    # The holdings endpoint lagged the real close: the close predates the last
+    # observation, so the time window alone rejects it. The closed row is the
+    # very cycle that held the leg — its average cost matches the leg's average
+    # entry and its peak quantity covers the leg — so the empty read is real.
+    closed = {"symbol": "BTCUSDT", "side": "LONG", "opened": NOW_MS - 40_000, "closed": NOW_MS - 2_000,
+              "avgCost": "100", "maxQty": "3"}
+    snapshot = await collector.sync_snapshot("lead", {}, [closed], with_analysis=False,
+                                             previous_snapshot=previous_snapshot())
+    assert snapshot["openPositions"] == [] and is_authoritative_snapshot(snapshot)
+    assert snapshot["openPositionsMeta"]["emptyVerified"] is True
+    collector.fetch_holdings.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("avg_cost,max_qty", [
+    ("90", "3"),   # different average cost: another cycle at another price
+    ("100", "1"),  # peak quantity does not cover the leg
+    (None, "3"),   # no average cost: cannot identify the cycle
+])
+async def test_close_row_that_does_not_identify_the_leg_cannot_verify_empty(collector, avg_cost, max_qty):
+    closed = {"symbol": "BTCUSDT", "side": "LONG", "opened": NOW_MS - 40_000, "closed": NOW_MS - 2_000,
+              "avgCost": avg_cost, "maxQty": max_qty}
+    snapshot = await collector.sync_snapshot("lead", {}, [closed], with_analysis=False,
+                                             previous_snapshot=previous_snapshot())
+    assert snapshot["openPositions"] and not is_authoritative_snapshot(snapshot)
+    assert collector.fetch_holdings.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_empty_holdings_without_previous_positions_is_authoritative(collector):
     snapshot = await collector.sync_snapshot("lead", {}, [], with_analysis=False, previous_snapshot=previous_snapshot(positions=[]))
     assert snapshot["openPositions"] == [] and is_authoritative_snapshot(snapshot)
