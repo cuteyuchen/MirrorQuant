@@ -2501,14 +2501,11 @@ class CopyRouter:
                 details="Account has unresolved orders; increases suspended", notify_cfg=notify_cfg)
             return
 
-        if await self._has_resting(db, binding.id, inst_id, local_pos_side):
-            # 同方向已有限价单在等待成交：不叠加新单，避免挂单与新开仓合计超出仓位/杠杆预算。
-            await self._record_execution(db, binding, lead, account, symbol, inst_id, side, ps, action,
-                "BLOCKED_RESTING_LIMIT", lead_qty, lead_avg_px, lead_notional,
-                details="A resting limit order for this position is still open; new entry not stacked",
-                notify_cfg=notify_cfg)
-            return
-
+        # 加仓限价单允许叠加：每笔加仓按带单员的加仓量独立计算数量、独立挂单，
+        # 多笔都成交时合计正好等于带单员的合计加仓量。逐笔保证金仍按现有逻辑
+        # 检查，成交时交易所强制保证金。不要在这里用 _has_resting 拦截——
+        # 2026-11-21 实测：熬鹰 ZEC 三笔加仓，第二笔挂单后第三笔被挡，
+        # 用户明确要求多笔限价单可以同时在簿。
         allocations = (await db.scalars(select(PositionAllocation).where(PositionAllocation.account_id == account.id))).all()
         physical = {(p.inst_id, p.pos_side): exact(p.pos) for p in positions}
         claimed = {}

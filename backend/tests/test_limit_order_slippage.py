@@ -14,19 +14,38 @@ from test_router_remediations import NOW_MS, OfflineExchange, execute_batch, tra
 
 
 class LimitExchange(OfflineExchange):
-    """卖一价可调的离线交易所：限价单默认停在簿上，可模拟成交与撤单。"""
+    """卖一价可调的离线交易所：限价单默认停在簿上，可模拟成交与撤单。
+
+    查单按 cl_ord_id 逐单返回状态（已成功撤单的单报 canceled，未撤的报共享
+    state），多笔在簿限价单的场景下才不会互相串状态：若用全局 state，
+    撤掉第一笔后第二笔也会被误读成 canceled，测不出“只撤一笔”的回归。
+    """
 
     def __init__(self, ask=103.0):
         super().__init__(fill=0, state="new", price=100.5)
         self.get_orderbook = AsyncMock(return_value=OrderBook([[ask - 0.1, 100]], [[ask, 100]]))
         self.canceled = []
+        self.cancelled_ids = set()
         self.cancel_error = None
 
     async def cancel_order(self, inst_id, cl_ord_id):
         self.canceled.append(cl_ord_id)
         if self.cancel_error is not None:
             raise self.cancel_error
-        self.state = "canceled"
+        self.cancelled_ids.add(cl_ord_id)
+
+    async def get_order(self, inst_id, ord_id=None, cl_ord_id=None):
+        if not self.orders:
+            return None
+        order = self.orders[-1]
+        if cl_ord_id is not None:
+            order = next((o for o in self.orders if o["cl_ord_id"] == cl_ord_id), order)
+        if cl_ord_id is not None and cl_ord_id in self.cancelled_ids:
+            state = "canceled"
+        else:
+            state = self.state
+        return {"ordId": "exchange-id", "accFillSz": str(self.fill if self.fill is not None else order["sz"]),
+                "avgPx": str(self.price), "state": state}
 
 
 async def use_limit_mode(t, ttl=120):
@@ -183,13 +202,40 @@ async def test_unconfirmed_cancel_keeps_order_pending(trading, monkeypatch):
     assert intent.state == "RESTING" and statuses == ["LIMIT_PLACED"]
 
 
-async def test_new_entry_is_not_stacked_on_a_resting_limit(trading):
+async def test_new_entry_stacks_on_a_resting_limit(trading):
+    # 2026-11-21 用户要求：加仓限价单允许多笔同时在簿。第一笔因滑点超限挂单后，
+    # 第二笔同合约同方向加仓也照常挂出，不再被 BLOCKED_RESTING_LIMIT 挡掉。
     t, exchange = trading, LimitExchange()
     await use_limit_mode(t)
     await execute_batch(t, exchange, side="BUY", remaining=1, event="open-1")
     await execute_batch(t, exchange, side="BUY", remaining=2, event="open-2")
     statuses, _ = await records(t)
-    assert statuses == ["LIMIT_PLACED", "BLOCKED_RESTING_LIMIT"] and len(exchange.orders) == 1
+    assert statuses == ["LIMIT_PLACED", "LIMIT_PLACED"] and len(exchange.orders) == 2
+    intents = (await t.db.scalars(select(OrderIntent).where(
+        OrderIntent.binding_id == t.binding.id).order_by(OrderIntent.id))).all()
+    assert [intent.state for intent in intents] == ["RESTING", "RESTING"]
+    assert [order["ord_type"] for order in exchange.orders] == ["limit", "limit"]
+
+
+async def test_lead_exit_cancels_all_resting_limits(trading, monkeypatch):
+    # 带单员平仓时，本绑定的全部在簿限价单都要撤掉，不能只撤第一笔——
+    # 残留挂单会在平仓后被动开仓。
+    t, exchange = trading, LimitExchange()
+    await use_limit_mode(t)
+    await execute_batch(t, exchange, side="BUY", remaining=1, event="open-1")
+    await execute_batch(t, exchange, side="BUY", remaining=2, event="open-2")
+    intents = (await t.db.scalars(select(OrderIntent).where(
+        OrderIntent.binding_id == t.binding.id).order_by(OrderIntent.id))).all()
+    assert [intent.state for intent in intents] == ["RESTING", "RESTING"]
+    sent = capture_messages(monkeypatch)
+    await execute_batch(t, exchange, side="SELL", remaining=0, event="close-1")
+    intents = (await t.db.scalars(select(OrderIntent).where(
+        OrderIntent.binding_id == t.binding.id).order_by(OrderIntent.id))).all()
+    assert [intent.state for intent in intents] == ["CANCELED", "CANCELED"]
+    assert sorted(exchange.canceled) == sorted(intent.id for intent in intents)
+    statuses, _ = await records(t)
+    assert statuses.count("LIMIT_EXPIRED") == 2 and len(exchange.orders) == 2
+    assert any("已自动撤单（带单已减仓/平仓）" in message for message in sent)
 
 
 async def test_lead_exit_cancels_resting_limit(trading, monkeypatch):
