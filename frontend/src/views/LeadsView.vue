@@ -73,6 +73,7 @@ const columns = computed<TableColumn[]>(() => [
   { key: "freshness", label: t("board.snapshot"), width: "14%", mobileWide: true },
   { key: "followers", label: t("leads.followerAccounts"), numeric: true, mobileWide: true },
   { key: "public", label: t("leads.publicCol"), width: "68px", mobileWide: true },
+  { key: "slotWatch", label: t("leads.slotWatchCol"), width: "68px", mobileWide: true },
   { key: "actions", label: t("common.actions"), width: "68px", mobileWide: true },
 ]);
 interface LatestAction { time: number | null; symbol: string | null; side: string | null; qty: number | null; action: string | null; direction: string | null }
@@ -97,6 +98,7 @@ const form = ref({
   pollIntervalSec: 15 as number | null,
   proxyId: null as number | null,
   isPublicDashboard: false,
+  slotWatchEnabled: false,
   notificationEnabled: false,
   notificationDingtalkUrl: "",
   notificationWebhookUrl: "",
@@ -155,6 +157,7 @@ function edit(lead: Lead | null) {
     pollIntervalSec: lead ? lead.pollIntervalSec ?? null : 15,
     proxyId: lead?.proxyId ?? null,
     isPublicDashboard: lead?.isPublicDashboard === true,
+    slotWatchEnabled: lead?.slotWatchEnabled === true,
     notificationEnabled: !!(nc?.dingtalk_enabled || nc?.webhook_enabled),
     notificationDingtalkUrl: nc?.dingtalk_webhook_url || "",
     notificationWebhookUrl: nc?.webhook_url || "",
@@ -208,6 +211,12 @@ async function togglePublic(lead: Lead) {
   const result = await run(() => api.put(`/api/leads/${lead.id}`, { isPublicDashboard: !lead.isPublicDashboard }));
   if (result.ok) await load(true);
 }
+// 名额监控只影响通知，不影响跟单，所以不弹确认，点一下就切换。
+async function toggleSlotWatch(lead: Lead) {
+  if (lead.slotWatchEnabled == null) return;
+  const result = await run(() => api.put(`/api/leads/${lead.id}`, { slotWatchEnabled: !lead.slotWatchEnabled }));
+  if (result.ok) await load(true);
+}
 async function focusError() { await nextTick(); formElement.value?.querySelector<HTMLElement>('[aria-invalid="true"]')?.focus(); }
 async function sync(lead: Lead) {
   // 手动采集会进入跟单处理；HTTP 200 的业务失败不能误报成功。
@@ -254,6 +263,7 @@ onUnmounted(stop);
       <template #cell-name="{ row }"><div class="flex min-w-0 items-center gap-3"><img v-if="leadAvatar(row)" :src="leadAvatar(row) ?? undefined" :alt="row.name ?? t('common.unknown')" width="32" height="32" class="h-8 w-8 shrink-0 rounded-full object-cover" /><span v-else class="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-surface3 text-xs font-semibold text-muted" aria-hidden="true">{{ row.name?.slice(0, 2) ?? t("common.unknown") }}</span><div class="min-w-0"><RouterLink :to="`/leads/${row.id}`" class="break-words text-sm font-semibold hover:text-accent">{{ row.name ?? t("common.unknown") }}</RouterLink><p class="mt-1 break-all text-xs text-muted">{{ row.portfolioId ?? t("common.unknown") }}</p></div></div></template>
       <template #cell-enabled="{ row }"><button class="icon-button" role="switch" :aria-checked="row.isEnabled === true" :disabled="pending || row.isEnabled == null" :aria-label="t('leads.enableSwitch', { name: row.name ?? t('common.unknown') })" :title="t(row.isEnabled == null ? 'state.UNKNOWN' : row.isEnabled ? 'common.disable' : 'common.enable')" @click="operate(row, 'toggle')"><span class="relative h-5 w-9 rounded-full" :class="row.isEnabled ? 'bg-accent' : 'bg-surface3'" aria-hidden="true"><span class="absolute top-1 h-3 w-3 rounded-full bg-foreground" :class="row.isEnabled ? 'right-1' : 'left-1'" /></span></button></template>
       <template #cell-public="{ row }"><button class="icon-button" role="switch" :aria-checked="row.isPublicDashboard === true" :disabled="pending || row.isPublicDashboard == null" :aria-label="t('leads.publicSwitch', { name: row.name ?? t('common.unknown') })" :title="t('leads.publicSwitch', { name: row.name ?? t('common.unknown') })" @click="togglePublic(row)"><span class="relative h-5 w-9 rounded-full" :class="row.isPublicDashboard ? 'bg-accent' : 'bg-surface3'" aria-hidden="true"><span class="absolute top-1 h-3 w-3 rounded-full bg-foreground" :class="row.isPublicDashboard ? 'right-1' : 'left-1'" /></span></button></template>
+      <template #cell-slotWatch="{ row }"><button class="icon-button" role="switch" :aria-checked="row.slotWatchEnabled === true" :disabled="pending || row.slotWatchEnabled == null" :aria-label="t('leads.slotWatchSwitch', { name: row.name ?? t('common.unknown') })" :title="t('leads.slotWatchSwitch', { name: row.name ?? t('common.unknown') })" @click="toggleSlotWatch(row)"><span class="relative h-5 w-9 rounded-full" :class="row.slotWatchEnabled ? 'bg-accent' : 'bg-surface3'" aria-hidden="true"><span class="absolute top-1 h-3 w-3 rounded-full bg-foreground" :class="row.slotWatchEnabled ? 'right-1' : 'left-1'" /></span></button></template>
       <template #cell-positions="{ row }"><span class="text-base font-semibold">{{ formatQty(positionCount(row)) }}</span></template>
       <template #cell-today="{ row }"><span>{{ formatQty(boardLead(row)?.todayOpenCount) }} / {{ formatQty(boardLead(row)?.todayCloseCount) }}</span></template>
       <template #cell-pnl="{ row }"><span class="font-semibold" :class="pnlClass(boardLead(row)?.todayRealizedPnl)">{{ signedUsd(boardLead(row)?.todayRealizedPnl) }}</span></template>
@@ -273,6 +283,8 @@ onUnmounted(stop);
           <label class="field-label">{{ t("accts.proxy") }}<select v-model="form.proxyId" class="form-input mt-1" :aria-invalid="!!errors.proxy_id"><option :value="null">{{ t("accts.direct") }}</option><option v-for="proxy in proxies" :key="proxy.id" :value="proxy.id">{{ proxy.name ?? t("common.unknown") }}</option></select><span v-if="errors.proxy_id" class="field-error" role="alert">{{ errors.proxy_id }}</span></label>
           <label class="field-label">{{ t("leads.description") }}<textarea v-model="form.description" class="form-input mt-1" rows="2" /></label>
           <label class="flex min-h-11 items-center gap-3 text-sm"><input v-model="form.isPublicDashboard" type="checkbox" />{{ t("leads.public") }}</label>
+          <label class="flex min-h-11 items-center gap-3 text-sm"><input v-model="form.slotWatchEnabled" type="checkbox" />{{ t("leads.slotWatch") }}</label>
+          <p class="text-xs text-muted">{{ t("leads.slotWatchHint") }}</p>
         </div></details>
         <details class="border-y border-border/50 py-2">
           <summary class="flex min-h-11 cursor-pointer items-center justify-between gap-2 text-sm font-semibold">

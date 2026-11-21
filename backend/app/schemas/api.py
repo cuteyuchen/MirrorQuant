@@ -213,6 +213,7 @@ class LeadCreate(CamelModel):
     proxy_id: Optional[int] = None
     is_enabled: bool = True
     is_public_dashboard: bool = False
+    slot_watch_enabled: bool = False
     notification_config: Optional[NotificationSettings] = None
 
 
@@ -224,6 +225,7 @@ class LeadUpdate(UpdateModel):
     proxy_id: Optional[int] = None
     is_enabled: Optional[bool] = None
     is_public_dashboard: Optional[bool] = None
+    slot_watch_enabled: Optional[bool] = None
     notification_config: Optional[NotificationSettings] = None
 
 

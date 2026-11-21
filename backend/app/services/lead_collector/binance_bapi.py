@@ -1578,6 +1578,7 @@ class BinanceBapiCollector(BaseLeadCollector):
                 "copierPnl": fnum(detail.get("copierPnl")),
                 "currentCopyCount": detail.get("currentCopyCount"),
                 "maxCopyCount": detail.get("maxCopyCount"),
+                "fixedAmountMinCopyUsd": fnum(detail.get("fixedAmountMinCopyUsd")),
                 "totalCopyCount": detail.get("totalCopyCount"),
                 "favoriteCount": detail.get("favoriteCount"),
                 "mockCopyCount": detail.get("mockCopyCount"),

@@ -81,6 +81,7 @@ export interface Lead {
   id: number; name: string | null; portfolioId: string | null; platform?: string | null;
   avatarUrl?: string | null; description?: string | null; pollIntervalSec?: number | null;
   proxyId: number | null; isEnabled: boolean | null; isPublicDashboard?: boolean | null;
+  slotWatchEnabled?: boolean | null;
   positionShow?: boolean | null; marginBalance?: number | null; aumAmount?: number | null;
   lastTradeTime?: number | null; lastSyncAt?: Timestamp | null; lastError?: string | null;
   status?: string | null; openPositionsCount?: number | null; openUnrealizedPnl?: number | null;

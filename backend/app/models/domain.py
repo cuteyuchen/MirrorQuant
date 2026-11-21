@@ -141,6 +141,9 @@ class LeadSource(Base):
     )
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     is_public_dashboard: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # 名额监控：开启后，引擎每轮比对 detail 的 currentCopyCount/maxCopyCount，
+    # 满员 → 有空位的跳变只通知一次（见 orchestrator._check_copy_slot）。
+    slot_watch_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     position_show: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     margin_balance: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)

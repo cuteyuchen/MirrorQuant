@@ -42,6 +42,45 @@ SYNC_FAILURE_WARN_INTERVAL = 300.0
 SYNC_FAILURE_FIELDS = (
     "consecutiveSyncFailures", "firstSyncFailureAtMs", "lastFailureStartedAtMs", "syncFailureNotified",
 )
+# 名额监控：币安跟单组合的详情页链接模板（按 portfolio_id 生成）。
+SLOT_COPY_LINK_TEMPLATE = (
+    "https://www.binance.com/zh-CN/copy-trading/lead-details/{portfolio_id}?timeRange=30D&isSmartFilter=true"
+)
+SLOT_MIN_COPY_FALLBACK = "300"
+
+
+def _parse_copy_count(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isascii() and text.isdecimal():
+            return int(text)
+    return None
+
+
+def copy_slot_opened(previous_profile: Dict[str, Any], new_profile: Dict[str, Any]) -> Optional[tuple]:
+    """Detect a full -> open copy-slot transition between two snapshots.
+
+    Returns (current, maximum) only on the transition; None otherwise
+    (still full, still open, or counts unknown). Because the previous
+    profile is the persisted snapshot, no extra state is needed: while a
+    slot stays open every round sees previous=open and stays silent, and
+    once it refills the next opening is a fresh edge again.
+    """
+    prev_current = _parse_copy_count((previous_profile or {}).get("currentCopyCount"))
+    prev_max = _parse_copy_count((previous_profile or {}).get("maxCopyCount"))
+    new_current = _parse_copy_count((new_profile or {}).get("currentCopyCount"))
+    new_max = _parse_copy_count((new_profile or {}).get("maxCopyCount"))
+    if None in (prev_current, prev_max, new_current, new_max):
+        return None
+    if prev_max <= 0 or new_max <= 0:
+        return None
+    if prev_current >= prev_max and new_current < new_max:
+        return (new_current, new_max)
+    return None
 
 
 class WebSocketHub:
@@ -368,6 +407,12 @@ class EngineOrchestrator:
         if not await self._publish_lead_snapshot(db, lead, snapshot, orders_store, started_ms):
             return {"ok": True, "superseded": True}
 
+        try:
+            await self._check_copy_slot(db, lead, previous_snapshot, snapshot)
+        except Exception as exc:
+            # 名额监控绝不能影响跟单主流程：只记日志。
+            logger.warning("Lead %s slot-watch check failed: %s", lead.id, describe_exception(exc))
+
         if is_routable_snapshot(snapshot):
             self._last_unverified_logged[lead.id] = "verified"
             await self.router.process_lead_events(
@@ -395,6 +440,60 @@ class EngineOrchestrator:
             }
         )
         return {"ok": True, "snapshot": snapshot}
+
+    async def _check_copy_slot(self, db: AsyncSession, lead: LeadSource,
+                               previous_snapshot: Dict[str, Any], snapshot: Dict[str, Any]) -> None:
+        """Notify once when a watched lead's copy-trading slot opens.
+
+        Edge detection compares the persisted previous snapshot's profile
+        against the freshly published one (see copy_slot_opened), so no
+        extra state is needed. The alert goes to the lead's own notification
+        channels when configured, otherwise to the system notification
+        route (e.g. the DingTalk monitoring group). The outbox enqueue is
+        the only side effect; any failure propagates to the caller, which
+        logs it and continues the main follow flow.
+        """
+        if not lead.slot_watch_enabled:
+            return
+        opened = copy_slot_opened(
+            (previous_snapshot or {}).get("profile") or {},
+            (snapshot or {}).get("profile") or {},
+        )
+        if opened is None:
+            return
+        current, maximum = opened
+        profile = (snapshot or {}).get("profile") or {}
+        nickname = profile.get("nickname") or lead.name
+        min_copy = profile.get("fixedAmountMinCopyUsd")
+        min_copy_text = (
+            f"{float(min_copy):g}"
+            if isinstance(min_copy, (int, float)) and min_copy > 0
+            else SLOT_MIN_COPY_FALLBACK
+        )
+        link = SLOT_COPY_LINK_TEMPLATE.format(portfolio_id=lead.portfolio_id)
+        message = (
+            f"【{nickname}】跟单名额空出来了！\n"
+            f"当前跟单人数：{current}/{maximum}\n"
+            f"最低跟单金额：{min_copy_text} U\n"
+            f"马上抢：{link}"
+        )
+        cfg = None
+        if lead.notification_config_json:
+            try:
+                lead_cfg = json.loads(lead.notification_config_json)
+            except (ValueError, TypeError):
+                lead_cfg = None
+            if lead_cfg and any(bool(lead_cfg.get(f"{ch}_enabled"))
+                                for ch in ("webhook", "telegram", "wecom", "dingtalk")):
+                cfg = lead_cfg
+        if cfg is None:
+            cfg = await self.router._get_config(db, "notifications", DEFAULT_SYSTEM_CONFIG["notifications"])
+        enqueue_notification(
+            db, cfg, "MirrorQuant", message, event_type="LEAD_SLOT_OPEN",
+            event_key=f"lead-slot-open:{lead.id}:{current}/{maximum}",
+            lead_id=lead.id, destination_type="lead",
+        )
+        await db.commit()
 
     @serialized_execution
     async def _record_lead_sync_failure(self, db: AsyncSession, lead: LeadSource, started_ms: int, error: str) -> bool:

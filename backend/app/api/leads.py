@@ -58,6 +58,7 @@ def _lead_summary(lead: LeadSource) -> dict:
         "proxyId": lead.proxy_id,
         "isEnabled": lead.is_enabled,
         "isPublicDashboard": lead.is_public_dashboard,
+        "slotWatchEnabled": lead.slot_watch_enabled,
         "positionShow": lead.position_show,
         "marginBalance": lead.margin_balance,
         "aumAmount": lead.aum_amount,
@@ -106,6 +107,7 @@ async def create_lead(
         proxy_id=payload.proxy_id,
         is_enabled=payload.is_enabled,
         is_public_dashboard=payload.is_public_dashboard,
+        slot_watch_enabled=payload.slot_watch_enabled,
         notification_config_json=notify_json,
         created_by_user_id=current_user.id,
     )

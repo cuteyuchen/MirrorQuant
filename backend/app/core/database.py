@@ -192,6 +192,7 @@ SQLITE_MIGRATIONS: Dict[str, List[Tuple[str, str]]] = {
     "lead_sources": [
         ("notification_config_json", "TEXT"),
         ("created_by_user_id", "INTEGER"),
+        ("slot_watch_enabled", "BOOLEAN NOT NULL DEFAULT 0"),
     ],
     "notification_outbox": [
         ("execution_id", "INTEGER"),
@@ -328,6 +329,44 @@ def _relax_copy_binding_slippage_columns(sync_conn) -> None:
     sync_conn.execute(text(f"ALTER TABLE {new_table} RENAME TO {table}"))
 
 
+# 熬鹰资本的币安跟单组合 ID：名额监控的默认开启对象。
+SLOT_WATCH_SEED_PORTFOLIO_ID = "5075281354358777856"
+SLOT_WATCH_SEED_MARKER = "slot_watch_seeded"
+
+
+def _seed_slot_watch(sync_conn) -> None:
+    """One-time seed: enable slot watch for 熬鹰资本 only.
+
+    Guarded by a system_configs marker so a later user opt-out is never
+    re-enabled by a restart. No-op when the lead_sources table or the
+    slot_watch_enabled column is not present yet.
+    """
+    cols = {r[1] for r in sync_conn.execute(text("PRAGMA table_info(lead_sources)")).fetchall()}
+    if not {"slot_watch_enabled", "portfolio_id"} <= cols:
+        # 旧版表（例如迁移测试里的遗留结构）缺少列时跳过，不挡启动。
+        return
+    tables = {r[0] for r in sync_conn.execute(
+        text("SELECT name FROM sqlite_master WHERE type='table'")).fetchall()}
+    if "system_configs" not in tables:
+        return
+    marker = sync_conn.execute(
+        text("SELECT COUNT(*) FROM system_configs WHERE key=:key"),
+        {"key": SLOT_WATCH_SEED_MARKER},
+    ).scalar()
+    if marker:
+        return
+    sync_conn.execute(
+        text("UPDATE lead_sources SET slot_watch_enabled=1 WHERE portfolio_id=:pid"),
+        {"pid": SLOT_WATCH_SEED_PORTFOLIO_ID},
+    )
+    sync_conn.execute(
+        text("INSERT INTO system_configs (key, value_json, updated_at) "
+             "VALUES (:key, :value, datetime('now'))"),
+        {"key": SLOT_WATCH_SEED_MARKER, "value": json.dumps("1.3.5", ensure_ascii=False)},
+    )
+    logger.info("Seeded slot watch for portfolio %s", SLOT_WATCH_SEED_PORTFOLIO_ID)
+
+
 def _apply_sqlite_migrations(sync_conn) -> None:
     dialect_name = getattr(sync_conn.dialect, "name", "")
     if dialect_name != "sqlite":
@@ -372,6 +411,8 @@ def _apply_sqlite_migrations(sync_conn) -> None:
                     ), {"binding_id": binding_id, "event_id": event_id})
     # 补列完成后才放宽可空性：重建 copy_bindings 需要三列都已存在。
     _relax_copy_binding_slippage_columns(sync_conn)
+    # 名额监控一次性种子：只给熬鹰资本默认开启，标记防重复。
+    _seed_slot_watch(sync_conn)
     # create_all 不会为既有表补索引，升级时显式且幂等创建。
     for table, column in (("order_intents", "reporting_complete"),
                           ("notification_outbox", "execution_id"), ("notification_outbox", "event_key"),
