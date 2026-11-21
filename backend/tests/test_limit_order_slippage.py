@@ -102,12 +102,34 @@ async def test_excess_drift_places_resting_limit_order(trading):
     assert exchange.canceled == [] and intent.state == "RESTING"
 
 
-async def test_favorable_drift_is_still_blocked_in_limit_mode(trading):
-    t, exchange = trading, LimitExchange(ask=97.0)
+async def test_favorable_drift_enters_at_market_in_limit_mode(trading):
+    # Favorable drift is not slippage, even in limit mode: a buy 3% below the
+    # lead's price enters at market (IOC), not as a limit order and not blocked.
+    t = trading
+    exchange = OfflineExchange(price=97.0)
+    exchange.get_orderbook.return_value = OrderBook([[96.9, 100]], [[97.0, 100]])
     await use_limit_mode(t)
     await execute_batch(t, exchange, side="BUY", remaining=1, event="open-1")
-    statuses, _ = await records(t)
-    assert statuses == ["BLOCKED_CATCHUP_DRIFT"] and exchange.orders == []
+    assert len(exchange.orders) == 1
+    order = exchange.orders[0]
+    assert (order["ord_type"], order["px"]) == ("ioc", "97.4")
+    statuses, rows = await records(t)
+    assert statuses == ["EXECUTED"] and rows[0].my_price == 97.0
+
+
+async def test_favorable_drift_short_enters_at_market_in_limit_mode(trading):
+    # Short side mirrors the long side: a sell 2% above the lead's price
+    # enters at market (IOC), not as a limit order and not blocked.
+    t = trading
+    exchange = OfflineExchange(price=102.0)
+    exchange.get_orderbook.return_value = OrderBook([[102.0, 100]], [[102.1, 100]])
+    await use_limit_mode(t)
+    await execute_batch(t, exchange, side="SELL", position_side="SHORT", remaining=1, event="open-1")
+    assert len(exchange.orders) == 1
+    order = exchange.orders[0]
+    assert (order["ord_type"], order["px"]) == ("ioc", "101.5")
+    statuses, rows = await records(t)
+    assert statuses == ["EXECUTED"] and rows[0].my_price == 102.0
 
 
 async def test_resting_limit_fill_is_accounted_and_notified(trading, monkeypatch):

@@ -244,11 +244,12 @@ async def test_historical_open_is_skipped_when_lead_is_flat(trading):
     ("SELL", "SHORT", 99.4, 99.6, "BLOCKED_CATCHUP_DRIFT"),
     ("BUY", "LONG", 99.4, 99.6, "EXECUTED"),
     ("SELL", "SHORT", 100.4, 100.6, "EXECUTED"),
-    # Favorable moves also leave the lead's entry window and remain blocked.
-    ("BUY", "LONG", 99.3, 99.4, "BLOCKED_CATCHUP_DRIFT"),
-    ("SELL", "SHORT", 100.6, 100.7, "BLOCKED_CATCHUP_DRIFT"),
+    # Favorable moves are not drift: buying cheaper / selling dearer than the
+    # lead enters at market instead of being blocked.
+    ("BUY", "LONG", 99.3, 99.4, "EXECUTED"),
+    ("SELL", "SHORT", 100.6, 100.7, "EXECUTED"),
 ))
-async def test_catchup_uses_executable_side_and_symmetric_drift(trading, side, position_side, bid, ask, status):
+async def test_catchup_uses_executable_side_and_directional_drift(trading, side, position_side, bid, ask, status):
     t = trading
     executable_price = ask if side == "BUY" else bid
     exchange = OfflineExchange(price=executable_price)

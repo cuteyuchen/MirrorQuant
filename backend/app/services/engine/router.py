@@ -2580,9 +2580,11 @@ class CopyRouter:
             ref_price=ref_px,
             lead_avg_price=lead_avg_px,
             catchup_max_price_dev_pct=float(resilience_cfg.get("catchup_max_price_dev_pct", 0.5)),
+            order_side=order_side,
         )
         # 滑点超限处理为“挂限价单”时，只对追价方向（买入现价更高 / 卖出现价更低）的偏离改挂单；
-        # 反向偏离、行情缺失、事件过旧等仍按原规则拦截。
+        # 有利方向的偏离（买入现价更低 / 卖出现价更高）不是滑点，直接走市价/IOC。
+        # 行情缺失、事件过旧等仍按原规则拦截。
         adverse = ref_px > 0 and lead_avg_px > 0 and (
             ref_px > lead_avg_px if order_side == "buy" else ref_px < lead_avg_px)
         limit_mode = getattr(binding, "slippage_action", "block") == "limit" and adverse
@@ -2607,7 +2609,7 @@ class CopyRouter:
             )
             return
 
-        slip_res = RiskEngine.check_slippage(ref_px, lead_avg_px, binding.max_slippage_pct)
+        slip_res = RiskEngine.check_slippage(ref_px, lead_avg_px, binding.max_slippage_pct, order_side=order_side)
         use_limit = use_limit or (limit_mode and not slip_res.allowed)
         if not slip_res.allowed and not use_limit:
             await self._record_execution(

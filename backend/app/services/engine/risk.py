@@ -64,18 +64,30 @@ class RiskEngine:
         ref_price: float,
         lead_avg_price: float,
         max_slippage_pct: float,
+        order_side: str | None = None,
     ) -> RiskCheckResult:
         if not all(math.isfinite(v) for v in (ref_price, lead_avg_price, max_slippage_pct)) or ref_price <= 0 or lead_avg_price <= 0 or max_slippage_pct < 0:
             return RiskCheckResult(False, "Invalid slippage price or limit", code="BLOCKED_SLIPPAGE")
-        slip_pct = abs(ref_price - lead_avg_price) / lead_avg_price * 100.0
-        if slip_pct > max_slippage_pct:
+        # Only adverse deviation is slippage: buying above the lead's price or
+        # selling below it. A favorable move (buying cheaper / selling dearer)
+        # is never blocked — the follower gets a better price than the lead.
+        # Without a known direction, keep the old symmetric bound (fail closed).
+        signed_pct = (ref_price - lead_avg_price) / lead_avg_price * 100.0
+        side = (order_side or "").lower()
+        if side == "buy":
+            adverse_pct = signed_pct
+        elif side == "sell":
+            adverse_pct = -signed_pct
+        else:
+            adverse_pct = abs(signed_pct)
+        if adverse_pct > max_slippage_pct:
             return RiskCheckResult(
                 False,
-                f"Slippage {slip_pct:.2f}% exceeds limit {max_slippage_pct:.2f}%",
-                value=round(slip_pct, 4),
+                f"Slippage {adverse_pct:.2f}% exceeds limit {max_slippage_pct:.2f}%",
+                value=round(abs(signed_pct), 4),
                 code="BLOCKED_SLIPPAGE",
             )
-        return RiskCheckResult(True, value=round(slip_pct, 4))
+        return RiskCheckResult(True, value=round(abs(signed_pct), 4))
 
     @staticmethod
     def check_spread(
@@ -148,13 +160,22 @@ class RiskEngine:
         ref_price: float,
         lead_avg_price: float,
         catchup_max_price_dev_pct: float,
+        order_side: str | None = None,
     ) -> RiskCheckResult:
-        """Catch-up gate: price drift decides, age is only a wide sanity backstop.
+        """Catch-up gate: adverse price drift decides, age is only a wide sanity backstop.
 
         Rationale: Binance public copy-trade BAPI exposes lead fills with a 2-3 minute
         aggregation lag. A short age cutoff can discard valid entries before they
-        are published. The entry must still be inside the lead's price window;
-        max_age_sec is a hard ceiling against replaying ancient history.
+        are published. The entry must still be inside the lead's price window
+        on the adverse side; max_age_sec is a hard ceiling against replaying
+        ancient history.
+
+        Only adverse drift is bounded: buying above the lead's price or selling
+        below it. A favorable move is not evidence the lead's entry thesis is
+        stale — the lead still holds the position (the snapshot confirms it),
+        and the follower entering at a better price is strictly better. The
+        real staleness protection is the age ceiling, which stays symmetric.
+        Without a known direction, keep the old symmetric bound (fail closed).
         """
         # Missing/non-finite prices are not evidence of zero drift. Fail closed even
         # when this guard is called without the router's spread/slippage checks.
@@ -166,11 +187,18 @@ class RiskEngine:
             return RiskCheckResult(False, "Missing or future source order timestamp", code="SKIPPED_STALE_MISSED_ORDER")
         age_sec = max(0.0, (now_ms - order_time_ms) / 1000.0)
 
-        # Keep the window symmetric: even a favorable move can mean the lead's
-        # entry thesis is stale. Buy at the ask / sell at the bid; neither direction
-        # should bypass this guard merely because its price appears better.
-        dev_pct = abs(ref_price - lead_avg_price) / lead_avg_price * 100.0
-        if dev_pct > catchup_max_price_dev_pct:
+        # Only adverse drift is bounded. A favorable move (buying cheaper /
+        # selling dearer than the lead) is a better entry, not a stale thesis.
+        signed_pct = (ref_price - lead_avg_price) / lead_avg_price * 100.0
+        side = (order_side or "").lower()
+        if side == "buy":
+            adverse_pct = signed_pct
+        elif side == "sell":
+            adverse_pct = -signed_pct
+        else:
+            adverse_pct = abs(signed_pct)
+        dev_pct = abs(signed_pct)
+        if adverse_pct > catchup_max_price_dev_pct:
             return RiskCheckResult(
                 False,
                 f"Catch-up price drift {dev_pct:.2f}% > max {catchup_max_price_dev_pct:.2f}% (age {age_sec:.0f}s)",

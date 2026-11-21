@@ -83,6 +83,50 @@ def test_risk_engine_checks():
     assert dl_bad.allowed is False
 
 
+def test_slippage_only_blocks_adverse_direction():
+    # Favorable moves are never slippage, even beyond the cap: buying cheaper
+    # than the lead (long 1000, current 980) or selling dearer (short 1000,
+    # current 1020) is a better entry, not a worse one.
+    assert RiskEngine.check_slippage(980.0, 1000.0, 1.0, order_side="buy").allowed is True
+    assert RiskEngine.check_slippage(1020.0, 1000.0, 1.0, order_side="sell").allowed is True
+    # Adverse moves are still bounded by the same cap.
+    assert RiskEngine.check_slippage(1020.0, 1000.0, 1.0, order_side="buy").allowed is False
+    assert RiskEngine.check_slippage(980.0, 1000.0, 1.0, order_side="sell").allowed is False
+    # Adverse moves inside the cap are allowed.
+    assert RiskEngine.check_slippage(1005.0, 1000.0, 1.0, order_side="buy").allowed is True
+    assert RiskEngine.check_slippage(995.0, 1000.0, 1.0, order_side="sell").allowed is True
+    # No direction given keeps the old symmetric bound (fail closed).
+    assert RiskEngine.check_slippage(980.0, 1000.0, 1.0).allowed is False
+    assert RiskEngine.check_slippage(1020.0, 1000.0, 1.0).allowed is False
+
+
+def test_catchup_only_blocks_adverse_drift():
+    now_ms = 1700000100000
+    # Favorable drift beyond the cap is allowed when fresh.
+    res = RiskEngine.check_missed_order_catchup(
+        now_ms - 10000, now_ms, 900, ref_price=98.0, lead_avg_price=100.0,
+        catchup_max_price_dev_pct=1.0, order_side="buy")
+    assert res.allowed is True
+    res = RiskEngine.check_missed_order_catchup(
+        now_ms - 10000, now_ms, 900, ref_price=102.0, lead_avg_price=100.0,
+        catchup_max_price_dev_pct=1.0, order_side="sell")
+    assert res.allowed is True
+    # Adverse drift beyond the cap is still blocked.
+    res = RiskEngine.check_missed_order_catchup(
+        now_ms - 10000, now_ms, 900, ref_price=102.0, lead_avg_price=100.0,
+        catchup_max_price_dev_pct=1.0, order_side="buy")
+    assert res.allowed is False and res.code == "BLOCKED_CATCHUP_DRIFT"
+    res = RiskEngine.check_missed_order_catchup(
+        now_ms - 10000, now_ms, 900, ref_price=98.0, lead_avg_price=100.0,
+        catchup_max_price_dev_pct=1.0, order_side="sell")
+    assert res.allowed is False and res.code == "BLOCKED_CATCHUP_DRIFT"
+    # The age backstop stays symmetric: a favorable but ancient order is stale.
+    res = RiskEngine.check_missed_order_catchup(
+        now_ms - 1000000, now_ms, 900, ref_price=98.0, lead_avg_price=100.0,
+        catchup_max_price_dev_pct=1.0, order_side="buy")
+    assert res.allowed is False and res.code == "SKIPPED_STALE_MISSED_ORDER"
+
+
 def test_missed_order_catchup_and_stale_guards():
     now_ms = 1700000100000  # 100s after
 
@@ -152,16 +196,23 @@ def test_missed_order_catchup_and_stale_guards():
 
 @pytest.mark.parametrize("ref_price", [99.5, 100.5])
 def test_catchup_allows_exact_drift_and_age_boundaries(ref_price):
-    result = RiskEngine.check_missed_order_catchup(1_000_000, 1_900_000, 900, ref_price, 100, 0.5)
+    # Exactly at the 0.5% drift bound is allowed, in either direction.
+    result = RiskEngine.check_missed_order_catchup(1_000_000, 1_900_000, 900, ref_price, 100, 0.5, order_side="buy")
     assert result.allowed and result.code == "OK"
 
 
-@pytest.mark.parametrize("ref_price", [99.49, 100.51])
 @pytest.mark.parametrize("age_ms", [0, 150_000, 1_000_000])
-def test_catchup_absolute_drift_precedes_age_backstop(ref_price, age_ms):
-    # Both favorable and adverse moves are bounded, even for fresh or ancient fills.
-    result = RiskEngine.check_missed_order_catchup(2_000_000 - age_ms, 2_000_000, 900, ref_price, 100, 0.5)
+def test_catchup_adverse_drift_precedes_age_backstop(age_ms):
+    # Adverse drift is blocked even for fresh or ancient fills.
+    result = RiskEngine.check_missed_order_catchup(2_000_000 - age_ms, 2_000_000, 900, 100.51, 100, 0.5, order_side="buy")
     assert not result.allowed and result.code == "BLOCKED_CATCHUP_DRIFT"
+
+
+@pytest.mark.parametrize("age_ms", [0, 150_000])
+def test_catchup_favorable_drift_is_allowed_when_fresh(age_ms):
+    # Favorable drift is not drift: a buy below the lead's price is allowed.
+    result = RiskEngine.check_missed_order_catchup(2_000_000 - age_ms, 2_000_000, 900, 99.49, 100, 0.5, order_side="buy")
+    assert result.allowed and result.code == "OK"
 
 
 @pytest.mark.parametrize("field", ["ref_price", "lead_avg_price"])
