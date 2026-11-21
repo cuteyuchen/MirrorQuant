@@ -322,6 +322,19 @@ def reconstruct_open_positions(
     return out
 
 
+def _parse_holdings_leverage(value: Any) -> Optional[int]:
+    """Parse a direct-holdings leverage; invalid/missing values become None, never an error.
+
+    Public leaders publish leverage on their positions (e.g. 49); the value is
+    informational only, so a bad value must never invalidate the whole snapshot.
+    """
+    try:
+        lev = int(float(value)) if value is not None else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return lev if lev is not None and lev > 0 else None
+
+
 def normalize_holdings(holdings: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Normalize direct positions; an unknown row invalidates the entire snapshot."""
     positions: List[Dict[str, Any]] = []
@@ -358,6 +371,7 @@ def normalize_holdings(holdings: Sequence[Dict[str, Any]]) -> List[Dict[str, Any
             "notional": float(abs(qty) * entry),
             "openTime": row.get("openTime") or row.get("opened"),
             "entryOrders": [],
+            "leverage": _parse_holdings_leverage(row.get("leverage")),
             "source": "api",
         })
     return positions

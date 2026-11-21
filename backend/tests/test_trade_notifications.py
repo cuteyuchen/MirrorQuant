@@ -218,7 +218,7 @@ async def test_fanout_keeps_source_identity_and_does_not_duplicate_messages(monk
         await configure_sink(db, dingtalk_enabled=True)
         outcomes = ["EXECUTED", "BLOCKED_SPREAD", "SKIPPED_UNSUPPORTED"]
 
-        async def record(db, binding, lead, account, adapter, batch, *args):
+        async def record(db, binding, lead, account, adapter, batch, *args, **kwargs):
             index = next(i for i, pair in enumerate(bindings) if pair[0].id == binding.id)
             # A mapped follower close must not replace the independent lead's opening action.
             await router._record_execution(db, binding, lead, account, "MAPPEDUSDT", "MAPPEDUSDT",

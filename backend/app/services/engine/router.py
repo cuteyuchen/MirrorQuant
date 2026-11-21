@@ -142,12 +142,14 @@ def _exposure_ratio_matches(lead_ratio, my_ratio, tolerance_pct) -> bool:
     return abs(mine - lead) <= lead * tol / 100
 
 
-def _effective_open_leverage(existing_leverage, target_notional, equity, max_symbol_leverage) -> int:
-    """开仓/加仓杠杆：品种已有仓位时沿用交易所当前杠杆，无仓位时动态计算。
+def _effective_open_leverage(existing_leverage, target_notional, equity, max_symbol_leverage, lead_leverage=None) -> int:
+    """开仓/加仓杠杆：品种已有仓位时沿用交易所当前杠杆，无仓位时优先用带单员杠杆，否则动态计算。
 
     杠杆是按品种设置的：每次加仓都重算并重设，会擅自改动整仓（含认领仓位）的杠杆。
     已有仓位时沿用其杠杆，认领仓与后续加仓自然一致；档位上限是交易所硬约束，
-    已有杠杆高于档位上限时才降到上限。已有杠杆无效（空/零/负/NaN）时回落动态计算。
+    已有杠杆高于档位上限时才降到上限。已有杠杆无效（空/零/负/NaN）时回落：
+    带单员杠杆有效（公开持仓才能看到）时用它并同样 cap 到档位上限；
+    否则动态计算（隐藏持仓看不到杠杆，只能由系统推算）。
     """
     try:
         current = float(existing_leverage) if existing_leverage is not None else 0.0
@@ -155,8 +157,41 @@ def _effective_open_leverage(existing_leverage, target_notional, equity, max_sym
         current = 0.0
     if current > 0:
         return min(int(max_symbol_leverage), max(1, int(current)))
+    try:
+        lead = float(lead_leverage) if lead_leverage is not None else 0.0
+    except (TypeError, ValueError):
+        lead = 0.0
+    if lead > 0:
+        return min(int(max_symbol_leverage), max(1, int(lead)))
     return PositionSizer.compute_dynamic_leverage(
         target_notional=target_notional, equity=equity, max_symbol_leverage=max_symbol_leverage)
+
+
+def _lead_position_leverage(snapshot, symbol, position_side):
+    """Return the leader's leverage for one open position from a fresh snapshot.
+
+    Only public leaders publish leverage (normalize_holdings carries it);
+    hidden leaders' reconstructed positions have no leverage, so this returns
+    None and the caller falls back to dynamic leverage. Any malformed input
+    (missing snapshot, no matching position, invalid leverage) returns None
+    instead of raising.
+    """
+    try:
+        positions = (snapshot or {}).get("openPositions") or []
+        side = str(position_side or "").upper()
+        for p in positions:
+            if not isinstance(p, dict):
+                continue
+            if p.get("symbol") != symbol or str(p.get("positionSide") or "").upper() != side:
+                continue
+            try:
+                lev = int(float(p.get("leverage"))) if p.get("leverage") is not None else None
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return lev if lev is not None and lev > 0 else None
+        return None
+    except (TypeError, AttributeError):
+        return None
 
 
 def _effective_slippage_settings(binding, risk_defaults):
@@ -2461,10 +2496,15 @@ class CopyRouter:
                             else:
                                 delivery.state = "APPLIED"
                         else:
+                            # 公开持仓的带单员：快照里有该仓位的杠杆时，开仓/加仓按带单员杠杆做；
+                            # 隐藏持仓快照里没有杠杆，_lead_position_leverage 返回 None，仍由系统动态推算。
+                            lead_lvr = None
+                            if is_open_leg(batch.get("side"), batch.get("positionSide")):
+                                lead_lvr = _lead_position_leverage(snapshot, batch.get("symbol"), batch.get("positionSide"))
                             await self._execute_batch_for_binding(db, binding, lead, account, adapter,
                                 batch, lead_margin_balance, active, bal.eq, positions, instruments,
                                 bool(await self._get_config(db, "global_kill_switch", False)), notify_cfg, resilience_cfg,
-                                risk_defaults_cfg)
+                                risk_defaults_cfg, lead_leverage=lead_lvr)
                         db.info.pop("delivery", None)
                         db.info.pop("snapshot_admission", None)
                         await db.commit()
@@ -2510,6 +2550,7 @@ class CopyRouter:
         notify_cfg: Dict[str, Any],
         resilience_cfg: Optional[Dict[str, Any]] = None,
         risk_defaults: Optional[Dict[str, Any]] = None,
+        lead_leverage: Optional[int] = None,
     ) -> None:
         resilience_cfg = resilience_cfg or DEFAULT_SYSTEM_CONFIG["resilience"]
         risk_defaults = risk_defaults or DEFAULT_SYSTEM_CONFIG["risk_defaults"]
@@ -2858,6 +2899,7 @@ class CopyRouter:
             local_pos.lever if local_pos is not None and local_pos.pos > 0 else None,
             target_notional=capped_qty * exact(entry_px) * spec.ct_val,
             equity=my_equity, max_symbol_leverage=max_allowed_lvr,
+            lead_leverage=lead_leverage,
         )
         margin_policy = str(resilience_cfg.get("insufficient_margin_policy", "auto_scale_down"))
         avail_eq = available_collateral
