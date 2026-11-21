@@ -1973,6 +1973,137 @@ class CopyRouter:
         await db.commit()
         return adopted
 
+    async def _adopt_manual_positions(
+        self, db: AsyncSession, binding: CopyBinding, lead: LeadSource, account: TradingAccount,
+        adapter: BaseExchangeAdapter, instruments: Dict[str, Any], snapshot: Dict[str, Any],
+        received_at_ms: int, notify_cfg: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """持续自动认领：每轮把带单员在交易的标的上、实盘与账本不一致的仓位按实盘对齐。
+
+        用户手动下单后实盘与账本有出入是正常的：只要该标的是带单员正在
+        交易的标的，就直接按实盘仓位认领进账本，不做敞口比例/容差检查，
+        后续跟单从认领后的账本继续。认领只改账、不下单。引擎有在途订单
+        的品种本轮跳过，避免认领与成交确认重复记账；不在带单员交易集合
+        内的标的不认领（孤儿仓仍由链路监控处理）。
+        """
+        if not binding.is_enabled or not account.is_enabled:
+            return []
+        if not binding.adopt_existing_positions:
+            # 用户关掉了该绑定的认领开关：持续认领也不跑。
+            return []
+        if not binding.adoption_completed:
+            # 未完成接入的绑定不持续认领：接入窗口的认领仍是唯一入口。
+            return []
+        symbol_map = json.loads(binding.symbol_map_json or "{}")
+        whitelist = json.loads(binding.symbol_whitelist_json or "[]")
+        blacklist = json.loads(binding.symbol_blacklist_json or "[]")
+        # 带单员正在交易的 (inst_id, pos_side) -> (symbol, lead_qty)
+        leader_trading: Dict[tuple, tuple] = {}
+        for entry in snapshot.get("openPositions") or []:
+            if not isinstance(entry, dict):
+                continue
+            symbol = entry.get("symbol")
+            position_side = str(entry.get("positionSide") or "").upper()
+            if not symbol or position_side not in ("LONG", "SHORT"):
+                continue
+            if not RiskEngine.check_symbol_filter(symbol, whitelist, blacklist).allowed:
+                continue
+            inst_id, supported = adapter.resolve_symbol(symbol, instruments, symbol_map)
+            if not supported:
+                continue
+            local_pos_side = "long" if position_side == "LONG" else "short"
+            try:
+                lead_qty = exact(entry.get("qtyExact", entry.get("qty")) or 0)
+            except (ValueError, InvalidOperation, TypeError, AttributeError):
+                lead_qty = Decimal("0")
+            leader_trading[(inst_id, local_pos_side)] = (symbol, lead_qty)
+        if not leader_trading:
+            return []
+        positions = await adapter.get_positions()
+        physical: Dict[tuple, ExchangePosition] = {}
+        for position in positions:
+            if position.pos > 0:
+                physical[(position.inst_id, position.pos_side)] = position
+        adopted: List[Dict[str, Any]] = []
+        for (inst_id, local_pos_side), (symbol, lead_qty) in leader_trading.items():
+            mine = physical.get((inst_id, local_pos_side))
+            physical_qty = exact(mine.pos) if mine is not None else Decimal("0")
+            if mine is not None:
+                allocation = await self._get_allocation(
+                    db, binding.id, account.id, inst_id, local_pos_side)
+                owned = self._owned_qty(allocation)
+            else:
+                # 实盘已无该仓：只查现有账本，不新建空归属行。
+                allocation = await db.scalar(select(PositionAllocation).where(
+                    PositionAllocation.binding_id == binding.id,
+                    PositionAllocation.inst_id == inst_id,
+                    PositionAllocation.pos_side == local_pos_side
+                ).execution_options(populate_existing=True))
+                if allocation is None:
+                    continue
+                owned = self._owned_qty(allocation)
+            if abs(physical_qty - owned) <= Decimal("1e-8"):
+                continue
+            # 引擎有在途订单时跳过，避免认领与成交确认重复记账。
+            in_flight = await db.scalar(select(OrderIntent.id).where(
+                OrderIntent.binding_id == binding.id,
+                OrderIntent.inst_id == inst_id,
+                OrderIntent.pos_side == local_pos_side,
+                ~OrderIntent.state.in_(TERMINAL_STATES)).limit(1))
+            if in_flight is not None:
+                continue
+            position_side = "LONG" if local_pos_side == "long" else "SHORT"
+            if physical_qty == 0:
+                # 用户手动平掉了该仓：账上与成本均置 0。
+                allocation.owned_qty = 0.0
+                allocation.owned_qty_exact = "0"
+                allocation.entry_cost = 0.0
+                allocation.entry_cost_exact = "0"
+                allocation.generation += 1
+                await self._clear_guard(db, binding.id, inst_id, local_pos_side)
+                details = ("持续自动认领：实盘仓位已平（0），账上 "
+                           f"{owned} 已清零；带单员正在交易该标的")
+                await self._record_execution(
+                    db, binding, lead, account, symbol, inst_id,
+                    "BUY" if local_pos_side == "long" else "SELL", position_side,
+                    "ADOPT", "ADOPTED_POSITION",
+                    float(lead_qty), 0.0, 0.0,
+                    my_qty=0.0, my_price=0.0, my_notional=0.0,
+                    details=details, notify_cfg=notify_cfg)
+                adopted.append({"symbol": symbol, "positionSide": position_side, "qty": 0.0})
+                continue
+            try:
+                entry_px = exact(mine.avg_px)
+            except (ValueError, InvalidOperation, TypeError, AttributeError):
+                continue
+            if entry_px <= 0:
+                continue
+            entry_cost = physical_qty * entry_px
+            was_zero = owned == 0
+            if was_zero:
+                allocation.opened_at_ms = received_at_ms
+                await self._clear_guard(db, binding.id, inst_id, local_pos_side)
+            allocation.entry_cost_exact = format_exact(entry_cost)
+            allocation.entry_cost = float(allocation.entry_cost_exact)
+            allocation.owned_qty_exact = format_exact(physical_qty)
+            allocation.owned_qty = float(allocation.owned_qty_exact)
+            allocation.generation += 1
+            await self._upsert_guard(db, binding.id, inst_id, local_pos_side, float(entry_px))
+            details = ("持续自动认领：实盘 "
+                       f"{physical_qty} 与账上 {owned} 不符，按实盘对齐；"
+                       "带单员正在交易该标的")
+            await self._record_execution(
+                db, binding, lead, account, symbol, inst_id,
+                "BUY" if local_pos_side == "long" else "SELL", position_side,
+                "ADOPT", "ADOPTED_POSITION",
+                float(lead_qty), float(entry_px), float(lead_qty * entry_px),
+                my_qty=float(physical_qty), my_price=float(entry_px),
+                my_notional=float(entry_cost), details=details, notify_cfg=notify_cfg)
+            adopted.append({"symbol": symbol, "positionSide": position_side,
+                            "qty": float(physical_qty)})
+        await db.commit()
+        return adopted
+
     @serialized_execution
     async def process_lead_events(
         self, db: AsyncSession, lead: LeadSource, raw_orders: List[Dict[str, Any]],
@@ -2165,6 +2296,12 @@ class CopyRouter:
                                 lead_margin_balance, received_at_ms, notify_cfg)
                         except Exception:
                             logger.exception("Position adoption deferred for binding %s", binding.id)
+                    try:
+                        await self._adopt_manual_positions(
+                            db, binding, lead, account, adapter, instruments, snapshot,
+                            received_at_ms, notify_cfg)
+                    except Exception:
+                        logger.exception("Manual position adoption deferred for binding %s", binding.id)
                     completed = (await db.scalars(select(BindingDelivery).where(
                         BindingDelivery.binding_id == binding.id, BindingDelivery.state == "APPLIED"))).all()
                     for previous in completed:

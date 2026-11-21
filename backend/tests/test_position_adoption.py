@@ -14,7 +14,7 @@ import pytest
 from sqlalchemy import select
 
 from app.models.domain import (
-    BindingDelivery, ExecutionRecord, PositionAllocation, PositionGuardState,
+    BindingDelivery, ExecutionRecord, OrderIntent, PositionAllocation, PositionGuardState,
 )
 from app.services.adapters.base import BalanceInfo, ExchangePosition
 from app.services.engine.router import _exposure_ratio_matches
@@ -102,13 +102,13 @@ async def test_baseline_run_adopts_matching_position(trading, monkeypatch):
     assert exchange.orders == []  # 认领只改账，不下单。
 
 
-async def test_ratio_outside_tolerance_is_not_adopted(trading, monkeypatch):
+async def test_ratio_outside_tolerance_is_not_adopted(trading):
+    # 接入窗口的敞口比例检查只在 _adopt_matching_positions 内生效；
+    # process_lead_events 每轮还会跑持续自动认领（不做比例检查），所以
+    # 这里直接调接入认领，隔离验证比例检查本身。
     t = trading
     exchange = _exchange_with([_position(1.2)])
-    await prepare_event_router(t, exchange, monkeypatch)
-    t.binding.baseline_seeded = False
-    await t.db.commit()
-    await t.router.process_lead_events(t.db, t.lead, [], [], _snapshot(), [t.proxy])
+    assert await _adopt(t, exchange, _snapshot()) == []
     assert await _allocation(t) is None
     assert (await t.db.scalars(select(ExecutionRecord))).all() == []
     await t.db.refresh(t.binding)
@@ -279,3 +279,144 @@ def test_adoption_notification_names_the_adoption():
     assert "📥 已认领现有仓位为跟单仓位" in follower
     assert "📋 原因：现有仓位与带单员持仓一致" in follower
     assert "📦 均价 100 ｜ 金额 100.00 U" in follower
+
+# ---------------------------------------------------------------------------
+# 持续自动认领（_adopt_manual_positions）：每轮按实盘对齐带单员在交易的标的，
+# 不做敞口比例/容差检查；有在途订单跳过；不在带单员交易集合内的标的不认领。
+# ---------------------------------------------------------------------------
+
+async def _adopt_manual(t, exchange, snapshot, received_at_ms=NOW_MS):
+    # 持续认领只对已完成接入的绑定跑；直接调方法时先把绑定置为已接入。
+    t.binding.adoption_completed = True
+    await t.db.commit()
+    return await t.router._adopt_manual_positions(
+        t.db, t.binding, t.lead, t.account, exchange, {"BTCUSDT": t.spec},
+        snapshot, received_at_ms, {})
+
+
+async def _seed_manual_allocation(t, qty, generation=1, opened_at_ms=100):
+    from app.services.engine.sizer import format_exact
+    t.db.add(PositionAllocation(binding_id=t.binding.id, account_id=t.account.id, inst_id="BTCUSDT",
+                                pos_side="long", owned_qty=qty, owned_qty_exact=format_exact(qty),
+                                entry_cost=qty * 100, entry_cost_exact=format_exact(qty * 100),
+                                generation=generation, opened_at_ms=opened_at_ms))
+    await t.db.commit()
+
+
+async def test_manual_adopt_aligns_physical_to_ledger(trading):
+    t = trading
+    await _seed_manual_allocation(t, 0.5)
+    exchange = _exchange_with([_position(1)])
+    adopted = await _adopt_manual(t, exchange, _snapshot())
+    assert len(adopted) == 1 and adopted[0]["qty"] == 1.0
+    allocation = await _allocation(t)
+    assert allocation.owned_qty_exact == "1" and allocation.entry_cost_exact == "100"
+    assert allocation.generation == 2 and allocation.opened_at_ms == 100  # 非新建不改开仓时间
+    guard = await t.db.scalar(select(PositionGuardState).where(
+        PositionGuardState.binding_id == t.binding.id, PositionGuardState.inst_id == "BTCUSDT"))
+    assert guard is not None and guard.entry_px == 100
+    record = await t.db.scalar(select(ExecutionRecord))
+    assert record.status == "ADOPTED_POSITION" and record.action == "ADOPT"
+    assert "持续自动认领" in record.details
+    assert record.my_qty == 1 and record.my_price == 100 and record.my_notional == 100
+    assert exchange.orders == []  # 认领只改账，不下单。
+
+
+async def test_manual_adopt_ignores_ratio_mismatch(trading):
+    # 与接入认领不同：持续认领不做敞口比例检查，手动仓位多大都照实盘认领。
+    t = trading
+    exchange = _exchange_with([_position(1.2)])
+    adopted = await _adopt_manual(t, exchange, _snapshot())
+    assert len(adopted) == 1 and adopted[0]["qty"] == 1.2
+    allocation = await _allocation(t)
+    assert allocation.owned_qty_exact == "1.2" and allocation.entry_cost_exact == "120"
+    assert allocation.generation == 1 and allocation.opened_at_ms == NOW_MS
+
+
+async def test_manual_adopt_skips_in_flight_order(trading):
+    t = trading
+    await _seed_manual_allocation(t, 0.5)
+    t.db.add(OrderIntent(id="intent-1", binding_id=t.binding.id, account_id=t.account.id,
+                         inst_id="BTCUSDT", pos_side="long", source_event_id="test-event",
+                         state="submitted", requested_qty="1", reduce_only=False))
+    await t.db.commit()
+    exchange = _exchange_with([_position(1)])
+    assert await _adopt_manual(t, exchange, _snapshot()) == []
+    assert (await _allocation(t)).owned_qty_exact == "0.5"
+    assert (await t.db.scalars(select(ExecutionRecord))).all() == []
+
+
+async def test_manual_adopt_proceeds_when_intent_terminal(trading):
+    t = trading
+    await _seed_manual_allocation(t, 0.5)
+    t.db.add(OrderIntent(id="intent-1", binding_id=t.binding.id, account_id=t.account.id,
+                         inst_id="BTCUSDT", pos_side="long", source_event_id="test-event",
+                         state="filled", requested_qty="1", reduce_only=False))
+    await t.db.commit()
+    exchange = _exchange_with([_position(1)])
+    adopted = await _adopt_manual(t, exchange, _snapshot())
+    assert len(adopted) == 1
+    assert (await _allocation(t)).owned_qty_exact == "1"
+
+
+async def test_manual_adopt_skips_symbol_not_traded_by_lead(trading):
+    t = trading
+    await _seed_manual_allocation(t, 0.5)
+    snapshot = current_snapshot("LONG")
+    snapshot["openPositions"] = [{"symbol": "ETHUSDT", "positionSide": "LONG", "qty": 5, "qtyExact": "5"}]
+    exchange = _exchange_with([_position(1)])
+    assert await _adopt_manual(t, exchange, snapshot) == []
+    assert (await _allocation(t)).owned_qty_exact == "0.5"
+    assert (await t.db.scalars(select(ExecutionRecord))).all() == []
+
+
+async def test_manual_adopt_zeroes_manually_closed_position(trading):
+    t = trading
+    await _seed_manual_allocation(t, 0.5)
+    t.db.add(PositionGuardState(binding_id=t.binding.id, inst_id="BTCUSDT", pos_side="long",
+                                entry_px=100, peak_px=100, trough_px=100))
+    await t.db.commit()
+    exchange = _exchange_with([])
+    adopted = await _adopt_manual(t, exchange, _snapshot())
+    assert len(adopted) == 1 and adopted[0]["qty"] == 0.0
+    allocation = await _allocation(t)
+    assert allocation.owned_qty_exact == "0" and allocation.entry_cost_exact == "0"
+    assert allocation.generation == 2
+    guard = await t.db.scalar(select(PositionGuardState).where(
+        PositionGuardState.binding_id == t.binding.id, PositionGuardState.inst_id == "BTCUSDT"))
+    assert guard is None
+    record = await t.db.scalar(select(ExecutionRecord))
+    assert record.status == "ADOPTED_POSITION" and record.my_qty == 0
+
+
+async def test_manual_adopt_skips_when_already_aligned(trading):
+    t = trading
+    await _seed_manual_allocation(t, 1)
+    exchange = _exchange_with([_position(1)])
+    assert await _adopt_manual(t, exchange, _snapshot()) == []
+    assert (await _allocation(t)).generation == 1
+    assert (await t.db.scalars(select(ExecutionRecord))).all() == []
+
+
+async def test_manual_adopt_skips_when_toggle_off(trading):
+    t = trading
+    t.binding.adopt_existing_positions = False
+    await t.db.commit()
+    exchange = _exchange_with([_position(1)])
+    assert await _adopt_manual(t, exchange, _snapshot()) == []
+    assert await _allocation(t) is None
+    assert (await t.db.scalars(select(ExecutionRecord))).all() == []
+
+
+async def test_manual_adopt_runs_inside_process_lead_events(trading, monkeypatch):
+    t = trading
+    exchange = _exchange_with([_position(1)])
+    await prepare_event_router(t, exchange, monkeypatch)
+    await _seed_manual_allocation(t, 0.5)
+    t.binding.adoption_completed = True  # 跳过接入窗口认领，只测持续认领
+    await t.db.commit()
+    await t.router.process_lead_events(t.db, t.lead, [], [], _snapshot(), [t.proxy])
+    assert (await _allocation(t)).owned_qty_exact == "1"
+    record = await t.db.scalar(select(ExecutionRecord))
+    assert record.status == "ADOPTED_POSITION" and "持续自动认领" in record.details
+    assert exchange.orders == []
