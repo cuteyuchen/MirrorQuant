@@ -219,13 +219,15 @@ class CopyBinding(Base):
     max_instrument_leverage: Mapped[int] = mapped_column(Integer, default=20, nullable=False)
     max_drawdown_pct: Mapped[float] = mapped_column(Float, default=30.0, nullable=False)
     daily_max_loss_pct: Mapped[float] = mapped_column(Float, default=10.0, nullable=False)
-    max_slippage_pct: Mapped[float] = mapped_column(Float, default=1.0, nullable=False)
+    max_slippage_pct: Mapped[Optional[float]] = mapped_column(Float, default=None, nullable=True)
     max_spread_pct: Mapped[float] = mapped_column(Float, default=0.3, nullable=False)
     ioc_offset_pct: Mapped[float] = mapped_column(Float, default=0.5, nullable=False)
     order_mode: Mapped[str] = mapped_column(String(32), default="ioc_then_market", nullable=False)
     # 开仓滑点超限时的处理：block=拦截不下单；limit=改挂限价单，超过有效期未成交自动撤单。
-    slippage_action: Mapped[str] = mapped_column(String(16), default="block", nullable=False)
-    limit_order_ttl_sec: Mapped[int] = mapped_column(Integer, default=120, nullable=False)
+    # max_slippage_pct / slippage_action / limit_order_ttl_sec 为 None 时表示“未设置”，
+    # 生效值回退到全局 risk_defaults；设置了则以跟单设置为准。
+    slippage_action: Mapped[Optional[str]] = mapped_column(String(16), default=None, nullable=True)
+    limit_order_ttl_sec: Mapped[Optional[int]] = mapped_column(Integer, default=None, nullable=True)
 
     tp_sl_mode: Mapped[str] = mapped_column(String(32), default="follow_lead", nullable=False)  # follow_lead | independent | hybrid_guard
     enable_stop_loss: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)

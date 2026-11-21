@@ -137,6 +137,8 @@ DEFAULT_SYSTEM_CONFIG = {
     },
     "resilience": {
         "missed_order_max_age_sec": 900,
+        # 保留在配置里（设置界面仍展示），但补单漂移上限已改用生效滑点
+        # （跟单 max_slippage_pct，未设置时回退全局 risk_defaults），此处不再使用。
         "catchup_max_price_dev_pct": 0.5,
         "reconcile_interval_sec": 60,
         "auto_close_orphan_positions": "alert_only",  # alert_only | auto_close
@@ -228,8 +230,9 @@ SQLITE_MIGRATIONS: Dict[str, List[Tuple[str, str]]] = {
         ("hard_stop_loss_pct", "FLOAT NOT NULL DEFAULT 15.0"),
         ("consecutive_failures", "INTEGER NOT NULL DEFAULT 0"),
         # 旧绑定升级后保持原行为（拦截），需要挂限价单时在绑定里手动开启。
-        ("slippage_action", "VARCHAR(16) NOT NULL DEFAULT 'block'"),
-        ("limit_order_ttl_sec", "INTEGER NOT NULL DEFAULT 120"),
+        # 三列可空：NULL 表示“未设置”，生效时回退到全局 risk_defaults。
+        ("slippage_action", "VARCHAR(16) DEFAULT 'block'"),
+        ("limit_order_ttl_sec", "INTEGER DEFAULT 120"),
         ("adopt_existing_positions", "BOOLEAN NOT NULL DEFAULT 1"),
         ("adopt_tolerance_pct", "FLOAT NOT NULL DEFAULT 10.0"),
         ("adoption_completed", "BOOLEAN NOT NULL DEFAULT 0"),
@@ -237,6 +240,87 @@ SQLITE_MIGRATIONS: Dict[str, List[Tuple[str, str]]] = {
         ("deleted_at", "DATETIME"),
     ],
 }
+
+
+def _relax_copy_binding_slippage_columns(sync_conn) -> None:
+    """Allow NULL on the slippage columns so NULL can mean "use global".
+
+    SQLite cannot ALTER a column's nullability, so rebuild copy_bindings when
+    the columns are still NOT NULL. Idempotent: no-op when already nullable.
+    Existing explicit values are preserved; only the constraint changes.
+    The rebuild runs inside the caller's transaction (init_db BEGIN IMMEDIATE),
+    so a failure rolls back instead of leaving a half-rebuilt table.
+    Unique constraints are rebuilt anonymous: the old table still holds the
+    named autoindex until it is dropped, and a duplicate name would fail the
+    CREATE TABLE. The constraint itself (not its name) is what blocks dupes.
+    """
+    table = "copy_bindings"
+    targets = ("max_slippage_pct", "slippage_action", "limit_order_ttl_sec")
+    info = sync_conn.execute(text(f"PRAGMA table_info({table})")).fetchall()
+    if not info:
+        return
+    cols = {row[1]: row for row in info}
+    if any(name not in cols for name in targets):
+        return
+    if all(cols[name][3] == 0 for name in targets):
+        return
+    # Never rebuild over corrupt references: a failed INSERT would abort init
+    # and the app would not start. Leave the columns NOT NULL in that case.
+    violations = sync_conn.execute(text(f"PRAGMA foreign_key_check({table})")).fetchall()
+    if violations:
+        logger.warning("Skipping %s nullability migration: %d foreign-key violations", table, len(violations))
+        return
+    col_defs = []
+    pk_cols = []
+    for row in info:
+        _cid, name, ctype, notnull, dflt, pk = row[0], row[1], row[2], row[3], row[4], row[5]
+        if name in targets:
+            notnull = 0
+        parts = [f'"{name}" {ctype}']
+        if notnull:
+            parts.append("NOT NULL")
+        if dflt is not None:
+            parts.append(f"DEFAULT {dflt}")
+        col_defs.append(" ".join(parts))
+        if pk:
+            pk_cols.append((pk, name))
+    if pk_cols:
+        pk_cols.sort()
+        col_defs.append("PRIMARY KEY (" + ", ".join(f'"{name}"' for _, name in pk_cols) + ")")
+    for idx in sync_conn.execute(text(f"PRAGMA index_list({table})")).fetchall():
+        _seq, _idx_name, is_unique, origin, _partial = idx[0], idx[1], idx[2], idx[3], idx[4]
+        if not is_unique or origin != "u":
+            continue
+        idx_cols = [r[2] for r in sync_conn.execute(text(f"PRAGMA index_info({_idx_name})")).fetchall()]
+        if not idx_cols:
+            continue
+        col_defs.append("UNIQUE (" + ", ".join(f'"{c}"' for c in idx_cols) + ")")
+    fk_groups = {}
+    for row in sync_conn.execute(text(f"PRAGMA foreign_key_list({table})")).fetchall():
+        _id, seq, ref_table, from_col, to_col, on_update, on_delete, match = row
+        fk_groups.setdefault(_id, []).append((seq, ref_table, from_col, to_col, on_update, on_delete, match))
+    for _id in sorted(fk_groups):
+        parts = sorted(fk_groups[_id])
+        ref_table = parts[0][1]
+        from_cols = ", ".join(f'"{p[2]}"' for p in parts)
+        to_cols = ", ".join(f'"{p[3]}"' for p in parts)
+        fk = f'FOREIGN KEY ({from_cols}) REFERENCES "{ref_table}" ({to_cols})'
+        on_update, on_delete, match = parts[0][4], parts[0][5], parts[0][6]
+        if on_update and str(on_update).upper() != "NO ACTION":
+            fk += f" ON UPDATE {on_update}"
+        if on_delete and str(on_delete).upper() != "NO ACTION":
+            fk += f" ON DELETE {on_delete}"
+        if match and str(match).upper() != "NONE":
+            fk += f" MATCH {match}"
+        col_defs.append(fk)
+    new_table = f"{table}_new_slippage_nullable"
+    col_list = ", ".join(f'"{row[1]}"' for row in info)
+    logger.info("Rebuilding SQLite table %s to allow NULL on %s", table, ", ".join(targets))
+    sync_conn.execute(text(f"DROP TABLE IF EXISTS {new_table}"))
+    sync_conn.execute(text(f"CREATE TABLE {new_table} ({', '.join(col_defs)})"))
+    sync_conn.execute(text(f"INSERT INTO {new_table} ({col_list}) SELECT {col_list} FROM {table}"))
+    sync_conn.execute(text(f"DROP TABLE {table}"))
+    sync_conn.execute(text(f"ALTER TABLE {new_table} RENAME TO {table}"))
 
 
 def _apply_sqlite_migrations(sync_conn) -> None:
@@ -281,6 +365,8 @@ def _apply_sqlite_migrations(sync_conn) -> None:
                         "UPDATE binding_deliveries SET state='PENDING', exit_progress='REVIEW_REQUIRED' "
                         "WHERE binding_id=:binding_id AND source_event_id=:event_id"
                     ), {"binding_id": binding_id, "event_id": event_id})
+    # 补列完成后才放宽可空性：重建 copy_bindings 需要三列都已存在。
+    _relax_copy_binding_slippage_columns(sync_conn)
     # create_all 不会为既有表补索引，升级时显式且幂等创建。
     for table, column in (("order_intents", "reporting_complete"),
                           ("notification_outbox", "execution_id"), ("notification_outbox", "event_key"),

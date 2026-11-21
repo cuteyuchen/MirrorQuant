@@ -136,7 +136,7 @@ async def test_legacy_allocation_exact_fields_are_canonical_after_reload(trading
 
 async def execute_batch(t, exchange, side="SELL", qty=1, remaining=0, event="test-event",
                         position_side="LONG", avg_price="100", batch_fields=None, resilience_cfg=None,
-                        source_proven=True, global_kill=False):
+                        source_proven=True, global_kill=False, risk_defaults=None):
     batch = {"symbol": "BTCUSDT", "side": side, "positionSide": position_side, "qty": str(qty),
              "avgPrice": avg_price, "notional": str(Decimal(str(qty)) * 100), "_event_id": event,
              "startTime": NOW_MS - 150_000, "endTime": NOW_MS - 150_000}
@@ -154,7 +154,7 @@ async def execute_batch(t, exchange, side="SELL", qty=1, remaining=0, event="tes
         t.db, t.binding, t.lead, t.account, exchange, batch,
         lead_margin_balance=1000, active_lead_positions={f"BTCUSDT_{position_side}": remaining}, my_equity=1000,
         positions=[] if is_open else [t.pos], instruments={"BTCUSDT": t.spec}, global_kill=global_kill,
-        notify_cfg={}, resilience_cfg=resilience_cfg,
+        notify_cfg={}, resilience_cfg=resilience_cfg, risk_defaults=risk_defaults,
     )
     await t.db.commit()
 
@@ -254,7 +254,11 @@ async def test_catchup_uses_executable_side_and_directional_drift(trading, side,
     executable_price = ask if side == "BUY" else bid
     exchange = OfflineExchange(price=executable_price)
     exchange.get_orderbook.return_value = OrderBook([[bid, 100]], [[ask, 100]])
-    await execute_batch(t, exchange, side=side, position_side=position_side, remaining=1)
+    # 本用例的边界在 0.4% 与 0.6% 之间：漂移上限现在来自生效滑点（跟单优先、
+    # 未设置时回退全局），不再是 resilience 的 catchup_max_price_dev_pct，
+    # 这里显式把生效滑点定为 0.5% 以保留原边界。
+    await execute_batch(t, exchange, side=side, position_side=position_side, remaining=1,
+                        risk_defaults={"max_slippage_pct": 0.5})
     record = await t.db.scalar(select(ExecutionRecord))
     assert record.status == status and record.my_price == executable_price
     if status == "EXECUTED":
@@ -316,12 +320,29 @@ async def test_catchup_invalid_lead_price_is_recorded(trading, side, position_si
     exchange.ensure_leverage.assert_not_awaited()
 
 
-@pytest.mark.parametrize("field", ("missed_order_max_age_sec", "catchup_max_price_dev_pct"))
+# catchup_max_price_dev_pct 已不再是漂移上限（生效滑点取而代之，见上），
+# 该字段的无效值现在被忽略；仍在生效的上限字段只有 missed_order_max_age_sec。
+@pytest.mark.parametrize("field", ("missed_order_max_age_sec",))
 @pytest.mark.parametrize("value", (0, -1))
 async def test_invalid_catchup_limits_are_recorded_before_execution(trading, field, value):
     t = trading
     exchange = OfflineExchange()
     await execute_batch(t, exchange, side="BUY", remaining=1, resilience_cfg={field: value})
+    assert exchange.orders == []
+    record = await t.db.scalar(select(ExecutionRecord))
+    assert record.status == "BLOCKED_CATCHUP_CONFIG" and record.details
+    exchange.ensure_leverage.assert_not_awaited()
+
+
+@pytest.mark.parametrize("value", (0, -1))
+async def test_invalid_effective_slippage_is_recorded_before_execution(trading, value):
+    # 漂移上限来自生效滑点：脏值（API 层 gt=0 校验已挡正常写入，这里直接写库模拟）
+    # 仍要在执行前被补单门禁拦下并记录为 BLOCKED_CATCHUP_CONFIG。
+    t = trading
+    t.binding.max_slippage_pct = value
+    await t.db.commit()
+    exchange = OfflineExchange()
+    await execute_batch(t, exchange, side="BUY", remaining=1)
     assert exchange.orders == []
     record = await t.db.scalar(select(ExecutionRecord))
     assert record.status == "BLOCKED_CATCHUP_CONFIG" and record.details
@@ -351,8 +372,11 @@ async def test_catchup_rejects_before_spread_slippage_sizing_and_leverage(tradin
     monkeypatch.setattr(RiskEngine, "check_slippage", unexpected)
     monkeypatch.setattr(PositionSizer, "calculate_target_usd", unexpected)
     monkeypatch.setattr(RiskEngine, "cap_by_leverage", unexpected)
+    # 漂移 1%（ask 101 vs 带单价 100）：生效滑点定为 0.5% 才能让补单门禁先于
+    # 价差/滑点/仓位/杠杆拦截；缺省全局 1.0% 时 1% 漂移不超限，会走到后面的 stale 检查。
     await execute_batch(t, exchange, side="BUY", remaining=1,
-                        batch_fields={"endTime": NOW_MS - 1_000_000})
+                        batch_fields={"endTime": NOW_MS - 1_000_000},
+                        risk_defaults={"max_slippage_pct": 0.5})
     assert exchange.orders == []
     assert (await t.db.scalar(select(ExecutionRecord))).status == "BLOCKED_CATCHUP_DRIFT"
     exchange.ensure_leverage.assert_not_awaited()

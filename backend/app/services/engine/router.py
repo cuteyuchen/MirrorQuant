@@ -159,6 +159,27 @@ def _effective_open_leverage(existing_leverage, target_notional, equity, max_sym
         target_notional=target_notional, equity=equity, max_symbol_leverage=max_symbol_leverage)
 
 
+def _effective_slippage_settings(binding, risk_defaults):
+    """Resolve the slippage settings actually in force for a binding.
+
+    Binding override wins; None on the binding means "not set", fall back to
+    the global risk_defaults. The drift limit, the slippage check, the limit
+    order price and its TTL all use the resolved values, so the binding's
+    setting is authoritative when set and the global governs otherwise.
+    """
+    rd = risk_defaults or {}
+    max_slip = getattr(binding, "max_slippage_pct", None)
+    if max_slip is None:
+        max_slip = rd.get("max_slippage_pct") or 1.0
+    action = getattr(binding, "slippage_action", None)
+    if action is None:
+        action = rd.get("slippage_action") or "block"
+    ttl = getattr(binding, "limit_order_ttl_sec", None)
+    if ttl is None:
+        ttl = rd.get("limit_order_ttl_sec") or 120
+    return float(max_slip), action, int(ttl)
+
+
 def lead_position_context(db) -> Optional[Dict[str, Any]]:
     """Recover pre/post lead inventory for a notification from the current delivery scope.
 
@@ -2110,6 +2131,7 @@ class CopyRouter:
         await db.commit()
         notify_cfg = await self._get_config(db, "notifications", DEFAULT_SYSTEM_CONFIG["notifications"])
         resilience_cfg = await self._get_config(db, "resilience", DEFAULT_SYSTEM_CONFIG["resilience"])
+        risk_defaults_cfg = await self._get_config(db, "risk_defaults", DEFAULT_SYSTEM_CONFIG["risk_defaults"])
         lead_margin_balance = (snapshot.get("profile") or {}).get("marginBalance") or lead.margin_balance or 0
         active = {f"{p['symbol']}_{p['positionSide']}": exact(p.get("qtyExact", p.get("qty")) or 0)
                   for p in snapshot.get("openPositions") or []}
@@ -2303,7 +2325,8 @@ class CopyRouter:
                         else:
                             await self._execute_batch_for_binding(db, binding, lead, account, adapter,
                                 batch, lead_margin_balance, active, bal.eq, positions, instruments,
-                                bool(await self._get_config(db, "global_kill_switch", False)), notify_cfg, resilience_cfg)
+                                bool(await self._get_config(db, "global_kill_switch", False)), notify_cfg, resilience_cfg,
+                                risk_defaults_cfg)
                         db.info.pop("delivery", None)
                         db.info.pop("snapshot_admission", None)
                         await db.commit()
@@ -2348,8 +2371,10 @@ class CopyRouter:
         global_kill: bool,
         notify_cfg: Dict[str, Any],
         resilience_cfg: Optional[Dict[str, Any]] = None,
+        risk_defaults: Optional[Dict[str, Any]] = None,
     ) -> None:
         resilience_cfg = resilience_cfg or DEFAULT_SYSTEM_CONFIG["resilience"]
+        risk_defaults = risk_defaults or DEFAULT_SYSTEM_CONFIG["risk_defaults"]
         symbol = batch["symbol"]
         side = batch["side"]
         ps = batch["positionSide"]
@@ -2572,6 +2597,8 @@ class CopyRouter:
         ref_px = best_ask if order_side == "buy" else best_bid
 
         # Every opening must pass, including batches with missing timestamps.
+        # 生效滑点三件套：跟单设置优先，未设置时回退全局 risk_defaults。
+        eff_slippage, eff_action, eff_ttl = _effective_slippage_settings(binding, risk_defaults)
         batch_ts_ms = int(batch.get("endTime") or batch.get("time") or 0)
         catchup_res = RiskEngine.check_missed_order_catchup(
             order_time_ms=batch_ts_ms,
@@ -2579,7 +2606,9 @@ class CopyRouter:
             max_age_sec=int(resilience_cfg.get("missed_order_max_age_sec", 900)),
             ref_price=ref_px,
             lead_avg_price=lead_avg_px,
-            catchup_max_price_dev_pct=float(resilience_cfg.get("catchup_max_price_dev_pct", 0.5)),
+            # 补单漂移上限就是生效滑点；resilience 里的 catchup_max_price_dev_pct
+            # 已不再用于此（保留在配置里不动，免得动设置界面）。
+            catchup_max_price_dev_pct=eff_slippage,
             order_side=order_side,
         )
         # 滑点超限处理为“挂限价单”时，只对追价方向（买入现价更高 / 卖出现价更低）的偏离改挂单；
@@ -2587,7 +2616,7 @@ class CopyRouter:
         # 行情缺失、事件过旧等仍按原规则拦截。
         adverse = ref_px > 0 and lead_avg_px > 0 and (
             ref_px > lead_avg_px if order_side == "buy" else ref_px < lead_avg_px)
-        limit_mode = getattr(binding, "slippage_action", "block") == "limit" and adverse
+        limit_mode = eff_action == "limit" and adverse
         use_limit = limit_mode and not catchup_res.allowed and catchup_res.code == "BLOCKED_CATCHUP_DRIFT"
         if not catchup_res.allowed and not use_limit:
             await self._record_execution(
@@ -2609,7 +2638,7 @@ class CopyRouter:
             )
             return
 
-        slip_res = RiskEngine.check_slippage(ref_px, lead_avg_px, binding.max_slippage_pct, order_side=order_side)
+        slip_res = RiskEngine.check_slippage(ref_px, lead_avg_px, eff_slippage, order_side=order_side)
         use_limit = use_limit or (limit_mode and not slip_res.allowed)
         if not slip_res.allowed and not use_limit:
             await self._record_execution(
@@ -2623,9 +2652,9 @@ class CopyRouter:
         entry_px = ref_px
         limit_px_dec = None
         if use_limit:
-            # 限价 = 带单均价按“允许的最大偏离”外扩一档：买单向下取整到最小价位，卖单向上取整。
-            allowed = min(exact(binding.max_slippage_pct),
-                          exact(resilience_cfg.get("catchup_max_price_dev_pct", 0.5))) / Decimal("100")
+            # 限价 = 带单均价按生效滑点外扩一档：买单向下取整到最小价位，卖单向上取整。
+            # 不再取 min(跟单, catchup_dev)：跟单设置（或全局）说了算。
+            allowed = exact(eff_slippage) / Decimal("100")
             if order_side == "buy":
                 limit_px_dec = quantize_down(exact(lead_avg_px) * (1 + allowed), spec.tick_sz)
             else:
@@ -2715,7 +2744,7 @@ class CopyRouter:
         # A price-limited IOC makes the configured slippage limit an execution bound.
         # Market-only and IOC-then-market settings cannot bypass that bound.
         offset = exact(binding.ioc_offset_pct) / Decimal("100")
-        slippage = exact(binding.max_slippage_pct) / Decimal("100")
+        slippage = exact(eff_slippage) / Decimal("100")
         if order_side == "buy":
             limit = min(exact(ref_px) * (1 + offset), exact(lead_avg_px) * (1 + slippage))
             ioc_px_dec = quantize_down(limit, spec.tick_sz)
@@ -2723,7 +2752,7 @@ class CopyRouter:
             limit = max(exact(ref_px) * (1 - offset), exact(lead_avg_px) * (1 - slippage))
             ioc_px_dec = (limit / spec.tick_sz).to_integral_value(rounding=ROUND_UP) * spec.tick_sz
         ord_type, order_px, expires_at_ms = "ioc", ioc_px_dec, None
-        limit_ttl_sec = int(getattr(binding, "limit_order_ttl_sec", 120) or 120)
+        limit_ttl_sec = int(eff_ttl)
         if use_limit:
             ord_type, order_px = "limit", limit_px_dec
             expires_at_ms = int(time.time() * 1000) + limit_ttl_sec * 1000

@@ -253,6 +253,9 @@ async def test_actual_filled_unfilled_and_risk_paths_keep_terminal_states(workfl
     await configure_sink(t.db, dingtalk_enabled=True)
     if outcome == "BLOCKED_CATCHUP_DRIFT":
         t.adapter.get_orderbook.return_value = OrderBook([[100.9, 100]], [[101, 100]])
+        # 漂移 1%（ask 101 vs 带单价 100）：生效滑点定为 0.5% 才能被拦；
+        # 跟单未设滑点时回退全局 1.0%，1% 漂移不超限。
+        t.binding.max_slippage_pct = 0.5
     elif outcome == "BLOCKED_SPREAD":
         t.adapter.get_orderbook.return_value = OrderBook([[99.5, 100]], [[100, 100]])
     elif outcome == "SKIPPED_UNSUPPORTED":

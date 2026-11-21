@@ -237,3 +237,75 @@ async def test_login_brute_force_lockout_and_captcha(async_client: AsyncClient):
     assert "Retry-After" in res.headers
     assert res.json().get("code") == "ACCOUNT_LOCKED"
     assert res.json().get("lockRemainingSec", 0) > 0
+
+
+@pytest.mark.asyncio
+async def test_binding_slippage_fields_default_to_null_and_update_clears(async_client: AsyncClient):
+    # 建绑定时不传滑点三字段就存 NULL（回退全局）；传了存传的值；更新显式 null 可清回 NULL。
+    res = await async_client.post(
+        "/api/auth/setup",
+        json={"username": "superadmin", "password": "SecurePassword2026!"},
+    )
+    assert res.status_code == 201
+    res = await async_client.post(
+        "/api/auth/login", json={"username": "superadmin", "password": "SecurePassword2026!"},
+    )
+    assert res.status_code == 200
+    headers = {"Authorization": f"Bearer {res.json()['token']}"}
+
+    async def make_lead(name, portfolio_id):
+        res = await async_client.post(
+            "/api/leads", headers=headers,
+            json={"name": name, "platform": "binance_bapi", "portfolioId": portfolio_id,
+                  "pollIntervalSec": 15, "isPublicDashboard": True},
+        )
+        assert res.status_code == 201
+        return res.json()["item"]["id"]
+
+    async def make_account(name):
+        res = await async_client.post(
+            "/api/accounts", headers=headers,
+            json={"name": name, "exchange": "okx", "environment": "demo",
+                  "api_key": "test_okx_key_12345", "secret_key": "test_okx_secret_67890",
+                  "passphrase": "test_okx_passphrase"},
+        )
+        assert res.status_code == 201
+        return res.json()["item"]["id"]
+
+    lead1 = await make_lead("Lead-1", "3829104719284719283")
+    lead2 = await make_lead("Lead-2", "3829104719284719284")
+    acct1, acct2 = await make_account("Acct-1"), await make_account("Acct-2")
+
+    # 不传滑点字段：存 NULL。
+    res = await async_client.post(
+        "/api/bindings", headers=headers,
+        json={"name": "B1", "lead_id": lead1, "account_id": acct1},
+    )
+    assert res.status_code == 201
+    b1 = res.json()["item"]
+    assert b1["maxSlippagePct"] is None and b1["slippageAction"] is None and b1["limitOrderTtlSec"] is None
+
+    # 传了：存传的值。
+    res = await async_client.post(
+        "/api/bindings", headers=headers,
+        json={"name": "B2", "lead_id": lead2, "account_id": acct2,
+              "max_slippage_pct": 2.0, "slippage_action": "limit", "limit_order_ttl_sec": 600},
+    )
+    assert res.status_code == 201
+    b2 = res.json()["item"]
+    assert (b2["maxSlippagePct"], b2["slippageAction"], b2["limitOrderTtlSec"]) == (2.0, "limit", 600)
+
+    # 更新显式 null：清回 NULL。
+    res = await async_client.put(
+        f"/api/bindings/{b2['id']}", headers=headers, json={"maxSlippagePct": None},
+    )
+    assert res.status_code == 200
+    assert res.json()["item"]["maxSlippagePct"] is None
+    assert res.json()["item"]["slippageAction"] == "limit"
+
+    # 更新传值：正常改。
+    res = await async_client.put(
+        f"/api/bindings/{b2['id']}", headers=headers, json={"maxSlippagePct": 0.5},
+    )
+    assert res.status_code == 200
+    assert res.json()["item"]["maxSlippagePct"] == 0.5

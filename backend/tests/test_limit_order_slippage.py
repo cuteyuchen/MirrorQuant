@@ -90,13 +90,14 @@ async def test_excess_drift_places_resting_limit_order(trading):
     await use_limit_mode(t)
     await execute_batch(t, exchange, side="BUY", remaining=1, event="open-1")
     order = exchange.orders[0]
-    # 限价 = 带单均价 100 × (1 + min(滑点 1%, 追单偏离 0.5%))，仓位按限价测算。
-    assert (order["ord_type"], order["px"], order["sz"], order["reduce_only"]) == ("limit", "100.5", "0.9", False)
+    # 限价 = 带单均价 100 × (1 + 生效滑点 1%)：跟单未设滑点时回退全局 1.0%，
+    # 不再被补单漂移上限 0.5% 压住。仓位按限价测算（目标 100 美元 / 101 = 0.9 手）。
+    assert (order["ord_type"], order["px"], order["sz"], order["reduce_only"]) == ("limit", "101.0", "0.9", False)
     intent = await t.db.get(OrderIntent, order["cl_ord_id"])
-    assert (intent.state, intent.limit_px, intent.expires_at_ms) == ("RESTING", "100.5", NOW_MS + 120_000)
+    assert (intent.state, intent.limit_px, intent.expires_at_ms) == ("RESTING", "101.0", NOW_MS + 120_000)
     statuses, rows = await records(t)
     assert statuses == ["LIMIT_PLACED"]
-    assert rows[0].my_qty == 0 and rows[0].my_price == 100.5 and rows[0].order_id == "exchange-id"
+    assert rows[0].my_qty == 0 and rows[0].my_price == 101 and rows[0].order_id == "exchange-id"
     # 未到期的在簿限价单不算未决订单，不会挂起账户的其他开仓。
     assert await reconcile(t, exchange) is True
     assert exchange.canceled == [] and intent.state == "RESTING"
@@ -144,7 +145,7 @@ async def test_resting_limit_fill_is_accounted_and_notified(trading, monkeypatch
     assert intent.state == "FILLED" and allocation.owned_qty_exact == "0.9"
     statuses, rows = await records(t)
     assert statuses == ["LIMIT_PLACED", "EXECUTED"] and rows[1].my_qty == 0.9
-    assert len(sent) == 1 and "✅ 限价单已成交" in sent[0] and "已成交 90.45 U / 委托 90.45 U" in sent[0]
+    assert len(sent) == 1 and "✅ 限价单已成交" in sent[0] and "已成交 90.90 U / 委托 90.90 U" in sent[0]
 
 
 async def test_resting_limit_is_cancelled_after_ttl(trading, monkeypatch):
@@ -184,7 +185,7 @@ async def test_partial_fill_then_expiry_keeps_fill_and_drops_remainder(trading, 
     # 已成交部分照常记账；未成交部分失效，不结转为待补金额。
     assert intent.state == "CANCELED" and allocation.owned_qty_exact == "0.4" and debt.pending_usd == 0
     assert "限价单部分成交，剩余继续挂单" in sent[0]
-    assert "限价单剩余部分已自动撤单（超时）" in sent[1] and "已成交 40.20 U / 委托 90.45 U" in sent[1]
+    assert "限价单剩余部分已自动撤单（超时）" in sent[1] and "已成交 40.40 U / 委托 90.90 U" in sent[1]
 
 
 async def test_cancel_rejected_because_order_filled_is_recorded_as_fill(trading, monkeypatch):
@@ -315,3 +316,95 @@ def test_limit_fill_shortfall_is_reported_as_partial_with_remainder_cancelled():
                          limit={"px": "100.5", "requested": "0.9", "filled": "0.4"})
     assert "⚠️ 限价单部分成交，剩余已撤单" in text and "已成交 40.20 U / 委托 90.45 U" in text
     assert Decimal("0.4") < Decimal("0.9")
+
+
+# ---- 滑点层级：跟单设置优先，未设置时回退全局 risk_defaults ----
+
+def _global_defaults(**overrides):
+    from app.core.database import DEFAULT_SYSTEM_CONFIG
+
+    rd = dict(DEFAULT_SYSTEM_CONFIG["risk_defaults"])
+    rd.update(overrides)
+    return rd
+
+
+async def _set_binding_slippage(t, max_slippage=None, action=None, ttl=None):
+    t.binding.max_slippage_pct = max_slippage
+    t.binding.slippage_action = action
+    t.binding.limit_order_ttl_sec = ttl
+    await t.db.commit()
+
+
+async def test_binding_slippage_overrides_global_for_limit_price(trading):
+    # 跟单设 2.0%：限价挂在带单价 ×1.02，不再被全局 1% 卡住。
+    t, exchange = trading, LimitExchange()
+    await _set_binding_slippage(t, max_slippage=2.0, action="limit", ttl=120)
+    await execute_batch(t, exchange, side="BUY", remaining=1, event="open-1")
+    order = exchange.orders[0]
+    assert (order["ord_type"], order["px"], order["sz"], order["reduce_only"]) == ("limit", "102.0", "0.9", False)
+    statuses, rows = await records(t)
+    assert statuses == ["LIMIT_PLACED"] and rows[0].my_price == 102.0
+
+
+async def test_binding_slippage_tighter_than_global(trading):
+    # 跟单设 0.5%：限价挂在带单价 ×1.005，比全局更紧。
+    t, exchange = trading, LimitExchange()
+    await _set_binding_slippage(t, max_slippage=0.5, action="limit", ttl=120)
+    await execute_batch(t, exchange, side="BUY", remaining=1, event="open-1")
+    order = exchange.orders[0]
+    assert (order["ord_type"], order["px"], order["sz"], order["reduce_only"]) == ("limit", "100.5", "0.9", False)
+    statuses, rows = await records(t)
+    assert statuses == ["LIMIT_PLACED"] and rows[0].my_price == 100.5
+
+
+async def test_unset_binding_slippage_falls_back_to_global(trading):
+    # 跟单未设滑点：全局 2.0% 生效，限价挂在带单价 ×1.02。
+    t, exchange = trading, LimitExchange()
+    await _set_binding_slippage(t, max_slippage=None, action="limit", ttl=120)
+    await execute_batch(t, exchange, side="BUY", remaining=1, event="open-1",
+                        risk_defaults=_global_defaults(max_slippage_pct=2.0))
+    order = exchange.orders[0]
+    assert (order["ord_type"], order["px"], order["sz"], order["reduce_only"]) == ("limit", "102.0", "0.9", False)
+    statuses, rows = await records(t)
+    assert statuses == ["LIMIT_PLACED"] and rows[0].my_price == 102.0
+
+
+async def test_unset_binding_slippage_action_falls_back_to_global(trading):
+    # 跟单未设动作：全局 limit 生效，超限改挂限价单而不是拦截。
+    t, exchange = trading, LimitExchange()
+    await _set_binding_slippage(t, max_slippage=None, action=None, ttl=120)
+    await execute_batch(t, exchange, side="BUY", remaining=1, event="open-1",
+                        risk_defaults=_global_defaults(slippage_action="limit"))
+    assert len(exchange.orders) == 1 and exchange.orders[0]["ord_type"] == "limit"
+    statuses, _ = await records(t)
+    assert statuses == ["LIMIT_PLACED"]
+
+
+async def test_binding_slippage_action_overrides_global(trading):
+    # 跟单显式 block：全局即使是 limit 也照样拦截。
+    t, exchange = trading, LimitExchange()
+    await _set_binding_slippage(t, max_slippage=None, action="block", ttl=120)
+    await execute_batch(t, exchange, side="BUY", remaining=1, event="open-1",
+                        risk_defaults=_global_defaults(slippage_action="limit"))
+    statuses, _ = await records(t)
+    assert statuses == ["BLOCKED_CATCHUP_DRIFT"] and exchange.orders == []
+
+
+async def test_unset_binding_ttl_falls_back_to_global(trading):
+    # 跟单未设 TTL：全局 600 秒生效。
+    t, exchange = trading, LimitExchange()
+    await _set_binding_slippage(t, max_slippage=None, action="limit", ttl=None)
+    await execute_batch(t, exchange, side="BUY", remaining=1, event="open-1",
+                        risk_defaults=_global_defaults(limit_order_ttl_sec=600))
+    intent = await t.db.get(OrderIntent, exchange.orders[0]["cl_ord_id"])
+    assert (intent.state, intent.expires_at_ms) == ("RESTING", NOW_MS + 600_000)
+
+
+async def test_binding_ttl_overrides_global(trading):
+    # 跟单设 300 秒：全局 600 秒不生效。
+    t, exchange = trading, LimitExchange()
+    await _set_binding_slippage(t, max_slippage=None, action="limit", ttl=300)
+    await execute_batch(t, exchange, side="BUY", remaining=1, event="open-1",
+                        risk_defaults=_global_defaults(limit_order_ttl_sec=600))
+    intent = await t.db.get(OrderIntent, exchange.orders[0]["cl_ord_id"])
+    assert (intent.state, intent.expires_at_ms) == ("RESTING", NOW_MS + 300_000)

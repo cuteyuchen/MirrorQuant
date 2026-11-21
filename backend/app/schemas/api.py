@@ -215,13 +215,13 @@ class BindingCreate(CamelModel):
     max_instrument_leverage: int = Field(default=20, ge=1, le=125)
     max_drawdown_pct: float = Field(default=30.0, ge=0.0, le=100.0)
     daily_max_loss_pct: float = Field(default=10.0, ge=0.0, le=100.0)
-    max_slippage_pct: float = Field(default=1.0, gt=0.0, le=50.0)
+    max_slippage_pct: Optional[float] = Field(default=None, gt=0.0, le=50.0)
     max_spread_pct: float = Field(default=0.3, ge=0.0, le=20.0)
     ioc_offset_pct: float = Field(default=0.5, ge=0.0, le=10.0)
     order_mode: str = Field(default="ioc_then_market", pattern="^(ioc_then_market|ioc_only|market_only)$")
-    # 滑点超限处理方式与限价单有效期（秒）。
-    slippage_action: str = Field(default="block", pattern="^(block|limit)$")
-    limit_order_ttl_sec: int = Field(default=120, ge=10, le=3600)
+    # 滑点超限处理方式与限价单有效期（秒）。不传（null）表示未设置，生效时回退到全局 risk_defaults。
+    slippage_action: Optional[str] = Field(default=None, pattern="^(block|limit)$")
+    limit_order_ttl_sec: Optional[int] = Field(default=None, ge=10, le=3600)
     adopt_existing_positions: bool = True
     adopt_tolerance_pct: float = Field(default=10.0, ge=0.0, le=100.0)
     tp_sl_mode: str = Field(default="follow_lead", pattern="^(follow_lead|independent|hybrid_guard)$")
@@ -238,6 +238,9 @@ class BindingCreate(CamelModel):
 
 
 class BindingUpdate(UpdateModel):
+    # 显式 null 允许用于滑点三字段：把它清回“未设置”，生效时回退到全局 risk_defaults。
+    nullable_fields: ClassVar[frozenset[str]] = frozenset({"max_slippage_pct", "slippage_action", "limit_order_ttl_sec"})
+
     name: Optional[str] = Field(default=None, min_length=1, max_length=120)
     is_enabled: Optional[bool] = None
     enable_circuit_breaker: Optional[bool] = None
