@@ -19,8 +19,10 @@ from app.core.secret_mask import mask_sensitive_payload, redact_proxy_userinfo
 from app.models.domain import CopyBinding, LeadSource, NotificationOutbox, ProxyNode, TradingAccount
 from app.maintenance.retention import cleanup_retained_records
 from app.services.adapters.factory import create_exchange_adapter
-from app.services.adapters.base import get_collateral_balance
+from app.services.adapters.base import ExchangeAPIError, get_collateral_balance
 from app.services.analysis.pa_analyzer import PAAnalyzer
+from app.services.engine.cashflow import cash_flow_is_fresh, fetch_today_net_flow
+from app.core.time_util import BEIJING_TZ
 from app.services.engine.router import CopyRouter
 from app.services.engine.risk import RiskEngine
 from app.services.engine.equity import display_equity, equity_baseline, persist_equity, risk_state
@@ -531,6 +533,36 @@ class EngineOrchestrator:
 
         return True
 
+    async def _refresh_today_cash_flow(self, account: TradingAccount, adapter: Any) -> Optional[Dict[str, Any]]:
+        """拉当日现货<->合约净划转，供看板算现金流调整后的今日盈亏。
+
+        返回 {"net_flow", "date", "updated_at_ms"} 交 persist_equity 写入；
+        已有新鲜记录时返回 None（不重复拉），拉不到时也返回 None（不改已存
+        记录、不让同步失败）。拉不到且当天无任何记录时，看板今日盈亏为 null。
+        """
+        today = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d")
+        now_ms = int(time.time() * 1000)
+        try:
+            state = risk_state(account)
+        except (ValueError, TypeError):
+            state = {"assets": {}}
+        if cash_flow_is_fresh(state, today, now_ms):
+            return None
+        try:
+            net_flow = await fetch_today_net_flow(adapter, "USDT", today)
+        except ExchangeAPIError as exc:
+            if exc.code == "UNSUPPORTED_CASH_FLOW":
+                logger.debug("Cash-flow history unsupported for account %s", account.id)
+            else:
+                logger.warning("Cash-flow fetch failed for account %s: %s",
+                               account.id, redact_proxy_userinfo(str(exc))[:200])
+            return None
+        except Exception as exc:
+            logger.warning("Cash-flow fetch failed for account %s: %s",
+                           account.id, redact_proxy_userinfo(str(exc))[:200])
+            return None
+        return {"net_flow": net_flow, "date": today, "updated_at_ms": now_ms}
+
     @serialized_execution
     async def sync_account(
         self,
@@ -567,7 +599,8 @@ class EngineOrchestrator:
 
             bal = await get_collateral_balance(adapter)
             positions = await adapter.get_positions()
-            await persist_equity(db, account, bal, all_assets=True)
+            cash_flow = await self._refresh_today_cash_flow(account, adapter)
+            await persist_equity(db, account, bal, all_assets=True, cash_flow=cash_flow)
             equity_display = display_equity(bal)
             account.total_notional = sum(p.notional_usd for p in positions)
             account.unrealized_pnl = sum(p.upl for p in positions)

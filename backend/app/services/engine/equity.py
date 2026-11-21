@@ -88,8 +88,14 @@ def observe_account_equity(account, balance):
     return observations
 
 
-async def persist_equity(db, account, balance=None, *, all_assets=False, display=None):
-    """Merge observations into the latest committed state with a transactional CAS."""
+async def persist_equity(db, account, balance=None, *, all_assets=False, display=None, cash_flow=None):
+    """Merge observations into the latest committed state with a transactional CAS.
+
+    cash_flow: {"net_flow", "date", "updated_at_ms"} or None. When given, the
+    day's net cash flow (spot<->futures transfers, +in / -out) is written into
+    the USDT asset state in the same CAS update as the equity observation, so
+    the two can never clobber each other. None means "leave stored flow alone".
+    """
     fields = ("risk_equity_json", "usdt_equity", "avail_equity", "hwm_equity",
               "day_start_equity", "day_start_date")
 
@@ -105,6 +111,13 @@ async def persist_equity(db, account, balance=None, *, all_assets=False, display
             state.update(display_usdt_confirmed=True, display_usdc=display["usdcEquity"])
             snapshot.risk_equity_json = json.dumps(state, allow_nan=False)
             snapshot.usdt_equity, snapshot.avail_equity = display["usdtEquity"], display["availEquity"]
+        if cash_flow is not None:
+            state = risk_state(snapshot)
+            asset = state["assets"].setdefault("USDT", {})
+            asset["today_net_flow"] = float(cash_flow["net_flow"])
+            asset["flow_date"] = cash_flow["date"]
+            asset["flow_updated_at"] = int(cash_flow["updated_at_ms"])
+            snapshot.risk_equity_json = json.dumps(state, allow_nan=False)
         return observations
 
     if inspect(account, raiseerr=False) is None:

@@ -49,7 +49,8 @@ async def board_state(async_client, monkeypatch):
             encrypted_credentials=CredentialVault().encrypt_dict({"api_key": "synthetic-key", "secret_key": "synthetic-secret"}),
             api_key_masked="masked", last_sync_at=NOW, status="connected",
             risk_equity_json=json.dumps({"assets": {
-                "USDT": {"equity": 1000, "available": 800, "day_start": 900, "date": "2026-11-15"},
+                "USDT": {"equity": 1000, "available": 800, "day_start": 900, "date": "2026-11-15",
+                         "today_net_flow": 0, "flow_date": "2026-11-15"},
                 "USDC": {"equity": 5000, "available": 4000, "day_start": 4000, "date": "2026-11-15"},
             }}),
             positions_json=json.dumps([{"instId": "BTCUSDT", "symbol": "BTCUSDT", "posSide": "long",

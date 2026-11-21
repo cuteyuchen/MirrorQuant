@@ -96,7 +96,13 @@ def _account_row(account, today):
     if account.last_sync_at and state.get("display_usdt_confirmed"):
         equity, available = number(account.usdt_equity), number(account.avail_equity)
     baseline = number(asset.get("day_start")) if asset.get("date") == today else None
-    pnl = number(equity - baseline) if equity is not None and baseline is not None else None
+    # 今日盈亏 = 权益变化 - 当日净划转（转入记 +，转出记 -），否则充的钱会被算成盈利。
+    # 流水未知（从未成功拉取，或记录不是今天的）时不拿权益差顶着，直接返回 null。
+    flow = number(asset.get("today_net_flow")) if asset.get("flow_date") == today else None
+    if equity is not None and baseline is not None and flow is not None:
+        pnl = number(equity - baseline - flow)
+    else:
+        pnl = None
     # 看板账户金额沿用 USDT 口径；非 USDT 仓位不能按一比一并入浮盈。
     try:
         positions = json.loads(account.positions_json)

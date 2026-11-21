@@ -32,6 +32,9 @@ class BinanceAdapter(BaseExchangeAdapter):
     exchange = "binance"
     LIVE_URL = "https://fapi.binance.com"
     TESTNET_URL = "https://testnet.binancefuture.com"
+    # SAPI（钱包类接口）不在 fapi 域名上：充值/提现/划转历史都在 api 域名。
+    SAPI_URL = "https://api.binance.com"
+    SAPI_TESTNET_URL = "https://testnet.binance.vision"
 
     def __init__(
         self,
@@ -46,6 +49,7 @@ class BinanceAdapter(BaseExchangeAdapter):
         self.api_key = credentials.get("api_key", "").strip()
         self.secret_key = credentials.get("secret_key", "").strip()
         self.base_url = self.TESTNET_URL if environment == "demo" else self.LIVE_URL
+        self.sapi_url = self.SAPI_TESTNET_URL if environment == "demo" else self.SAPI_URL
 
     def _sign_query(self, params: Dict[str, Any]) -> str:
         clean = [(k, v) for k, v in params.items() if v is not None]
@@ -64,12 +68,14 @@ class BinanceAdapter(BaseExchangeAdapter):
         params: Optional[Dict[str, Any]] = None,
         auth: bool = True,
         retries: int = 3,
+        base_url: Optional[str] = None,
     ) -> Any:
         self._check_rate_limit(auth)
         method = method.upper()
         # A mutation may already have reached the exchange when its response is lost.
         attempts = max(1, retries) if method == "GET" else 1
         base_params = dict(params or {})
+        host = base_url or self.base_url
 
         async with self.request_client(auth) as client:
             last_err: Optional[Exception] = None
@@ -84,7 +90,7 @@ class BinanceAdapter(BaseExchangeAdapter):
                 else:
                     qs = urlencode([(k, v) for k, v in req_params.items() if v is not None])
 
-                url = f"{self.base_url}{path}" + (f"?{qs}" if qs else "")
+                url = f"{host}{path}" + (f"?{qs}" if qs else "")
                 try:
                     if method == "GET":
                         resp = await client.get(url, headers=headers)
@@ -473,6 +479,53 @@ class BinanceAdapter(BaseExchangeAdapter):
         if not data.get("serverTime"):
             raise RuntimeError("Missing Binance server time")
         return self._calibrate_time(int(data["serverTime"]), sent_ms)
+
+    async def get_futures_transfer_history(
+        self, asset: str = "USDT",
+        start_ms: Optional[int] = None, end_ms: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """SAPI 期货划转历史（现货钱包 <-> U 本位合约钱包），只读。
+
+        合约权益只被这类划转改变：外部充值/提现只动现货钱包，不动合约权益，
+        所以算合约账户的现金流必须用划转记录，不能用充值/提现记录。
+        type 1 = 现货 -> U 本位合约（转入），2 = U 本位合约 -> 现货（转出）。
+        返回归一化行：{"asset", "amount", "type", "timestamp", "tranId"}。
+        密钥缺 SAPI 权限时交易所报 403，调用方按“流水未知”处理。
+        """
+        rows: List[Dict[str, Any]] = []
+        page = 1
+        fetched = 0
+        while True:
+            params: Dict[str, Any] = {
+                "asset": asset, "current": page, "size": 100,
+                "startTime": start_ms, "endTime": end_ms,
+            }
+            data = await self._request(
+                "GET", "/sapi/v1/futures/transfer", params=params, base_url=self.sapi_url)
+            if not isinstance(data, dict) or not isinstance(data.get("rows"), list):
+                raise ValueError("Incomplete Binance futures transfer history")
+            fetched += len(data["rows"])
+            for row in data["rows"]:
+                try:
+                    amount = float(row["amount"])
+                    ts = int(row["timestamp"])
+                    kind = int(row["type"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if row.get("asset") != asset or kind not in (1, 2) or not math.isfinite(amount):
+                    continue
+                status = str(row.get("status") or "").upper()
+                if status and status != "CONFIRMED":
+                    continue
+                rows.append({"asset": asset, "amount": amount, "type": kind,
+                             "timestamp": ts, "tranId": row.get("tranId")})
+            total = data.get("total")
+            if not isinstance(total, int) or fetched >= total or len(data["rows"]) < 100:
+                break
+            page += 1
+            if page > 10:
+                break
+        return rows
 
     async def place_tp_sl(
         self,

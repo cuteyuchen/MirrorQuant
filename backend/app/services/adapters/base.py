@@ -351,6 +351,14 @@ class BaseExchangeAdapter(ABC):
         """Return an exchange-confirmed tier limit. Concrete adapters must qualify it."""
         raise ExchangeAPIError(self.exchange, "UNQUALIFIED_TIERS", "Exchange leverage tiers unavailable")
 
+    async def get_futures_transfer_history(
+        self, asset: str = "USDT",
+        start_ms: Optional[int] = None, end_ms: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """现货 <-> 合约钱包划转历史；未实现的交易所按“流水未知”处理。"""
+        raise ExchangeAPIError(self.exchange, "UNSUPPORTED_CASH_FLOW",
+                               "Futures transfer history unavailable")
+
     async def get_open_orders(self) -> List[Dict[str, Any]]:
         """Read all ordinary and conditional pending orders, or reject an incomplete view."""
         raise ExchangeAPIError(self.exchange, "UNQUALIFIED_ORDERS", "Complete pending-order inventory unavailable")
