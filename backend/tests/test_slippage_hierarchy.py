@@ -3,13 +3,22 @@
 覆盖：生效值解析、建绑定 schema（不传存 NULL）、更新显式 null 清回全局、
 以及把旧库 copy_bindings 三列从 NOT NULL 放宽为可空的 SQLite 迁移。
 """
+import sqlite3
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
 from sqlalchemy import create_engine, text
 
-from app.core.database import DEFAULT_SYSTEM_CONFIG, _apply_sqlite_migrations
+from app.core.database import (
+    DEFAULT_SYSTEM_CONFIG,
+    _apply_sqlite_migrations,
+    init_db,
+    reset_db_engine,
+    reset_engine_for_tests,
+)
 from app.schemas.api import BindingCreate, BindingUpdate
 from app.services.engine.router import _effective_slippage_settings
 
@@ -172,3 +181,76 @@ def test_migration_relaxes_slippage_columns_to_nullable():
         assert _nullability(conn)["max_slippage_pct"] == 0
         assert conn.execute(text("SELECT COUNT(*) FROM copy_bindings")).scalar() == 2
         conn.commit()
+
+
+@pytest.mark.asyncio
+async def test_init_db_migrates_with_child_fk_references():
+    """回归：生产库子表外键指着 copy_bindings 时，init_db 不能崩。
+
+    2026-11-21 1.3.1 首次部署失败：_relax_copy_binding_slippage_columns
+    的 DROP TABLE copy_bindings 被子表外键挡住（FK 强制开启），容器起不来。
+    修复：init_db 在事务外先关外键、提交后再重开并校验。本测试复现生产
+    场景——旧 schema + 子表外键 + FK 强制开启——走真实 init_db 验证。
+    """
+    tmp = Path(tempfile.mkdtemp()) / "fk-migration.db"
+    raw = sqlite3.connect(tmp)
+    try:
+        raw.execute("PRAGMA foreign_keys=ON")
+        raw.execute("CREATE TABLE lead_sources (id INTEGER NOT NULL, PRIMARY KEY (id))")
+        raw.execute("CREATE TABLE trading_accounts (id INTEGER NOT NULL, PRIMARY KEY (id))")
+        raw.execute(OLD_DDL)
+        # 生产同款：子表外键引用 copy_bindings（持仓/意图/执行记录皆如此）。
+        raw.execute(
+            "CREATE TABLE position_allocations ("
+            "id INTEGER NOT NULL, binding_id INTEGER NOT NULL, symbol VARCHAR(32) NOT NULL, "
+            "PRIMARY KEY (id), FOREIGN KEY(binding_id) REFERENCES copy_bindings (id))"
+        )
+        raw.execute("INSERT INTO lead_sources (id) VALUES (1)")
+        raw.execute("INSERT INTO trading_accounts (id) VALUES (1)")
+        raw.execute(
+            "INSERT INTO copy_bindings (id, name, lead_id, account_id, is_enabled, "
+            "max_slippage_pct, slippage_action, limit_order_ttl_sec) "
+            "VALUES (1, 'primary', 1, 1, 1, 1.0, 'limit', 600)"
+        )
+        raw.execute("INSERT INTO position_allocations (id, binding_id, symbol) VALUES (1, 1, 'ZECUSDT')")
+        raw.commit()
+        # 确认外键强制确实开着：插一条指向不存在绑定的子表行必须失败。
+        with pytest.raises(sqlite3.IntegrityError):
+            raw.execute("INSERT INTO position_allocations (id, binding_id, symbol) VALUES (2, 999, 'BTCUSDT')")
+        raw.rollback()
+    finally:
+        raw.close()
+
+    try:
+        reset_engine_for_tests(f"sqlite+aiosqlite:///{tmp}")
+        await init_db()  # 真实入口：事务外关外键 -> 迁移 -> 提交 -> 重开并校验
+        # 迁移成功：三列已放宽，数据与子表行完好。
+        check = sqlite3.connect(tmp)
+        try:
+            nulls = {r[1]: r[3] for r in check.execute("PRAGMA table_info(copy_bindings)")}
+            assert nulls["max_slippage_pct"] == 0 and nulls["slippage_action"] == 0
+            assert nulls["limit_order_ttl_sec"] == 0
+            assert check.execute("SELECT COUNT(*) FROM copy_bindings").fetchone()[0] == 1
+            assert check.execute(
+                "SELECT max_slippage_pct, slippage_action, limit_order_ttl_sec "
+                "FROM copy_bindings WHERE id=1").fetchone() == (1.0, "limit", 600)
+            assert check.execute("SELECT COUNT(*) FROM position_allocations").fetchone()[0] == 1
+            assert check.execute("PRAGMA foreign_key_check").fetchall() == []
+            # 外键仍在强制：坏引用依旧拒绝。
+            check.execute("PRAGMA foreign_keys=ON")
+            with pytest.raises(sqlite3.IntegrityError):
+                check.execute(
+                    "INSERT INTO position_allocations (id, binding_id, symbol) VALUES (2, 999, 'BTCUSDT')")
+            check.rollback()
+        finally:
+            check.close()
+        # 幂等：再跑一次 init_db 无变化、不丢数据。
+        await init_db()
+        again = sqlite3.connect(tmp)
+        try:
+            assert again.execute("SELECT COUNT(*) FROM copy_bindings").fetchone()[0] == 1
+            assert again.execute("SELECT COUNT(*) FROM position_allocations").fetchone()[0] == 1
+        finally:
+            again.close()
+    finally:
+        await reset_db_engine()

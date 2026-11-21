@@ -250,6 +250,10 @@ def _relax_copy_binding_slippage_columns(sync_conn) -> None:
     Existing explicit values are preserved; only the constraint changes.
     The rebuild runs inside the caller's transaction (init_db BEGIN IMMEDIATE),
     so a failure rolls back instead of leaving a half-rebuilt table.
+    init_db disables foreign-key enforcement outside the transaction before
+    running migrations (PRAGMA foreign_keys is a no-op inside one), because
+    child tables reference copy_bindings and would block DROP TABLE; it
+    re-enables enforcement and runs foreign_key_check after commit.
     Unique constraints are rebuilt anonymous: the old table still holds the
     named autoindex until it is dropped, and a duplicate name would fail the
     CREATE TABLE. The constraint itself (not its name) is what blocks dupes.
@@ -382,12 +386,36 @@ async def init_db() -> None:
     from app.models import domain  # noqa: F401
 
     engine = get_engine()
-    async with engine.begin() as conn:
+    # 外键开关只能在无事务时切换（事务内 PRAGMA foreign_keys 是 no-op），
+    # 且 SQLAlchemy 的 execute 会自动开启事务，所以开关必须绕过它、直接走
+    # DBAPI cursor（run_sync + sync_conn.connection），否则 conn.begin()
+    # 会因已自动开启事务而报错。迁移里重建 copy_bindings 要 DROP 父表，
+    # 子表外键会挡住，所以先在事务外关掉，提交后再重开并校验；失败回滚，
+    # 开关状态不影响已提交数据。
+    async with engine.connect() as conn:
         if engine.dialect.name == "sqlite":
-            # 驱动的隐式事务只覆盖 DML，DDL 升级也要失败时完整回滚。
-            await conn.execute(text("BEGIN IMMEDIATE"))
-        await conn.run_sync(Base.metadata.create_all)
-        await conn.run_sync(_apply_sqlite_migrations)
+            def _fk_off(sync_conn):
+                cur = sync_conn.connection.cursor()
+                cur.execute("PRAGMA foreign_keys=OFF")
+                cur.close()
+
+            def _fk_on(sync_conn):
+                cur = sync_conn.connection.cursor()
+                cur.execute("PRAGMA foreign_keys=ON")
+                cur.close()
+
+            await conn.run_sync(_fk_off)
+        async with conn.begin():
+            if engine.dialect.name == "sqlite":
+                # 驱动的隐式事务只覆盖 DML，DDL 升级也要失败时完整回滚。
+                await conn.execute(text("BEGIN IMMEDIATE"))
+            await conn.run_sync(Base.metadata.create_all)
+            await conn.run_sync(_apply_sqlite_migrations)
+        if engine.dialect.name == "sqlite":
+            await conn.run_sync(_fk_on)
+            violations = (await conn.execute(text("PRAGMA foreign_key_check"))).fetchall()
+            if violations:
+                raise RuntimeError(f"Foreign key violations after migration: {violations[:5]}")
 
     factory = get_session_factory()
     async with factory() as session:
