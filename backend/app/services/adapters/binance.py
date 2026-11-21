@@ -484,47 +484,41 @@ class BinanceAdapter(BaseExchangeAdapter):
         self, asset: str = "USDT",
         start_ms: Optional[int] = None, end_ms: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """SAPI 期货划转历史（现货钱包 <-> U 本位合约钱包），只读。
+        """合约钱包资金进出：用 /fapi/v1/income 的 TRANSFER 记录。
 
         合约权益只被这类划转改变：外部充值/提现只动现货钱包，不动合约权益，
         所以算合约账户的现金流必须用划转记录，不能用充值/提现记录。
-        type 1 = 现货 -> U 本位合约（转入），2 = U 本位合约 -> 现货（转出）。
+        注意不用 SAPI /sapi/v1/futures/transfer：实测它对本账户返回
+        total 0（且零记录时不带 rows 键），漏掉了收入历史里明明存在的划转；
+        而收入历史的 TRANSFER 条目是合约钱包资金进出的权威记录。
+        income 为有符号数：正=转入（type 1），负=转出（type 2）。
         返回归一化行：{"asset", "amount", "type", "timestamp", "tranId"}。
-        密钥缺 SAPI 权限时交易所报 403，调用方按“流水未知”处理。
+        密钥缺权限时交易所报 403，调用方按“流水未知”处理。
+        单日划转是低频操作，一次拉 limit 1000 足够，无需分页。
         """
+        params: Dict[str, Any] = {
+            "incomeType": "TRANSFER",
+            "startTime": start_ms, "endTime": end_ms, "limit": 1000,
+        }
+        data = await self._request("GET", "/fapi/v1/income", params=params)
+        if not isinstance(data, list):
+            raise ValueError("Incomplete Binance futures transfer history")
         rows: List[Dict[str, Any]] = []
-        page = 1
-        fetched = 0
-        while True:
-            params: Dict[str, Any] = {
-                "asset": asset, "current": page, "size": 100,
-                "startTime": start_ms, "endTime": end_ms,
-            }
-            data = await self._request(
-                "GET", "/sapi/v1/futures/transfer", params=params, base_url=self.sapi_url)
-            if not isinstance(data, dict) or not isinstance(data.get("rows"), list):
-                raise ValueError("Incomplete Binance futures transfer history")
-            fetched += len(data["rows"])
-            for row in data["rows"]:
-                try:
-                    amount = float(row["amount"])
-                    ts = int(row["timestamp"])
-                    kind = int(row["type"])
-                except (KeyError, TypeError, ValueError):
-                    continue
-                if row.get("asset") != asset or kind not in (1, 2) or not math.isfinite(amount):
-                    continue
-                status = str(row.get("status") or "").upper()
-                if status and status != "CONFIRMED":
-                    continue
-                rows.append({"asset": asset, "amount": amount, "type": kind,
-                             "timestamp": ts, "tranId": row.get("tranId")})
-            total = data.get("total")
-            if not isinstance(total, int) or fetched >= total or len(data["rows"]) < 100:
-                break
-            page += 1
-            if page > 10:
-                break
+        for entry in data:
+            if not isinstance(entry, dict) or entry.get("incomeType") != "TRANSFER":
+                continue
+            if entry.get("asset") != asset:
+                continue
+            try:
+                amount = float(entry["income"])
+                ts = int(entry["time"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not math.isfinite(amount) or amount == 0:
+                continue
+            kind = 1 if amount > 0 else 2
+            rows.append({"asset": asset, "amount": abs(amount), "type": kind,
+                         "timestamp": ts, "tranId": entry.get("tranId")})
         return rows
 
     async def place_tp_sl(

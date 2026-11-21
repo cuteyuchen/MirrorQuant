@@ -4,8 +4,9 @@
 当天转进来的钱也算成了盈利。修正公式：今日盈亏 = 权益 - 日初权益 - 当日净划转。
 
 注意：外部充值/提现只动现货钱包，不动合约权益，所以不能用充值/提现
-记录；必须用期货划转记录（/sapi/v1/futures/transfer），type 1 现货->合约
-为转入（+），type 2 合约->现货为转出（-）。日期一律按北京时间。
+记录；必须用期货划转记录（/fapi/v1/income 的 TRANSFER 条目），正数转入、
+负数转出。SAPI /sapi/v1/futures/transfer 对本账户返回 total 0，漏掉了
+收入历史里明明存在的划转，不能用它。日期一律按北京时间。
 """
 from __future__ import annotations
 

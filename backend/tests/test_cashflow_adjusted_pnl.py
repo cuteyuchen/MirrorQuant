@@ -84,40 +84,41 @@ async def test_fetch_today_net_flow_calls_adapter_with_day_window():
     assert args == ("USDT", START_MS, END_MS)
 
 
-# ---- 适配器：SAPI 期货划转历史 ----
+# ---- 适配器：收入历史 TRANSFER 条目 ----
 
 @pytest.mark.asyncio
-async def test_adapter_transfer_history_normalizes_and_paginates():
+async def test_adapter_transfer_history_normalizes_income():
     adapter = BinanceAdapter({}, environment="live")
     seen = []
 
     async def fake_request(method, path, params=None, auth=True, retries=3, base_url=None):
         seen.append((method, path, params, base_url))
-        page = params["current"]
-        if page == 1:
-            return {"total": 101, "rows": [
-                {"asset": "USDT", "tranId": 1, "amount": "124.0", "type": 1,
-                 "timestamp": START_MS + 1000, "status": "CONFIRMED"},
-                {"asset": "USDT", "tranId": 2, "amount": "5.0", "type": 2,
-                 "timestamp": START_MS + 2000, "status": "PENDING"},
-            ] + [{"asset": "USDT", "tranId": 100 + i, "amount": "0",
-                  "type": 1, "timestamp": START_MS + 3000, "status": "CONFIRMED"}
-                 for i in range(98)]}
-        return {"total": 101, "rows": [
-            {"asset": "USDT", "tranId": 3, "amount": "50.0", "type": 2,
-             "timestamp": START_MS + 4000, "status": "CONFIRMED"}]}
+        return [
+            {"symbol": "", "incomeType": "TRANSFER", "income": "124.0", "asset": "USDT",
+             "info": "TRANSFER", "time": START_MS + 1000, "tranId": 1, "tradeId": ""},
+            {"symbol": "", "incomeType": "TRANSFER", "income": "-50.0", "asset": "USDT",
+             "info": "TRANSFER", "time": START_MS + 2000, "tranId": 2, "tradeId": ""},
+            {"symbol": "ZECUSDT", "incomeType": "REALIZED_PNL", "income": "10.0", "asset": "USDT",
+             "info": "123", "time": START_MS + 3000, "tranId": 3, "tradeId": "1"},
+            {"symbol": "", "incomeType": "TRANSFER", "income": "5.0", "asset": "BTC",
+             "info": "TRANSFER", "time": START_MS + 4000, "tranId": 4, "tradeId": ""},
+            {"symbol": "", "incomeType": "TRANSFER", "income": "0", "asset": "USDT",
+             "info": "TRANSFER", "time": START_MS + 5000, "tranId": 5, "tradeId": ""},
+            {"symbol": "", "incomeType": "TRANSFER", "income": "bad", "asset": "USDT",
+             "info": "TRANSFER", "time": START_MS + 6000, "tranId": 6, "tradeId": ""},
+        ]
 
     adapter._request = fake_request
     rows = await adapter.get_futures_transfer_history("USDT", START_MS, END_MS)
-    # 未确认的转出被过滤；分页拿到第二页；走 SAPI 域名而非 fapi。
+    # 只留 USDT 的 TRANSFER：正数转入 type 1，负数转出 type 2；已实现盈亏、非 USDT、零额、坏值都过滤。
     assert rows == [
         {"asset": "USDT", "amount": 124.0, "type": 1, "timestamp": START_MS + 1000, "tranId": 1},
-        *[{"asset": "USDT", "amount": 0.0, "type": 1, "timestamp": START_MS + 3000,
-            "tranId": 100 + i} for i in range(98)],
-        {"asset": "USDT", "amount": 50.0, "type": 2, "timestamp": START_MS + 4000, "tranId": 3},
+        {"asset": "USDT", "amount": 50.0, "type": 2, "timestamp": START_MS + 2000, "tranId": 2},
     ]
-    assert all(url == "https://api.binance.com" for *_, url in seen)
-    assert seen[0][2]["asset"] == "USDT" and seen[0][2]["startTime"] == START_MS
+    # 走 fapi 域名、带 incomeType=TRANSFER 与日窗口。
+    assert seen[0][1] == "/fapi/v1/income"
+    assert seen[0][2]["incomeType"] == "TRANSFER"
+    assert seen[0][2]["startTime"] == START_MS and seen[0][2]["endTime"] == END_MS
 
 
 # ---- 看板：扣掉净划转 / 未知为 null ----
