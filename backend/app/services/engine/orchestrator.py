@@ -45,26 +45,43 @@ SYNC_FAILURE_FIELDS = (
 
 
 class WebSocketHub:
+    """Fan-out for live updates, scoped per connected user.
+
+    Broadcasts carrying an ``ownerUserId`` (account updates, execution
+    events) only reach that user and admins; broadcasts without one (lead
+    updates, which are visible to every logged-in user) reach everyone.
+    """
+
     def __init__(self):
         self._clients: Set[WebSocket] = set()
         self._validators = {}
+        self._audiences: Dict[WebSocket, tuple] = {}
         self._lock = asyncio.Lock()
 
-    async def connect(self, ws: WebSocket, validator=None) -> None:
+    async def connect(self, ws: WebSocket, validator=None, user_id=None, is_admin=False) -> None:
         await ws.accept()
         async with self._lock:
             self._clients.add(ws)
             self._validators[ws] = validator
+            self._audiences[ws] = (user_id, bool(is_admin))
 
     async def disconnect(self, ws: WebSocket) -> None:
         async with self._lock:
             self._clients.discard(ws)
             self._validators.pop(ws, None)
+            self._audiences.pop(ws, None)
+
+    def _may_receive(self, ws: WebSocket, message: Dict[str, Any]) -> bool:
+        owner = message.get("ownerUserId")
+        if owner is None:
+            return True
+        user_id, is_admin = self._audiences.get(ws, (None, False))
+        return bool(is_admin) or user_id == owner
 
     async def broadcast(self, message: Dict[str, Any]) -> None:
         message = mask_sensitive_payload(message)
         async with self._lock:
-            clients = list(self._clients)
+            clients = [ws for ws in list(self._clients) if self._may_receive(ws, message)]
         if not clients:
             return
         async def send(ws: WebSocket) -> None:
@@ -614,6 +631,7 @@ class EngineOrchestrator:
                 {
                     "type": "account_update",
                     "accountId": account.id,
+                    "ownerUserId": getattr(account, "owner_user_id", None),
                     "name": account.name,
                     "totalEquity": equity_display["totalEquity"],
                     "usdtEquity": equity_display["usdtEquity"],

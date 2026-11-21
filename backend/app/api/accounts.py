@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_current_admin, get_current_user, record_audit
+from app.api.deps import get_current_admin, get_current_user, owner_filter, record_audit, require_owner_or_admin
 from app.api.exposure import require_account_flat, require_account_soft_deletable
 from app.core.database import get_db
 from app.core.security import CredentialVault
@@ -61,8 +61,18 @@ def _account_out(a: TradingAccount) -> dict:
 @router.get("")
 async def list_accounts(db: AsyncSession = Depends(get_db), _user: User = Depends(get_current_user)):
     rows = list((await db.scalars(select(TradingAccount).where(
-        TradingAccount.deleted_at.is_(None)).order_by(TradingAccount.id))).all())
+        TradingAccount.deleted_at.is_(None),
+        owner_filter(_user, TradingAccount.owner_user_id)).order_by(TradingAccount.id))).all())
     return {"items": [_account_out(a) for a in rows]}
+
+
+async def _get_owned_account(db: AsyncSession, account_id: int, user: User) -> TradingAccount:
+    """Fetch a live account the caller may touch; deleted rows are invisible."""
+    acct = await db.get(TradingAccount, account_id)
+    if not acct or acct.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Account not found")
+    require_owner_or_admin(user, acct.owner_user_id)
+    return acct
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
@@ -70,7 +80,7 @@ async def create_account(
     payload: AccountCreate,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_current_user),
 ):
     if payload.exchange in ("okx", "bitget") and not (payload.passphrase or "").strip():
         raise HTTPException(
@@ -86,6 +96,7 @@ async def create_account(
     }
     encrypted = vault.encrypt_dict(creds)
     acct = TradingAccount(
+        owner_user_id=current_user.id,
         name=payload.name.strip(),
         exchange=payload.exchange,
         environment=payload.environment,
@@ -119,11 +130,9 @@ async def update_account(
     payload: AccountUpdate,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_current_user),
 ):
-    acct = await db.get(TradingAccount, account_id)
-    if not acct:
-        raise HTTPException(status_code=404, detail="Account not found")
+    acct = await _get_owned_account(db, account_id, current_user)
 
     vault = CredentialVault()
     data = payload.model_dump(exclude_unset=True)
@@ -163,11 +172,9 @@ async def delete_account(
     account_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_current_user),
 ):
-    acct = await db.get(TradingAccount, account_id)
-    if not acct:
-        raise HTTPException(status_code=404, detail="Account not found")
+    acct = await _get_owned_account(db, account_id, current_user)
     if acct.is_enabled:
         raise HTTPException(status_code=409, detail="Disable the account and drain exposure before deletion")
     await require_account_soft_deletable(db, acct)
@@ -191,11 +198,9 @@ async def delete_account(
 async def test_account_connectivity(
     account_id: int,
     db: AsyncSession = Depends(get_db),
-    _user: User = Depends(get_current_admin),
+    _user: User = Depends(get_current_user),
 ):
-    acct = await db.get(TradingAccount, account_id)
-    if not acct:
-        raise HTTPException(status_code=404, detail="Account not found")
+    acct = await _get_owned_account(db, account_id, _user)
 
     vault = CredentialVault()
     creds = vault.decrypt_dict(acct.encrypted_credentials)
@@ -239,11 +244,9 @@ async def test_account_connectivity(
 async def sync_account_now(
     account_id: int,
     db: AsyncSession = Depends(get_db),
-    _user: User = Depends(get_current_admin),
+    _user: User = Depends(get_current_user),
 ):
-    acct = await db.get(TradingAccount, account_id)
-    if not acct:
-        raise HTTPException(status_code=404, detail="Account not found")
+    acct = await _get_owned_account(db, account_id, _user)
     res = await orchestrator.sync_account(db, acct)
     await db.refresh(acct)
     return mask_sensitive_payload({"item": _account_out(acct), **res})

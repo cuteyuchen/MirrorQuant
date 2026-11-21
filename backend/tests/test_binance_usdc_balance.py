@@ -284,6 +284,7 @@ async def test_sync_account_persists_usdt_collateral_and_displays_usdc_separatel
     assert account.status == "connected" and account.last_sync_at is not None
     engine.ws_hub.broadcast.assert_awaited_once_with({
         "type": "account_update", "accountId": account.id, "name": account.name,
+        "ownerUserId": getattr(account, "owner_user_id", None),
         "totalEquity": 4602.64, "usdtEquity": 4602.64, "usdcEquity": 5000,
         "unrealizedPnl": -25, "positions": result["positions"],
     })

@@ -72,7 +72,8 @@ async def get_current_user_optional(
         user_id = int(payload["sub"])
     except (TypeError, ValueError):
         return None
-    user = await db.scalar(select(User).where(User.id == user_id, User.is_active == True))  # noqa: E712
+    user = await db.scalar(select(User).where(
+        User.id == user_id, User.is_active == True, User.deleted_at.is_(None)))  # noqa: E712
     if user is None or payload.get("ver") != user.session_version:
         return None
     return user
@@ -98,6 +99,37 @@ async def get_current_admin(
             detail="Administrator role required",
         )
     return user
+
+
+def owner_filter(user: Optional[User], owner_column):
+    """Scope a query to the caller's own rows.
+
+    Admins see everything; ordinary users only see rows they own. Returns a
+    SQLAlchemy condition (``True`` for admins, i.e. no filtering).
+    """
+    if user is None:
+        return True  # internal/system caller (engine): no ownership restriction
+    if user.role == "admin":
+        return True
+    return owner_column == user.id
+
+
+def require_owner_or_admin(user: Optional[User], owner_user_id: Optional[int]) -> None:
+    """Raise 403 unless the caller is an admin or owns the resource.
+
+    Rows with no owner are admin-only: a non-admin can never claim them.
+    A ``None`` user is an internal/system caller (engine), not an HTTP
+    request, so there is no ownership to restrict.
+    """
+    if user is None:
+        return
+    if user.role == "admin":
+        return
+    if owner_user_id is None or owner_user_id != user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not your resource",
+        )
 
 
 async def record_audit(

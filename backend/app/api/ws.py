@@ -31,14 +31,27 @@ async def websocket_stream(ws: WebSocket):
         if not current:
             return False
         async with get_session_factory()() as db:
-            user = await db.scalar(select(User).where(User.id == int(current["sub"]), User.is_active.is_(True)))
+            user = await db.scalar(select(User).where(
+                User.id == int(current["sub"]), User.is_active.is_(True), User.deleted_at.is_(None)))
             return user is not None and current.get("ver") == user.session_version
+
+    async def audience() -> tuple:
+        current = decode_access_token(token)
+        if not current:
+            return (None, False)
+        async with get_session_factory()() as db:
+            user = await db.scalar(select(User).where(
+                User.id == int(current["sub"]), User.is_active.is_(True), User.deleted_at.is_(None)))
+            if user is None:
+                return (None, False)
+            return (user.id, user.role == "admin")
 
     if not await authorized():
         await ws.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
-    await orchestrator.ws_hub.connect(ws, validator=authorized)
+    user_id, is_admin = await audience()
+    await orchestrator.ws_hub.connect(ws, validator=authorized, user_id=user_id, is_admin=is_admin)
     try:
         await ws.send_json({"type": "connected", "user": payload.get("username")})
         while True:

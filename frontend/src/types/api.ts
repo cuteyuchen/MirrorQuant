@@ -186,6 +186,35 @@ export interface User {
 }
 export interface AuthStatus { initialized: boolean; authenticated: boolean; user: User | null }
 export interface CaptchaChallenge { captchaToken: string; svg: string; expiresInSec: number }
+// 1.3.3 多用户：邀请码注册与管理员用户管理（后端契约，camelCase）。
+export type InviteCodeStatus = "active" | "revoked" | "expired" | "exhausted";
+export interface InviteCode {
+  id: number; code: string; createdByUserId: number | null; createdByUsername: string | null;
+  maxUses: number | null; usedCount: number | null; expiresAt: string | null;
+  isRevoked: boolean | null; createdAt: string | null; status: InviteCodeStatus | null;
+}
+export interface AdminUserSummary {
+  id: number; username: string; role: string; isActive: boolean | null;
+  createdAt: string | null; lastLoginAt: string | null;
+  accountCount: number | null; bindingCount: number | null; enabledBindingCount: number | null;
+  openPositionCount: number | null; totalEquity: number | null;
+}
+export interface AdminUserAccount {
+  id: number; name: string | null; exchange: string | null; environment: Environment | null;
+  status: string | null; isEnabled: boolean | null; equity: number | null;
+}
+export interface AdminUserBindingPosition { instId: string | null; posSide: string | null; qty: number | null }
+export interface AdminUserBinding {
+  id: number; name: string | null; leadId: number | null; leadName: string | null;
+  accountId: number | null; accountName: string | null; isEnabled: boolean | null;
+  openPositions: AdminUserBindingPosition[] | null;
+}
+export interface AdminUserSubscription { leadId: number; leadName: string | null; isEnabled: boolean | null }
+export interface AdminUserDetail {
+  user: AdminUserSummary;
+  accounts: AdminUserAccount[] | null; bindings: AdminUserBinding[] | null;
+  subscriptions: AdminUserSubscription[] | null;
+}
 export interface TotpSetup { secret: string; otpauthUri: string; qrSvgDataUri: string }
 // 通知测试接口逐渠道返回实际投递结果。
 export interface NotificationTestResponse {

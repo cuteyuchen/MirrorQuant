@@ -21,7 +21,7 @@ afterEach(() => {
 async function renderLogin() {
   const router = createRouter({ history: createMemoryHistory(), routes: [
     { path: "/login", component: LoginView }, { path: "/dashboard", component: { template: "<div />" } },
-    { path: "/public", component: { template: "<div />" } },
+    { path: "/public", component: { template: "<div />" } }, { path: "/register", component: { template: "<div />" } },
   ] });
   await router.push("/login");
   const wrapper = mount(LoginView, { global: { plugins: [pinia, router] } });

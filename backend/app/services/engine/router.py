@@ -1234,6 +1234,7 @@ class CopyRouter:
 
         payload = {
             "type": "execution",
+            "ownerUserId": getattr(binding, "owner_user_id", None) or getattr(account, "owner_user_id", None),
             "data": {
                 "id": rec.id,
                 "bindingId": binding.id,
@@ -1252,7 +1253,7 @@ class CopyRouter:
             },
         }
         if notify_cfg:
-            owner_user_id = getattr(binding, "owner_user_id", None) or getattr(account, "owner_user_id", None)
+            owner_user_id = payload["ownerUserId"]
             target_cfg = notify_cfg
             if owner_user_id:
                 pref = await db.get(UserPreference, owner_user_id)

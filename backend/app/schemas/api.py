@@ -74,6 +74,64 @@ class UserOut(CamelModel):
         return to_utc_iso(value)
 
 
+class RegisterRequest(CamelModel):
+    """Invite-only registration: username + password + invite code."""
+    username: str = Field(min_length=3, max_length=64)
+    password: str = Field(min_length=8, max_length=128)
+    invite_code: str = Field(min_length=1, max_length=64)
+
+
+class InviteCodeCreate(CamelModel):
+    max_uses: int = Field(default=1, ge=1, le=1000)
+    expires_at: Optional[datetime] = None
+
+
+class InviteCodeOut(CamelModel):
+    id: int
+    code: str
+    created_by_user_id: Optional[int] = None
+    created_by_username: Optional[str] = None
+    max_uses: int
+    used_count: int
+    expires_at: Optional[datetime] = None
+    is_revoked: bool = False
+    created_at: datetime
+    status: str = "active"  # active | revoked | expired | exhausted
+
+    @field_serializer("expires_at", "created_at", when_used="json")
+    def serialize_time(self, value: Optional[datetime]) -> Optional[str]:
+        return to_utc_iso(value)
+
+
+class AdminUserSummary(CamelModel):
+    """One user row for the admin list, with a follow-activity summary."""
+    id: int
+    username: str
+    role: str
+    is_active: bool
+    created_at: datetime
+    last_login_at: Optional[datetime] = None
+    account_count: int = 0
+    binding_count: int = 0
+    enabled_binding_count: int = 0
+    open_position_count: int = 0
+    total_equity: float = 0.0
+
+    @field_serializer("created_at", "last_login_at", when_used="json")
+    def serialize_time(self, value: Optional[datetime]) -> Optional[str]:
+        return to_utc_iso(value)
+
+
+class UserPatchRequest(CamelModel):
+    """Admin edits to a user: role and/or active flag; omitted fields stay."""
+    role: Optional[str] = Field(default=None, pattern="^(user|admin)$")
+    is_active: Optional[bool] = None
+
+
+class ResetPasswordRequest(CamelModel):
+    new_password: str = Field(min_length=8, max_length=128)
+
+
 class ProxyCreate(CamelModel):
     name: str = Field(min_length=1, max_length=100)
     url: str = Field(min_length=3, max_length=255)

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onUnmounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { Activity, ClipboardList, Ellipsis, GitFork, Globe, LayoutDashboard, LogOut, Network, Settings, Users, Wallet } from "lucide-vue-next";
+import { Activity, ClipboardList, Ellipsis, GitFork, Globe, LayoutDashboard, LogOut, Network, Settings, UserCog, Users, Wallet } from "lucide-vue-next";
 import { useAuthStore } from "@/stores/auth";
 import { useBoardStore } from "@/stores/board";
 import { useSocketStore } from "@/stores/socket";
@@ -26,7 +26,10 @@ const moreOpen = ref(false);
 const loggingOut = ref(false);
 const intentsError = ref(false);
 const showShell = computed(() => auth.authenticated && route.meta.fullscreen !== true);
-const navItems = [
+const isAdmin = computed(() => auth.user?.role === "admin");
+// 普通用户只看自己的看板、账户、绑定、执行记录与公开监控；
+// 带单员、代理、设置与用户管理是管理员专属导航（带单员列表接口本身仍对普通用户开放，只是不在导航里出现）。
+const allNavItems = [
   { key: "dashboard", path: "/dashboard", icon: LayoutDashboard },
   { key: "executions", path: "/executions", icon: ClipboardList },
   { key: "leads", path: "/leads", icon: Users },
@@ -34,15 +37,17 @@ const navItems = [
   { key: "bindings", path: "/bindings", icon: GitFork },
   { key: "proxies", path: "/proxies", icon: Network },
   { key: "settings", path: "/settings", icon: Settings },
+  { key: "users", path: "/users", icon: UserCog },
   { key: "publicFeed", path: "/public", icon: Globe },
 ];
-const navGroups = [
-  { key: "monitoring", items: navItems.filter(item => ["dashboard", "executions"].includes(item.key)) },
-  { key: "configuration", items: navItems.filter(item => ["leads", "accounts", "bindings", "proxies"].includes(item.key)) },
-  { key: "system", items: navItems.filter(item => ["settings", "publicFeed"].includes(item.key)) },
-];
-const mobileItems = navItems.filter(item => ["dashboard", "executions", "leads", "bindings"].includes(item.key));
-const moreItems = navItems.filter(item => !mobileItems.includes(item));
+const navItems = computed(() => allNavItems.filter(item => isAdmin.value || ["dashboard", "executions", "accounts", "bindings", "publicFeed"].includes(item.key)));
+const navGroups = computed(() => [
+  { key: "monitoring", items: navItems.value.filter(item => ["dashboard", "executions"].includes(item.key)) },
+  { key: "configuration", items: navItems.value.filter(item => ["leads", "accounts", "bindings", "proxies"].includes(item.key)) },
+  { key: "system", items: navItems.value.filter(item => ["settings", "users", "publicFeed"].includes(item.key)) },
+]);
+const mobileItems = computed(() => navItems.value.filter(item => ["dashboard", "executions", "leads", "bindings"].includes(item.key)));
+const moreItems = computed(() => navItems.value.filter(item => !mobileItems.value.includes(item)));
 const pendingCount = computed(() => intentsError.value ? null : cache.intents?.data.length ?? null);
 // 侧栏底部的用户头像只取用户名首字符，不依赖外部头像服务。
 const userInitial = computed(() => (auth.user?.username?.trim() || "?").slice(0, 1).toUpperCase());

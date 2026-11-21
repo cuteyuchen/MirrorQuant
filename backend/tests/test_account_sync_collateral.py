@@ -85,6 +85,7 @@ async def test_sync_account_persists_only_usdt_collateral(sync_state, available)
     assert state.account.status == "connected"
     state.engine.ws_hub.broadcast.assert_awaited_once_with({
         "type": "account_update", "accountId": state.account.id, "name": state.account.name,
+        "ownerUserId": None,
         "totalEquity": 1000, "usdtEquity": 1000, "usdcEquity": 5000,
         "unrealizedPnl": 0, "positions": [],
     })

@@ -148,7 +148,10 @@ async function handleSubmit() {
     <template #footer>
       <div class="flex flex-wrap items-center justify-between gap-3">
         <span class="inline-flex items-center gap-1.5"><ShieldCheck :size="15" />{{ t("login.securityFoot") }}</span>
-        <RouterLink to="/public" class="text-accent hover:underline">{{ t("login.publicLink") }}</RouterLink>
+        <span class="flex flex-wrap items-center gap-4">
+          <RouterLink to="/register" class="text-accent hover:underline">{{ t("login.registerLink") }}</RouterLink>
+          <RouterLink to="/public" class="text-accent hover:underline">{{ t("login.publicLink") }}</RouterLink>
+        </span>
       </div>
     </template>
   </AuthLayout>

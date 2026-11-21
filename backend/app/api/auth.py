@@ -33,10 +33,11 @@ from app.core.security import (
     verify_password_async,
     verify_totp_code,
 )
-from app.models.domain import LoginAttemptGuard, SystemConfig, User
+from app.models.domain import InviteCode, LoginAttemptGuard, SystemConfig, User
 from app.schemas.api import (
     ChangePasswordRequest,
     LoginRequest,
+    RegisterRequest,
     SetupRequest,
     TotpDisableRequest,
     TotpSetupRequest,
@@ -82,7 +83,7 @@ def _user_dict(u: User) -> dict:
         totp_enabled=bool(getattr(u, "totp_enabled", False)),
         created_at=u.created_at,
         last_login_at=u.last_login_at,
-    ).model_dump(mode="json")
+    ).model_dump(mode="json", by_alias=True)
 
 
 async def _get_or_create_guard(
@@ -276,6 +277,63 @@ async def setup_admin(
     return {"user": _user_dict(user), "token": token}
 
 
+@router.post("/register", status_code=status.HTTP_201_CREATED)
+async def register(
+    payload: RegisterRequest,
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+):
+    """Invite-only registration. No open sign-up: a valid invite code is required.
+
+    The code is consumed atomically in the same transaction as the user
+    creation, so two concurrent registrations cannot both spend the last use.
+    """
+    code_text = payload.invite_code.strip()
+    code = await db.scalar(select(InviteCode).where(InviteCode.code == code_text))
+    now = _utcnow()
+    if code is None:
+        raise HTTPException(status_code=400, detail="Invalid invite code")
+    if code.is_revoked:
+        raise HTTPException(status_code=400, detail="Invite code has been revoked")
+    if code.expires_at is not None and _as_utc(code.expires_at) <= now:
+        raise HTTPException(status_code=400, detail="Invite code has expired")
+    if code.used_count >= code.max_uses:
+        raise HTTPException(status_code=400, detail="Invite code has been fully used")
+
+    username = payload.username.strip()
+    existing = await db.scalar(select(User).where(User.username == username))
+    if existing is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Username already taken")
+
+    user = User(
+        username=username,
+        password_hash=await hash_password_async(payload.password),
+        role="user",
+        is_active=True,
+        last_login_at=now,
+    )
+    db.add(user)
+    await db.flush()
+    # 原子消耗：条件更新只在仍有余量时 +1；并发抢完最后一格时回滚本次注册。
+    consumed = await db.execute(
+        update(InviteCode)
+        .where(InviteCode.id == code.id, InviteCode.used_count < InviteCode.max_uses)
+        .values(used_count=InviteCode.used_count + 1)
+    )
+    if consumed.rowcount != 1:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail="Invite code has been fully used")
+    await record_audit(db, "REGISTER", "user", str(user.id),
+                       f"Registered {username} with invite code {code.id}", user, request)
+    await db.commit()
+    await db.refresh(user)
+
+    token = create_access_token(user.id, user.username, user.role, session_version=user.session_version)
+    _set_auth_cookie(response, token)
+    return {"user": _user_dict(user), "token": token}
+
+
 @router.post("/login")
 async def login(
     payload: LoginRequest,
@@ -362,7 +420,8 @@ async def login(
             )
 
     # 3. Verify credentials
-    user = await db.scalar(select(User).where(User.username == username))
+    # 已删除用户按账号不存在处理，不透露是已删。
+    user = await db.scalar(select(User).where(User.username == username, User.deleted_at.is_(None)))
     valid_password = await verify_password_async(
         payload.password, user.password_hash if user else DUMMY_PASSWORD_HASH)
     if not user or not valid_password:

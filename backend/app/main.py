@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select, text
 
-from app.api import accounts, auth, bindings, dashboard, leads, notifications, proxies, settings as settings_api, ws
+from app.api import accounts, admin_invites, admin_users, auth, bindings, dashboard, leads, notifications, proxies, settings as settings_api, ws
 from app.core.config import get_settings
 from app.core.database import get_session_factory, init_db
 from app.core.version import get_app_version
@@ -96,6 +96,8 @@ def create_app() -> FastAPI:
         return await call_next(request)
 
     app.include_router(auth.router)
+    app.include_router(admin_invites.router)
+    app.include_router(admin_users.router)
     app.include_router(dashboard.router)
     app.include_router(leads.router)
     app.include_router(accounts.router)

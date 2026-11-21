@@ -30,6 +30,7 @@ async function render(component: typeof LoginView, path: string) {
     { path: "/login", component: LoginView }, { path: "/setup", component: SetupWizard },
     { path: "/connection-error", component: ConnectionErrorView }, { path: "/missing", component: NotFoundView },
     { path: "/dashboard", component: { template: "<div />" } }, { path: "/public", component: { template: "<div />" } },
+    { path: "/register", component: { template: "<div />" } },
   ] });
   await router.push(path);
   const wrapper = mount(component, { global: { plugins: [pinia, router] } });

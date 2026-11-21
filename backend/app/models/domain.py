@@ -37,8 +37,32 @@ class User(Base):
     totp_secret_enc: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     totp_pending_secret_enc: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     session_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # Logical delete: set instead of removing the row so the audit ledger
+    # and the user's follow history stay queryable.
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     last_login_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class InviteCode(Base):
+    """One-time or multi-use invitation code for user registration.
+
+    Registration is invite-only: there is no open sign-up. An admin creates
+    codes (max_uses, optional expiry); each successful registration consumes
+    one use. Revoked, expired, or exhausted codes are rejected.
+    """
+    __tablename__ = "invite_codes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    code: Mapped[str] = mapped_column(String(32), unique=True, nullable=False, index=True)
+    created_by_user_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    max_uses: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    used_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    is_revoked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 
 class UserPreference(Base):

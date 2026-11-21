@@ -557,12 +557,22 @@ async def test_board_daily_events_are_bounded_and_counts_use_full_day(board_stat
 
 
 @pytest.mark.parametrize("path", ["/api/dashboard/board", "/api/dashboard/intents", "/api/dashboard/executions"])
-@pytest.mark.parametrize("role,status", [("admin", 200), ("viewer", 403), ("anonymous", 401)])
-async def test_dashboard_contract_endpoints_require_admin(board_state, path, role, status):
+@pytest.mark.parametrize("role,status", [("admin", 200), ("viewer", 200), ("anonymous", 401)])
+async def test_dashboard_contract_endpoints_require_login(board_state, path, role, status):
     t = board_state
     t.client.headers.pop("Authorization", None)
     headers = {"Authorization": f"Bearer {t.tokens[role]}"} if role != "anonymous" else {}
     assert (await t.client.get(path, headers=headers)).status_code == status
+
+
+async def test_dashboard_board_scopes_to_viewer_own_accounts(board_state):
+    # 1.3.3：普通用户只能看到自己的账户/绑定；fixture 里的账户无 owner，viewer 看不到它。
+    t = board_state
+    admin_board = (await t.client.get("/api/dashboard/board", headers={"Authorization": f"Bearer {t.tokens['admin']}"})).json()
+    assert len(admin_board["accounts"]) == 2
+    viewer_board = (await t.client.get("/api/dashboard/board", headers={"Authorization": f"Bearer {t.tokens['viewer']}"})).json()
+    assert viewer_board["accounts"] == []
+    assert len(viewer_board["leads"]) == 1  # 带单员对所有登录用户可见。
 
 
 async def test_intents_filter_camel_case_and_execution_pagination(board_state):

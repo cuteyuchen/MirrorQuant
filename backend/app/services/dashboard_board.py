@@ -380,16 +380,25 @@ def _events(lead, snapshot, deliveries, records, day_start, now):
     return result, realized, classifications_complete
 
 
-async def build_board(db, *, now=None):
+async def build_board(db, *, now=None, owner_user_id=None):
+    """Build the copy board snapshot.
+
+    owner_user_id scopes the board to one user's accounts/bindings (and their
+    allocations, intents, deliveries and execution records). Admins pass None
+    and see everything; leads themselves are visible to all users.
+    """
     now = now or datetime.now(timezone.utc)
     local = now.astimezone(BEIJING_TZ)
     start = local.replace(hour=0, minute=0, second=0, microsecond=0)
     now_ms, start_ms = milliseconds(now), milliseconds(start)
     leads = list((await db.scalars(select(LeadSource).order_by(LeadSource.id))).all())
-    accounts = {a.id: a for a in (await db.scalars(select(TradingAccount).where(
-        TradingAccount.deleted_at.is_(None)).order_by(TradingAccount.id))).all()}
-    bindings = list((await db.scalars(select(CopyBinding).where(
-        CopyBinding.deleted_at.is_(None)).order_by(CopyBinding.id))).all())
+    account_stmt = select(TradingAccount).where(TradingAccount.deleted_at.is_(None))
+    binding_stmt = select(CopyBinding).where(CopyBinding.deleted_at.is_(None))
+    if owner_user_id is not None:
+        account_stmt = account_stmt.where(TradingAccount.owner_user_id == owner_user_id)
+        binding_stmt = binding_stmt.where(CopyBinding.owner_user_id == owner_user_id)
+    accounts = {a.id: a for a in (await db.scalars(account_stmt.order_by(TradingAccount.id))).all()}
+    bindings = list((await db.scalars(binding_stmt.order_by(CopyBinding.id))).all())
     allocations = {(a.binding_id, a.inst_id, a.pos_side.upper()): a for a in
                    (await db.scalars(select(PositionAllocation))).all()}
     guards = {(g.binding_id, g.inst_id, g.pos_side.upper()): g for g in
@@ -402,6 +411,14 @@ async def build_board(db, *, now=None):
     records = list((await db.scalars(select(ExecutionRecord).where(
         ExecutionRecord.created_at >= start.astimezone(timezone.utc),
     ).order_by(ExecutionRecord.created_at.desc(), ExecutionRecord.id.desc()))).all())
+    if owner_user_id is not None:
+        binding_ids = {b.id for b in bindings}
+        account_ids = set(accounts)
+        allocations = {k: v for k, v in allocations.items() if v.binding_id in binding_ids}
+        guards = {k: v for k, v in guards.items() if v.binding_id in binding_ids}
+        intents = [i for i in intents if i.account_id in account_ids]
+        deliveries = [d for d in deliveries if d.binding_id in binding_ids]
+        records = [r for r in records if r.account_id in account_ids]
     latest = {}
     for record in records:
         latest.setdefault((record.binding_id, record.inst_id, record.position_side), record)

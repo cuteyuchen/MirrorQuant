@@ -26,8 +26,8 @@ MUTATIONS = [
     ("PUT", "/api/proxies/{proxy}", {"name": "updated-proxy"}, 200),
     ("DELETE", "/api/proxies/{proxy}", None, 200),
     ("POST", "/api/proxies/{proxy}/test", None, 200),
-    ("POST", "/api/accounts", {"name": "new-account", "exchange": "binance", "apiKey": "synthetic-key",
-                               "secretKey": "synthetic-secret", "isEnabled": False}, 201),
+    # 1.3.3：POST /api/accounts 不再是 admin 专属——普通用户可创建自己的账户，
+    # 见 test_viewer_can_create_own_account_but_not_touch_others。
     ("PUT", "/api/accounts/{account}", {"name": "updated-account"}, 200),
     ("DELETE", "/api/accounts/{account}", None, 200),
     ("POST", "/api/accounts/{account}/test", None, 200),
@@ -131,6 +131,24 @@ async def test_management_mutations_require_current_admin(
         assert await management_snapshot() == before
         for external_call in state.external_calls:
             external_call.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_viewer_can_create_own_account_but_not_touch_others(async_client, management_state):
+    # 1.3.3：普通用户可创建自己的账户（owner 强制为本人），但碰不了别人的账户。
+    state = management_state
+    viewer = {"Authorization": f"Bearer {state.tokens['viewer']}"}
+    created = await async_client.post("/api/accounts", json={
+        "name": "viewer-account", "exchange": "binance", "apiKey": "synthetic-key",
+        "secretKey": "synthetic-secret", "isEnabled": False,
+    }, headers=viewer)
+    assert created.status_code == 201
+    mine = await async_client.get("/api/accounts", headers=viewer)
+    assert [a["name"] for a in mine.json()["items"]] == ["viewer-account"]
+    # fixture 的账户无 owner，viewer 既看不到也改不了。
+    assert (await async_client.put(f"/api/accounts/{state.ids['account']}",
+                                   json={"name": "nope"}, headers=viewer)).status_code == 403
+    assert (await async_client.delete(f"/api/accounts/{state.ids['account']}", headers=viewer)).status_code == 403
 
 
 @pytest.mark.asyncio

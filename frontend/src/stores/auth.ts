@@ -4,6 +4,7 @@ import { api, ApiError } from "@/api/client";
 import { useDataCacheStore } from "./dataCache";
 import { useSocketStore } from "./socket";
 import { useUiStore } from "./ui";
+import { useI18n } from "@/i18n";
 import { errorMessage } from "@/utils/errors";
 import type { AuthStatus, CaptchaChallenge, User } from "@/types/api";
 export type { User, CaptchaChallenge } from "@/types/api";
@@ -87,6 +88,27 @@ export const useAuthStore = defineStore("auth", () => {
       return false;
     } finally { if (request === sequence) loading.value = false; }
   }
+  async function register(username: string, password: string, inviteCode: string) {
+    const request = ++sequence;
+    loading.value = true; error.value = null;
+    try {
+      // 注册成功由后端设 auth cookie，会话只认 cookie，不在本地存 token。
+      const response = await api.post<{ user: User }>("/api/auth/register", { username, password, inviteCode });
+      if (request !== sequence) return false;
+      if (!response?.user) throw new ApiError(502, "INVALID_RESPONSE");
+      initialized.value = true; authenticated.value = true; user.value = response.user;
+      captchaRequired.value = false; totpRequired.value = false; lockRemainingSec.value = 0; captchaData.value = null;
+      return true;
+    } catch (cause: unknown) {
+      if (request !== sequence) return false;
+      // 注册失败按状态码给本地化原因：400 邀请码问题、409 用户名已存在，其余沿用通用映射。
+      const { t } = useI18n();
+      if (cause instanceof ApiError && cause.status === 400) error.value = t("register.invalidInvite");
+      else if (cause instanceof ApiError && cause.status === 409) error.value = t("register.usernameTaken");
+      else error.value = errorMessage(cause);
+      return false;
+    } finally { if (request === sequence) loading.value = false; }
+  }
   async function setup(username: string, password: string, bootstrapToken: string) {
     const request = ++sequence;
     loading.value = true; error.value = null;
@@ -108,5 +130,5 @@ export const useAuthStore = defineStore("auth", () => {
     catch (cause: unknown) { useUiStore().toast(errorMessage(cause), "warning"); }
     finally { clearSession(); }
   }
-  return { initialized, authenticated, user, loading, error, captchaRequired, totpRequired, lockRemainingSec, captchaData, checkStatus, fetchCaptcha, login, setup, logout, clearSession };
+  return { initialized, authenticated, user, loading, error, captchaRequired, totpRequired, lockRemainingSec, captchaData, checkStatus, fetchCaptcha, login, register, setup, logout, clearSession };
 });

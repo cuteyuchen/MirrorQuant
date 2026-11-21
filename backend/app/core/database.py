@@ -206,6 +206,7 @@ SQLITE_MIGRATIONS: Dict[str, List[Tuple[str, str]]] = {
         ("totp_enabled", "BOOLEAN NOT NULL DEFAULT 0"),
         ("totp_secret_enc", "TEXT"),
         ("totp_pending_secret_enc", "TEXT"),
+        ("deleted_at", "DATETIME"),
     ],
     "trading_accounts": [
         ("risk_equity_json", "TEXT"),

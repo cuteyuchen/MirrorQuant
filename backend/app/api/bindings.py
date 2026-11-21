@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_current_admin, get_current_user, record_audit
+from app.api.deps import get_current_admin, get_current_user, owner_filter, record_audit, require_owner_or_admin
 from app.api.exposure import require_binding_flat, require_binding_soft_deletable
 from app.core.database import DEFAULT_SYSTEM_CONFIG, get_db
 from app.core.secret_mask import redact_error_urls, redact_proxy_userinfo
@@ -91,7 +91,8 @@ async def _binding_out(db: AsyncSession, b: CopyBinding) -> dict:
 @router.get("")
 async def list_bindings(db: AsyncSession = Depends(get_db), _user: User = Depends(get_current_user)):
     rows = list((await db.scalars(select(CopyBinding).where(
-        CopyBinding.deleted_at.is_(None)).order_by(CopyBinding.id))).all())
+        CopyBinding.deleted_at.is_(None),
+        owner_filter(_user, CopyBinding.owner_user_id)).order_by(CopyBinding.id))).all())
     items = [await _binding_out(db, b) for b in rows]
     ks = await db.scalar(select(SystemConfig).where(SystemConfig.key == "global_kill_switch"))
     return {
@@ -100,17 +101,28 @@ async def list_bindings(db: AsyncSession = Depends(get_db), _user: User = Depend
     }
 
 
+async def _get_owned_binding(db: AsyncSession, binding_id: int, user: User) -> CopyBinding:
+    """Fetch a live binding the caller may touch; deleted rows are invisible."""
+    binding = await db.get(CopyBinding, binding_id)
+    if not binding or binding.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Binding not found")
+    require_owner_or_admin(user, binding.owner_user_id)
+    return binding
+
+
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_binding(
     payload: BindingCreate,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_current_user),
 ):
     lead = await db.get(LeadSource, payload.lead_id)
     acct = await db.get(TradingAccount, payload.account_id)
-    if not lead or not acct:
+    if not lead or not acct or acct.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Lead or TradingAccount not found")
+    # 只能绑自己的账户；admin 可绑任何账户。
+    require_owner_or_admin(current_user, acct.owner_user_id)
 
     dup = await db.scalar(
         select(CopyBinding).where(
@@ -124,6 +136,7 @@ async def create_binding(
         raise HTTPException(status_code=409, detail="Binding for this Lead and Account already exists")
 
     binding = CopyBinding(
+        owner_user_id=current_user.id,
         name=payload.name.strip(),
         lead_id=payload.lead_id,
         account_id=payload.account_id,
@@ -173,11 +186,9 @@ async def update_binding(
     payload: BindingUpdate,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_current_user),
 ):
-    binding = await db.get(CopyBinding, binding_id)
-    if not binding:
-        raise HTTPException(status_code=404, detail="Binding not found")
+    binding = await _get_owned_binding(db, binding_id, current_user)
 
     data = payload.model_dump(exclude_unset=True)
     protection_fields = {"symbol_map", "tp_sl_mode", "enable_stop_loss", "stop_loss_pct", "enable_take_profit",
@@ -210,11 +221,9 @@ async def delete_binding(
     binding_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_current_user),
 ):
-    binding = await db.get(CopyBinding, binding_id)
-    if not binding:
-        raise HTTPException(status_code=404, detail="Binding not found")
+    binding = await _get_owned_binding(db, binding_id, current_user)
     if binding.is_enabled:
         raise HTTPException(status_code=409, detail="Disable the binding and drain exposure before deletion")
     await require_binding_soft_deletable(db, binding)
@@ -233,11 +242,9 @@ async def toggle_binding(
     binding_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_current_user),
 ):
-    binding = await db.get(CopyBinding, binding_id)
-    if not binding:
-        raise HTTPException(status_code=404, detail="Binding not found")
+    binding = await _get_owned_binding(db, binding_id, current_user)
     binding.is_enabled = not binding.is_enabled
     await record_audit(
         db, "TOGGLE_BINDING", "binding", str(binding.id), f"Set enabled={binding.is_enabled}", current_user, request
@@ -252,11 +259,9 @@ async def reset_circuit_breaker(
     binding_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_current_user),
 ):
-    binding = await db.get(CopyBinding, binding_id)
-    if not binding:
-        raise HTTPException(status_code=404, detail="Binding not found")
+    binding = await _get_owned_binding(db, binding_id, current_user)
     binding.circuit_breaker_tripped = False
     binding.circuit_breaker_reason = None
     binding.consecutive_failures = 0
@@ -271,11 +276,9 @@ async def reset_debt(
     binding_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_current_user),
 ):
-    binding = await db.get(CopyBinding, binding_id)
-    if not binding:
-        raise HTTPException(status_code=404, detail="Binding not found")
+    binding = await _get_owned_binding(db, binding_id, current_user)
     debts = list((await db.scalars(select(BindingDebt).where(BindingDebt.binding_id == binding_id))).all())
     for d in debts:
         d.pending_usd = 0.0
@@ -291,12 +294,10 @@ async def adopt_existing_positions(
     binding_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_current_user),
 ):
     """手动认领：把账户里与带单员持仓一致的已有仓位记为跟单仓位，只改账，不下单。"""
-    binding = await db.get(CopyBinding, binding_id)
-    if not binding:
-        raise HTTPException(status_code=404, detail="Binding not found")
+    binding = await _get_owned_binding(db, binding_id, current_user)
     account = await db.get(TradingAccount, binding.account_id)
     lead = await db.get(LeadSource, binding.lead_id)
     if not account or not lead:
