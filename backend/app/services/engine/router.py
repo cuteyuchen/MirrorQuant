@@ -8,7 +8,7 @@ import logging
 import math
 import time
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_UP
 from typing import Any, Callable, Coroutine, Dict, List, Optional
 
@@ -1321,6 +1321,22 @@ class CopyRouter:
                     ExecutionRecord.notification_state.in_(("pending", "sent")),
                     or_(ExecutionRecord.status.startswith("BLOCKED"), ExecutionRecord.status.startswith("SKIPPED"),
                         ExecutionRecord.status.in_(_GUARD_NO_TRADE_STATUSES))))
+                if already_notified is not None:
+                    should_notify = False
+            if (should_notify and delivery is None and _is_guard_outcome(status)
+                    and exact(my_qty) == 0):
+                # 持仓差额路径没有投递事件，上面的按投递去重永不命中；持续低于
+                # 最小下单量的差额会每轮都记一条 SKIPPED 并各推一条钉钉，刷屏。
+                # 同一绑定/账户/品种/方向/状态在 24 小时内已有已推送/待推送的
+                # 风控结论时只记账，不再推送。
+                window_start = datetime.now(timezone.utc) - timedelta(hours=24)
+                already_notified = await db.scalar(select(ExecutionRecord.id).where(
+                    ExecutionRecord.id != rec.id,
+                    ExecutionRecord.binding_id == binding.id, ExecutionRecord.account_id == account.id,
+                    ExecutionRecord.inst_id == inst_id, ExecutionRecord.position_side == position_side,
+                    ExecutionRecord.notification_state.in_(("pending", "sent")),
+                    ExecutionRecord.status == status,
+                    ExecutionRecord.created_at >= window_start))
                 if already_notified is not None:
                     should_notify = False
             if should_notify:
