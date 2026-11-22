@@ -145,6 +145,11 @@ async def prepare_simulation(t, monkeypatch):
     real_sync = engine.collector.sync_snapshot
     async def sync_without_analysis(**kwargs):
         kwargs["with_analysis"] = False
+        # 订单流粒度回归：这些测试断言每笔源单事件逐笔处理，必须每轮
+        # 都拉订单历史；轻量同步把历史推迟到 30 秒一次全量，快路会
+        # 先把净差额合成一单，粒度断言就对不上。轻量同步本身由
+        # test_order_history_degradation 的轻量测试单独覆盖。
+        kwargs["light"] = False
         return await real_sync(**kwargs)
     monkeypatch.setattr(engine.collector, "sync_snapshot", sync_without_analysis)
     t.binding.baseline_seeded = True

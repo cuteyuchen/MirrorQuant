@@ -154,6 +154,7 @@ class EngineOrchestrator:
         self._lead_sync_in_flight: Set[int] = set()
         self._lead_sync_tasks: Set[asyncio.Task] = set()
         self._last_full_sweep: Dict[int, float] = {}
+        self._last_history_sync: Dict[int, float] = {}
         self._last_account_poll: Dict[int, float] = {}
         self._last_clock_sync: Dict[int, float] = {}
         self._last_reconcile: Dict[int, float] = {}
@@ -422,6 +423,18 @@ class EngineOrchestrator:
         closed_cache = json.loads(lead.closed_cache_json or "[]")
         previous_snapshot = json.loads(lead.snapshot_json or "{}")
         full_sweep = (time.time() - self._last_full_sweep.get(lead.id, 0.0)) > 600 or len(orders_store) < 100
+        # 轻量同步：公开带单员的高频轮询只拉 detail + 持仓（快路只认
+        # 持仓），订单/闭仓历史每 30 秒才全量刷新一次。隐藏带单员
+        # 没有持仓快路、订单流是唯一信号源，永远全量同步。
+        # 轻量一次只剩 2 个请求、约 0.5 秒，全量约 4 秒；轻量把金木
+        # 的有效间隔从约 5-7 秒压到约 2 秒，同时把 BAPI 请求量从
+        # 每分钟约 150-300 次降到约 70 次，不再撞 90801003。
+        prev_meta = (previous_snapshot or {}).get("openPositionsMeta") or {}
+        is_public = ((previous_snapshot or {}).get("profile") or {}).get("positionShow") is True or prev_meta.get("positionShow") is True
+        last_history = self._last_history_sync.get(lead.id, 0.0)
+        light = bool(is_public and (time.time() - last_history) < 30.0 and orders_store)
+        if not light:
+            self._last_history_sync[lead.id] = time.time()
 
         snapshot: Optional[Dict[str, Any]] = None
         last_err: Optional[Exception] = None
@@ -436,6 +449,7 @@ class EngineOrchestrator:
                         full_sweep=full_sweep,
                         with_analysis=True,
                         previous_snapshot=previous_snapshot,
+                        light=light,
                     ),
                     timeout=45.0,
                 )

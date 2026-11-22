@@ -1283,10 +1283,20 @@ class BinanceBapiCollector(BaseLeadCollector):
         with_analysis: bool = True,
         closed_history: Optional[List[Dict[str, Any]]] = None,
         previous_snapshot: Optional[Dict[str, Any]] = None,
+        light: bool = False,
     ) -> Dict[str, Any]:
+        # 轻量同步（公开带单员的高频轮询）：只拉 detail + 持仓，
+        # 跳过订单历史与闭仓历史。快路只认持仓，订单流只是二次确认，
+        # 没必要每 2 秒都拉一次历史；历史每 30 秒由一次全量同步刷新。
+        # 注意：轻量不跳过行情（with_analysis 保持原样），因为快路
+        # 要 markPrice 才能下单；持仓本身不一定带 markPrice，行情
+        # 必须走 fetch_marks 单独拉（每轮 1 个请求）。分析刷新
+        # （perf/chart/alloc）有 180/300 秒缓存，全量轮询会刷新，
+        # 轻量轮询基本不重复拉。
         t0 = time.perf_counter()
         detail_ok = True
         detail_error = None
+        previous_meta = (previous_snapshot or {}).get("meta") or {}
         previous_profile = dict((previous_snapshot or {}).get("profile") or {})
         try:
             detail = await self.fetch_detail(portfolio_id, proxy_url=proxy_url)
@@ -1314,24 +1324,37 @@ class BinanceBapiCollector(BaseLeadCollector):
         # 重复处理，缺失的新单由持仓快路补上。
         order_history_complete = True
         order_history_error = None
-        try:
-            added = await self.sync_orders_into_store(
-                portfolio_id, orders_store, full_sweep=full_sweep, proxy_url=proxy_url,
-                history_max_pages=STORE_MAX // 100 + 1 if closed_history is not None else 25,
-                require_complete=closed_history is not None,
-            )
-        except Exception as exc:
-            if not is_rate_limit_exception(exc):
-                raise
-            order_history_complete = False
-            order_history_error = describe_exception(exc)[:240]
+        if light:
+            # 轻量轮询不拉订单历史：沿用上轮已知订单与完成标志，
+            # 快路只认持仓，不等订单流。
+            order_history_complete = bool(previous_meta.get("orderHistoryComplete", True))
+            order_history_error = previous_meta.get("orderHistoryError")
             added = 0
-            _log_history_degraded(self, portfolio_id, "order history", order_history_error)
+        else:
+            try:
+                added = await self.sync_orders_into_store(
+                    portfolio_id, orders_store, full_sweep=full_sweep, proxy_url=proxy_url,
+                    history_max_pages=STORE_MAX // 100 + 1 if closed_history is not None else 25,
+                    require_complete=closed_history is not None,
+                )
+            except Exception as exc:
+                if not is_rate_limit_exception(exc):
+                    raise
+                order_history_complete = False
+                order_history_error = describe_exception(exc)[:240]
+                added = 0
+                _log_history_degraded(self, portfolio_id, "order history", order_history_error)
 
         # 平仓历史同样只在限流时降级：失败时保留上轮缓存，不让它拖垮持仓发布。
         closed_rows = list(closed_cache)
         closed_total = None
-        if closed_history is not None:
+        if light:
+            # 轻量轮询不拉闭仓历史：沿用上轮缓存与完成标志。
+            closed_history_complete = bool(previous_meta.get("closedHistoryComplete", True))
+            closed_total = previous_meta.get("closedTotal", len(closed_rows))
+            closed_cursor = previous_meta.get("closedHistoryCursor")
+            lst = []
+        elif closed_history is not None:
             lst, closed_total, closed_history_complete, closed_cursor = closed_history, len(closed_history), True, None
         else:
             try:

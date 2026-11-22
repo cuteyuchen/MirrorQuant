@@ -122,3 +122,53 @@ async def test_sync_snapshot_still_publishes_complete_history_when_healthy(monke
     assert snapshot["meta"]["orderHistoryComplete"] is True
     assert snapshot["meta"]["orderHistoryError"] is None
     assert snapshot["openPositionsMeta"]["source"] == "api"
+
+async def test_light_sync_skips_history_and_publishes_holdings(monkeypatch):
+    # 轻量同步（公开带单员高频轮询）：只拉 detail + 持仓，不碰订单
+    # 历史与闭仓历史；快照照常从持仓发布、权威。
+    collector = collector_with_mocks(monkeypatch)
+    previous = {
+        "meta": {"orderHistoryComplete": True, "closedHistoryComplete": True,
+                 "closedTotal": 3, "closedHistoryCursor": None},
+        "profile": {"positionShow": True, "marginBalance": 1000},
+        "openPositions": [{"symbol": "BTCUSDT", "positionSide": "LONG",
+                           "qty": 1, "qtyExact": "1", "markPrice": 100}],
+        "openPositionsMeta": {"asOf": 1000},
+    }
+    snapshot = await collector.sync_snapshot(
+        "test-portfolio", {}, [], with_analysis=False,
+        previous_snapshot=previous, light=True)
+    # 历史接口一次都没调。
+    collector.fetch_order_history.assert_not_awaited()
+    collector.fetch_position_history.assert_not_awaited()
+    # 持仓照常拉、快照权威。
+    assert collector.fetch_holdings.await_count == 1
+    assert snapshot["openPositionsMeta"]["source"] == "api"
+    assert snapshot["openPositionsMeta"]["authoritative"] is True
+    assert len(snapshot["openPositions"]) == 1
+    assert is_authoritative_snapshot(snapshot) is True
+    # 完成标志沿用上轮，不因跳过历史而翻成不完整。
+    assert snapshot["meta"]["orderHistoryComplete"] is True
+    assert snapshot["meta"]["closedHistoryComplete"] is True
+    assert snapshot["meta"]["ordersAddedThisRound"] == 0
+
+
+async def test_light_sync_carries_degraded_flags_forward(monkeypatch):
+    # 上轮订单历史已降级（限流）时，轻量轮询不把标志翻回“完整”，
+    # 避免掩盖仍在限流的事实；下次全量同步恢复后再翻回来。
+    collector = collector_with_mocks(monkeypatch)
+    previous = {
+        "meta": {"orderHistoryComplete": False,
+                 "orderHistoryError": "bapi rate limit 90801003",
+                 "closedHistoryComplete": False},
+        "profile": {"positionShow": True, "marginBalance": 1000},
+        "openPositions": [],
+        "openPositionsMeta": {"asOf": 1000},
+    }
+    snapshot = await collector.sync_snapshot(
+        "test-portfolio", {}, [], with_analysis=False,
+        previous_snapshot=previous, light=True)
+    assert snapshot["meta"]["orderHistoryComplete"] is False
+    assert "90801003" in (snapshot["meta"]["orderHistoryError"] or "")
+    assert snapshot["meta"]["closedHistoryComplete"] is False
+    assert snapshot["openPositionsMeta"]["authoritative"] is True
