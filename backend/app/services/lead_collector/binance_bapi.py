@@ -1288,11 +1288,16 @@ class BinanceBapiCollector(BaseLeadCollector):
         # 轻量同步（公开带单员的高频轮询）：只拉 detail + 持仓，
         # 跳过订单历史与闭仓历史。快路只认持仓，订单流只是二次确认，
         # 没必要每 2 秒都拉一次历史；历史每 30 秒由一次全量同步刷新。
-        # 注意：轻量不跳过行情（with_analysis 保持原样），因为快路
-        # 要 markPrice 才能下单；持仓本身不一定带 markPrice，行情
-        # 必须走 fetch_marks 单独拉（每轮 1 个请求）。分析刷新
-        # （perf/chart/alloc）有 180/300 秒缓存，全量轮询会刷新，
-        # 轻量轮询基本不重复拉。
+        # 注意：轻量跳过行情（with_analysis=False），价格直接用持仓
+        # 自带的 markPrice——BAPI 持仓行里本来就有 markPrice，实测
+        # 1.3.14 轻量同步的快照 markPrice 正常；fetch_marks 单独
+        # 拉一轮要约 1 秒，是轻量同步里最贵的一项，省掉后轻量只剩
+        # 并行的 detail+持仓、约 1 秒。分析刷新（perf/chart/alloc）
+        # 有 180/300 秒缓存，全量轮询会刷新，轻量轮询不重复拉。
+        # 若某次持仓真没 markPrice，快路会因价格缺失跳过本轮、等
+        # 30 秒后的全量同步补行情，不会误下单。
+        if light:
+            with_analysis = False
         t0 = time.perf_counter()
         detail_ok = True
         detail_error = None
