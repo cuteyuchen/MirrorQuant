@@ -186,7 +186,7 @@ onUnmounted(stopPolling);
   <div class="min-w-0 space-y-4" :class="authStore.authenticated ? '' : 'mx-auto min-h-dvh max-w-[1800px] p-3 md:p-6'">
     <!-- 顶栏：标题旁就是监控信标，右侧是倒计时与开关；异常横幅始终排在持仓之前。 -->
     <header class="page-heading">
-      <div class="flex min-w-0 flex-1 items-center gap-3">
+      <div class="flex min-w-0 flex-1 basis-full items-center gap-3 sm:basis-auto">
         <span v-if="!authStore.authenticated" class="brand-mark" aria-hidden="true"><Radar :size="19" /></span>
         <div class="min-w-0">
           <div class="flex flex-wrap items-center gap-x-2.5 gap-y-1">

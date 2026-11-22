@@ -134,7 +134,7 @@ async function logout() {
           </div>
         </header>
         <GlobalStatusBar v-if="showShell" />
-        <main id="main-content" tabindex="-1" class="min-w-0 flex-1 focus:outline-none" :class="showShell ? 'mx-auto w-full max-w-[1680px] px-3 py-4 pb-28 md:px-6 md:py-5 md:pb-10' : ''">
+        <main id="main-content" tabindex="-1" class="min-w-0 flex-1 focus:outline-none" :class="showShell ? 'mx-auto w-full max-w-[1680px] px-3 py-4 pb-16 md:px-6 md:py-5 md:pb-10' : ''">
           <RouterView v-slot="{ Component }">
             <KeepAlive v-if="showShell" :key="auth.user?.id"><component :is="Component" /></KeepAlive>
             <component :is="Component" v-else />
@@ -142,17 +142,17 @@ async function logout() {
         </main>
       </div>
     </div>
-    <!-- 移动底栏：四个最常用入口 + “更多”，当前页用顶部指示条标出。 -->
+    <!-- 移动底栏：四个最常用入口 + “更多”，当前页用顶部指示条标出；紧凑高度释放首屏垂直视口。 -->
     <nav v-if="showShell" :aria-label="t('nav.main')" class="pb-safe fixed inset-x-0 bottom-0 z-30 grid grid-cols-5 border-t border-border/60 bg-surface/90 backdrop-blur-md md:hidden">
-      <RouterLink v-for="item in mobileItems" :key="item.path" :to="item.path" class="relative flex min-h-16 min-w-0 flex-col items-center justify-center gap-1 px-1 py-2 text-xs font-medium transition"
+      <RouterLink v-for="item in mobileItems" :key="item.path" :to="item.path" class="relative flex min-h-12 min-w-0 flex-col items-center justify-center gap-0.5 px-1 py-1.5 text-[11px] font-medium transition"
         :class="isActive(item.path) ? 'text-accent' : 'text-muted'" :aria-current="isActive(item.path) ? 'page' : undefined">
         <span v-if="isActive(item.path)" class="absolute inset-x-5 top-0 h-0.5 rounded-full bg-accent" aria-hidden="true" />
-        <span class="relative"><component :is="item.icon" :size="21" aria-hidden="true" /><span v-if="item.key === 'executions' && pendingCount != null && pendingCount > 0" class="absolute -right-3 -top-2 min-w-4 rounded-full bg-warning px-1 text-center text-xs font-bold tabular-nums text-onAccent" :aria-label="t('nav.pendingCount', { n: pendingCount })">{{ pendingCount }}</span></span>
+        <span class="relative"><component :is="item.icon" :size="18" aria-hidden="true" /><span v-if="item.key === 'executions' && pendingCount != null && pendingCount > 0" class="absolute -right-3 -top-2 min-w-4 rounded-full bg-warning px-1 text-center text-xs font-bold tabular-nums text-onAccent" :aria-label="t('nav.pendingCount', { n: pendingCount })">{{ pendingCount }}</span></span>
         <span class="max-w-full truncate">{{ t(`nav.${item.key}`) }}</span>
       </RouterLink>
-      <button type="button" class="relative flex min-h-16 flex-col items-center justify-center gap-1 text-xs font-medium transition" :class="moreItems.some(item => isActive(item.path)) ? 'text-accent' : 'text-muted'" :aria-expanded="moreOpen" @click="moreOpen = true">
+      <button type="button" class="relative flex min-h-12 flex-col items-center justify-center gap-0.5 text-[11px] font-medium transition" :class="moreItems.some(item => isActive(item.path)) ? 'text-accent' : 'text-muted'" :aria-expanded="moreOpen" @click="moreOpen = true">
         <span v-if="moreItems.some(item => isActive(item.path))" class="absolute inset-x-5 top-0 h-0.5 rounded-full bg-accent" aria-hidden="true" />
-        <Ellipsis :size="21" aria-hidden="true" />{{ t("nav.more") }}
+        <Ellipsis :size="18" aria-hidden="true" />{{ t("nav.more") }}
       </button>
     </nav>
     <BaseModal :open="moreOpen" :title="t('nav.more')" @close="moreOpen = false">

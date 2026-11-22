@@ -117,7 +117,8 @@ onUnmounted(stop);
     <EmptyState v-else-if="!validId || (!loading && !lead && !loadError)" :title="t('leadDetail.missing')" :description="t('leadDetail.missingHint')" />
     <template v-if="lead">
       <ErrorState v-if="boardError" :message="boardError" :busy="loading" @retry="load(true)" />
-      <LeadComparison v-if="boardLead" :lead="boardLead" :received-at="cache.board?.fetchedAt ?? null" :accounts="cache.board?.data.accounts ?? null" :show-details="false" />
+      <!-- 全页面唯一的权威持仓展示处，下方分析面板均链接回此锚点 -->
+      <LeadComparison id="canonical-positions" v-if="boardLead" :lead="boardLead" :received-at="cache.board?.fetchedAt ?? null" :accounts="cache.board?.data.accounts ?? null" :show-details="false" />
       <LoadingSkeleton v-else-if="loading" />
       <EmptyState v-else-if="!boardError" :title="t('board.unknownPositions')" />
       <section class="min-w-0 space-y-4 pt-3" :aria-label="t('leadDetail.analysis')">

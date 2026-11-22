@@ -49,8 +49,8 @@ function executionDetail(execution: BoardExecution): string | null {
     </div>
     <p v-if="readOnly" class="mb-3 text-xs text-muted">{{ t("pub.knownEvents") }}</p>
     <p v-if="!sorted.length" class="rounded-xl border border-dashed border-border/60 px-3 py-6 text-center text-xs text-muted">{{ events == null ? t("common.unknown") : t("board.noEvents") }}</p>
-    <!-- 动态列表高度封顶、内部滚动，不把整页撑开；时间轴竖线留在可滚动的 ol 上。 -->
-    <div v-else class="max-h-[calc(100vh-8rem)] overflow-y-auto overscroll-contain pr-1">
+    <!-- 桌面端动态列表高度封顶内部滚动，移动端取消内部滚动容器由整页统一滚动，杜绝嵌套滚动陷阱。 -->
+    <div v-else class="pr-1 xl:max-h-[calc(100vh-8rem)] xl:overflow-y-auto xl:overscroll-contain">
     <ol class="relative space-y-4 before:absolute before:bottom-2 before:left-[5px] before:top-2 before:w-px before:bg-border/70">
       <li v-for="event in visible" :key="event.id || `${event.time}:${event.symbol}:${event.action}`" class="relative min-w-0 pl-6">
         <span class="absolute left-0 top-1.5 h-[11px] w-[11px] rounded-full border-2 border-surface bg-accent" aria-hidden="true" />
@@ -67,15 +67,15 @@ function executionDetail(execution: BoardExecution): string | null {
           <span v-if="event.realizedPnl != null" class="ml-1 font-semibold" :class="pnlClass(event.realizedPnl)">{{ signedUsd(event.realizedPnl) }}</span>
         </p>
         <p v-if="!readOnly && !event.mine?.length" class="mt-1.5 text-xs font-medium text-warning">{{ t("board.noExecution") }}</p>
-        <!-- 我的执行结果只在私有看板出现，公开页不渲染账户与执行详情。 -->
+        <!-- 我的执行结果只在私有看板出现，精简展示执行状态与异常/拦截原因，不重复长篇持仓信息。 -->
         <template v-if="!readOnly">
-          <div v-for="execution in event.mine || []" :key="execution.bindingId || execution.accountName || 'execution'" class="mt-2 min-w-0 rounded-lg border border-border/50 bg-background/50 p-2 text-xs">
+          <div v-for="execution in event.mine || []" :key="execution.bindingId || execution.accountName || 'execution'" class="mt-1.5 min-w-0 rounded-lg border border-border/50 bg-background/50 p-2 text-xs">
             <div class="flex flex-wrap items-center gap-1.5">
               <span class="min-w-0 font-medium [overflow-wrap:anywhere]">{{ execution.accountName ?? t("common.unknown") }}</span>
               <EnvBadge :environment="environment(execution.bindingId, execution.accountName)" />
               <StatusBadge class="ml-auto" :state="execution.status" />
             </div>
-            <p class="mt-1 font-mono tabular-nums text-muted">{{ sizeText(execution.qty, null, execution.price) }} @ {{ formatPrice(execution.price) }} · {{ t("board.slippage") }} {{ formatPct(execution.slippagePct) }}</p>
+            <p v-if="execution.status === 'EXECUTED'" class="mt-1 font-mono tabular-nums text-muted">{{ sizeText(execution.qty, null, execution.price) }} · {{ t("board.slippage") }} {{ formatPct(execution.slippagePct) }}</p>
             <p v-if="executionDetail(execution)" class="mt-1 break-words font-medium text-warning">{{ executionDetail(execution) }}</p>
           </div>
         </template>

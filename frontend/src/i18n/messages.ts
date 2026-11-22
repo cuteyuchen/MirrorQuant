@@ -118,6 +118,7 @@ export const additions: Record<string, readonly [string, string]> = {
   "common.enabled": ["已启用", "Enabled"],
   "common.disabled": ["已停用", "Disabled"],
   "common.details": ["详情", "Details"],
+  "common.collapse": ["收起", "Collapse"],
   "common.working": ["处理中…", "Working…"],
   "common.success": ["操作成功", "Operation completed"],
   "common.all": ["全部", "All"],

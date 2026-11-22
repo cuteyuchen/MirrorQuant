@@ -58,8 +58,17 @@ const SECTIONS = [
   { key: "history", label: "telemetry.history", icon: History },
 ];
 const root = ref<HTMLElement | null>(null);
-// 滚动到指定区块；系统要求减少动效时直接定位，不做平滑滚动。
+// 滚动到指定区块；系统要求减少动效时直接定位，不做平滑滚动；嵌入模式下持仓可直达顶部权威持仓卡。
 function jump(key: string) {
+  if (props.embedded && key === "positions") {
+    const target = document.getElementById("canonical-positions");
+    if (target) {
+      target.scrollIntoView({
+        behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start",
+      });
+      return;
+    }
+  }
   root.value?.querySelector(`[data-section="${key}"]`)?.scrollIntoView({
     behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start",
   });
@@ -109,12 +118,12 @@ function jump(key: string) {
     </section>
     <!-- 持仓分析放最前；外层给了时间线（公开页的今日动态）时并排在右侧，滚动时跟随停留。 -->
     <div v-if="$slots.aside" class="grid min-w-0 items-start gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
-      <PositionAnalysis :snapshot="snapshot" data-section="positions" />
+      <PositionAnalysis :snapshot="snapshot" :embedded="embedded" data-section="positions" />
       <section data-section="timeline" class="card xl:sticky xl:top-[var(--sticky-top,1rem)] xl:max-h-[calc(100dvh-var(--sticky-top,1rem)-1rem)] xl:overflow-y-auto">
         <div class="card-body"><slot name="aside" /></div>
       </section>
     </div>
-    <PositionAnalysis v-else :snapshot="snapshot" data-section="positions" />
+    <PositionAnalysis v-else :snapshot="snapshot" :embedded="embedded" data-section="positions" />
     <PositionCalculatorCard :snapshot="snapshot" :display-name="displayName" data-section="calculator" />
     <PerformancePanel :snapshot="snapshot" data-section="performance" />
     <div class="grid min-w-0 gap-4 xl:grid-cols-3">

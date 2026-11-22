@@ -15,7 +15,7 @@ import EmptyState from "@/components/EmptyState.vue";
 import StatTile from "@/components/StatTile.vue";
 import PriceActionPanel from "./PriceActionPanel.vue";
 
-const props = defineProps<{ snapshot: LeadSnapshot }>();
+const props = withDefaults(defineProps<{ snapshot: LeadSnapshot; embedded?: boolean }>(), { embedded: false });
 const { t } = useI18n();
 const { unit, showQuantity, showNotional, sizeText } = useDisplayUnit();
 const now = useNow();
@@ -155,32 +155,24 @@ function orderNotional(order: TelemetryOrder) {
       <EmptyState v-if="!confirmed" :title="t('board.unknownPositions')" />
       <EmptyState v-else-if="flat" :title="t('tel.noOpenPositions')" />
       <div v-else class="space-y-3">
-        <!-- 一个持仓一张卡：现价与浮动盈亏最大，其余口径排成小格，右侧（或下方）是 PA / SMC 结构分析。 -->
-        <article v-for="position in positions" :key="positionKey(position)" class="cq min-w-0 rounded-xl border border-border/50 bg-background/40 p-3 sm:p-4" :class="openedToday(position) ? 'today-edge' : ''">
-          <div class="cq-split">
-            <div class="cq min-w-0">
+        <!-- 嵌入模式（详情页）：持仓已在顶部 LeadComparison 中权威展示，这里仅保留 SMC/PA 结构分析与建仓订单，不再重复渲染基础指标 -->
+        <template v-if="embedded">
+          <article v-for="position in positions" :key="positionKey(position)" class="cq min-w-0 rounded-xl border border-border/50 bg-background/40 p-3 sm:p-4" :class="openedToday(position) ? 'today-edge' : ''">
+            <div class="flex flex-wrap items-center justify-between gap-2 border-b border-border/40 pb-2.5">
               <div class="flex flex-wrap items-center gap-1.5">
                 <h4 class="text-base font-bold tracking-tight">{{ position.symbol ?? position.instId ?? t("common.unknown") }}</h4>
                 <span :class="sideClass(position)">{{ sideLabel(position.positionSide ?? position.posSide, position.qty ?? position.pos) }}</span>
                 <span v-if="openedToday(position)" class="pill tone-accent font-semibold">{{ t("board.today") }}</span>
                 <span v-if="position.fundingRate != null" class="pill font-mono tabular-nums">{{ t("pos.fundingRate", { rate: fundingText(position.fundingRate) }) }}</span>
               </div>
-              <div class="mt-3 flex flex-wrap items-end justify-between gap-x-4 gap-y-3">
-                <div class="min-w-0">
-                  <p class="flex items-center gap-1.5 text-xs text-muted"><span v-if="snapshot.meta?.stale === false" class="live-dot text-success" aria-hidden="true" />{{ t("pos.curPrice") }}</p>
-                  <p class="mt-1 font-mono text-3xl font-bold leading-none tabular-nums tracking-tight [overflow-wrap:anywhere]">{{ formatPrice(position.currentPrice ?? position.markPrice) }}</p>
-                  <p class="mt-1.5 font-mono text-xs font-semibold tabular-nums" :class="pnlClass(position.priceEdgePct)">{{ t("pos.vsAvg") }} {{ formatPct(position.priceDiffPct) }}</p>
-                </div>
-                <div class="min-w-0 text-right">
-                  <p class="text-xs text-muted">{{ t("pos.floatPnl") }}</p>
-                  <p class="mt-1 font-mono text-2xl font-bold leading-none tabular-nums [overflow-wrap:anywhere]" :class="pnlClass(position.uPnL)">{{ signedUsd(position.uPnL) }}</p>
-                  <p class="mt-1.5 font-mono text-xs font-semibold tabular-nums" :class="pnlClass(position.uPnLRoePct)">ROE {{ formatPct(position.uPnLRoePct) }}</p>
-                </div>
-              </div>
-              <dl class="cq-tiles mt-3.5">
-                <StatTile v-for="tile in positionTiles(position)" :key="tile.key" :label="tile.label" :value="tile.value" :sub="tile.sub" :value-class="tile.valueClass" />
-              </dl>
-              <details v-if="position.entryOrders?.length" class="mt-3 rounded-lg border border-border/40 bg-surface/60">
+              <a :href="`#pos-${position.symbol ?? position.instId}`" class="inline-flex min-h-8 items-center gap-1 text-xs font-semibold text-accent transition hover:underline">
+                {{ t("common.details") }} ↑
+              </a>
+            </div>
+            <div class="mt-3 space-y-3">
+              <PriceActionPanel v-if="position.analysis?.ok" :analysis="position.analysis" />
+              <p v-else class="tile self-start text-xs text-muted">{{ t("pa.pending") }}</p>
+              <details v-if="position.entryOrders?.length" class="rounded-lg border border-border/40 bg-surface/60">
                 <summary class="cursor-pointer rounded-lg px-3 py-2 text-xs font-semibold text-accent">{{ t("pos.entryFills") }} · {{ t("pos.entryOrdersCount", { n: position.entryOrders.length }) }}</summary>
                 <ul class="divide-y divide-border/40 px-3 pb-1.5 font-mono text-xs tabular-nums">
                   <li v-for="order in position.entryOrders" :key="orderKey(order)" class="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 py-1.5">
@@ -192,10 +184,51 @@ function orderNotional(order: TelemetryOrder) {
                 </ul>
               </details>
             </div>
-            <PriceActionPanel v-if="position.analysis?.ok" :analysis="position.analysis" />
-            <p v-else class="tile self-start text-xs text-muted">{{ t("pa.pending") }}</p>
-          </div>
-        </article>
+          </article>
+        </template>
+        <!-- 独立模式（公开看板等）：外层无权威持仓卡，渲染完整的持仓分析大卡 -->
+        <template v-else>
+          <article v-for="position in positions" :key="positionKey(position)" class="cq min-w-0 rounded-xl border border-border/50 bg-background/40 p-3 sm:p-4" :class="openedToday(position) ? 'today-edge' : ''">
+            <div class="cq-split">
+              <div class="cq min-w-0">
+                <div class="flex flex-wrap items-center gap-1.5">
+                  <h4 class="text-base font-bold tracking-tight">{{ position.symbol ?? position.instId ?? t("common.unknown") }}</h4>
+                  <span :class="sideClass(position)">{{ sideLabel(position.positionSide ?? position.posSide, position.qty ?? position.pos) }}</span>
+                  <span v-if="openedToday(position)" class="pill tone-accent font-semibold">{{ t("board.today") }}</span>
+                  <span v-if="position.fundingRate != null" class="pill font-mono tabular-nums">{{ t("pos.fundingRate", { rate: fundingText(position.fundingRate) }) }}</span>
+                </div>
+                <div class="mt-3 flex flex-wrap items-end justify-between gap-x-4 gap-y-2">
+                  <div class="min-w-0">
+                    <p class="flex items-center gap-1.5 text-xs text-muted"><span v-if="snapshot.meta?.stale === false" class="live-dot text-success" aria-hidden="true" />{{ t("pos.curPrice") }}</p>
+                    <p class="mt-1 font-mono text-2xl font-bold leading-none tabular-nums tracking-tight sm:text-3xl [overflow-wrap:anywhere]">{{ formatPrice(position.currentPrice ?? position.markPrice) }}</p>
+                    <p class="mt-1.5 font-mono text-xs font-semibold tabular-nums" :class="pnlClass(position.priceEdgePct)">{{ t("pos.vsAvg") }} {{ formatPct(position.priceDiffPct) }}</p>
+                  </div>
+                  <div class="min-w-0 text-right">
+                    <p class="text-xs text-muted">{{ t("pos.floatPnl") }}</p>
+                    <p class="mt-1 font-mono text-xl font-bold leading-none tabular-nums sm:text-2xl [overflow-wrap:anywhere]" :class="pnlClass(position.uPnL)">{{ signedUsd(position.uPnL) }}</p>
+                    <p class="mt-1.5 font-mono text-xs font-semibold tabular-nums" :class="pnlClass(position.uPnLRoePct)">ROE {{ formatPct(position.uPnLRoePct) }}</p>
+                  </div>
+                </div>
+                <dl class="cq-tiles mt-3.5">
+                  <StatTile v-for="tile in positionTiles(position)" :key="tile.key" :label="tile.label" :value="tile.value" :sub="tile.sub" :value-class="tile.valueClass" />
+                </dl>
+                <details v-if="position.entryOrders?.length" class="mt-3 rounded-lg border border-border/40 bg-surface/60">
+                  <summary class="cursor-pointer rounded-lg px-3 py-2 text-xs font-semibold text-accent">{{ t("pos.entryFills") }} · {{ t("pos.entryOrdersCount", { n: position.entryOrders.length }) }}</summary>
+                  <ul class="divide-y divide-border/40 px-3 pb-1.5 font-mono text-xs tabular-nums">
+                    <li v-for="order in position.entryOrders" :key="orderKey(order)" class="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 py-1.5">
+                      <time class="text-muted">{{ formatDateTime(order.t ?? order.time, { short: true }) }}</time>
+                      <span class="font-sans">{{ entryDirection(order, position) }}</span>
+                      <span><strong class="font-semibold">{{ unit === "both" ? formatQty(order.q ?? order.qty) : sizeText(order.q ?? order.qty, orderNotional(order), order.p ?? order.price ?? order.avgPrice) }}</strong> <span class="text-accent">@ {{ formatPrice(order.p ?? order.price ?? order.avgPrice) }}</span></span>
+                      <span v-if="unit === 'both'" class="text-muted">{{ formatUsd(orderNotional(order)) }}</span>
+                    </li>
+                  </ul>
+                </details>
+              </div>
+              <PriceActionPanel v-if="position.analysis?.ok" :analysis="position.analysis" />
+              <p v-else class="tile self-start text-xs text-muted">{{ t("pa.pending") }}</p>
+            </div>
+          </article>
+        </template>
         <p class="text-xs leading-relaxed text-faint">{{ t("tel.formulaNote", { mb: formatUsd(marginBalance), src: mmrSource }) }}</p>
       </div>
     </div>

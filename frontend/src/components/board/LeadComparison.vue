@@ -24,12 +24,19 @@ const { t } = useI18n();
 const { showQuantity, showNotional } = useDisplayUnit();
 // 看板里就地测算跟单仓位，不必跳到详情页；未展开时不请求快照。
 const calcOpen = ref(false);
+// 移动端折叠次要持仓明细（均价/数量/名义价值/止盈止损），默认紧凑收起、可展开。
+const expandedDetails = ref<Record<string, boolean>>({});
+function toggleDetails(key: string) { expandedDetails.value[key] = !expandedDetails.value[key]; }
+function isDetailsExpanded(key: string) { return !!expandedDetails.value[key]; }
 // 今日新仓优先；未知开仓时间放在最后，不改变后端持仓状态。
 const positions = computed(() => [...(props.lead.positions || [])].sort((a, b) =>
   Number(b.openedToday === true) - Number(a.openedToday === true) || (b.openedAt ?? -Infinity) - (a.openedAt ?? -Infinity)));
 function positionKey(position: BoardPosition) { return position.key || `${position.symbol}:${position.side}:${position.openedAt}`; }
-// 公开模式不渲染账户、执行结果、残留仓或私有详情入口。
-function mineRows(position: BoardPosition) { return !props.readOnly && position.mine?.length ? position.mine : [null]; }
+// 公开模式不渲染账户、执行结果、残留仓或私有详情入口；正在运行的绑定优先排在前列。
+function mineRows(position: BoardPosition) {
+  if (props.readOnly || !position.mine?.length) return [null];
+  return [...position.mine].sort((a, b) => Number(b.bindingEnabled !== false) - Number(a.bindingEnabled !== false));
+}
 // 没有任何绑定跟这位带单员时只是“未绑定”，不算异常；有绑定但没跟齐才需要关注。
 function attention(position: BoardPosition) { return !props.readOnly && !!position.mine?.some(mine => mine.state !== "aligned"); }
 // 持仓卡的底色跟随“我跟得怎么样”：被拦截最醒目，其次是没跟齐，跟上了保持安静。
@@ -48,9 +55,9 @@ function distancePct(level: NumericValue, mark: NumericValue) {
   const base = finiteNumber(mark);
   return price == null || base == null || base === 0 ? null : (price - base) / base * 100;
 }
-// 公开页拿不到止盈止损，整块隐藏；私有看板始终展示，未知显示破折号。
+// 止盈或止损至少有一项已知时才展示；全部未知时隐藏，不在移动端留出一整块破折号占位。
 function showLevels(position: BoardPosition) {
-  return !props.readOnly || position.takeProfitPrice != null || position.stopLossPrice != null;
+  return position.takeProfitPrice != null || position.stopLossPrice != null;
 }
 // 公开页的“今日开 / 平 / 已实现”没有可靠来源时不渲染，避免一排破折号。
 const showToday = computed(() => !props.readOnly
@@ -106,9 +113,9 @@ const showToday = computed(() => !props.readOnly
           <EmptyState v-if="!positions.length" :title="t(lead.positions == null || lead.positionShow !== true ? 'board.unknownPositions' : 'board.noPositions')" data-testid="empty-positions" />
           <!-- 一个持仓一张卡：左边是带单员的现价 / 盈亏 / 止盈止损，右边紧挨着我的对应持仓。 -->
           <div v-else class="grid min-w-0 gap-3" :class="readOnly ? 'lg:grid-cols-2' : ''">
-            <article v-for="position in positions" :key="positionKey(position)" :data-position="position.key"
+            <article v-for="position in positions" :id="`pos-${position.symbol}`" :key="positionKey(position)" :data-position="position.key"
               class="min-w-0 rounded-xl border p-3 sm:p-4" :class="[cardTone(position), position.openedToday ? 'today-edge' : '']">
-              <div class="grid min-w-0 gap-4" :class="readOnly ? '' : 'lg:grid-cols-[minmax(0,1.15fr)_minmax(0,1fr)]'">
+              <div class="grid min-w-0 gap-3 sm:gap-4" :class="readOnly ? '' : 'lg:grid-cols-[minmax(0,1.15fr)_minmax(0,1fr)]'">
                 <div class="min-w-0">
                   <div class="flex flex-wrap items-center gap-1.5">
                     <h3 class="text-base font-bold tracking-tight">{{ position.symbol ?? t("common.unknown") }}</h3>
@@ -117,43 +124,52 @@ const showToday = computed(() => !props.readOnly
                     <span v-if="position.openedToday" class="pill tone-accent font-semibold">{{ t("board.today") }}</span>
                     <time class="ml-auto font-mono text-xs tabular-nums text-muted" :title="t('board.openedAt')">{{ formatDateTime(position.openedAt, { short: true, withSeconds: false }) }}</time>
                   </div>
-                  <!-- 现价与浮动盈亏是最需要一眼看到的两个数。 -->
-                  <div class="mt-3 flex flex-wrap items-end justify-between gap-x-4 gap-y-2">
+                  <!-- 现价与浮动盈亏是最需要一眼看到的两个数，移动端字号适当降档以节省垂直空间。 -->
+                  <div class="mt-2.5 flex flex-wrap items-end justify-between gap-x-4 gap-y-1.5 sm:mt-3">
                     <div class="min-w-0">
                       <p class="text-xs text-muted">{{ t("board.mark") }}</p>
-                      <p class="mt-1 font-mono font-bold leading-none tabular-nums tracking-tight [overflow-wrap:anywhere]" :class="readOnly ? 'text-3xl' : 'text-2xl'" data-testid="mark-price">{{ formatPrice(position.markPrice) }}</p>
+                      <p class="mt-0.5 font-mono font-bold leading-none tabular-nums tracking-tight [overflow-wrap:anywhere]" :class="readOnly ? 'text-2xl sm:text-3xl' : 'text-xl sm:text-2xl'" data-testid="mark-price">{{ formatPrice(position.markPrice) }}</p>
                     </div>
                     <div class="min-w-0 text-right">
-                      <p class="font-mono text-xl font-bold leading-none tabular-nums" :class="pnlClass(position.pnlPct)">{{ formatPct(position.pnlPct) }}</p>
-                      <p class="mt-1.5 font-mono text-xs font-semibold tabular-nums" :class="pnlClass(position.pnl)">{{ signedUsd(position.pnl) }}</p>
+                      <p class="font-mono text-lg font-bold leading-none tabular-nums sm:text-xl" :class="pnlClass(position.pnlPct)">{{ formatPct(position.pnlPct) }}</p>
+                      <p class="mt-1 font-mono text-xs font-semibold tabular-nums sm:mt-1.5" :class="pnlClass(position.pnl)">{{ signedUsd(position.pnl) }}</p>
                     </div>
                   </div>
-                  <dl class="mt-3 grid gap-2 text-xs" :class="showQuantity && showNotional ? 'grid-cols-3' : 'grid-cols-2'">
-                    <div class="min-w-0"><dt class="text-muted">{{ t("board.entry") }}</dt><dd class="mt-0.5 font-mono font-semibold tabular-nums">{{ formatPrice(position.entryPrice) }}</dd></div>
-                    <div v-if="showQuantity" class="min-w-0"><dt class="text-muted">{{ t("common.quantity") }}</dt><dd class="mt-0.5 font-mono font-semibold tabular-nums">{{ formatQty(position.qty) }}</dd></div>
-                    <div v-if="showNotional" class="min-w-0 text-right"><dt class="text-muted">{{ t("board.notional") }}</dt><dd class="mt-0.5 font-mono font-semibold tabular-nums">{{ formatUsd(position.notional, 0) }}</dd></div>
-                  </dl>
-                  <!-- 止损在左、止盈在右，中间的位置条标出现价落在两者之间的哪里。 -->
-                  <div v-if="showLevels(position)" class="mt-3 rounded-lg border border-border/40 bg-surface/70 p-2.5">
-                    <div class="flex items-start justify-between gap-3 text-xs">
-                      <div class="min-w-0">
-                        <p class="font-semibold text-danger">{{ t("board.stopLoss") }}</p>
-                        <p class="mt-0.5 font-mono font-semibold tabular-nums">{{ formatPrice(position.stopLossPrice) }}</p>
-                        <p class="font-mono tabular-nums text-muted">{{ t("board.fromMark") }} {{ formatPct(distancePct(position.stopLossPrice, position.markPrice)) }}</p>
+                  <!-- 移动端紧凑摘要行：均价与数量一行呈现，次要信息默认收起、提供展开开关。 -->
+                  <div class="mt-2 flex items-center justify-between text-xs sm:hidden">
+                    <span class="font-mono tabular-nums text-muted">{{ t("board.entry") }} {{ formatPrice(position.entryPrice) }}<span v-if="showQuantity"> · {{ formatQty(position.qty) }}</span></span>
+                    <button type="button" class="inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 font-semibold text-accent hover:bg-accent/10" @click="toggleDetails(positionKey(position))">
+                      {{ isDetailsExpanded(positionKey(position)) ? t("common.collapse") : t("common.details") }}
+                    </button>
+                  </div>
+                  <div :class="isDetailsExpanded(positionKey(position)) ? '' : 'hidden sm:block'">
+                    <dl class="mt-2.5 grid gap-2 text-xs sm:mt-3" :class="showQuantity && showNotional ? 'grid-cols-3' : 'grid-cols-2'">
+                      <div class="min-w-0"><dt class="text-muted">{{ t("board.entry") }}</dt><dd class="mt-0.5 font-mono font-semibold tabular-nums">{{ formatPrice(position.entryPrice) }}</dd></div>
+                      <div v-if="showQuantity" class="min-w-0"><dt class="text-muted">{{ t("common.quantity") }}</dt><dd class="mt-0.5 font-mono font-semibold tabular-nums">{{ formatQty(position.qty) }}</dd></div>
+                      <div v-if="showNotional" class="min-w-0 text-right"><dt class="text-muted">{{ t("board.notional") }}</dt><dd class="mt-0.5 font-mono font-semibold tabular-nums">{{ formatUsd(position.notional, 0) }}</dd></div>
+                    </dl>
+                    <!-- 止损在左、止盈在右，中间的位置条标出现价落在两者之间的哪里；仅在有已知止损或止盈时渲染。 -->
+                    <div v-if="showLevels(position)" class="mt-3 rounded-lg border border-border/40 bg-surface/70 p-2.5">
+                      <div class="flex items-start justify-between gap-3 text-xs">
+                        <div class="min-w-0">
+                          <p class="font-semibold text-danger">{{ t("board.stopLoss") }}</p>
+                          <p class="mt-0.5 font-mono font-semibold tabular-nums">{{ formatPrice(position.stopLossPrice) }}</p>
+                          <p class="font-mono tabular-nums text-muted">{{ t("board.fromMark") }} {{ formatPct(distancePct(position.stopLossPrice, position.markPrice)) }}</p>
+                        </div>
+                        <div class="min-w-0 text-right">
+                          <p class="font-semibold text-success">{{ t("board.takeProfit") }}</p>
+                          <p class="mt-0.5 font-mono font-semibold tabular-nums">{{ formatPrice(position.takeProfitPrice) }}</p>
+                          <p class="font-mono tabular-nums text-muted">{{ t("board.fromMark") }} {{ formatPct(distancePct(position.takeProfitPrice, position.markPrice)) }}</p>
+                        </div>
                       </div>
-                      <div class="min-w-0 text-right">
-                        <p class="font-semibold text-success">{{ t("board.takeProfit") }}</p>
-                        <p class="mt-0.5 font-mono font-semibold tabular-nums">{{ formatPrice(position.takeProfitPrice) }}</p>
-                        <p class="font-mono tabular-nums text-muted">{{ t("board.fromMark") }} {{ formatPct(distancePct(position.takeProfitPrice, position.markPrice)) }}</p>
-                      </div>
+                      <LevelTrack class="mt-2.5" :mark="position.markPrice" :entry="position.entryPrice" :take-profit="position.takeProfitPrice" :stop-loss="position.stopLossPrice" />
                     </div>
-                    <LevelTrack class="mt-2.5" :mark="position.markPrice" :entry="position.entryPrice" :take-profit="position.takeProfitPrice" :stop-loss="position.stopLossPrice" />
                   </div>
                 </div>
-                <div v-if="!readOnly" class="min-w-0 border-t border-border/50 pt-3 lg:border-l lg:border-t-0 lg:pl-4 lg:pt-0">
+                <div v-if="!readOnly" class="min-w-0 border-t border-border/50 pt-2.5 sm:pt-3 lg:border-l lg:border-t-0 lg:pl-4 lg:pt-0">
                   <p class="eyebrow mb-2">{{ t("board.mine") }}</p>
                   <div class="space-y-2">
-                    <MineCard v-for="mine in mineRows(position)" :key="mine?.bindingId || mine?.accountName || 'unbound'" :mine="mine" />
+                    <MineCard v-for="mine in mineRows(position)" :key="mine?.bindingId || mine?.accountName || 'unbound'" :mine="mine" :class="mine?.bindingEnabled === false ? 'opacity-65' : ''" />
                   </div>
                 </div>
               </div>

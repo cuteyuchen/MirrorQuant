@@ -86,7 +86,8 @@ describe("跟单看板", () => {
       accounts: [{ ...mockBoard.accounts![0], name, equity: Number.MAX_SAFE_INTEGER }],
     } });
     wrappers.push(wrapper);
-    expect(wrapper.find("section > div").classes()).toEqual(expect.arrayContaining(["min-w-0", "grid-cols-2"]));
+    // 移动端横向滑动：卡片以 260px 为底宽、不压缩（容器横向滚动）；sm 及以上恢复 min-w-0 收缩。
+    expect(wrapper.find("section > div").classes()).toEqual(expect.arrayContaining(["min-w-[260px]", "shrink-0", "sm:min-w-0", "grid-cols-2"]));
     const label = wrapper.find("span.font-semibold");
     expect(label.text()).toBe(name);
     expect(label.classes()).toEqual(expect.arrayContaining(["min-w-0", "flex-1", "[overflow-wrap:anywhere]"]));

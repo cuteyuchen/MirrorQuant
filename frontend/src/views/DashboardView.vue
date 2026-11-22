@@ -112,23 +112,23 @@ onActivated(() => { void board.refresh(); });
     <LoadingSkeleton v-if="board.loading && !board.data" />
     <template v-else-if="board.data">
       <!-- 首屏五个数：我的钱、今天赚亏、浮动盈亏、带单员手里有多少仓、哪里需要我处理。 -->
-      <section class="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-5" :aria-label="t('kpi.region')">
-        <KpiCard class="col-span-2 md:col-span-1" tone="accent" :icon="Wallet" :label="t(`kpi.equity.${scope}`)" :value="formatUsd(money?.main.equity.total)" :sub="equitySub">
+      <section class="flex overflow-x-auto gap-2.5 pb-1 no-scrollbar md:grid md:grid-cols-3 xl:grid-cols-5" :aria-label="t('kpi.region')">
+        <KpiCard class="min-w-[170px] shrink-0 md:min-w-0 md:col-span-1" tone="accent" :icon="Wallet" :label="t(`kpi.equity.${scope}`)" :value="formatUsd(money?.main.equity.total)" :sub="equitySub">
           <p v-if="money?.main.equity.missing" class="mt-1 text-xs font-medium text-warning">{{ t("kpi.partial", { n: money.main.equity.missing }) }}</p>
         </KpiCard>
-        <KpiCard :tone="pnlTone(money?.main.todayPnl.total)" :icon="(money?.main.todayPnl.total ?? 0) < 0 ? TrendingDown : TrendingUp" :label="t(`kpi.todayPnl.${scope}`)"
+        <KpiCard class="min-w-[150px] shrink-0 md:min-w-0" :tone="pnlTone(money?.main.todayPnl.total)" :icon="(money?.main.todayPnl.total ?? 0) < 0 ? TrendingDown : TrendingUp" :label="t(`kpi.todayPnl.${scope}`)"
           :value="signedUsd(money?.main.todayPnl.total)" :value-class="pnlClass(money?.main.todayPnl.total)" :sub="todaySub">
           <p v-if="money?.main.todayPnl.missing" class="mt-1 text-xs font-medium text-warning">{{ t("kpi.partial", { n: money.main.todayPnl.missing }) }}</p>
         </KpiCard>
-        <KpiCard :tone="pnlTone(money?.main.unrealized.total)" :icon="Activity" :label="t(`kpi.unrealized.${scope}`)"
+        <KpiCard class="min-w-[150px] shrink-0 md:min-w-0" :tone="pnlTone(money?.main.unrealized.total)" :icon="Activity" :label="t(`kpi.unrealized.${scope}`)"
           :value="signedUsd(money?.main.unrealized.total)" :value-class="pnlClass(money?.main.unrealized.total)" :sub="unrealizedSub">
           <p v-if="money?.main.unrealized.missing" class="mt-1 text-xs font-medium text-warning">{{ t("kpi.partial", { n: money.main.unrealized.missing }) }}</p>
         </KpiCard>
-        <KpiCard tone="brand" :icon="Layers" :label="t('kpi.leadPositions')" :value="leadStats?.positions"
+        <KpiCard class="min-w-[150px] shrink-0 md:min-w-0" tone="brand" :icon="Layers" :label="t('kpi.leadPositions')" :value="leadStats?.positions"
           :sub="t('kpi.todayFlow', { open: leadStats?.opened ?? '—', close: leadStats?.closed ?? '—' })">
           <p v-if="leadStats?.unknownLeads" class="mt-1 text-xs font-medium text-warning">{{ t("kpi.leadsUnknown", { n: leadStats.unknownLeads }) }}</p>
         </KpiCard>
-        <KpiCard :tone="attentionTone" :icon="attentionTone === 'success' ? CheckCircle2 : AlertTriangle" :label="t('kpi.attention')" :value="leadStats?.attention"
+        <KpiCard class="min-w-[150px] shrink-0 md:min-w-0" :tone="attentionTone" :icon="attentionTone === 'success' ? CheckCircle2 : AlertTriangle" :label="t('kpi.attention')" :value="leadStats?.attention"
           :value-class="attentionTone === 'danger' ? 'text-danger' : attentionTone === 'warning' ? 'text-warning' : attentionTone === 'success' ? 'text-success' : ''"
           :sub="leadStats?.attention === 0 ? t('kpi.allAligned') : leadStats?.attention == null ? '' : t('kpi.attentionDetail', { orphans: leadStats.orphans, misaligned: leadStats.misaligned })" />
       </section>

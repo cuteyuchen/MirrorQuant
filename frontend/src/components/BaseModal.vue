@@ -87,7 +87,7 @@ onBeforeUnmount(cleanup);
     <div v-if="open" class="fixed inset-0 flex bg-scrim/70 p-3 backdrop-blur-sm sm:p-6" :style="{ zIndex: 50 + level }" :class="drawer ? 'items-start justify-end' : 'items-center justify-center'" @click.self="close">
       <section ref="panel" role="dialog" aria-modal="true" :aria-labelledby="titleId" :aria-busy="busy"
         tabindex="-1" class="max-h-[90vh] w-full overflow-y-auto rounded-2xl border border-border/70 bg-surface p-4 shadow-pop sm:p-6"
-        :class="drawer ? 'h-[90vh] max-w-2xl' : wide ? 'max-w-6xl' : 'max-w-xl'">
+        :class="drawer ? 'h-auto max-h-[90vh] sm:h-[90vh] max-w-2xl' : wide ? 'max-w-6xl' : 'max-w-xl'">
         <header class="mb-4 flex items-center justify-between gap-3">
           <h2 :id="titleId" class="text-lg font-bold tracking-tight">{{ title }}</h2>
           <button type="button" class="icon-button shrink-0" :aria-label="t('common.close')" :title="t('common.close')" :disabled="busy" @click="close"><X :size="20" /></button>

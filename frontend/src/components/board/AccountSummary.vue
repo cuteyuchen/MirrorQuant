@@ -12,10 +12,10 @@ const { t } = useI18n();
 // 未知资金仍显示破折号，不用零顶替。
 </script>
 <template>
-  <section :aria-label="t('nav.accounts')" class="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-    <div v-if="accounts == null || !accounts.length" class="card col-span-full px-4 py-6 text-center text-sm text-muted">{{ accounts == null ? t("common.unknown") : t("board.noAccounts") }}</div>
-    <!-- 卡片内固定两列且均可收缩，长名称和大额数字不能撑开卡片。 -->
-    <div v-for="account in accounts || []" :key="account.id || account.name || 'account'" class="card grid min-w-0 grid-cols-2 gap-x-4 gap-y-3 p-3.5">
+  <section :aria-label="t('nav.accounts')" class="flex overflow-x-auto gap-3 pb-1 snap-x no-scrollbar sm:grid sm:grid-cols-2 xl:grid-cols-4">
+    <div v-if="accounts == null || !accounts.length" class="card w-full sm:col-span-full px-4 py-6 text-center text-sm text-muted">{{ accounts == null ? t("common.unknown") : t("board.noAccounts") }}</div>
+    <!-- 卡片在移动端横向滑动对齐，桌面端恢复栅格；长名称和大额数字不撑开卡片。 -->
+    <div v-for="account in accounts || []" :key="account.id || account.name || 'account'" class="card grid min-w-[260px] shrink-0 snap-start grid-cols-2 gap-x-4 gap-y-2.5 p-3 sm:min-w-0 sm:shrink sm:p-3.5">
       <div class="col-span-2 min-w-0">
         <div class="flex flex-wrap items-center gap-2">
           <span class="min-w-0 flex-1 font-semibold [overflow-wrap:anywhere]">{{ account.name ?? t("common.unknown") }}</span>

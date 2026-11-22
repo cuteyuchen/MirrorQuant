@@ -120,12 +120,12 @@
   /* —— 指标文字 —— */
   .eyebrow { @apply text-xs font-semibold uppercase tracking-wider text-muted; }
   .kpi-label { @apply flex items-center gap-1.5 text-xs font-medium text-muted; }
-  .kpi-value { @apply mt-1 font-mono text-xl font-bold leading-tight tabular-nums tracking-tight; overflow-wrap: anywhere; }
+  .kpi-value { @apply mt-1 font-mono text-lg sm:text-xl font-bold leading-tight tabular-nums tracking-tight; overflow-wrap: anywhere; }
   .kpi-sub { @apply mt-1 text-xs text-muted; overflow-wrap: anywhere; }
   /* 带语义色调的 KPI 卡：色调由下方 .tone-* 提供，缺省为中性边框色。 */
   .kpi-card {
     --tone: initial;
-    @apply relative min-w-0 overflow-hidden rounded-2xl border bg-surface p-4 shadow-card;
+    @apply relative min-w-0 overflow-hidden rounded-2xl border bg-surface p-3 sm:p-4 shadow-card;
     border-color: rgb(var(--tone, var(--c-border)) / 0.45);
     background-image: linear-gradient(140deg, rgb(var(--tone, var(--c-border)) / 0.14), transparent 62%);
   }
@@ -279,6 +279,9 @@
 ::-webkit-scrollbar-thumb:hover {
   background: rgb(var(--c-border));
 }
+
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
