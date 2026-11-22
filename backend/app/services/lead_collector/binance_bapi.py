@@ -1298,22 +1298,52 @@ class BinanceBapiCollector(BaseLeadCollector):
         detail_error = None
         previous_meta = (previous_snapshot or {}).get("meta") or {}
         previous_profile = dict((previous_snapshot or {}).get("profile") or {})
-        try:
-            detail = await self.fetch_detail(portfolio_id, proxy_url=proxy_url)
-        except Exception as exc:
-            detail_ok = False
-            detail_error = describe_exception(exc)
-            detail = dict(previous_profile)
-            if detail.get("positionShow") is None:
-                detail["positionShow"] = False
-            now = time.monotonic()
-            last_warn = self._detail_degraded_log_at.get(portfolio_id)
-            if last_warn is None or now - last_warn >= DETAIL_DEGRADED_WARN_INTERVAL:
-                self._detail_degraded_log_at[portfolio_id] = now
-                log = logger.warning
+        # 轻量同步：detail 与持仓并行拉（两者独立，BAPI 单请求约 1 秒，
+        # 串行要 2 秒、并行只要 1 秒）。轻量只用于公开带单员，持仓
+        # 一定会拉，不用等 detail 的 positionShow 再决定。
+        prefetched_holdings = None
+        prefetched_holdings_error = None
+        if light:
+            detail_task = asyncio.create_task(self.fetch_detail(portfolio_id, proxy_url=proxy_url))
+            holdings_task = asyncio.create_task(self.fetch_holdings(portfolio_id, proxy_url=proxy_url))
+            detail_result, holdings_result = await asyncio.gather(detail_task, holdings_task, return_exceptions=True)
+            if isinstance(detail_result, Exception):
+                detail_ok = False
+                detail_error = describe_exception(detail_result)
+                detail = dict(previous_profile)
+                if detail.get("positionShow") is None:
+                    detail["positionShow"] = False
+                now = time.monotonic()
+                last_warn = self._detail_degraded_log_at.get(portfolio_id)
+                if last_warn is None or now - last_warn >= DETAIL_DEGRADED_WARN_INTERVAL:
+                    self._detail_degraded_log_at[portfolio_id] = now
+                    log = logger.warning
+                else:
+                    log = logger.debug
+                log("Lead portfolio %s detail degraded: %s", portfolio_id, detail_error)
             else:
-                log = logger.debug
-            log("Lead portfolio %s detail degraded: %s", portfolio_id, detail_error)
+                detail = detail_result
+            if isinstance(holdings_result, Exception):
+                prefetched_holdings_error = describe_exception(holdings_result)[:240]
+            else:
+                prefetched_holdings = holdings_result
+        else:
+            try:
+                detail = await self.fetch_detail(portfolio_id, proxy_url=proxy_url)
+            except Exception as exc:
+                detail_ok = False
+                detail_error = describe_exception(exc)
+                detail = dict(previous_profile)
+                if detail.get("positionShow") is None:
+                    detail["positionShow"] = False
+                now = time.monotonic()
+                last_warn = self._detail_degraded_log_at.get(portfolio_id)
+                if last_warn is None or now - last_warn >= DETAIL_DEGRADED_WARN_INTERVAL:
+                    self._detail_degraded_log_at[portfolio_id] = now
+                    log = logger.warning
+                else:
+                    log = logger.debug
+                log("Lead portfolio %s detail degraded: %s", portfolio_id, detail_error)
         # 持仓与订单流都拉，哪个返回用哪个：订单流只是持仓的二次确认。
         # 订单流限流（BapiRateLimitError 90801003）时不让整轮同步失败——
         # 持仓照常发布、快路照常跑；订单流留空，下轮恢复后再补。
@@ -1392,7 +1422,14 @@ class BinanceBapiCollector(BaseLeadCollector):
         open_positions = reconstruct_open_positions(orders_store, closed_rows=closed_rows)
         if detail.get("positionShow") is True:
             try:
-                holdings = await self.fetch_holdings(portfolio_id, proxy_url=proxy_url)
+                if light and prefetched_holdings is not None:
+                    # 轻量同步已在顶部与 detail 并行拉过持仓，直接用，
+                    # 不再重复请求。
+                    holdings = prefetched_holdings
+                elif light and prefetched_holdings_error is not None:
+                    raise RuntimeError(prefetched_holdings_error)
+                else:
+                    holdings = await self.fetch_holdings(portfolio_id, proxy_url=proxy_url)
                 candidate_positions = normalize_holdings(holdings)
                 if not candidate_positions and previous_positions:
                     close_evidence = previous_observed_ms is not None and positions_have_close_evidence(
