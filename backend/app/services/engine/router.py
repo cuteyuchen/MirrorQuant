@@ -2179,20 +2179,17 @@ class CopyRouter:
             return
         if not lead_margin_balance or lead_margin_balance <= 0:
             return
-        try:
-            bal = await get_collateral_balance(adapter, None)
-            my_equity = float(bal.eq)
-        except Exception:
-            return
-        if my_equity <= 0:
-            return
-        ratio = exact(binding.risk_scale or 1) * exact(my_equity) / exact(lead_margin_balance)
+        # 余额与持仓懒取：只有某个品种真的出现加仓缺口（已有基线且带单量
+        # 超过基线）时才拉一次。无缺口时不碰余额接口，既省请求，也不在
+        # 非 USDT 结算品种上回落到 legacy USDT 余额（1.3.9 曾在快照入口
+        # 无条件 get_collateral_balance(None)，导致 USDC 品种测试与
+        # 抵押失败退出恢复测试失败）。余额按该品种的 instrument spec
+        # 取，不用 None（None 默认 USDT，等于绕过结算币种检查）。
         as_of_ms = int((snapshot.get("openPositionsMeta") or {}).get("asOf") or 0) or int(time.time() * 1000)
-        try:
-            positions = await adapter.get_positions()
-        except Exception:
-            return
         symbol_map = json.loads(binding.symbol_map_json or "{}")
+        my_equity = None
+        ratio = None
+        positions = None
         for pos in snapshot.get("openPositions") or []:
             symbol = str(pos.get("symbol") or "")
             side = str(pos.get("positionSide") or "").upper()
@@ -2216,6 +2213,22 @@ class CopyRouter:
                     await db.commit()
                     continue
                 base_qty = exact(progress.cumulative_qty)
+                if lead_qty <= base_qty:
+                    # 带单减仓：走订单流/平仓路径，快照快路只跟增量，不处理减量。
+                    continue
+                if my_equity is None:
+                    try:
+                        bal = await get_collateral_balance(adapter, instruments.get(inst_id))
+                        my_equity = float(bal.eq)
+                    except Exception:
+                        return
+                    if my_equity <= 0:
+                        return
+                    ratio = exact(binding.risk_scale or 1) * exact(my_equity) / exact(lead_margin_balance)
+                    try:
+                        positions = await adapter.get_positions()
+                    except Exception:
+                        return
                 allocation = await self._get_allocation(db, binding.id, account.id, inst_id, side.lower())
                 owned = self._owned_qty(allocation) if allocation is not None else Decimal("0")
                 target = lead_qty * ratio
@@ -2225,9 +2238,6 @@ class CopyRouter:
                     if base_qty != lead_qty:
                         progress.cumulative_qty = str(lead_qty)
                         await db.commit()
-                    continue
-                if lead_qty <= base_qty:
-                    # 带单减仓：走订单流/平仓路径，快照快路只跟增量，不处理减量。
                     continue
                 ordering = await db.get(BindingPositionProgress, (binding.id, symbol, side))
                 if ordering is not None and ordering.review_reason:

@@ -151,6 +151,8 @@ class EngineOrchestrator:
         self._risk_task: Optional[asyncio.Task] = None
         self.last_heartbeat_monotonic: Optional[float] = None
         self._last_lead_poll: Dict[int, float] = {}
+        self._lead_sync_in_flight: Set[int] = set()
+        self._lead_sync_tasks: Set[asyncio.Task] = set()
         self._last_full_sweep: Dict[int, float] = {}
         self._last_account_poll: Dict[int, float] = {}
         self._last_clock_sync: Dict[int, float] = {}
@@ -177,7 +179,13 @@ class EngineOrchestrator:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        for task in list(self._lead_sync_tasks):
+            task.cancel()
+        if self._lead_sync_tasks:
+            await asyncio.gather(*self._lead_sync_tasks, return_exceptions=True)
         self._task = self._risk_task = None
+        self._lead_sync_tasks.clear()
+        self._lead_sync_in_flight.clear()
         logger.info("EngineOrchestrator stopped")
 
     @property
@@ -246,9 +254,44 @@ class EngineOrchestrator:
 
             for lead in leads:
                 last = self._last_lead_poll.get(lead.id, 0.0)
-                if now - last >= max(5, lead.poll_interval_sec):
+                # 并行轮询：各 lead 独立会话并发同步，不再顺序等待。顺序轮询时
+                # 一轮要等全部 lead 串行同步完（每人约 3 秒），金木的有效间隔
+                # 被拖到 10 秒以上；并行后每人的间隔只取决于自己的同步耗时。
+                # 下限 1 秒（原 5 秒钳制会挡住 2 秒以内的交易级轮询）。
+                # 同一 lead 正在同步时不重复派发（_lead_sync_in_flight），
+                # 避免同步耗时超过间隔时同一 lead 的同步重叠。
+                if (lead.id not in self._lead_sync_in_flight
+                        and now - last >= max(1, lead.poll_interval_sec)):
                     self._last_lead_poll[lead.id] = now
-                    await self.sync_lead(db, lead, proxies)
+                    self._lead_sync_in_flight.add(lead.id)
+                    task = asyncio.create_task(
+                        self._sync_lead_isolated(lead.id), name=f"mirrorquant-lead-sync-{lead.id}")
+                    self._lead_sync_tasks.add(task)
+                    task.add_done_callback(self._discard_lead_sync_task)
+
+    def _discard_lead_sync_task(self, task: asyncio.Task) -> None:
+        self._lead_sync_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.exception("Lead sync task failed: %s", exc)
+
+    async def _sync_lead_isolated(self, lead_id: int) -> None:
+        """一个 lead 独占一个会话：与其他 lead 的同步并发跑，互不串会话。"""
+        try:
+            factory = get_session_factory()
+            async with factory() as db:
+                lead = await db.get(LeadSource, lead_id)
+                if lead is None or not lead.is_enabled:
+                    return
+                await self.sync_lead(db, lead, proxies=None)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Lead %s isolated sync failed", lead_id)
+        finally:
+            self._lead_sync_in_flight.discard(lead_id)
 
     async def risk_tick(self) -> None:
         """Protect owned exposure even while ingestion fails or entry controls are disabled."""
