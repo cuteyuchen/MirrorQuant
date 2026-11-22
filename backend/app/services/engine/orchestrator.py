@@ -216,7 +216,11 @@ class EngineOrchestrator:
                 break
             except Exception as exc:
                 logger.exception("Orchestrator tick error: %s", exc)
-            await asyncio.sleep(2.0)
+            # 0.5 秒：tick 本身只做派发（各 lead 同步在后台任务里），
+            # 睡 2 秒会让 2 秒轮询的 lead 实际间隔拖到 4-5 秒以上。
+            # 派发仍受各 lead 的 poll_interval_sec 与 in-flight 守卫约束，
+            # 不会因此多发请求。
+            await asyncio.sleep(0.5)
 
     async def tick(self) -> None:
         factory = get_session_factory()
