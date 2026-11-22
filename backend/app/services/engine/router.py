@@ -1936,11 +1936,19 @@ class CopyRouter:
                 PositionAllocation.pos_side == local_pos_side))
             if existing is not None and self._owned_qty(existing) > 0:
                 continue
-            others = (await db.scalars(select(PositionAllocation).where(
-                PositionAllocation.account_id == account.id,
-                PositionAllocation.inst_id == inst_id,
-                PositionAllocation.pos_side == local_pos_side,
-                PositionAllocation.binding_id != binding.id))).all()
+            # 认领可采用量只扣其他启用中绑定的已占量：已停用绑定的冻结账本
+            # 不占实盘，否则同品种会被少认领（与开仓门同一根因，2026-11-22）。
+            others = (await db.scalars(
+                select(PositionAllocation)
+                .join(CopyBinding, CopyBinding.id == PositionAllocation.binding_id)
+                .where(
+                    PositionAllocation.account_id == account.id,
+                    PositionAllocation.inst_id == inst_id,
+                    PositionAllocation.pos_side == local_pos_side,
+                    PositionAllocation.binding_id != binding.id,
+                    CopyBinding.is_enabled.is_(True),
+                )
+            )).all()
             claimed = sum((self._owned_qty(other) for other in others), Decimal("0"))
             try:
                 adoptable = exact(mine.pos) - claimed
@@ -2138,6 +2146,124 @@ class CopyRouter:
                             "qty": float(physical_qty)})
         await db.commit()
         return adopted
+
+    async def _follow_position_diffs(
+        self, db: AsyncSession, binding: CopyBinding, lead: LeadSource, account: TradingAccount,
+        adapter: Any, instruments: Dict[str, Any], snapshot: Dict[str, Any],
+        active: Dict[str, Decimal], lead_margin_balance: float,
+        notify_cfg: Dict[str, Any], resilience_cfg: Dict[str, Any],
+        risk_defaults_cfg: Dict[str, Any],
+    ) -> None:
+        """公开带单员仓位差额快照跟单：快照持仓增加时直接按差额跟单，不等订单流。
+
+        订单流（BAPI order-history）对公开带单员也有约 2 分钟发布延迟
+        （2026-11-22 实测金木 ETH 加仓 02:47:44，事件 02:49:56 才到），
+        而快照持仓 15 秒一刷且权威新鲜。只对公开持仓（positionShow、
+        快照源为 api）且快照权威新鲜时启用；隐藏带单员快照持仓由订单流
+        反推、本身就没有实时持仓，不走这条路。
+        基线：每个品种首次见到时只记录当前带单量为基线、不交易，避免把
+        上线前已存在的缺口一次性补掉（用户 2026-11-22 明确不要自动补
+        漏跟的 ETH 加仓）。之后带单量每增加都按增量跟单；去重靠开仓门
+        的已跟足保护（SKIPPED_ALREADY_FOLLOWED）：订单流事件后到时，
+        账上已跟足，直接跳过，不重复买入。
+        """
+        if not binding.is_enabled:
+            return
+        meta = snapshot.get("meta") or {}
+        if meta.get("source") != "api" or not meta.get("positionShow"):
+            return
+        if not is_authoritative_snapshot(snapshot):
+            return
+        if not lead_margin_balance or lead_margin_balance <= 0:
+            return
+        try:
+            bal = await get_collateral_balance(adapter, None)
+            my_equity = float(bal.eq)
+        except Exception:
+            return
+        if my_equity <= 0:
+            return
+        ratio = exact(binding.risk_scale or 1) * exact(my_equity) / exact(lead_margin_balance)
+        as_of_ms = int((snapshot.get("openPositionsMeta") or {}).get("asOf") or 0) or int(time.time() * 1000)
+        try:
+            positions = await adapter.get_positions()
+        except Exception:
+            return
+        symbol_map = json.loads(binding.symbol_map_json or "{}")
+        for pos in snapshot.get("openPositions") or []:
+            symbol = str(pos.get("symbol") or "")
+            side = str(pos.get("positionSide") or "").upper()
+            if side not in ("LONG", "SHORT") or not symbol:
+                continue
+            try:
+                lead_qty = exact(pos.get("qtyExact", pos.get("qty")) or 0)
+                if lead_qty <= 0:
+                    continue
+                mark = pos.get("markPrice") or pos.get("currentPrice") or 0
+                if not mark or float(mark) <= 0:
+                    continue
+                inst_id, supported = adapter.resolve_symbol(symbol, instruments, symbol_map)
+                if not supported or instruments.get(inst_id) is None:
+                    continue
+                key = f"posdiff:{symbol}:{side}"
+                progress = await db.get(BindingSourceProgress, (binding.id, key))
+                if progress is None:
+                    db.add(BindingSourceProgress(binding_id=binding.id, source_key=key,
+                                                 cumulative_qty=str(lead_qty), cumulative_notional="0"))
+                    await db.commit()
+                    continue
+                base_qty = exact(progress.cumulative_qty)
+                allocation = await self._get_allocation(db, binding.id, account.id, inst_id, side.lower())
+                owned = self._owned_qty(allocation) if allocation is not None else Decimal("0")
+                target = lead_qty * ratio
+                dust = max(Decimal("1e-8"), target * Decimal("0.001"))
+                if abs(owned - target) <= dust:
+                    # 已同步：基线跟进当前带单量（含减仓后）。
+                    if base_qty != lead_qty:
+                        progress.cumulative_qty = str(lead_qty)
+                        await db.commit()
+                    continue
+                if lead_qty <= base_qty:
+                    # 带单减仓：走订单流/平仓路径，快照快路只跟增量，不处理减量。
+                    continue
+                ordering = await db.get(BindingPositionProgress, (binding.id, symbol, side))
+                if ordering is not None and ordering.review_reason:
+                    # 源顺序待人工核对的品种不走快路，等正常流程。
+                    continue
+                # 带单加仓：按带单增量合成一批，复用开仓执行（含风控门、滑点门、
+                # 已跟足保护）。时间戳用快照 asOf（新鲜），价格用快照 mark。
+                delta = lead_qty - base_qty
+                batch = {
+                    "symbol": symbol, "side": "BUY" if side == "LONG" else "SELL",
+                    "positionSide": side, "type": "MARKET",
+                    "qty": str(delta), "qtyExact": str(delta),
+                    "avgPrice": str(mark), "notional": str(delta * exact(mark)),
+                    "notionalExact": str(delta * exact(mark)),
+                    "dir": "OPEN_LONG" if side == "LONG" else "OPEN_SHORT",
+                    "orderCount": 1,
+                    "startTime": as_of_ms, "endTime": as_of_ms, "time": as_of_ms,
+                    "_event_id": f"posdiff:{symbol}:{side}:{lead_qty}",
+                    "_source_time_ms": as_of_ms, "_source_start_ms": as_of_ms,
+                    "_source_key": key,
+                }
+                batch["_lead_remaining_qty"] = lead_qty
+                lead_lvr = _lead_position_leverage(snapshot, symbol, side)
+                await self._execute_batch_for_binding(
+                    db, binding, lead, account, adapter, batch, lead_margin_balance, active,
+                    my_equity, positions, instruments,
+                    bool(await self._get_config(db, "global_kill_switch", False)),
+                    notify_cfg, resilience_cfg, risk_defaults_cfg, lead_leverage=lead_lvr)
+                await db.commit()
+                # 成交后账上若已跟足，下轮把基线跟进；未跟足（被门拦截）则基线
+                # 不动，下轮重试。
+                allocation = await self._get_allocation(db, binding.id, account.id, inst_id, side.lower())
+                owned_after = self._owned_qty(allocation) if allocation is not None else Decimal("0")
+                if abs(owned_after - target) <= dust:
+                    progress.cumulative_qty = str(lead_qty)
+                    await db.commit()
+            except Exception:
+                logger.exception("Position-diff follow deferred for binding %s %s", binding.id, symbol)
+                continue
 
     @serialized_execution
     async def process_lead_events(
@@ -2512,6 +2638,15 @@ class CopyRouter:
                             break
                         if delivery.state != "APPLIED":
                             break
+                    # 公开带单员仓位差额快路：订单流滞后约 2 分钟，快照持仓
+                    # 增加时直接跟单。快路自身失败不影响本轮已处理的部分。
+                    try:
+                        await self._follow_position_diffs(
+                            db, binding, lead, account, adapter, instruments, snapshot,
+                            active, lead_margin_balance, notify_cfg, resilience_cfg,
+                            risk_defaults_cfg)
+                    except Exception:
+                        logger.exception("Position-diff follow deferred for binding %s", binding.id)
                 except Exception as exc:
                     db.info.pop("delivery", None)
                     db.info.pop("snapshot_admission", None)
@@ -2710,7 +2845,15 @@ class CopyRouter:
         # 检查，成交时交易所强制保证金。不要在这里用 _has_resting 拦截——
         # 2026-11-21 实测：熬鹰 ZEC 三笔加仓，第二笔挂单后第三笔被挡，
         # 用户明确要求多笔限价单可以同时在簿。
-        allocations = (await db.scalars(select(PositionAllocation).where(PositionAllocation.account_id == account.id))).all()
+        # 账实核对只统计启用中绑定的 allocation：已停用绑定的冻结账本（如切走
+        # 带单员后残留的旧 allocation）不是实盘归属，不参与核对，否则会把在跑
+        # 绑定的开仓/加仓一律拦截（2026-11-22 实测：熬鹰冻结 ZEC 0.673 +
+        # 金木 ZEC 0.842 = 1.515 > 实盘 0.842，exec 158 BLOCKED）。
+        allocations = (await db.scalars(
+            select(PositionAllocation)
+            .join(CopyBinding, CopyBinding.id == PositionAllocation.binding_id)
+            .where(PositionAllocation.account_id == account.id, CopyBinding.is_enabled.is_(True))
+        )).all()
         physical = {(p.inst_id, p.pos_side): exact(p.pos) for p in positions}
         claimed = {}
         for owned in allocations:
@@ -2842,6 +2985,33 @@ class CopyRouter:
             # 仓位、杠杆、保证金都按限价（最差成交价）测算。
             entry_px = float(limit_px_dec)
 
+        # 已跟足保护（放在所有风控门之后，只做幂等去重，不绕过任何门）：
+        # 按当前带单持仓与权益比例算出本绑定应有量，已跟足时不再重复买入，
+        # 只差一部分时后续只补差额。同一加仓可能经订单流与仓位差额快照两
+        # 条路到达（2026-11-22 实测公开带单订单流滞后约 2 分钟，快照先行
+        # 跟单后订单事件后到），没有这层幂等保护会重复买入。
+        # active_lead_positions 为当前快照的带单持仓；未提供或为 0 时不启用。
+        open_residual: Optional[Decimal] = None
+        try:
+            active_qty = active_lead_positions.get(f"{symbol}_{ps}")
+            if (active_qty is not None and exact(active_qty) > 0 and my_equity and my_equity > 0
+                    and lead_margin_balance and lead_margin_balance > 0):
+                owned_now = sum((self._owned_qty(a) for a in allocations
+                                 if a.binding_id == binding.id and a.inst_id == inst_id
+                                 and a.pos_side == ps.lower()), Decimal("0"))
+                target_owned = (exact(active_qty) * exact(binding.risk_scale or 1)
+                                * exact(my_equity) / exact(lead_margin_balance))
+                open_residual = target_owned - owned_now
+                if open_residual <= 0:
+                    await self._record_execution(db, binding, lead, account, symbol, inst_id, side, ps, action,
+                        "SKIPPED_ALREADY_FOLLOWED", lead_qty, lead_avg_px, lead_notional,
+                        my_price=ref_px, slippage_pct=slip_res.value,
+                        details=f"Owned {owned_now} already covers target {target_owned} for lead qty {active_qty}",
+                        notify_cfg=notify_cfg)
+                    return
+        except (ValueError, InvalidOperation, TypeError, AttributeError, ZeroDivisionError):
+            open_residual = None
+
         target_usd = PositionSizer.calculate_target_usd(
             follower_equity=my_equity,
             lead_margin_balance=lead_margin_balance,
@@ -2864,6 +3034,16 @@ class CopyRouter:
 
         leverage_cap_enabled = getattr(binding, "enable_leverage_cap", False)
         capped_qty, cap_reason = sized.contracts, None
+        if open_residual is not None:
+            if open_residual * exact(entry_px) < exact(sized.min_usd):
+                # 只差灰尘（低于最小名义金额），视为已跟足，不下灰尘单。
+                await self._record_execution(db, binding, lead, account, symbol, inst_id, side, ps, action,
+                    "SKIPPED_ALREADY_FOLLOWED", lead_qty, lead_avg_px, lead_notional,
+                    my_price=ref_px, slippage_pct=slip_res.value,
+                    details=f"Residual {open_residual} below min notional ${sized.min_usd:.2f}; already followed",
+                    notify_cfg=notify_cfg)
+                return
+            capped_qty = min(capped_qty, open_residual)
         if leverage_cap_enabled:
             capped_qty, cap_reason = RiskEngine.cap_by_leverage(
                 requested_qty=sized.contracts,
@@ -3030,11 +3210,20 @@ class CopyRouter:
             return False
         if delivery is not None:
             quantity = exact(delivery.exit_remaining_qty)
-        other_allocations = (await db.scalars(select(PositionAllocation).where(
-            PositionAllocation.account_id == account.id,
-            PositionAllocation.inst_id == pos.inst_id,
-            PositionAllocation.pos_side == pos.pos_side,
-            PositionAllocation.binding_id != binding.id))).all()
+        # 预留只算其他启用中绑定的 allocation：已停用绑定的冻结账本不占实盘，
+        # 否则在跑绑定的减仓/平仓也会被 BLOCKED_ALLOCATION_DEFICIT 拦住
+        # （与开仓门同一根因，2026-11-22）。
+        other_allocations = (await db.scalars(
+            select(PositionAllocation)
+            .join(CopyBinding, CopyBinding.id == PositionAllocation.binding_id)
+            .where(
+                PositionAllocation.account_id == account.id,
+                PositionAllocation.inst_id == pos.inst_id,
+                PositionAllocation.pos_side == pos.pos_side,
+                PositionAllocation.binding_id != binding.id,
+                CopyBinding.is_enabled.is_(True),
+            )
+        )).all()
         reserved = sum((self._owned_qty(a) for a in other_allocations), Decimal("0"))
         if exact(pos.pos) < reserved + self._owned_qty(allocation):
             if delivery is None or delivery.exit_progress != "WAITING_HOLDINGS":
