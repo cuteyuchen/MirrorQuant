@@ -42,6 +42,10 @@ async def lifespan(_app: FastAPI):
     async with get_session_factory()() as db:
         try:
             for encrypted in await db.scalars(select(TradingAccount.encrypted_credentials)):
+                # 已删账户清掉密钥后存的是空值，没有可解密的内容，跳过；
+                # 只校验确实存有凭据的账户，确认主密钥正确。
+                if not encrypted:
+                    continue
                 vault.decrypt_dict(encrypted)
             for user in await db.scalars(select(User)):
                 for encrypted in (user.totp_secret_enc, user.totp_pending_secret_enc):

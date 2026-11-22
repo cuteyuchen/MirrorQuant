@@ -278,6 +278,22 @@ def _position_line(position: Optional[dict], display_unit: str = DEFAULT_DISPLAY
     return f"【原仓位】 {format(previous, 'f')} → 【现仓位】 {format(current, 'f')}"
 
 
+def _notify_time_line(record) -> Optional[str]:
+    """本条通知的生成时间（北京时间）；记录本身没有时间时不显示。"""
+    try:
+        created = getattr(record, "created_at", None)
+        if created is None:
+            return None
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)  # 数据库存的是不带时区的 UTC 时间
+        moment = created.astimezone(BEIJING_TZ)
+    except (TypeError, ValueError, AttributeError, OverflowError, OSError):
+        return None
+    if not 2020 <= moment.year <= 2100:
+        return None
+    return f"🕐 通知时间 {moment.strftime('%Y/%m/%d %H:%M:%S')}（北京时间）"
+
+
 def _event_time_line(source: dict) -> Optional[str]:
     """带单成交的北京时间；事件本身过旧时也如实显示，供判断消息时效。"""
     try:
@@ -379,6 +395,9 @@ def _lead_section(record, source: dict, lead_margin: Any = None, lead: Any = Non
     event_time = _event_time_line(source)
     if event_time:
         lines.append(event_time)
+    notify_time = _notify_time_line(record)
+    if notify_time:
+        lines.append(notify_time)
     snapshot = _snapshot_line(position, lead_margin)
     if snapshot:
         lines.append(snapshot)
