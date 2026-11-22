@@ -258,3 +258,102 @@ async def test_position_diff_increase_trades_delta_and_late_order_event_is_skipp
                     event="late-order-event")
     assert len(exchange.orders) == 1
     assert "SKIPPED_ALREADY_FOLLOWED" in await execution_statuses(t)
+
+async def _publish_snapshot_for_exit(t, snapshot):
+    """Mirror production: the orchestrator publishes the snapshot to the lead
+    row and process_lead_events sets snapshot_admission before the fast path
+    runs, so _validate_exit_source can prove the exit against fresh data."""
+    t.lead.snapshot_json = json.dumps(snapshot)
+    t.db.info["snapshot_admission"] = (t.lead, snapshot)
+    await t.db.commit()
+
+
+def _empty_snapshot():
+    return {
+        "meta": {"generatedAt": NOW_MS, "detailOk": True},
+        "profile": {"marginBalance": 1000},
+        "openPositionsMeta": {"source": "api", "positionShow": True, "asOf": NOW_MS,
+                              "complete": True, "authoritative": True},
+        "openPositions": [],
+    }
+
+
+async def test_position_diff_reduce_follows_lead_percentage(trading):
+    # 带单 10→6 张：快路按持仓百分比减，我方 10 张减 4 张到 6 张。
+    # 不等订单流（订单流滞后约 2 分钟）。
+    t = trading
+    await seed_allocations(t, own_qty=10, other_qty=0, physical_qty=10)
+    exchange = OfflineExchange()
+    await run_position_diff(t, exchange, public_snapshot(10), 10)
+    assert len(exchange.orders) == 0
+    snapshot = public_snapshot(6)
+    await _publish_snapshot_for_exit(t, snapshot)
+    await run_position_diff(t, exchange, snapshot, 6)
+    assert len(exchange.orders) == 1
+    assert exchange.orders[0]["side"].upper() == "SELL"
+    assert Decimal(str(exchange.orders[0]["sz"])) == Decimal("4")
+    progress = await t.db.get(BindingSourceProgress, (t.binding.id, "posdiff:BTCUSDT:LONG"))
+    assert progress.cumulative_qty == "6"
+
+
+async def test_position_diff_full_close_when_qty_zero_in_snapshot(trading):
+    # 带单 10→0 张（快照里持仓量为 0）：快路全平我方 10 张。
+    t = trading
+    await seed_allocations(t, own_qty=10, other_qty=0, physical_qty=10)
+    exchange = OfflineExchange()
+    await run_position_diff(t, exchange, public_snapshot(10), 10)
+    snapshot = public_snapshot(0)
+    await _publish_snapshot_for_exit(t, snapshot)
+    await run_position_diff(t, exchange, snapshot, 0)
+    assert len(exchange.orders) == 1
+    assert exchange.orders[0]["side"].upper() == "SELL"
+    assert Decimal(str(exchange.orders[0]["sz"])) == Decimal("10")
+    progress = await t.db.get(BindingSourceProgress, (t.binding.id, "posdiff:BTCUSDT:LONG"))
+    assert progress.cumulative_qty == "0"
+
+
+async def test_position_diff_full_close_when_position_missing_from_snapshot(trading):
+    # 带单平仓后品种直接从快照消失：快路全平我方 10 张，基线清零。
+    t = trading
+    await seed_allocations(t, own_qty=10, other_qty=0, physical_qty=10)
+    exchange = OfflineExchange()
+    await run_position_diff(t, exchange, public_snapshot(10), 10)
+    snapshot = _empty_snapshot()
+    await _publish_snapshot_for_exit(t, snapshot)
+    await run_position_diff(t, exchange, snapshot, 0)
+    assert len(exchange.orders) == 1
+    assert exchange.orders[0]["side"].upper() == "SELL"
+    assert Decimal(str(exchange.orders[0]["sz"])) == Decimal("10")
+    progress = await t.db.get(BindingSourceProgress, (t.binding.id, "posdiff:BTCUSDT:LONG"))
+    assert progress.cumulative_qty == "0"
+
+
+async def test_position_diff_reduce_already_done_by_order_flow_is_noop(trading):
+    # 订单流已先把我方减到 6 张：快路只把基线跟进到 6，不重复下单。
+    t = trading
+    await seed_allocations(t, own_qty=6, other_qty=0, physical_qty=6)
+    exchange = OfflineExchange()
+    await run_position_diff(t, exchange, public_snapshot(10), 10)
+    snapshot = public_snapshot(6)
+    await _publish_snapshot_for_exit(t, snapshot)
+    await run_position_diff(t, exchange, snapshot, 6)
+    assert len(exchange.orders) == 0
+    progress = await t.db.get(BindingSourceProgress, (t.binding.id, "posdiff:BTCUSDT:LONG"))
+    assert progress.cumulative_qty == "6"
+
+
+async def test_position_diff_reduce_twice_to_same_qty_is_not_replayed(trading):
+    # 同一减仓目标重复出现（快照重放）：第一次减 4 张，第二次不再下单。
+    t = trading
+    await seed_allocations(t, own_qty=10, other_qty=0, physical_qty=10)
+    exchange = OfflineExchange()
+    await run_position_diff(t, exchange, public_snapshot(10), 10)
+    snapshot = public_snapshot(6)
+    await _publish_snapshot_for_exit(t, snapshot)
+    await run_position_diff(t, exchange, snapshot, 6)
+    assert len(exchange.orders) == 1
+    # 快路成交后实盘降到 6 张，否则账实门会拦住后面的处理。
+    t.pos.pos = t.pos.avail_pos = 6
+    t.pos.notional_usd = 600
+    await run_position_diff(t, exchange, snapshot, 6)
+    assert len(exchange.orders) == 1

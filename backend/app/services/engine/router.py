@@ -2179,17 +2179,18 @@ class CopyRouter:
             return
         if not lead_margin_balance or lead_margin_balance <= 0:
             return
-        # 余额与持仓懒取：只有某个品种真的出现加仓缺口（已有基线且带单量
-        # 超过基线）时才拉一次。无缺口时不碰余额接口，既省请求，也不在
-        # 非 USDT 结算品种上回落到 legacy USDT 余额（1.3.9 曾在快照入口
-        # 无条件 get_collateral_balance(None)，导致 USDC 品种测试与
-        # 抵押失败退出恢复测试失败）。余额按该品种的 instrument spec
+        # 持仓是唯一的准：本轮持仓与上轮持仓（基线）算差额，立即执行
+        # 加仓、减仓、平仓，不等订单流。订单流只是二次确认。
+        # 余额与持仓懒取：只有某个品种真的出现持仓差额时才拉一次。
+        # 无差额时不碰余额接口，既省请求，也不在非 USDT 结算品种上
+        # 回落到 legacy USDT 余额。余额按该品种的 instrument spec
         # 取，不用 None（None 默认 USDT，等于绕过结算币种检查）。
         as_of_ms = int((snapshot.get("openPositionsMeta") or {}).get("asOf") or 0) or int(time.time() * 1000)
         symbol_map = json.loads(binding.symbol_map_json or "{}")
         my_equity = None
         ratio = None
         positions = None
+        seen_keys = set()
         for pos in snapshot.get("openPositions") or []:
             symbol = str(pos.get("symbol") or "")
             side = str(pos.get("positionSide") or "").upper()
@@ -2197,15 +2198,20 @@ class CopyRouter:
                 continue
             try:
                 lead_qty = exact(pos.get("qtyExact", pos.get("qty")) or 0)
-                if lead_qty <= 0:
+                if lead_qty < 0:
                     continue
                 mark = pos.get("markPrice") or pos.get("currentPrice") or 0
                 if not mark or float(mark) <= 0:
-                    continue
+                    # 持仓量为 0（已平）时价格可能缺失：平仓是市价单，
+                    # 价格只作记录，用 0 即可。
+                    if lead_qty > 0:
+                        continue
+                    mark = 0
                 inst_id, supported = adapter.resolve_symbol(symbol, instruments, symbol_map)
                 if not supported or instruments.get(inst_id) is None:
                     continue
                 key = f"posdiff:{symbol}:{side}"
+                seen_keys.add(key)
                 progress = await db.get(BindingSourceProgress, (binding.id, key))
                 if progress is None:
                     db.add(BindingSourceProgress(binding_id=binding.id, source_key=key,
@@ -2213,8 +2219,7 @@ class CopyRouter:
                     await db.commit()
                     continue
                 base_qty = exact(progress.cumulative_qty)
-                if lead_qty <= base_qty:
-                    # 带单减仓：走订单流/平仓路径，快照快路只跟增量，不处理减量。
+                if lead_qty == base_qty:
                     continue
                 if my_equity is None:
                     try:
@@ -2234,32 +2239,54 @@ class CopyRouter:
                 target = lead_qty * ratio
                 dust = max(Decimal("1e-8"), target * Decimal("0.001"))
                 if abs(owned - target) <= dust:
-                    # 已同步：基线跟进当前带单量（含减仓后）。
-                    if base_qty != lead_qty:
-                        progress.cumulative_qty = str(lead_qty)
-                        await db.commit()
+                    # 已同步（订单流已处理或无需处理）：基线跟进当前带单量。
+                    progress.cumulative_qty = str(lead_qty)
+                    await db.commit()
                     continue
                 ordering = await db.get(BindingPositionProgress, (binding.id, symbol, side))
                 if ordering is not None and ordering.review_reason:
                     # 源顺序待人工核对的品种不走快路，等正常流程。
                     continue
-                # 带单加仓：按带单增量合成一批，复用开仓执行（含风控门、滑点门、
-                # 已跟足保护）。时间戳用快照 asOf（新鲜），价格用快照 mark。
-                delta = lead_qty - base_qty
-                batch = {
-                    "symbol": symbol, "side": "BUY" if side == "LONG" else "SELL",
-                    "positionSide": side, "type": "MARKET",
-                    "qty": str(delta), "qtyExact": str(delta),
-                    "avgPrice": str(mark), "notional": str(delta * exact(mark)),
-                    "notionalExact": str(delta * exact(mark)),
-                    "dir": "OPEN_LONG" if side == "LONG" else "OPEN_SHORT",
-                    "orderCount": 1,
-                    "startTime": as_of_ms, "endTime": as_of_ms, "time": as_of_ms,
-                    "_event_id": f"posdiff:{symbol}:{side}:{lead_qty}",
-                    "_source_time_ms": as_of_ms, "_source_start_ms": as_of_ms,
-                    "_source_key": key,
-                }
-                batch["_lead_remaining_qty"] = lead_qty
+                if lead_qty > base_qty:
+                    # 带单加仓：按带单增量合成一批，复用开仓执行（含风控门、滑点门、
+                    # 已跟足保护）。时间戳用快照 asOf（新鲜），价格用快照 mark。
+                    delta = lead_qty - base_qty
+                    batch = {
+                        "symbol": symbol, "side": "BUY" if side == "LONG" else "SELL",
+                        "positionSide": side, "type": "MARKET",
+                        "qty": str(delta), "qtyExact": str(delta),
+                        "avgPrice": str(mark), "notional": str(delta * exact(mark)),
+                        "notionalExact": str(delta * exact(mark)),
+                        "dir": "OPEN_LONG" if side == "LONG" else "OPEN_SHORT",
+                        "orderCount": 1,
+                        "startTime": as_of_ms, "endTime": as_of_ms, "time": as_of_ms,
+                        "_event_id": f"posdiff:{symbol}:{side}:{lead_qty}",
+                        "_source_time_ms": as_of_ms, "_source_start_ms": as_of_ms,
+                        "_source_key": key,
+                    }
+                    batch["_lead_remaining_qty"] = lead_qty
+                else:
+                    # 带单减仓/平仓：按持仓百分比减（与 2026-11-21 确认的减仓
+                    # 规则一致）。lead 减了 delta，剩余 lead_qty；执行层据此
+                    # 算 close_sz = owned * delta / (delta + lead_qty)。
+                    # lead_qty == 0 即全平（_lead_remaining_qty=0）。
+                    # 事件 ID 带 asOf：同一目标量在不同时间出现是两次
+                    # 独立减仓，不能当成重复投递跳过。
+                    delta = base_qty - lead_qty
+                    batch = {
+                        "symbol": symbol, "side": "SELL" if side == "LONG" else "BUY",
+                        "positionSide": side, "type": "MARKET",
+                        "qty": str(delta), "qtyExact": str(delta),
+                        "avgPrice": str(mark), "notional": str(delta * exact(mark)),
+                        "notionalExact": str(delta * exact(mark)),
+                        "dir": "CLOSE_LONG" if side == "LONG" else "CLOSE_SHORT",
+                        "orderCount": 1,
+                        "startTime": as_of_ms, "endTime": as_of_ms, "time": as_of_ms,
+                        "_event_id": f"posdiff:{symbol}:{side}:{lead_qty}:{as_of_ms}",
+                        "_source_time_ms": as_of_ms, "_source_start_ms": as_of_ms,
+                        "_source_key": key,
+                    }
+                    batch["_lead_remaining_qty"] = lead_qty
                 lead_lvr = _lead_position_leverage(snapshot, symbol, side)
                 await self._execute_batch_for_binding(
                     db, binding, lead, account, adapter, batch, lead_margin_balance, active,
@@ -2276,6 +2303,91 @@ class CopyRouter:
                     await db.commit()
             except Exception:
                 logger.exception("Position-diff follow deferred for binding %s %s", binding.id, symbol)
+                continue
+        # 带单平仓：基线里有、本轮快照里已没有的品种（带单已平仓）。
+        # 只有权威快照才处理，避免一次空快照误平。
+        try:
+            rows = (await db.scalars(select(BindingSourceProgress).where(
+                BindingSourceProgress.binding_id == binding.id,
+                BindingSourceProgress.source_key.like("posdiff:%"),
+            ))).all()
+        except Exception:
+            logger.exception("Position-diff close scan deferred for binding %s", binding.id)
+            return
+        for row in rows:
+            key = row.source_key
+            if key in seen_keys:
+                continue
+            try:
+                _, symbol, side = key.split(":")
+            except ValueError:
+                continue
+            side = side.upper()
+            if side not in ("LONG", "SHORT") or not symbol:
+                continue
+            base_qty = exact(row.cumulative_qty)
+            if base_qty <= 0:
+                continue
+            try:
+                inst_id, supported = adapter.resolve_symbol(symbol, instruments, symbol_map)
+                if not supported or instruments.get(inst_id) is None:
+                    continue
+                if my_equity is None:
+                    try:
+                        bal = await get_collateral_balance(adapter, instruments.get(inst_id))
+                        my_equity = float(bal.eq)
+                    except Exception:
+                        return
+                    if my_equity <= 0:
+                        return
+                    ratio = exact(binding.risk_scale or 1) * exact(my_equity) / exact(lead_margin_balance)
+                    try:
+                        positions = await adapter.get_positions()
+                    except Exception:
+                        return
+                allocation = await self._get_allocation(db, binding.id, account.id, inst_id, side.lower())
+                owned = self._owned_qty(allocation) if allocation is not None else Decimal("0")
+                if owned <= 0:
+                    # 账上已无仓位：基线清零即可，不下单。
+                    row.cumulative_qty = "0"
+                    await db.commit()
+                    continue
+                ordering = await db.get(BindingPositionProgress, (binding.id, symbol, side))
+                if ordering is not None and ordering.review_reason:
+                    continue
+                # 平仓是市价单：价格只作记录，用我方持仓的现价。
+                local_pos = next(
+                    (p for p in (positions or [])
+                     if p.inst_id == inst_id and p.pos_side == side.lower()), None)
+                mark = float(getattr(local_pos, "cur_px", 0) or 0)
+                batch = {
+                    "symbol": symbol, "side": "SELL" if side == "LONG" else "BUY",
+                    "positionSide": side, "type": "MARKET",
+                    "qty": str(base_qty), "qtyExact": str(base_qty),
+                    "avgPrice": str(mark), "notional": str(base_qty * exact(mark)),
+                    "notionalExact": str(base_qty * exact(mark)),
+                    "dir": "CLOSE_LONG" if side == "LONG" else "CLOSE_SHORT",
+                    "orderCount": 1,
+                    "startTime": as_of_ms, "endTime": as_of_ms, "time": as_of_ms,
+                    "_event_id": f"posdiff:{symbol}:{side}:0:{as_of_ms}",
+                    "_source_time_ms": as_of_ms, "_source_start_ms": as_of_ms,
+                    "_source_key": key,
+                }
+                batch["_lead_remaining_qty"] = 0
+                lead_lvr = _lead_position_leverage(snapshot, symbol, side)
+                await self._execute_batch_for_binding(
+                    db, binding, lead, account, adapter, batch, lead_margin_balance, active,
+                    my_equity, positions, instruments,
+                    bool(await self._get_config(db, "global_kill_switch", False)),
+                    notify_cfg, resilience_cfg, risk_defaults_cfg, lead_leverage=lead_lvr)
+                await db.commit()
+                allocation = await self._get_allocation(db, binding.id, account.id, inst_id, side.lower())
+                owned_after = self._owned_qty(allocation) if allocation is not None else Decimal("0")
+                if owned_after <= max(Decimal("1e-8"), owned * Decimal("0.001")):
+                    row.cumulative_qty = "0"
+                    await db.commit()
+            except Exception:
+                logger.exception("Position-diff close deferred for binding %s %s", binding.id, symbol)
                 continue
 
     @serialized_execution

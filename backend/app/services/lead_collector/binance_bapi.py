@@ -85,6 +85,32 @@ def is_retryable_exception(exc: BaseException) -> bool:
     return False
 
 
+def is_rate_limit_exception(exc: BaseException) -> bool:
+    """Detect BAPI 90801003 through the cause chain (_http_json wraps it in RuntimeError)."""
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, BapiRateLimitError):
+            return True
+        exc = exc.__cause__
+    return False
+
+
+def _log_history_degraded(collector, portfolio_id: str, what: str, error: str) -> None:
+    """Log a rate-limited history degradation at most once per warn interval per portfolio."""
+    now = time.monotonic()
+    last_warn = collector._history_degraded_log_at.get((portfolio_id, what))
+    if last_warn is None or now - last_warn >= DETAIL_DEGRADED_WARN_INTERVAL:
+        collector._history_degraded_log_at[(portfolio_id, what)] = now
+        logger.warning(
+            "Lead portfolio %s %s degraded (positions still authoritative): %s",
+            portfolio_id, what, error)
+    else:
+        logger.debug(
+            "Lead portfolio %s %s degraded (positions still authoritative): %s",
+            portfolio_id, what, error)
+
+
 def fnum(val: Any) -> Optional[float]:
     try:
         if val is None or val == "":
@@ -757,6 +783,7 @@ class BinanceBapiCollector(BaseLeadCollector):
         self._chart_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
         self._alloc_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
         self._detail_degraded_log_at: Dict[str, float] = {}
+        self._history_degraded_log_at: Dict[str, float] = {}
 
     @staticmethod
     def _headers(portfolio_id: str, time_range: str = "7D") -> Dict[str, str]:
@@ -781,6 +808,7 @@ class BinanceBapiCollector(BaseLeadCollector):
         retry_budget: Optional[float] = None,
         retry_backoff_cap: float = 2.4,
         retry_jitter: float = 0.0,
+        retry_rate_limit: bool = True,
     ) -> Any:
         headers = self._headers(portfolio_id, time_range)
         last_err: Optional[Exception] = None
@@ -813,6 +841,10 @@ class BinanceBapiCollector(BaseLeadCollector):
                     except Exception as exc:
                         last_err = exc
                         if not is_retryable_exception(exc):
+                            break
+                        # 订单流是次要数据：限流时立刻失败、由调用方降级，
+                        # 不要重试 4 次白白拖 10 秒预算（持仓才是准的）。
+                        if not retry_rate_limit and is_rate_limit_exception(exc):
                             break
                         if attempt + 1 < retries:
                             delay = 0.8 * 2 ** attempt
@@ -887,6 +919,9 @@ class BinanceBapiCollector(BaseLeadCollector):
             proxy_url=proxy_url,
             retries=4,
             retry_budget=HISTORY_RETRY_BUDGET,
+            # 订单流只是持仓的二次确认：限流时立刻失败、由 sync_snapshot
+            # 降级处理（持仓照常发布），不要重试拖时间。
+            retry_rate_limit=False,
         )
         return (data or {}).get("list") or []
 
@@ -1269,20 +1304,45 @@ class BinanceBapiCollector(BaseLeadCollector):
             else:
                 log = logger.debug
             log("Lead portfolio %s detail degraded: %s", portfolio_id, detail_error)
-        added = await self.sync_orders_into_store(
-            portfolio_id, orders_store, full_sweep=full_sweep, proxy_url=proxy_url,
-            history_max_pages=STORE_MAX // 100 + 1 if closed_history is not None else 25,
-            require_complete=closed_history is not None,
-        )
+        # 持仓与订单流都拉，哪个返回用哪个：订单流只是持仓的二次确认。
+        # 订单流限流（BapiRateLimitError 90801003）时不让整轮同步失败——
+        # 持仓照常发布、快路照常跑；订单流留空，下轮恢复后再补。
+        # 只有“限流”才降级：其它订单流失败（数据损坏、连续性断裂等）
+        # 仍抛错走同步失败记录，不能把真问题藏起来。
+        # sync_orders_into_store 在副本上工作、只在成功时才提交进
+        # store，所以降级时 store 保持上轮已知订单，路由侧的去重不会
+        # 重复处理，缺失的新单由持仓快路补上。
+        order_history_complete = True
+        order_history_error = None
+        try:
+            added = await self.sync_orders_into_store(
+                portfolio_id, orders_store, full_sweep=full_sweep, proxy_url=proxy_url,
+                history_max_pages=STORE_MAX // 100 + 1 if closed_history is not None else 25,
+                require_complete=closed_history is not None,
+            )
+        except Exception as exc:
+            if not is_rate_limit_exception(exc):
+                raise
+            order_history_complete = False
+            order_history_error = describe_exception(exc)[:240]
+            added = 0
+            _log_history_degraded(self, portfolio_id, "order history", order_history_error)
 
-        # History failures must reach the orchestrator's failure/alert handling.
+        # 平仓历史同样只在限流时降级：失败时保留上轮缓存，不让它拖垮持仓发布。
         closed_rows = list(closed_cache)
         closed_total = None
         if closed_history is not None:
             lst, closed_total, closed_history_complete, closed_cursor = closed_history, len(closed_history), True, None
         else:
-            lst, closed_history_complete, closed_total, closed_cursor = await self.collect_closed_history(
-                portfolio_id, closed_cache, previous_snapshot, proxy_url)
+            try:
+                lst, closed_history_complete, closed_total, closed_cursor = await self.collect_closed_history(
+                    portfolio_id, closed_cache, previous_snapshot, proxy_url)
+            except Exception as exc:
+                if not is_rate_limit_exception(exc):
+                    raise
+                lst, closed_history_complete, closed_total, closed_cursor = [], False, None, None
+                _log_history_degraded(
+                    self, portfolio_id, "closed history", describe_exception(exc)[:240])
         if lst:
             # 保留已知闭仓周期和刚补齐的增量，不再只保留首屏八十条。
             seen_c = {(str(p.get("id")), p.get("opened")): p for p in closed_rows}
@@ -1568,7 +1628,8 @@ class BinanceBapiCollector(BaseLeadCollector):
                 "orderStoreSize": len(orders_store),
                 "ordersAddedThisRound": added,
                 "fullSweep": full_sweep,
-                "orderHistoryComplete": True,  # 连续性验证失败会在 sync_orders_into_store 抛错，不发布成功快照。
+                "orderHistoryComplete": order_history_complete,  # 订单流只是持仓的二次确认：限流时降级、不失败，快照照常发布。
+                "orderHistoryError": order_history_error,
                 "closedHistoryComplete": closed_history_complete,
                 "closedHistoryCursor": closed_cursor,
                 "detailOk": detail_ok,

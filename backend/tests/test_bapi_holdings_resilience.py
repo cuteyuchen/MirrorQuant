@@ -119,7 +119,9 @@ async def test_fetch_holdings_retries_at_least_three_times_on_transient_error(mo
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("endpoint", ["fetch_holdings", "fetch_detail", "fetch_order_history", "fetch_position_history"])
+# 订单流不在此列：它是持仓的二次确认，限流时立刻失败、由 sync_snapshot
+# 降级处理（持仓照常发布），不重试拖时间（见 test_order_history_degradation）。
+@pytest.mark.parametrize("endpoint", ["fetch_holdings", "fetch_detail", "fetch_position_history"])
 @pytest.mark.parametrize("code", [RATE_LIMIT_CODE, int(RATE_LIMIT_CODE)])
 async def test_bapi_rate_limit_twice_then_success(monkeypatch, endpoint, code):
     data = [HOLDING] if endpoint == "fetch_holdings" else {"list": [], "positionShow": True}
@@ -129,8 +131,22 @@ async def test_bapi_rate_limit_twice_then_success(monkeypatch, endpoint, code):
         httpx.Response(200, json={"code": "000000", "data": data}),
     ])
     result = await getattr(BinanceBapiCollector(), endpoint)("lead")
-    assert result == ([] if endpoint == "fetch_order_history" else data)
+    assert result == data
     assert len(calls) == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", [RATE_LIMIT_CODE, int(RATE_LIMIT_CODE)])
+async def test_fetch_order_history_fails_fast_on_rate_limit(monkeypatch, code):
+    # 订单流限流时不重试：一次就失败，sync_snapshot 降级用持仓。
+    calls, sleep = mock_http(monkeypatch, [
+        httpx.Response(200, json={"code": code, "message": "请求次数过多，请使用 WebSocket 更新"}),
+        httpx.Response(200, json={"code": "000000", "data": {"list": []}}),
+    ])
+    with pytest.raises(RuntimeError, match="90801003"):
+        await BinanceBapiCollector().fetch_order_history("lead")
+    assert len(calls) == 1
+    sleep.assert_not_awaited()
 
 
 @pytest.mark.asyncio
