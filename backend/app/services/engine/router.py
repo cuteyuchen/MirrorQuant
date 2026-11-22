@@ -2243,10 +2243,10 @@ class CopyRouter:
                     progress.cumulative_qty = str(lead_qty)
                     await db.commit()
                     continue
-                ordering = await db.get(BindingPositionProgress, (binding.id, symbol, side))
-                if ordering is not None and ordering.review_reason:
-                    # 源顺序待人工核对的品种不走快路，等正常流程。
-                    continue
+                # 快路不查 BindingPositionProgress.review_reason：那是订单流
+                # 的顺序门（由订单历史推导），订单历史一限流就过期，会把
+                # 持仓明明正确的跟单也拦住（2026-11-22 ETH 100→110 实
+                # 例）。快路只认权威新鲜快照的持仓，持仓即准。
                 if lead_qty > base_qty:
                     # 带单加仓：按带单增量合成一批，复用开仓执行（含风控门、滑点门、
                     # 已跟足保护）。时间戳用快照 asOf（新鲜），价格用快照 mark。
@@ -2352,9 +2352,7 @@ class CopyRouter:
                     row.cumulative_qty = "0"
                     await db.commit()
                     continue
-                ordering = await db.get(BindingPositionProgress, (binding.id, symbol, side))
-                if ordering is not None and ordering.review_reason:
-                    continue
+                # 快路不查 review_reason，理由同主循环：持仓即准。
                 # 平仓是市价单：价格只作记录，用我方持仓的现价。
                 local_pos = next(
                     (p for p in (positions or [])
