@@ -2169,7 +2169,10 @@ class CopyRouter:
         """
         if not binding.is_enabled:
             return
-        meta = snapshot.get("meta") or {}
+        # 注意：source/positionShow 在 openPositionsMeta 里，不在顶层 meta 里
+        # （顶层 meta 只有 generatedAt/detailOk 等；2026-11-22 曾误读顶层
+        # meta 导致快路在生产上一次都没跑起来）。
+        meta = snapshot.get("openPositionsMeta") or {}
         if meta.get("source") != "api" or not meta.get("positionShow"):
             return
         if not is_authoritative_snapshot(snapshot):

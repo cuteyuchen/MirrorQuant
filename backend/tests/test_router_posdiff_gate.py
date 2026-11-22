@@ -129,10 +129,15 @@ async def execution_statuses(t):
 
 
 def public_snapshot(lead_qty):
-    """Authoritative fresh public-leader snapshot with one LONG BTCUSDT leg."""
+    """Authoritative fresh public-leader snapshot with one LONG BTCUSDT leg.
+
+    Shape mirrors production: source/positionShow live in openPositionsMeta,
+    NOT in the top-level meta (which only carries generatedAt/detailOk).
+    A regression here caught the 2026-11-22 bug where the fast path read the
+    top-level meta and never ran in production.
+    """
     return {
-        "meta": {"source": "api", "positionShow": True, "asOf": NOW_MS,
-                 "complete": True, "authoritative": True},
+        "meta": {"generatedAt": NOW_MS, "detailOk": True},
         "profile": {"marginBalance": 1000},
         "openPositionsMeta": {"source": "api", "positionShow": True, "asOf": NOW_MS,
                               "complete": True, "authoritative": True},
