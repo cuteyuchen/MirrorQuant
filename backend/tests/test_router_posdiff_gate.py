@@ -357,3 +357,50 @@ async def test_position_diff_reduce_twice_to_same_qty_is_not_replayed(trading):
     t.pos.notional_usd = 600
     await run_position_diff(t, exchange, snapshot, 6)
     assert len(exchange.orders) == 1
+
+
+async def test_guard_skip_record_is_not_rewritten_every_cycle(trading):
+    # 1.3.19：持仓差额路径的风控结论（已跟足/低于最小量）没有投递事件，
+    # 1.3.17 只压了钉钉通知，执行记录仍每轮写一条，执行记录页刷屏
+    #（2026-11-23 实测 10 分钟 28 条 SKIPPED_ALREADY_FOLLOWED）。
+    # 同一明细 24 小时内只记一条；明细变化才记新条；真实成交永不去重。
+    t = trading
+    details = "Owned 1.23 already covers target 1.2122 for lead qty 78.46"
+    await t.router._record_execution(
+        t.db, t.binding, t.lead, t.account, "SNDKUSDT", "SNDKUSDT", "BUY", "LONG",
+        "OPEN_LONG", "SKIPPED_ALREADY_FOLLOWED", 78.46, 85.38, 6700.0,
+        my_price=83.88, details=details, notify_cfg=None)
+    await t.router._record_execution(
+        t.db, t.binding, t.lead, t.account, "SNDKUSDT", "SNDKUSDT", "BUY", "LONG",
+        "OPEN_LONG", "SKIPPED_ALREADY_FOLLOWED", 78.46, 85.38, 6700.0,
+        my_price=83.88, details=details, notify_cfg=None)
+    await t.router._record_execution(
+        t.db, t.binding, t.lead, t.account, "SNDKUSDT", "SNDKUSDT", "BUY", "LONG",
+        "OPEN_LONG", "SKIPPED_ALREADY_FOLLOWED", 78.46, 85.38, 6700.0,
+        my_price=83.88, details=details, notify_cfg=None)
+    rows = (await t.db.scalars(select(ExecutionRecord).where(
+        ExecutionRecord.binding_id == t.binding.id,
+        ExecutionRecord.status == "SKIPPED_ALREADY_FOLLOWED"))).all()
+    assert len(rows) == 1
+    # 明细变化（带单加仓到 90）：新情况，记新条。
+    await t.router._record_execution(
+        t.db, t.binding, t.lead, t.account, "SNDKUSDT", "SNDKUSDT", "BUY", "LONG",
+        "OPEN_LONG", "SKIPPED_ALREADY_FOLLOWED", 90.0, 85.38, 7684.2,
+        my_price=83.88,
+        details="Owned 1.23 already covers target 1.3939 for lead qty 90.0",
+        notify_cfg=None)
+    rows = (await t.db.scalars(select(ExecutionRecord).where(
+        ExecutionRecord.binding_id == t.binding.id,
+        ExecutionRecord.status == "SKIPPED_ALREADY_FOLLOWED"))).all()
+    assert len(rows) == 2
+    # 真实成交不去重：同一明细连记两条 EXECUTED。
+    for _ in range(2):
+        await t.router._record_execution(
+            t.db, t.binding, t.lead, t.account, "SNDKUSDT", "SNDKUSDT", "BUY", "LONG",
+            "OPEN_LONG", "EXECUTED", 78.46, 85.38, 6700.0,
+            my_qty=0.5, my_price=83.88, my_notional=41.94,
+            details="Bought 0.5", notify_cfg=None, order_id=None)
+    rows = (await t.db.scalars(select(ExecutionRecord).where(
+        ExecutionRecord.binding_id == t.binding.id,
+        ExecutionRecord.status == "EXECUTED"))).all()
+    assert len(rows) == 2

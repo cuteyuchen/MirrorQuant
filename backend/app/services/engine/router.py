@@ -1234,6 +1234,22 @@ class CopyRouter:
             if previous is not None:
                 await db.commit()
                 return previous
+        if delivery is None and _is_guard_outcome(status) and exact(my_qty) == 0:
+            # 持仓差额路径没有投递事件，同一风控结论（已跟足/低于最小量/
+            # 源顺序拦截）每轮都会记一条，执行记录页刷屏。1.3.17 只压了
+            # 钉钉通知，没压记录。24 小时内同一绑定/账户/品种/方向/
+            # 状态/明细已有记录时不再重复记账，只返回已有记录；明细变化
+            #（带单量、目标量变化）会产生新记录，审计轨迹不断。
+            window_start = datetime.now(timezone.utc) - timedelta(hours=24)
+            previous = await db.scalar(select(ExecutionRecord).where(
+                ExecutionRecord.binding_id == binding.id, ExecutionRecord.account_id == account.id,
+                ExecutionRecord.inst_id == inst_id, ExecutionRecord.position_side == position_side,
+                ExecutionRecord.status == status, ExecutionRecord.details == details,
+                ExecutionRecord.created_at >= window_start
+            ).order_by(ExecutionRecord.created_at.desc()))
+            if previous is not None:
+                await db.commit()
+                return previous
         rec = ExecutionRecord(
             binding_id=binding.id,
             lead_id=lead.id,
