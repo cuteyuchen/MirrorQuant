@@ -313,6 +313,41 @@ async def test_disabled_notification_preferences_remain_respected(status):
         assert not (await db.scalars(select(NotificationOutbox))).all()
 
 
+@pytest.mark.parametrize("disable_binding,disable_account", [(True, False), (False, True), (True, True)])
+async def test_disabled_binding_kill_switch_block_is_recorded_without_notification(disable_binding, disable_account):
+    """A BLOCKED_KILL_SWITCH for a disabled binding/account is an expected skip:
+    the execution record stays as an audit trail, but no notification is enqueued.
+    Otherwise every leader signal spams one block notice per disabled binding on
+    top of the live binding's fill notice, and the stopped account shows up in
+    notifications."""
+    async with get_session_factory()() as db:
+        router, binding, lead, account = await record_execution(db)
+        binding.is_enabled = not disable_binding
+        account.is_enabled = not disable_account
+        await db.commit()
+        await router._record_execution(db, binding, lead, account, "BTCUSDT", "BTCUSDT", "BUY", "LONG",
+            "OPEN_LONG", "BLOCKED_KILL_SWITCH", 1, 100, 100,
+            details="Binding is disabled; Account is disabled",
+            notify_cfg={"dingtalk_enabled": True, "notify_on_execution": True, "notify_on_risk_block": True})
+        assert not (await db.scalars(select(NotificationOutbox))).all()
+        rec = await db.scalar(select(ExecutionRecord))
+        assert rec is not None and rec.status == "BLOCKED_KILL_SWITCH"
+        assert rec.notification_state == "not_required"
+
+
+async def test_enabled_binding_kill_switch_block_still_notifies():
+    """Global kill switch with the binding/account still enabled must still notify."""
+    async with get_session_factory()() as db:
+        router, binding, lead, account = await record_execution(db)
+        await router._record_execution(db, binding, lead, account, "BTCUSDT", "BTCUSDT", "BUY", "LONG",
+            "OPEN_LONG", "BLOCKED_KILL_SWITCH", 1, 100, 100,
+            details="Global kill switch is active",
+            notify_cfg={"dingtalk_enabled": True, "notify_on_execution": True, "notify_on_risk_block": True})
+        rows = (await db.scalars(select(NotificationOutbox))).all()
+        assert len(rows) == 1
+        assert json.loads(rows[0].payload)["event_type"] == "BLOCKED_KILL_SWITCH"
+
+
 @pytest.mark.parametrize("http_status,body,ok", [
     (200, {"errcode": 0}, True), (201, {"errcode": 0}, True),
     (200, {"errcode": 310000, "errmsg": "synthetic-sensitive-marker"}, False),

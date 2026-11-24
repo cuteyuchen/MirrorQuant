@@ -1325,6 +1325,12 @@ class CopyRouter:
                     and target_cfg.get("notify_on_risk_block", True)
                 )
             )
+            if status == "BLOCKED_KILL_SWITCH" and (not binding.is_enabled or not account.is_enabled):
+                # 已停用的绑定/账户是预期内的跳过：每个带单信号都会给它记一条
+                # BLOCKED_KILL_SWITCH，若再推送就会与在跑绑定的成交通知重复，
+                # 且已停用的账户不应出现在通知里。只记账，不推送。
+                # 全局急停时绑定/账户仍为启用状态，不受此条影响，照常推送。
+                should_notify = False
             if (should_notify and delivery is not None and _is_guard_outcome(status)
                     and exact(my_qty) == 0):
                 # 同一投递事件已有已推送/待推送的风控结论：只记账，不再推送。
