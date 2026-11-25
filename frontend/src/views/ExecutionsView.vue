@@ -10,7 +10,7 @@ import { useDisplayUnit } from "@/composables/useDisplayUnit";
 import type { ExecutionRecord } from "@/types/api";
 import { errorMessage, reasonText } from "@/utils/errors";
 import { actionLabel, sideLabel, statusLabel } from "@/utils/status";
-import { formatDateTime, formatPct, formatPrice, timestampMs } from "@/utils/format";
+import { finiteNumber, formatDateTime, formatPct, formatPrice, timestampMs } from "@/utils/format";
 import { EXECUTION_FILTERS, executionGroup, readExecutionCounts, readExecutionPage, type ExecutionCounts, type ExecutionFilter } from "@/utils/executions";
 import PageHeader from "@/components/PageHeader.vue";
 import DataTable from "@/components/DataTable.vue";
@@ -31,7 +31,7 @@ const { unit, sizeText } = useDisplayUnit();
 const sizeLabel = computed(() => unit.value === "notional" ? t("board.notional") : unit.value === "quantity" ? t("common.quantity") : `${t("common.quantity")} / ${t("board.notional")}`);
 const tab = computed(() => route.query.tab === "intents" ? "intents" : "history");
 const bindingId = ref("");
-const filter = ref<ExecutionFilter>("all");
+const filter = ref<ExecutionFilter>("actionable");
 const page = ref(0);
 const pageSize = 20;
 const items = ref<ExecutionRecord[]>([]);
@@ -39,7 +39,7 @@ const total = ref<number | null>(null);
 const loading = ref(false);
 const error = ref("");
 const metadataError = ref("");
-const counts = ref<ExecutionCounts>({ all: null, success: null, failed: null, skipped: null, blocked: null });
+const counts = ref<ExecutionCounts>({ actionable: null, all: null, success: null, failed: null, skipped: null, blocked: null });
 const countsLoading = ref(false);
 const countsError = ref("");
 const receivedAt = ref<number | null>(null);
@@ -71,6 +71,7 @@ function bindingName(record: ExecutionRecord) { return record.bindingName ?? bin
 function accountName(record: ExecutionRecord) { return record.accountName ?? cache.accounts?.data.find(account => account.id === record.accountId)?.name ?? t("common.unknown"); }
 function recordKey(record: ExecutionRecord) { return record.id ?? `${record.bindingId}:${record.createdAt}:${record.symbol}:${record.action}:${record.orderId}`; }
 function displayStatus(record: ExecutionRecord) { return record.status?.toUpperCase() === "PARTIAL" ? "PARTIALLY_FILLED" : record.status; }
+function hasFill(record: ExecutionRecord) { return (finiteNumber(record.myQty) ?? 0) > 0; }
 function rowTone(record: ExecutionRecord) {
   const group = executionGroup(record.status);
   return group === "failed" || group === "blocked" ? "bg-danger/5" : group === "success" ? "" : "bg-warning/5";
@@ -83,6 +84,11 @@ function resultReason(record: ExecutionRecord) {
   if (status === "DEFERRED_SOURCE_UNPROVEN") return t("executions.deferredWarning");
   if (status === "ACCUMULATED_DEBT") return reasonText("WAITING_EXECUTION");
   return statusLabel(displayStatus(record));
+}
+function showRawAudit(record: ExecutionRecord | null) {
+  const raw = record?.details?.trim();
+  if (!raw) return false;
+  return raw !== reasonText(raw);
 }
 async function loadMetadata(force = false) {
   try { await Promise.all([cache.fetchBindings(force), cache.fetchAccounts(force)]); if (active) metadataError.value = ""; }
@@ -98,7 +104,7 @@ async function loadCounts() {
   } catch (cause: unknown) {
     if (request === countSequence && active && !isCancelled(cause)) {
       countsError.value = errorMessage(cause);
-      counts.value = { all: null, success: null, failed: null, skipped: null, blocked: null };
+      counts.value = { actionable: null, all: null, success: null, failed: null, skipped: null, blocked: null };
     }
   } finally { if (request === countSequence) countsLoading.value = false; }
 }
@@ -106,13 +112,19 @@ async function loadHistory(refreshCounts = false) {
   if (!active || tab.value !== "history") return;
   const request = ++sequence;
   loading.value = true; error.value = "";
-  if (refreshCounts) void loadCounts();
   try {
-    const response = await readExecutionPage({ bindingId: selectedBinding.value, filter: filter.value, page: page.value, pageSize });
+    const response = await readExecutionPage({ bindingId: selectedBinding.value, filter: filter.value, page: page.value, pageSize, includeCounts: refreshCounts });
     // 快速筛选、翻页和离开页面时，旧响应不能覆盖当前视图。
     if (request !== sequence || !active) return;
     items.value = response.items; total.value = response.total; receivedAt.value = Date.now();
-    counts.value = { ...counts.value, [filter.value]: response.total };
+    if (response.counts) {
+      counts.value = response.counts;
+      countsError.value = "";
+      countsReceivedAt.value = Date.now();
+    } else {
+      counts.value = { ...counts.value, [filter.value]: response.total };
+      if (refreshCounts) void loadCounts();
+    }
   } catch (cause: unknown) { if (request === sequence && active && !isCancelled(cause)) error.value = errorMessage(cause); }
   finally { if (request === sequence) loading.value = false; }
 }
@@ -128,11 +140,11 @@ function refresh() {
   if (tab.value === "intents") void loadIntents(true);
   else void loadHistory(true);
 }
-function resetPage() { page.value = 0; items.value = []; total.value = null; selected.value = null; sequence++; }
+function resetPage() { page.value = 0; total.value = null; selected.value = null; sequence++; }
 function changeBinding() {
-  resetPage();
+  resetPage(); items.value = [];
   countSequence++; countsLoading.value = false; countsError.value = "";
-  counts.value = { all: null, success: null, failed: null, skipped: null, blocked: null };
+  counts.value = { actionable: null, all: null, success: null, failed: null, skipped: null, blocked: null };
   countsReceivedAt.value = null;
   if (tab.value === "history") void loadHistory(true);
 }
@@ -142,7 +154,7 @@ function chooseFilter(value: ExecutionFilter) {
 }
 function changePage(delta: number) {
   page.value = Math.max(0, page.value + delta);
-  items.value = []; selected.value = null; void loadHistory();
+  selected.value = null; void loadHistory();
 }
 function chooseTab(value: "history" | "intents") { void router.replace({ query: { ...route.query, tab: value === "intents" ? value : undefined } }); }
 function start() {
@@ -178,13 +190,13 @@ onMounted(start); onActivated(start); onDeactivated(stop); onUnmounted(stop);
       <template #actions><button class="icon-button" :disabled="loading || countsLoading || intentLoading" :title="t('common.refresh')" :aria-label="t('common.refresh')" @click="refresh"><RefreshCw :size="18" :class="{ 'animate-spin': loading || intentLoading }" /></button></template>
     </PageHeader>
     <ErrorState v-if="metadataError" :message="metadataError" @retry="loadMetadata(true)" />
-    <div class="flex flex-wrap items-end justify-between gap-4 border-b border-border/50">
-      <nav class="flex min-w-0 flex-wrap" role="tablist" :aria-label="t('executions.title')">
+    <div class="flex flex-wrap items-center justify-between gap-3 border-b border-border/50 pb-1">
+      <nav class="flex min-w-0" role="tablist" :aria-label="t('executions.title')">
         <button class="tab-button" role="tab" :aria-selected="tab === 'history'" @click="chooseTab('history')">{{ t("executions.historyTab") }}</button>
         <button class="tab-button flex items-center gap-2" role="tab" :aria-selected="tab === 'intents'" @click="chooseTab('intents')">{{ t("executions.intentsTab") }}<span v-if="cache.intents && cache.intents.data.length" class="rounded bg-warning/15 px-1.5 text-xs tabular-nums text-warning">{{ cache.intents.data.length }}</span></button>
       </nav>
-      <div class="mb-2 w-full sm:w-64">
-        <label for="execution-binding" class="field-label mb-1">{{ t("executions.binding") }}</label>
+      <div class="w-full sm:mb-1 sm:w-64">
+        <label for="execution-binding" class="field-label mb-1 sm:sr-only">{{ t("executions.binding") }}</label>
         <select id="execution-binding" v-model="bindingId" class="form-input" @change="changeBinding">
           <option value="">{{ t("common.all") }}</option>
           <option v-for="binding in bindings" :key="binding.id" :value="String(binding.id)">{{ binding.name ?? t("common.unknown") }}</option>
@@ -192,11 +204,11 @@ onMounted(start); onActivated(start); onDeactivated(stop); onUnmounted(stop);
       </div>
     </div>
     <template v-if="tab === 'history'">
-      <div class="flex flex-wrap items-center justify-between gap-3">
-        <div class="flex min-w-0 flex-wrap gap-1 rounded-md bg-surface p-1" role="group" :aria-label="t('executions.filters')">
-          <button v-for="value in EXECUTION_FILTERS" :key="value" :data-testid="`filter-${value}`" class="min-h-11 rounded px-3 py-2 text-sm"
+      <div class="flex flex-wrap items-center justify-between gap-2.5">
+        <div class="flex min-w-0 max-w-full overflow-x-auto gap-1 rounded-lg bg-surface p-1 no-scrollbar" role="group" :aria-label="t('executions.filters')">
+          <button v-for="value in EXECUTION_FILTERS" :key="value" :data-testid="`filter-${value}`" class="min-h-9 shrink-0 whitespace-nowrap rounded-md px-2.5 py-1.5 text-xs sm:min-h-10 sm:px-3 sm:text-sm"
             :aria-pressed="filter === value" :class="filter === value ? 'bg-surface3 font-semibold text-foreground' : 'text-muted hover:bg-surface2'" @click="chooseFilter(value)">
-            {{ t(`executions.filter.${value}`) }} <span class="ml-1 tabular-nums" :class="value === 'failed' || value === 'blocked' ? 'text-danger' : ''">{{ counts[value] ?? t("common.unknown") }}</span>
+            {{ t(`executions.filter.${value}`) }} <span class="ml-1 tabular-nums" :class="(value === 'failed' || value === 'blocked') && (counts[value] ?? 0) > 0 ? 'text-danger' : ''">{{ counts[value] ?? t("common.unknown") }}</span>
           </button>
         </div>
         <p class="flex flex-wrap items-center gap-2 text-xs text-muted">{{ t("executions.updated") }}<FreshnessStamp :timestamp="receivedAt" :warn-after="30" :critical-after="90" :stale="!!error" /></p>
@@ -204,13 +216,13 @@ onMounted(start); onActivated(start); onDeactivated(stop); onUnmounted(stop);
       <ErrorState v-if="countsError" :message="`${t('executions.countError')}: ${countsError}`" :busy="countsLoading" @retry="loadCounts" />
       <DataTable :rows="items" :row-key="recordKey" :row-tone="rowTone" :loading="loading" :error="error" :empty="t('executions.empty')"
         :label="t('executions.title')" selectable @select="selected = $event" @retry="loadHistory(true)" :columns="[
-          { key: 'result', label: t('executions.result'), width: '21%', mobileWide: true },
+          { key: 'result', label: t('executions.result'), width: '19%', mobileWide: true },
           { key: 'symbol', label: t('feed.colDirSym'), width: '12%' },
           { key: 'binding', label: t('executions.binding'), width: '17%', mobileWide: true },
           { key: 'lead', label: t('executions.leadReference'), width: '12%', numeric: true },
           { key: 'fill', label: t('executions.fill'), width: '12%', numeric: true },
-          { key: 'slippage', label: t('executions.slippage'), width: '8%', numeric: true },
-          { key: 'spread', label: t('executions.spread'), width: '8%', numeric: true },
+          { key: 'slippage', label: t('executions.slippage'), width: '9%', numeric: true },
+          { key: 'spread', label: t('executions.spread'), width: '9%', numeric: true },
           { key: 'time', label: t('common.time'), width: '10%', numeric: true },
         ]">
         <template #cell-result="{ row }">
@@ -219,14 +231,48 @@ onMounted(start); onActivated(start); onDeactivated(stop); onUnmounted(stop);
         </template>
         <template #cell-symbol="{ row }"><strong>{{ row.symbol ?? row.instId ?? t("common.unknown") }}</strong><p class="mt-1 text-xs text-muted">{{ sideLabel(row.positionSide) }} · {{ actionLabel(row.action) }}</p></template>
         <template #cell-binding="{ row }">
-          <strong>{{ row.leadName ?? t("common.unknown") }}</strong><p class="mt-1 text-xs text-muted">{{ bindingName(row) }}</p>
-          <div class="mt-1.5 flex flex-wrap items-center gap-2"><span class="text-xs text-muted">{{ accountName(row) }}</span><EnvBadge :environment="environment(row)" /></div>
+          <strong>{{ row.leadName ?? t("common.unknown") }}</strong>
+          <p class="mt-1 text-xs text-muted">{{ bindingName(row) }}<span v-if="row.bindingDeleted" class="ml-1 rounded bg-surface2 px-1 py-0.5 text-[10px]">{{ t("executions.deletedTag") }}</span></p>
+          <div class="mt-1.5 flex flex-wrap items-center gap-1.5"><span class="text-xs text-muted">{{ accountName(row) }}</span><span v-if="row.accountDeleted" class="rounded bg-surface2 px-1 py-0.5 text-[10px] text-muted">{{ t("executions.deletedTag") }}</span><EnvBadge :environment="environment(row)" /></div>
         </template>
         <template #cell-lead="{ row }"><span>{{ sizeText(row.leadQty, row.leadNotional, row.leadPrice) }}</span><p class="mt-1 text-xs text-muted">{{ formatPrice(row.leadPrice) }}</p></template>
-        <template #cell-fill="{ row }"><strong>{{ sizeText(row.myQty, row.myNotional, row.myPrice) }}</strong><p class="mt-1 text-xs text-muted">{{ formatPrice(row.myPrice) }}</p></template>
-        <template #cell-slippage="{ row }"><span>{{ formatPct(row.slippagePct, 4) }}</span></template>
-        <template #cell-spread="{ row }"><span>{{ formatPct(row.spreadPct, 4) }}</span></template>
+        <template #cell-fill="{ row }">
+          <template v-if="hasFill(row)"><strong>{{ sizeText(row.myQty, row.myNotional, row.myPrice) }}</strong><p class="mt-1 text-xs text-muted">{{ formatPrice(row.myPrice) }}</p></template>
+          <span v-else class="text-muted">—</span>
+        </template>
+        <template #cell-slippage="{ row }"><span class="whitespace-nowrap font-mono tabular-nums">{{ hasFill(row) ? formatPct(row.slippagePct, 4) : "—" }}</span></template>
+        <template #cell-spread="{ row }"><span class="whitespace-nowrap font-mono tabular-nums">{{ hasFill(row) ? formatPct(row.spreadPct, 4) : "—" }}</span></template>
         <template #cell-time="{ row }"><span class="text-xs tabular-nums">{{ formatDateTime(row.createdAt) }}</span></template>
+        <template #mobile-card="{ row }">
+          <div class="space-y-2.5">
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <div class="flex min-w-0 flex-wrap items-center gap-1.5">
+                <strong class="text-sm">{{ row.symbol ?? row.instId ?? t("common.unknown") }}</strong>
+                <span class="text-xs text-muted">{{ sideLabel(row.positionSide) }} · {{ actionLabel(row.action) }}</span>
+              </div>
+              <StatusBadge :state="displayStatus(row)" />
+            </div>
+            <div class="flex flex-wrap items-center gap-1.5 text-xs text-muted">
+              <span class="font-medium text-foreground">{{ row.leadName ?? t("common.unknown") }}</span>
+              <span>→</span>
+              <span>{{ accountName(row) }}</span>
+              <span v-if="row.accountDeleted || row.bindingDeleted" class="rounded bg-surface2 px-1 py-0.5 text-[10px]">{{ t("executions.deletedTag") }}</span>
+              <EnvBadge :environment="environment(row)" />
+              <time class="ml-auto font-mono tabular-nums">{{ formatDateTime(row.createdAt, { short: true }) }}</time>
+            </div>
+            <div class="grid grid-cols-2 gap-3 rounded-lg bg-background/40 px-2.5 py-2 text-xs">
+              <div class="min-w-0">
+                <span class="text-muted">{{ t("executions.leadReference") }}</span>
+                <p class="mt-0.5 font-mono font-semibold tabular-nums">{{ sizeText(row.leadQty, row.leadNotional, row.leadPrice) }}</p>
+              </div>
+              <div class="min-w-0 text-right">
+                <span class="text-muted">{{ t("executions.fill") }}</span>
+                <p class="mt-0.5 font-mono font-semibold tabular-nums">{{ hasFill(row) ? sizeText(row.myQty, row.myNotional, row.myPrice) : "—" }}</p>
+              </div>
+            </div>
+            <p v-if="executionGroup(row.status) !== 'success'" class="text-xs leading-relaxed" :class="executionGroup(row.status) === 'failed' || executionGroup(row.status) === 'blocked' ? 'text-danger' : 'text-warning'">{{ resultReason(row) }}</p>
+          </div>
+        </template>
         <template #select-label>{{ t("executions.expand") }}</template>
       </DataTable>
       <div class="flex flex-wrap items-center justify-between gap-3">
@@ -241,25 +287,41 @@ onMounted(start); onActivated(start); onDeactivated(stop); onUnmounted(stop);
       <p class="flex flex-wrap items-center gap-2 text-xs text-muted">{{ t("executions.updated") }}<FreshnessStamp :timestamp="cache.intents?.fetchedAt" :warn-after="15" :critical-after="45" :stale="!!intentError" /></p>
       <IntentList :items="intents" :loading="intentLoading" :error="intentError" @retry="loadIntents(true)" />
     </template>
-    <BaseModal drawer :open="selected != null" :title="t('executions.details')" @close="selected = null">
-      <div v-if="selected" class="space-y-5">
-        <header class="space-y-2">
-          <div class="flex flex-wrap items-center gap-2"><StatusBadge :state="displayStatus(selected)" large /><EnvBadge :environment="environment(selected)" /></div>
-          <h3 class="section-title">{{ selected.symbol ?? selected.instId ?? t("common.unknown") }} · {{ sideLabel(selected.positionSide) }} · {{ actionLabel(selected.action) }}</h3>
-          <p class="text-sm text-muted">{{ selected.leadName ?? t("common.unknown") }} · {{ bindingName(selected) }} · {{ accountName(selected) }}</p>
+    <BaseModal :open="selected != null" :title="t('executions.details')" @close="selected = null">
+      <div v-if="selected" class="space-y-4">
+        <header class="space-y-1.5">
+          <div class="flex flex-wrap items-center gap-2"><StatusBadge :state="displayStatus(selected)" large /><EnvBadge :environment="environment(selected)" /><time class="ml-auto font-mono text-xs tabular-nums text-muted">{{ formatDateTime(selected.createdAt) }}</time></div>
+          <h3 class="text-base font-bold tracking-tight sm:text-lg">{{ selected.symbol ?? selected.instId ?? t("common.unknown") }} · {{ sideLabel(selected.positionSide) }} · {{ actionLabel(selected.action) }}</h3>
+          <p class="text-xs sm:text-sm text-muted">
+            {{ selected.leadName ?? t("common.unknown") }} · {{ bindingName(selected) }}
+            <span v-if="selected.bindingDeleted" class="ml-1 rounded bg-surface2 px-1 py-0.5 text-[10px]">{{ t("executions.deletedTag") }}</span>
+            · {{ accountName(selected) }}
+            <span v-if="selected.accountDeleted" class="ml-1 rounded bg-surface2 px-1 py-0.5 text-[10px]">{{ t("executions.deletedTag") }}</span>
+          </p>
         </header>
         <p v-if="executionGroup(selected.status) !== 'success'" class="warning-banner">{{ resultReason(selected) }}</p>
-        <dl class="grid grid-cols-2 gap-4">
-          <div class="number"><dt class="text-xs text-muted">{{ t("executions.leadReference") }} · {{ sizeLabel }}</dt><dd class="mt-1 font-semibold">{{ sizeText(selected.leadQty, selected.leadNotional, selected.leadPrice) }}</dd></div>
-          <div class="number"><dt class="text-xs text-muted">{{ t("executions.leadReference") }} · {{ t("common.price") }}</dt><dd class="mt-1 font-semibold">{{ formatPrice(selected.leadPrice) }}</dd></div>
-          <div class="number"><dt class="text-xs text-muted">{{ t("executions.fill") }} · {{ sizeLabel }}</dt><dd class="mt-1 font-semibold">{{ sizeText(selected.myQty, selected.myNotional, selected.myPrice) }}</dd></div>
-          <div class="number"><dt class="text-xs text-muted">{{ t("executions.fill") }} · {{ t("common.price") }}</dt><dd class="mt-1 font-semibold">{{ formatPrice(selected.myPrice) }}</dd></div>
-          <div class="number"><dt class="text-xs text-muted">{{ t("executions.slippage") }}</dt><dd class="mt-1">{{ formatPct(selected.slippagePct, 4) }}</dd></div>
-          <div class="number"><dt class="text-xs text-muted">{{ t("executions.spread") }}</dt><dd class="mt-1">{{ formatPct(selected.spreadPct, 4) }}</dd></div>
-          <div class="number"><dt class="text-xs text-muted">{{ t("common.time") }}</dt><dd class="mt-1 text-xs">{{ formatDateTime(selected.createdAt) }}</dd></div>
-          <div class="col-span-2 min-w-0"><dt class="text-xs text-muted">{{ t("executions.orderId") }}</dt><dd class="mt-1 break-all font-mono text-sm">{{ selected.orderId ?? t("common.unknown") }}</dd></div>
-          <div class="col-span-2 min-w-0"><dt class="text-xs text-muted">{{ t("executions.details") }}</dt><dd class="mt-1 whitespace-pre-wrap break-words text-sm leading-relaxed">{{ reasonText(selected.details) }}</dd></div>
+        <div class="grid grid-cols-2 gap-2.5">
+          <div class="rounded-xl border border-border/50 bg-background/40 p-3">
+            <p class="text-xs text-muted">{{ t("executions.leadReference") }}</p>
+            <p class="mt-1 font-mono text-sm font-bold tabular-nums">{{ sizeText(selected.leadQty, selected.leadNotional, selected.leadPrice) }}</p>
+            <p class="mt-0.5 font-mono text-xs tabular-nums text-muted">{{ t("common.price") }} {{ formatPrice(selected.leadPrice) }}</p>
+          </div>
+          <div class="rounded-xl border border-border/50 bg-background/40 p-3">
+            <p class="text-xs text-muted">{{ t("executions.fill") }}</p>
+            <p class="mt-1 font-mono text-sm font-bold tabular-nums">{{ hasFill(selected) ? sizeText(selected.myQty, selected.myNotional, selected.myPrice) : "—" }}</p>
+            <p class="mt-0.5 font-mono text-xs tabular-nums text-muted">{{ t("common.price") }} {{ hasFill(selected) ? formatPrice(selected.myPrice) : "—" }}</p>
+          </div>
+        </div>
+        <dl class="grid grid-cols-2 gap-3 rounded-xl border border-border/40 bg-background/30 p-3 text-xs">
+          <div><dt class="text-muted">{{ t("executions.slippage") }}</dt><dd class="mt-0.5 font-mono text-sm font-semibold tabular-nums">{{ hasFill(selected) ? formatPct(selected.slippagePct, 4) : "—" }}</dd></div>
+          <div><dt class="text-muted">{{ t("executions.spread") }}</dt><dd class="mt-0.5 font-mono text-sm font-semibold tabular-nums">{{ hasFill(selected) ? formatPct(selected.spreadPct, 4) : "—" }}</dd></div>
+          <div class="col-span-2 min-w-0 border-t border-border/40 pt-2"><dt class="text-muted">{{ t("executions.orderId") }}</dt><dd class="mt-0.5 break-all font-mono text-xs">{{ selected.orderId ?? t("common.unknown") }}</dd></div>
+          <div class="col-span-2 min-w-0"><dt class="text-muted">{{ t("executions.details") }}</dt><dd class="mt-0.5 whitespace-pre-wrap break-words text-sm leading-relaxed">{{ resultReason(selected) }}</dd></div>
         </dl>
+        <details v-if="showRawAudit(selected)" class="rounded-lg border border-border/50 bg-background/50 p-3 text-xs">
+          <summary class="cursor-pointer font-medium text-muted hover:text-foreground">{{ t("executions.rawAudit") }}</summary>
+          <p class="mt-2 whitespace-pre-wrap break-all font-mono text-muted">{{ selected.details }}</p>
+        </details>
       </div>
     </BaseModal>
   </div>

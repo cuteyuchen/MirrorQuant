@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from app.core.time_util import to_utc_iso
-
 import json
 import csv
 import io
@@ -13,10 +11,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_admin, get_current_user, record_audit
-from app.api.exposure import require_binding_flat
+from app.api.exposure import require_binding_soft_deletable
 from app.core.database import get_db
 from app.core.secret_mask import NOTIFICATION_SECRET_FIELDS, mask_sensitive_payload, merge_secrets, redact_error_urls
-from app.models.domain import CopyBinding, LeadSource, ProxyNode, User
+from app.core.time_util import to_utc_iso
+from app.models.domain import CopyBinding, LeadSource, ProxyNode, User, utcnow
 from app.schemas.api import LeadCreate, LeadUpdate
 from app.services.engine.orchestrator import orchestrator
 from app.services.engine.serialization import serialized_execution
@@ -26,6 +25,58 @@ from app.services.notifier.trade import resolve_display_unit
 from app.services.proxy.manager import ProxyEgressError, ProxyManager
 
 router = APIRouter(prefix="/api/leads", tags=["leads"])
+
+
+def _extract_latest_action(lead: LeadSource, snap: Optional[dict]) -> Optional[dict]:
+    best = None
+    best_ts = -1
+    if snap and isinstance(snap.get("orders"), list):
+        for o in snap["orders"]:
+            if not isinstance(o, dict):
+                continue
+            ts = o.get("time") or o.get("t") or 0
+            try:
+                ts_num = int(ts)
+            except (TypeError, ValueError):
+                ts_num = 0
+            if ts_num >= best_ts:
+                best_ts = ts_num
+                best = {
+                    "time": ts_num if ts_num > 0 else None,
+                    "symbol": o.get("symbol"),
+                    "side": o.get("positionSide"),
+                    "qty": o.get("qty") if o.get("qty") is not None else o.get("q"),
+                    "direction": o.get("dir"),
+                }
+    if best is None and lead.orders_store_json:
+        try:
+            store = json.loads(lead.orders_store_json)
+            if isinstance(store, dict):
+                for raw in store.values():
+                    if not isinstance(raw, dict):
+                        continue
+                    ts = raw.get("t") or raw.get("orderUpdateTime") or raw.get("ot") or 0
+                    try:
+                        ts_num = int(ts)
+                    except (TypeError, ValueError):
+                        ts_num = 0
+                    if ts_num >= best_ts:
+                        best_ts = ts_num
+                        ps = raw.get("ps") or raw.get("positionSide")
+                        trade_side = raw.get("side")
+                        direction = None
+                        if ps in ("LONG", "SHORT") and trade_side in ("BUY", "SELL"):
+                            direction = ("OPEN_" if (trade_side, ps) in (("BUY", "LONG"), ("SELL", "SHORT")) else "REDUCE_") + ps
+                        best = {
+                            "time": ts_num if ts_num > 0 else None,
+                            "symbol": raw.get("sym") or raw.get("symbol"),
+                            "side": ps,
+                            "qty": raw.get("q") if raw.get("q") is not None else raw.get("executedQty"),
+                            "direction": direction,
+                        }
+        except Exception:
+            pass
+    return best
 
 
 def _lead_summary(lead: LeadSource) -> dict:
@@ -68,13 +119,22 @@ def _lead_summary(lead: LeadSource) -> dict:
         "status": lead.status,
         "openPositionsCount": open_count,
         "openUnrealizedPnl": round(total_upnl, 2),
+        "latestAction": _extract_latest_action(lead, snap),
         "notificationConfig": notify_cfg,
     }
 
 
+async def _get_live_lead(db: AsyncSession, lead_id: int) -> LeadSource:
+    lead = await db.get(LeadSource, lead_id)
+    if not lead or lead.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    return lead
+
+
 @router.get("")
 async def list_leads(db: AsyncSession = Depends(get_db), _user: User = Depends(get_current_user)):
-    leads = list((await db.scalars(select(LeadSource).order_by(LeadSource.id))).all())
+    leads = list((await db.scalars(select(LeadSource).where(
+        LeadSource.deleted_at.is_(None)).order_by(LeadSource.id))).all())
     return {"items": [_lead_summary(l) for l in leads]}
 
 
@@ -89,6 +149,7 @@ async def create_lead(
         select(LeadSource).where(
             LeadSource.platform == payload.platform,
             LeadSource.portfolio_id == payload.portfolio_id.strip(),
+            LeadSource.deleted_at.is_(None),
         )
     )
     if existing:
@@ -130,9 +191,7 @@ async def update_lead(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_admin),
 ):
-    lead = await db.get(LeadSource, lead_id)
-    if not lead:
-        raise HTTPException(status_code=404, detail="Lead not found")
+    lead = await _get_live_lead(db, lead_id)
 
     data = payload.model_dump(exclude_unset=True)
     if "notification_config" in data:
@@ -168,9 +227,7 @@ async def test_lead_notification(
     db: AsyncSession = Depends(get_db),
     _user: User = Depends(get_current_admin),
 ):
-    lead = await db.get(LeadSource, lead_id)
-    if not lead:
-        raise HTTPException(status_code=404, detail="Lead not found")
+    lead = await _get_live_lead(db, lead_id)
     if not lead.notification_config_json:
         raise HTTPException(status_code=400, detail="Lead has no notification configuration")
     try:
@@ -201,20 +258,30 @@ async def test_lead_notification(
 async def delete_lead(
     lead_id: int,
     request: Request,
+    auto_disable: bool = Query(default=False),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_admin),
 ):
-    lead = await db.get(LeadSource, lead_id)
-    if not lead:
-        raise HTTPException(status_code=404, detail="Lead not found")
-    if lead.is_enabled:
+    lead = await _get_live_lead(db, lead_id)
+    if lead.is_enabled and not auto_disable:
         raise HTTPException(status_code=409, detail="Disable the lead and drain exposure before deletion")
-    bindings = list((await db.scalars(select(CopyBinding).where(CopyBinding.lead_id == lead_id))).all())
+    bindings = list((await db.scalars(select(CopyBinding).where(
+        CopyBinding.lead_id == lead_id, CopyBinding.deleted_at.is_(None)))).all())
     for binding in bindings:
-        await require_binding_flat(db, binding, deleting=True)
+        if binding.is_enabled and not auto_disable:
+            raise HTTPException(status_code=409, detail="Disable the lead and drain exposure before deletion")
+        await require_binding_soft_deletable(db, binding)
     name = lead.name
-    await db.delete(lead)
-    await record_audit(db, "DELETE_LEAD", "lead", str(lead_id), f"Deleted lead {name}", current_user, request)
+    now = utcnow()
+    lead.is_enabled = False
+    lead.is_public_dashboard = False
+    lead.slot_watch_enabled = False
+    lead.proxy_id = None
+    lead.deleted_at = now
+    for binding in bindings:
+        binding.is_enabled = False
+        binding.deleted_at = now
+    await record_audit(db, "DELETE_LEAD", "lead", str(lead_id), f"Soft-deleted lead {name}", current_user, request)
     await db.commit()
     return {"ok": True}
 
@@ -225,9 +292,7 @@ async def get_lead_snapshot(
     db: AsyncSession = Depends(get_db),
     _user: User = Depends(get_current_user),
 ):
-    lead = await db.get(LeadSource, lead_id)
-    if not lead:
-        raise HTTPException(status_code=404, detail="Lead not found")
+    lead = await _get_live_lead(db, lead_id)
     snapshot = json.loads(lead.snapshot_json) if lead.snapshot_json else None
     return mask_sensitive_payload({"lead": _lead_summary(lead), "snapshot": snapshot})
 
@@ -239,9 +304,7 @@ async def sync_lead_now(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_admin),
 ):
-    lead = await db.get(LeadSource, lead_id)
-    if not lead:
-        raise HTTPException(status_code=404, detail="Lead not found")
+    lead = await _get_live_lead(db, lead_id)
     res = await orchestrator.sync_lead(db, lead)
     await record_audit(db, "SYNC_LEAD", "lead", str(lead.id), f"Manual sync ok={res.get('ok')}", current_user, request)
     await db.commit()
@@ -258,9 +321,7 @@ async def analyze_lead_symbol(
     db: AsyncSession = Depends(get_db),
     _user: User = Depends(get_current_user),
 ):
-    lead = await db.get(LeadSource, lead_id)
-    if not lead:
-        raise HTTPException(status_code=404, detail="Lead not found")
+    lead = await _get_live_lead(db, lead_id)
 
     proxies = list((await db.scalars(select(ProxyNode).order_by(ProxyNode.priority))).all())
     try:
@@ -297,9 +358,7 @@ async def export_lead_csv(
     db: AsyncSession = Depends(get_db),
     _user: User = Depends(get_current_user),
 ):
-    lead = await db.get(LeadSource, lead_id)
-    if not lead:
-        raise HTTPException(status_code=404, detail="Lead not found")
+    lead = await _get_live_lead(db, lead_id)
 
     snap = json.loads(lead.snapshot_json) if lead.snapshot_json else {}
     output = io.StringIO(newline="")

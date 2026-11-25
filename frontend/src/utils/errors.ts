@@ -16,6 +16,16 @@ const knownErrors: Record<string, string> = {
   "Cannot verify a flat account; keep it disabled until reconciliation succeeds": "errors.unverifiedFlat",
   "Drain physical positions and pending orders before changing or deleting the account": "errors.accountExposure",
   "Proxy is assigned; explicitly reassign accounts and leads first": "errors.proxyAssigned",
+  "No binding-owned position to reduce": "reason.NO_OWNED_POS_TO_REDUCE",
+  "Binding-owned position absent from exchange holdings": "reason.POS_ABSENT_ON_EXCHANGE",
+  "Lead position is already closed in current snapshot; skipping historical open": "reason.LEAD_ALREADY_CLOSED",
+  "Historical reduction predates this allocation's opening cycle": "reason.REDUCTION_PREDATES_ALLOC",
+  "Terminal order has no newly confirmed fills; debt retained": "reason.UNFILLED_DEBT_RETAINED",
+  "Exchange inventory is below allocated quantity; reconciliation required": "reason.ALLOCATION_EXCEEDS_EXCHANGE",
+  "Account has unresolved orders; increases suspended": "reason.UNRESOLVED_ORDERS_SUSPEND",
+  "Global kill switch is active": "reason.GLOBAL_KILL_SWITCH",
+  "Binding is disabled": "reason.BINDING_DISABLED",
+  "Account is disabled": "reason.ACCOUNT_DISABLED",
   REQUEST_TIMEOUT: "errors.timeout", NETWORK_ERROR: "errors.network", MOCK_READONLY: "errors.mockReadonly",
   INVALID_RESPONSE: "errors.invalidResponse",
   GLOBAL_KILL_SWITCH: "reason.GLOBAL_KILL_SWITCH", BINDING_DISABLED: "reason.BINDING_DISABLED",
@@ -29,8 +39,16 @@ export function reasonText(reason?: string | null): string {
   const { t } = useI18n();
   const parsed = parseGuardDetails(reason, t);
   if (parsed) return parsed;
+  if (reason.includes("; ")) {
+    const parts = reason.split("; ");
+    if (parts.every(part => part in knownErrors)) {
+      return parts.map(part => t(knownErrors[part]!)).join(" · ");
+    }
+  }
   const key = knownErrors[reason] || `reason.${reason.toUpperCase()}`;
-  return t(key) === key ? reason : t(key);
+  if (t(key) !== key) return t(key);
+  const auditKey = `audit.${reason.toUpperCase()}`;
+  return t(auditKey) === auditKey ? reason : t(auditKey);
 }
 // 风控拦截的详情是 risk.py 固定格式的自由文本（如 "Catch-up price drift 1.72% > max 0.50% (age 39149s)"），
 // 严格全匹配才转译为本地化原因行，格式稍有出入就保留原文，绝不猜测数字含义。
@@ -39,6 +57,12 @@ const STALE_RE = /^Missed order stale: age ([0-9]+(?:\.[0-9]+)?)s > max ([0-9]+(
 const ADOPT_RE = /^Adopted existing position: my exposure ([0-9]+(?:\.[0-9]+)?)x, lead exposure ([0-9]+(?:\.[0-9]+)?)x, tolerance ([0-9]+(?:\.[0-9]+)?)%$/;
 const SPREAD_RE = /^Orderbook spread ([0-9]+(?:\.[0-9]+)?)% exceeds guard ([0-9]+(?:\.[0-9]+)?)%$/;
 const SLIPPAGE_RE = /^Slippage ([0-9]+(?:\.[0-9]+)?)% exceeds limit ([0-9]+(?:\.[0-9]+)?)%$/;
+const DUST_RE = /^Exit remainder ([0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?) below exchange minimum ([0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?); absorbed to complete delivery$/i;
+function compactDecimal(raw: string): string {
+  const num = Number(raw);
+  if (!Number.isFinite(num)) return raw;
+  return Number(num.toPrecision(6)).toString();
+}
 function durationText(seconds: number, t: ReturnType<typeof useI18n>["t"]): string {
   const total = Math.floor(seconds);
   if (total < 120) return t("duration.seconds", { n: total });
@@ -66,6 +90,10 @@ function parseGuardDetails(reason: string, t: ReturnType<typeof useI18n>["t"]): 
   const slippage = SLIPPAGE_RE.exec(reason);
   if (slippage) {
     return t("reasonDetail.slippageGuard", { measured: slippage[1], limit: slippage[2] });
+  }
+  const dust = DUST_RE.exec(reason);
+  if (dust) {
+    return t("reasonDetail.exitDustAbsorbed", { rem: compactDecimal(dust[1]), min: compactDecimal(dust[2]) });
   }
   return null;
 }

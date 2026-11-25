@@ -108,9 +108,10 @@ function jump(key: string) {
           </p>
         </div>
       </div>
-      <nav class="flex flex-wrap items-center gap-1.5 border-t border-border/50 px-4 py-2.5 sm:px-5" :aria-label="t('tel.jumpNav')">
+      <!-- 手机上单行横向滑动，不占多行高度。 -->
+      <nav class="flex flex-nowrap items-center gap-1.5 overflow-x-auto border-t border-border/50 px-4 py-2.5 no-scrollbar sm:flex-wrap sm:px-5" :aria-label="t('tel.jumpNav')">
         <template v-for="item in SECTIONS" :key="item.key">
-          <button v-if="item.key !== 'timeline' || $slots.aside" type="button" class="chip-button gap-1.5 font-sans" @click="jump(item.key)">
+          <button v-if="item.key !== 'timeline' || $slots.aside" type="button" class="chip-button shrink-0 gap-1.5 whitespace-nowrap font-sans" @click="jump(item.key)">
             <component :is="item.icon" :size="14" aria-hidden="true" />{{ t(item.label) }}
           </button>
         </template>

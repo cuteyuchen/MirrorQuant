@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, onActivated, onMounted, ref } from "vue";
-import { KeyRound, Plus, RefreshCw, Trash2 } from "lucide-vue-next";
+import { Check, Copy, KeyRound, Plus, RefreshCw, Trash2 } from "lucide-vue-next";
 import { api, ApiError, isCancelled } from "@/api/client";
 import { useAsyncAction } from "@/composables/useAsyncAction";
+import { useUiStore } from "@/stores/ui";
 import { useI18n } from "@/i18n";
 import type { AdminUserBinding, AdminUserDetail, AdminUserSummary, InviteCode } from "@/types/api";
 import { formatDateTime, formatQty, formatUsd } from "@/utils/format";
@@ -14,7 +15,10 @@ import PageHeader from "@/components/PageHeader.vue";
 
 defineOptions({ name: "UsersView" });
 const { t } = useI18n();
+const ui = useUiStore();
 const { pending, error, run } = useAsyncAction();
+const copiedInviteId = ref<number | null>(null);
+const hasInactiveInvites = computed(() => invites.value.some(code => inviteStatus(code) !== "active"));
 const users = ref<AdminUserSummary[]>([]);
 const invites = ref<InviteCode[]>([]);
 const loading = ref(false);
@@ -141,6 +145,28 @@ async function revokeInvite(code: InviteCode) {
     if (index >= 0 && updated?.item) invites.value[index] = updated.item;
   }, { confirm: { title: t("invites.revoke"), message: t("invites.revokeConfirm", { code: code.code }) }, success: t("invites.revoked") });
 }
+async function deleteInvite(code: InviteCode) {
+  await run(async () => {
+    await api.delete(`/api/admin/invite-codes/${code.id}`);
+    invites.value = invites.value.filter(item => item.id !== code.id);
+  }, { confirm: { title: t("invites.delete"), message: t("invites.deleteConfirm", { code: code.code }) } });
+}
+async function cleanupInvites() {
+  const inactiveCount = invites.value.filter(item => inviteStatus(item) !== "active").length;
+  await run(async () => {
+    const res = await api.delete<{ deleted?: number; deletedCount?: number; count?: number }>("/api/admin/invite-codes?inactive_only=true");
+    invites.value = invites.value.filter(item => inviteStatus(item) === "active");
+    return res?.deleted ?? res?.deletedCount ?? res?.count ?? inactiveCount;
+  }, { confirm: { title: t("invites.cleanup"), message: t("invites.cleanupConfirm") }, success: t("invites.cleaned", { n: inactiveCount }) });
+}
+async function copyInvite(code: InviteCode) {
+  try {
+    await navigator.clipboard?.writeText(code.code);
+    copiedInviteId.value = code.id;
+    ui.toast(t("invites.copied"));
+    setTimeout(() => { if (copiedInviteId.value === code.id) copiedInviteId.value = null; }, 2000);
+  } catch { /* ignore clipboard errors in restricted contexts */ }
+}
 function bindingPositions(binding: AdminUserBinding) { return binding.openPositions ?? []; }
 onMounted(() => { void load(); });
 onActivated(() => { void load(); });
@@ -157,38 +183,58 @@ onActivated(() => { void load(); });
 
     <section class="card space-y-4 p-4" :aria-label="t('invites.title')">
       <div class="flex flex-wrap items-center justify-between gap-3">
-        <h2 class="section-title">{{ t("invites.title") }}</h2>
+        <div class="flex flex-wrap items-center gap-3">
+          <h2 class="section-title">{{ t("invites.title") }}</h2>
+          <button v-if="hasInactiveInvites" type="button" class="button-secondary min-h-9 px-3 py-1 text-xs" :disabled="pending" @click="cleanupInvites">
+            <Trash2 :size="14" />{{ t("invites.cleanup") }}
+          </button>
+        </div>
         <form class="flex flex-wrap items-end gap-3" @submit.prevent="createInvite">
-          <label class="field-label">{{ t("invites.maxUses") }}<input v-model.number="inviteMaxUses" name="maxUses" class="form-input mt-1 w-24" type="number" min="1" required /></label>
-          <label class="field-label">{{ t("invites.expiresAt") }}<input v-model="inviteExpiresAt" name="expiresAt" class="form-input mt-1" type="datetime-local" /></label>
+          <label class="field-label flex flex-col">{{ t("invites.maxUses") }}<input v-model.number="inviteMaxUses" name="maxUses" class="form-input mt-1 w-24" type="number" min="1" required /></label>
+          <label class="field-label flex flex-col">{{ t("invites.expiresAt") }}<input v-model="inviteExpiresAt" name="expiresAt" class="form-input mt-1" type="datetime-local" /></label>
           <button type="submit" class="button-primary" :disabled="inviteBusy || pending"><Plus :size="17" />{{ t("invites.create") }}</button>
         </form>
       </div>
       <p v-if="inviteError" class="error-banner" role="alert">{{ inviteError }}</p>
       <EmptyState v-if="!invites.length && !loading" :title="t('invites.empty')" />
-      <div v-else class="divide-y divide-border/50">
-        <article v-for="code in invites" :key="code.id" class="flex flex-wrap items-center gap-x-4 gap-y-2 py-3">
-          <code class="min-w-0 flex-1 break-all font-mono text-sm font-semibold">{{ code.code }}</code>
-          <span class="pill" :class="inviteStatus(code) === 'active' ? 'tone-success' : inviteStatus(code) === 'revoked' ? 'tone-danger' : 'tone-warning'">{{ t(inviteStatusKey[inviteStatus(code)] ?? "common.unknown") }}</span>
-          <span class="text-sm text-muted">{{ t("invites.usedCount") }} {{ code.usedCount ?? "—" }} / {{ code.maxUses ?? "—" }}</span>
-          <span class="text-sm text-muted">{{ code.expiresAt ? formatDateTime(code.expiresAt, { short: true, withSeconds: false }) : t("invites.noExpiry") }}</span>
-          <span class="text-sm text-muted">{{ t("invites.createdBy") }} {{ code.createdByUsername ?? t("common.unknown") }}</span>
-          <button type="button" class="button-secondary" :disabled="pending || inviteStatus(code) !== 'active'" @click="revokeInvite(code)">{{ t("invites.revoke") }}</button>
+      <div v-else class="grid gap-2.5">
+        <article v-for="code in invites" :key="code.id" class="flex flex-col gap-2 rounded-xl border border-border/50 bg-background/40 p-3">
+          <div class="flex items-center justify-between gap-2">
+            <div class="flex min-w-0 flex-1 items-center gap-2 overflow-x-auto no-scrollbar">
+              <code class="whitespace-nowrap font-mono text-sm font-bold tracking-wide text-foreground">{{ code.code }}</code>
+              <button type="button" class="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border/50 text-muted hover:bg-surface2 hover:text-foreground" :aria-label="t('invites.copy')" :title="t('invites.copy')" @click="copyInvite(code)">
+                <Check v-if="copiedInviteId === code.id" :size="14" class="text-success" />
+                <Copy v-else :size="14" />
+              </button>
+            </div>
+            <span class="pill shrink-0" :class="inviteStatus(code) === 'active' ? 'tone-success' : inviteStatus(code) === 'revoked' ? 'tone-danger' : 'tone-warning'">{{ t(inviteStatusKey[inviteStatus(code)] ?? "common.unknown") }}</span>
+          </div>
+          <div class="flex flex-wrap items-center justify-between gap-2 text-xs text-muted">
+            <div class="flex flex-wrap items-center gap-x-3 gap-y-1">
+              <span>{{ t("invites.usedCount") }} <strong class="font-mono text-foreground">{{ code.usedCount ?? "—" }} / {{ code.maxUses ?? "—" }}</strong></span>
+              <span>{{ code.expiresAt ? formatDateTime(code.expiresAt, { short: true, withSeconds: false }) : t("invites.noExpiry") }}</span>
+              <span>{{ t("invites.createdBy") }} {{ code.createdByUsername ?? t("common.unknown") }}</span>
+            </div>
+            <div class="flex items-center gap-2">
+              <button v-if="inviteStatus(code) === 'active'" type="button" class="button-secondary min-h-8 px-2.5 py-1 text-xs" :disabled="pending" @click="revokeInvite(code)">{{ t("invites.revoke") }}</button>
+              <button type="button" class="button-danger min-h-8 px-2.5 py-1 text-xs" :disabled="pending" :aria-label="`${t('invites.delete')} ${code.code}`" @click="deleteInvite(code)"><Trash2 :size="13" />{{ t("invites.delete") }}</button>
+            </div>
+          </div>
         </article>
       </div>
     </section>
 
     <DataTable :rows="rows" :label="t('users.title')" :row-key="row => row.id" :loading="loading" :error="loadError" :empty="t('users.empty')" selectable :expanded="expanded" @select="selectUser" @retry="load(true)" :columns="[
-      { key: 'user', label: t('users.username'), width: '16%', mobileWide: true },
-      { key: 'role', label: t('users.role'), width: '10%' },
-      { key: 'status', label: t('users.status'), width: '9%' },
-      { key: 'accounts', label: t('users.accounts'), numeric: true, width: '7%' },
-      { key: 'bindings', label: t('users.bindings'), numeric: true, width: '7%' },
-      { key: 'enabled', label: t('users.enabledBindings'), numeric: true, width: '9%' },
-      { key: 'positions', label: t('users.openPositions'), numeric: true, width: '8%' },
+      { key: 'user', label: t('users.username'), width: '14%', mobileWide: true },
+      { key: 'role', label: t('users.role'), width: '9%' },
+      { key: 'status', label: t('users.status'), width: '8%' },
+      { key: 'accounts', label: t('users.accounts'), numeric: true, width: '6%' },
+      { key: 'bindings', label: t('users.bindings'), numeric: true, width: '6%' },
+      { key: 'enabled', label: t('users.enabledBindings'), numeric: true, width: '8%' },
+      { key: 'positions', label: t('users.openPositions'), numeric: true, width: '7%' },
       { key: 'equity', label: t('users.equity'), numeric: true, width: '11%' },
-      { key: 'lastLogin', label: t('users.lastLogin'), width: '12%' },
-      { key: 'actions', label: t('common.actions'), width: '11%' },
+      { key: 'lastLogin', label: t('users.lastLogin'), width: '11%' },
+      { key: 'actions', label: t('common.actions'), width: '20%' },
     ]">
       <template #cell-user="{ row }"><p class="min-w-0 flex-1 font-semibold [overflow-wrap:anywhere]">{{ row.username }}</p><p class="text-xs text-muted">{{ t("users.createdAt") }} {{ formatDateTime(row.createdAt, { short: true, withSeconds: false }) }}</p></template>
       <template #cell-role="{ row }"><span class="pill" :class="row.role === 'admin' ? 'tone-accent' : ''">{{ t(row.role === "admin" ? "users.roleAdmin" : "users.roleUser") }}</span></template>
@@ -201,13 +247,47 @@ onActivated(() => { void load(); });
       <template #cell-lastLogin="{ row }"><span class="text-sm text-muted">{{ formatDateTime(row.lastLoginAt, { short: true, withSeconds: false }) }}</span></template>
       <template #cell-actions="{ row }">
         <div class="flex flex-wrap items-center justify-end gap-1">
-          <button type="button" class="button-secondary" :disabled="pending" @click="toggleActive(row)">{{ t(row.isActive === true ? "common.disable" : "common.enable") }}</button>
-          <button type="button" class="button-secondary" :disabled="pending" @click="changeRole(row)">{{ t(row.role === "admin" ? "users.makeUser" : "users.makeAdmin") }}</button>
-          <button type="button" class="icon-button" :disabled="pending" :aria-label="t('users.resetPassword')" :title="t('users.resetPassword')" @click="openReset(row)"><KeyRound :size="17" /></button>
-          <button type="button" class="icon-button text-danger" :disabled="pending" :aria-label="t('common.delete')" :title="t('common.delete')" @click="deleteUser(row)"><Trash2 :size="17" /></button>
+          <button type="button" class="button-secondary min-h-8 whitespace-nowrap px-2.5 py-1 text-xs" :disabled="pending" @click="toggleActive(row)">{{ t(row.isActive === true ? "common.disable" : "common.enable") }}</button>
+          <button type="button" class="button-secondary min-h-8 whitespace-nowrap px-2.5 py-1 text-xs" :disabled="pending" @click="changeRole(row)">{{ t(row.role === "admin" ? "users.makeUser" : "users.makeAdmin") }}</button>
+          <button type="button" class="icon-button h-8 w-8" :disabled="pending" :aria-label="t('users.resetPassword')" :title="t('users.resetPassword')" @click="openReset(row)"><KeyRound :size="16" /></button>
+          <button type="button" class="icon-button h-8 w-8 text-danger" :disabled="pending" :aria-label="t('common.delete')" :title="t('common.delete')" @click="deleteUser(row)"><Trash2 :size="16" /></button>
         </div>
       </template>
       <template #select-label>{{ t("common.details") }}</template>
+      <template #mobile-card="{ row }">
+        <div class="space-y-2.5">
+          <div class="flex items-start justify-between gap-2">
+            <div class="min-w-0 flex-1">
+              <div class="flex flex-wrap items-center gap-2">
+                <p class="font-bold [overflow-wrap:anywhere]">{{ row.username }}</p>
+                <span class="pill" :class="row.role === 'admin' ? 'tone-accent' : ''">{{ t(row.role === "admin" ? "users.roleAdmin" : "users.roleUser") }}</span>
+                <span class="text-xs font-medium" :class="row.isActive === true ? 'text-success' : 'text-warning'">{{ t(row.isActive === true ? "users.active" : "users.inactive") }}</span>
+              </div>
+              <p class="mt-0.5 text-xs text-muted">{{ t("users.lastLogin") }} {{ formatDateTime(row.lastLoginAt, { short: true, withSeconds: false }) }}</p>
+            </div>
+          </div>
+          <div class="grid grid-cols-3 gap-2 rounded-lg bg-background/40 px-2.5 py-2 text-xs">
+            <div>
+              <span class="text-muted">{{ t("users.accounts") }} / {{ t("users.bindings") }}</span>
+              <p class="mt-0.5 font-mono font-semibold tabular-nums">{{ row.accountCount ?? "—" }} / {{ row.enabledBindingCount ?? "—" }}/{{ row.bindingCount ?? "—" }}</p>
+            </div>
+            <div>
+              <span class="text-muted">{{ t("users.openPositions") }}</span>
+              <p class="mt-0.5 font-mono font-semibold tabular-nums">{{ row.openPositionCount ?? "—" }}</p>
+            </div>
+            <div class="text-right">
+              <span class="text-muted">{{ t("users.equity") }}</span>
+              <p class="mt-0.5 font-mono font-semibold tabular-nums">{{ formatUsd(row.totalEquity) }}</p>
+            </div>
+          </div>
+          <div class="flex flex-wrap items-center justify-end gap-1.5 border-t border-border/40 pt-2" @click.stop>
+            <button type="button" class="button-secondary min-h-8 px-2.5 py-1 text-xs" :disabled="pending" @click="toggleActive(row)">{{ t(row.isActive === true ? "common.disable" : "common.enable") }}</button>
+            <button type="button" class="button-secondary min-h-8 px-2.5 py-1 text-xs" :disabled="pending" @click="changeRole(row)">{{ t(row.role === "admin" ? "users.makeUser" : "users.makeAdmin") }}</button>
+            <button type="button" class="icon-button h-8 w-8" :disabled="pending" :aria-label="t('users.resetPassword')" :title="t('users.resetPassword')" @click="openReset(row)"><KeyRound :size="15" /></button>
+            <button type="button" class="icon-button h-8 w-8 text-danger" :disabled="pending" :aria-label="t('common.delete')" :title="t('common.delete')" @click="deleteUser(row)"><Trash2 :size="15" /></button>
+          </div>
+        </div>
+      </template>
       <template #details="{ row }">
         <div class="space-y-4">
           <p v-if="detailError[row.id]" class="error-banner" role="alert">{{ detailError[row.id] }}</p>

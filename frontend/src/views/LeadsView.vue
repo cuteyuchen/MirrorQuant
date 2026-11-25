@@ -62,24 +62,33 @@ const summary = computed(() => t("leads.summary", {
   unknown: leads.value.filter(lead => stale(lead) == null || positionCount(lead) == null || lead.isEnabled == null).length,
 }));
 const columns = computed<TableColumn[]>(() => [
-  { key: "name", label: t("common.name"), width: "20%", mobileWide: true },
-  // 固定操作列包含 44px 触控目标和左右内边距，不能被百分比挤窄。
-  // 手机卡片全部单列：开关与数字混在双栏网格里基线对不齐，看着错乱。
-  { key: "enabled", label: t("common.enable"), width: "68px", mobileWide: true },
-  { key: "positions", label: t("leads.openPositions"), numeric: true, mobileWide: true },
-  { key: "today", label: t("leads.todayActivity"), numeric: true, mobileWide: true },
-  { key: "pnl", label: t("leads.todayRealized"), numeric: true, mobileWide: true },
-  { key: "action", label: t("leads.latestAction"), width: "16%", mobileWide: true },
-  { key: "freshness", label: t("board.snapshot"), width: "14%", mobileWide: true },
-  { key: "followers", label: t("leads.followerAccounts"), numeric: true, mobileWide: true },
-  { key: "public", label: t("leads.publicCol"), width: "68px", mobileWide: true },
-  { key: "slotWatch", label: t("leads.slotWatchCol"), width: "68px", mobileWide: true },
-  { key: "actions", label: t("common.actions"), width: "68px", mobileWide: true },
+  { key: "name", label: t("common.name"), width: "17%", mobileWide: true },
+  // 开关与数字列留足不折行宽度，避免 1280px 桌面上数字折行或横向溢出。
+  { key: "enabled", label: t("common.enable"), width: "54px", mobileWide: true },
+  { key: "positions", label: t("leads.openPositions"), width: "7%", numeric: true, mobileWide: true },
+  { key: "today", label: t("leads.todayActivity"), width: "8%", numeric: true, mobileWide: true },
+  { key: "pnl", label: t("leads.todayRealized"), width: "10%", numeric: true, mobileWide: true },
+  { key: "action", label: t("leads.latestAction"), width: "14%", mobileWide: true },
+  { key: "freshness", label: t("board.snapshot"), width: "13%", mobileWide: true },
+  { key: "followers", label: t("leads.followerAccounts"), width: "6%", numeric: true, mobileWide: true },
+  { key: "public", label: t("leads.publicCol"), width: "54px", mobileWide: true },
+  { key: "slotWatch", label: t("leads.slotWatchCol"), width: "54px", mobileWide: true },
+  { key: "actions", label: t("common.actions"), width: "54px", mobileWide: true },
 ]);
 interface LatestAction { time: number | null; symbol: string | null; side: string | null; qty: number | null; action: string | null; direction: string | null }
 function latestAction(lead: Lead): LatestAction | null {
   const event = [...(boardLead(lead)?.todayEvents ?? [])].sort((a, b) => (b.time ?? -Infinity) - (a.time ?? -Infinity))[0];
   if (event) return { time: event.time, symbol: event.symbol, side: event.side, qty: event.qty, action: event.action, direction: null };
+  if (lead.latestAction) {
+    return {
+      time: timestampMs(lead.latestAction.time),
+      symbol: lead.latestAction.symbol ?? null,
+      side: lead.latestAction.side ?? null,
+      qty: lead.latestAction.qty ?? null,
+      action: null,
+      direction: telemetryDirectionLabel(lead.latestAction.direction),
+    };
+  }
   const snapshot = cache.leadSnapshots[lead.id]?.data ?? lead.snapshot;
   const order = [...(snapshot?.orders ?? [])].sort((a, b) => (b.time ?? b.t ?? -Infinity) - (a.time ?? a.t ?? -Infinity))[0];
   if (order) return { time: order.time ?? order.t ?? null, symbol: order.symbol ?? null, side: telemetrySide(order.dir, order.qty ?? order.q), qty: order.qty ?? order.q ?? null, action: null, direction: telemetryDirectionLabel(order.dir) };
@@ -126,25 +135,11 @@ async function load(force = false) {
   const request = ++loadSequence;
   loading.value = true;
   if (force) { loadError.value = ""; actionError.value = ""; }
-  try {
-    await Promise.all([cache.fetchLeads(force), cache.fetchProxies(force), cache.fetchBindings(force), cache.fetchBoard(force)]);
-    if (request !== loadSequence) return;
-    // 今日没有事件时按需补取最近订单，避免只能显示列表中的一个历史时间。
-    const recent = leads.value.filter(lead => {
-      const last = timestampMs(lead.lastTradeTime);
-      const latest = latestAction(lead);
-      return !boardLead(lead)?.todayEvents?.length && last != null &&
-        (latest?.symbol == null || latest.time == null || latest.time < last);
-    });
-    await Promise.all(recent.map(lead => {
-      const latest = latestAction(lead);
-      const newer = cache.leadSnapshots[lead.id] != null && latest?.time != null && latest.time < timestampMs(lead.lastTradeTime)!;
-      return cache.fetchLeadSnapshot(lead.id, force || newer, 60_000);
-    }));
-    if (request === loadSequence) loadError.value = "";
-  } catch (cause: unknown) {
-    if (request === loadSequence && !isCancelled(cause)) loadError.value = errorMessage(cause);
-  } finally { if (request === loadSequence) loading.value = false; }
+  const results = await Promise.allSettled([cache.fetchLeads(force), cache.fetchProxies(force), cache.fetchBindings(force), cache.fetchBoard(force)]);
+  if (request !== loadSequence) return;
+  if (results[0].status === "fulfilled") loadError.value = "";
+  else if (!isCancelled(results[0].reason)) loadError.value = errorMessage(results[0].reason);
+  loading.value = false;
 }
 function environments(lead: Lead) { return (cache.bindings?.data.items || []).filter(binding => binding.leadId === lead.id).map(binding => binding.accountEnvironment); }
 function edit(lead: Lead | null) {
@@ -199,7 +194,7 @@ async function operate(lead: Lead, operation: "toggle" | "delete") {
   if (operation === "toggle" && lead.isEnabled == null) return;
   const title = t(operation === "delete" ? "common.delete" : lead.isEnabled ? "common.disable" : "common.enable");
   const result = await run(async () => {
-    if (operation === "delete") await api.delete(`/api/leads/${lead.id}`);
+    if (operation === "delete") await api.delete(`/api/leads/${lead.id}?auto_disable=true`);
     else await api.put(`/api/leads/${lead.id}`, { isEnabled: !lead.isEnabled });
   }, { confirm: { title, message: t(operation === "delete" ? "confirm.delete" : "confirm.toggle", { name: lead.name || "—", action: title }),
     environments: environments(lead), strong: !cache.bindings || environments(lead).some(environment => environment == null) || (operation === "toggle" && !lead.isEnabled) } });
@@ -264,13 +259,75 @@ onUnmounted(stop);
       <template #cell-enabled="{ row }"><button class="icon-button" role="switch" :aria-checked="row.isEnabled === true" :disabled="pending || row.isEnabled == null" :aria-label="t('leads.enableSwitch', { name: row.name ?? t('common.unknown') })" :title="t(row.isEnabled == null ? 'state.UNKNOWN' : row.isEnabled ? 'common.disable' : 'common.enable')" @click="operate(row, 'toggle')"><span class="relative h-5 w-9 rounded-full" :class="row.isEnabled ? 'bg-accent' : 'bg-surface3'" aria-hidden="true"><span class="absolute top-1 h-3 w-3 rounded-full bg-foreground" :class="row.isEnabled ? 'right-1' : 'left-1'" /></span></button></template>
       <template #cell-public="{ row }"><button class="icon-button" role="switch" :aria-checked="row.isPublicDashboard === true" :disabled="pending || row.isPublicDashboard == null" :aria-label="t('leads.publicSwitch', { name: row.name ?? t('common.unknown') })" :title="t('leads.publicSwitch', { name: row.name ?? t('common.unknown') })" @click="togglePublic(row)"><span class="relative h-5 w-9 rounded-full" :class="row.isPublicDashboard ? 'bg-accent' : 'bg-surface3'" aria-hidden="true"><span class="absolute top-1 h-3 w-3 rounded-full bg-foreground" :class="row.isPublicDashboard ? 'right-1' : 'left-1'" /></span></button></template>
       <template #cell-slotWatch="{ row }"><button class="icon-button" role="switch" :aria-checked="row.slotWatchEnabled === true" :disabled="pending || row.slotWatchEnabled == null" :aria-label="t('leads.slotWatchSwitch', { name: row.name ?? t('common.unknown') })" :title="t('leads.slotWatchSwitch', { name: row.name ?? t('common.unknown') })" @click="toggleSlotWatch(row)"><span class="relative h-5 w-9 rounded-full" :class="row.slotWatchEnabled ? 'bg-accent' : 'bg-surface3'" aria-hidden="true"><span class="absolute top-1 h-3 w-3 rounded-full bg-foreground" :class="row.slotWatchEnabled ? 'right-1' : 'left-1'" /></span></button></template>
-      <template #cell-positions="{ row }"><span class="text-base font-semibold">{{ formatQty(positionCount(row)) }}</span></template>
-      <template #cell-today="{ row }"><span>{{ formatQty(boardLead(row)?.todayOpenCount) }} / {{ formatQty(boardLead(row)?.todayCloseCount) }}</span></template>
-      <template #cell-pnl="{ row }"><span class="font-semibold" :class="pnlClass(boardLead(row)?.todayRealizedPnl)">{{ signedUsd(boardLead(row)?.todayRealizedPnl) }}</span></template>
+      <template #cell-positions="{ row }"><span class="whitespace-nowrap text-base font-semibold">{{ formatQty(positionCount(row)) }}</span></template>
+      <template #cell-today="{ row }"><span class="whitespace-nowrap">{{ formatQty(boardLead(row)?.todayOpenCount) }} / {{ formatQty(boardLead(row)?.todayCloseCount) }}</span></template>
+      <template #cell-pnl="{ row }"><span class="whitespace-nowrap font-semibold" :class="pnlClass(boardLead(row)?.todayRealizedPnl)">{{ signedUsd(boardLead(row)?.todayRealizedPnl) }}</span></template>
       <template #cell-action="{ row }"><template v-if="latestAction(row)"><p class="break-words text-xs font-medium">{{ latestAction(row)?.symbol ?? t("common.unknown") }} · {{ sideLabel(latestAction(row)?.side, latestAction(row)?.qty) }}</p><p v-if="latestAction(row)?.action || latestAction(row)?.direction" class="mt-1 text-xs text-muted">{{ latestAction(row)?.direction ?? actionLabel(latestAction(row)?.action) }}</p><time class="mt-1 block text-xs tabular-nums text-muted">{{ formatDateTime(latestAction(row)?.time, { short: true, withSeconds: false }) }}</time></template><span v-else class="text-xs text-muted">{{ t("leads.noRecentAction") }}</span></template>
       <template #cell-freshness="{ row }"><div class="flex flex-wrap items-center gap-2"><StatusBadge :state="row.isEnabled === false ? 'DISABLED' : stale(row) === true ? 'STALE' : row.status" /><FreshnessStamp v-if="boardLead(row)" :seconds="boardLead(row)?.snapshotAgeSec" :received-at="cache.board?.fetchedAt" :stale="stale(row)" /><FreshnessStamp v-else-if="row.snapshotAgeSec != null" :seconds="row.snapshotAgeSec" :received-at="cache.leads?.fetchedAt" :stale="row.stale" /><FreshnessStamp v-else :timestamp="row.lastSyncAt" :stale="row.stale" /></div><p v-if="row.lastError" class="mt-1 break-words text-xs text-danger">{{ reasonText(row.lastError) }}</p></template>
       <template #cell-followers="{ row }"><span>{{ formatQty(followerCount(row)) }}</span></template>
       <template #cell-actions="{ row }"><MoreMenu><button class="button-secondary justify-start" :disabled="pending" @click="edit(row)"><Pencil :size="16" />{{ t("common.edit") }}</button><button class="button-secondary justify-start" :disabled="pending" @click="sync(row)"><RefreshCw :size="16" />{{ t("leads.syncNow") }}</button><button class="button-danger justify-start" :disabled="pending" @click="operate(row, 'delete')"><Trash2 :size="16" />{{ t("common.delete") }}</button></MoreMenu></template>
+      <template #mobile-card="{ row }">
+        <div class="space-y-3">
+          <div class="flex items-start gap-3">
+            <img v-if="leadAvatar(row)" :src="leadAvatar(row) ?? undefined" :alt="row.name ?? t('common.unknown')" width="36" height="36" class="h-9 w-9 shrink-0 rounded-full object-cover" />
+            <span v-else class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-surface3 text-xs font-semibold text-muted" aria-hidden="true">{{ row.name?.slice(0, 2) ?? t("common.unknown") }}</span>
+            <div class="min-w-0 flex-1">
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <RouterLink :to="`/leads/${row.id}`" class="truncate text-sm font-bold hover:text-accent" @click.stop>{{ row.name ?? t("common.unknown") }}</RouterLink>
+                <StatusBadge :state="row.isEnabled === false ? 'DISABLED' : stale(row) === true ? 'STALE' : row.status" />
+              </div>
+              <div class="mt-0.5 flex flex-wrap items-center gap-2 text-xs text-muted">
+                <span class="truncate font-mono">{{ row.portfolioId ?? t("common.unknown") }}</span>
+                <FreshnessStamp v-if="boardLead(row)" :seconds="boardLead(row)?.snapshotAgeSec" :received-at="cache.board?.fetchedAt" :stale="stale(row)" />
+                <FreshnessStamp v-else-if="row.snapshotAgeSec != null" :seconds="row.snapshotAgeSec" :received-at="cache.leads?.fetchedAt" :stale="row.stale" />
+                <FreshnessStamp v-else :timestamp="row.lastSyncAt" :stale="row.stale" />
+              </div>
+            </div>
+          </div>
+          <p v-if="row.lastError" class="text-xs text-danger">{{ reasonText(row.lastError) }}</p>
+          <div class="grid grid-cols-3 gap-2 rounded-lg bg-background/40 px-2.5 py-2 text-xs">
+            <div>
+              <span class="text-muted">{{ t("leads.openPositions") }}</span>
+              <p class="mt-0.5 font-mono text-sm font-bold tabular-nums">{{ formatQty(positionCount(row)) }}</p>
+            </div>
+            <div>
+              <span class="text-muted">{{ t("leads.todayActivity") }}</span>
+              <p class="mt-0.5 font-mono font-semibold tabular-nums">{{ formatQty(boardLead(row)?.todayOpenCount) }} / {{ formatQty(boardLead(row)?.todayCloseCount) }}</p>
+            </div>
+            <div class="text-right">
+              <span class="text-muted">{{ t("leads.todayRealized") }}</span>
+              <p class="mt-0.5 font-mono font-semibold tabular-nums" :class="pnlClass(boardLead(row)?.todayRealizedPnl)">{{ signedUsd(boardLead(row)?.todayRealizedPnl) }}</p>
+            </div>
+          </div>
+          <div class="flex flex-wrap items-center justify-between gap-2 text-xs text-muted">
+            <span v-if="latestAction(row)" class="min-w-0 truncate">
+              {{ latestAction(row)?.symbol ?? t("common.unknown") }} · {{ sideLabel(latestAction(row)?.side, latestAction(row)?.qty) }}
+              <template v-if="latestAction(row)?.direction || latestAction(row)?.action"> · {{ latestAction(row)?.direction ?? actionLabel(latestAction(row)?.action) }}</template>
+            </span>
+            <span v-else>{{ t("leads.noRecentAction") }}</span>
+            <span class="shrink-0">{{ t("leads.followerAccounts") }} {{ formatQty(followerCount(row)) }}</span>
+          </div>
+          <div class="flex flex-wrap items-center justify-between gap-2 border-t border-border/40 pt-2">
+            <div class="flex flex-wrap items-center gap-3 text-xs">
+              <label class="inline-flex items-center gap-1.5" @click.stop>
+                <button class="inline-flex items-center" role="switch" :aria-checked="row.isEnabled === true" :disabled="pending || row.isEnabled == null" :aria-label="t('leads.enableSwitch', { name: row.name ?? t('common.unknown') })" @click.stop="operate(row, 'toggle')"><span class="relative h-5 w-9 rounded-full" :class="row.isEnabled ? 'bg-accent' : 'bg-surface3'" aria-hidden="true"><span class="absolute top-1 h-3 w-3 rounded-full bg-foreground" :class="row.isEnabled ? 'right-1' : 'left-1'" /></span></button>
+                <span class="text-muted">{{ t("common.enable") }}</span>
+              </label>
+              <label class="inline-flex items-center gap-1.5" @click.stop>
+                <button class="inline-flex items-center" role="switch" :aria-checked="row.isPublicDashboard === true" :disabled="pending || row.isPublicDashboard == null" :aria-label="t('leads.publicSwitch', { name: row.name ?? t('common.unknown') })" @click.stop="togglePublic(row)"><span class="relative h-5 w-9 rounded-full" :class="row.isPublicDashboard ? 'bg-accent' : 'bg-surface3'" aria-hidden="true"><span class="absolute top-1 h-3 w-3 rounded-full bg-foreground" :class="row.isPublicDashboard ? 'right-1' : 'left-1'" /></span></button>
+                <span class="text-muted">{{ t("leads.publicCol") }}</span>
+              </label>
+              <label class="inline-flex items-center gap-1.5" @click.stop>
+                <button class="inline-flex items-center" role="switch" :aria-checked="row.slotWatchEnabled === true" :disabled="pending || row.slotWatchEnabled == null" :aria-label="t('leads.slotWatchSwitch', { name: row.name ?? t('common.unknown') })" @click.stop="toggleSlotWatch(row)"><span class="relative h-5 w-9 rounded-full" :class="row.slotWatchEnabled ? 'bg-accent' : 'bg-surface3'" aria-hidden="true"><span class="absolute top-1 h-3 w-3 rounded-full bg-foreground" :class="row.slotWatchEnabled ? 'right-1' : 'left-1'" /></span></button>
+                <span class="text-muted">{{ t("leads.slotWatchCol") }}</span>
+              </label>
+            </div>
+            <div @click.stop>
+              <MoreMenu><button class="button-secondary justify-start" :disabled="pending" @click="edit(row)"><Pencil :size="16" />{{ t("common.edit") }}</button><button class="button-secondary justify-start" :disabled="pending" @click="sync(row)"><RefreshCw :size="16" />{{ t("leads.syncNow") }}</button><button class="button-danger justify-start" :disabled="pending" @click="operate(row, 'delete')"><Trash2 :size="16" />{{ t("common.delete") }}</button></MoreMenu>
+            </div>
+          </div>
+        </div>
+      </template>
       <template #select-label>{{ t("common.details") }}</template>
     </DataTable>
     <BaseModal :open="showModal" :title="t(editing ? 'leads.editTitle' : 'leads.modalAddTitle')" :busy="pending" @close="showModal = false">
@@ -278,22 +335,22 @@ onUnmounted(stop);
         <p v-if="actionError" class="error-banner" role="alert">{{ actionError }}</p>
         <label class="field-label">{{ t("common.name") }} *<input v-model="form.name" name="name" class="form-input mt-1" :aria-invalid="!!errors.name" required maxlength="120" /><span v-if="errors.name" class="field-error" role="alert">{{ errors.name }}</span></label>
         <div v-if="!editing"><label class="field-label">{{ t("leads.portfolioId") }} *<input v-model="form.portfolioId" name="portfolioId" class="form-input mt-1" :aria-invalid="!!errors.portfolio_id" required minlength="3" maxlength="100" /><span v-if="errors.portfolio_id" class="field-error" role="alert">{{ errors.portfolio_id }}</span></label><p class="mt-2 text-xs font-semibold text-muted">{{ t("leads.portfolioGuideTitle") }}</p><p class="mt-1 text-xs leading-relaxed text-muted">{{ t("leads.portfolioGuide") }}</p></div>
-        <details :open="!!(errors.poll_interval_sec || errors.proxy_id)" class="border-y border-border/50 py-2"><summary class="flex min-h-11 cursor-pointer items-center justify-between gap-2 text-sm font-semibold">{{ t("leads.extraOptions") }}<ChevronDown :size="17" /></summary><div class="mt-3 space-y-4">
+        <details :open="!!(errors.poll_interval_sec || errors.proxy_id)" class="rounded-xl border border-border/50 bg-background/40 px-3.5 py-2.5"><summary class="flex min-h-10 cursor-pointer items-center justify-between gap-2 text-sm font-semibold">{{ t("leads.extraOptions") }}<ChevronDown :size="17" /></summary><div class="mt-3 space-y-4">
           <NumberField v-model="form.pollIntervalSec" name="pollIntervalSec" :rule="POLL_RULE" :error="errors.poll_interval_sec" />
           <label class="field-label">{{ t("accts.proxy") }}<select v-model="form.proxyId" class="form-input mt-1" :aria-invalid="!!errors.proxy_id"><option :value="null">{{ t("accts.direct") }}</option><option v-for="proxy in proxies" :key="proxy.id" :value="proxy.id">{{ proxy.name ?? t("common.unknown") }}</option></select><span v-if="errors.proxy_id" class="field-error" role="alert">{{ errors.proxy_id }}</span></label>
           <label class="field-label">{{ t("leads.description") }}<textarea v-model="form.description" class="form-input mt-1" rows="2" /></label>
-          <label class="flex min-h-11 items-center gap-3 text-sm"><input v-model="form.isPublicDashboard" type="checkbox" />{{ t("leads.public") }}</label>
-          <label class="flex min-h-11 items-center gap-3 text-sm"><input v-model="form.slotWatchEnabled" type="checkbox" />{{ t("leads.slotWatch") }}</label>
+          <label class="flex min-h-10 items-center gap-3 text-sm"><input v-model="form.isPublicDashboard" type="checkbox" />{{ t("leads.public") }}</label>
+          <label class="flex min-h-10 items-center gap-3 text-sm"><input v-model="form.slotWatchEnabled" type="checkbox" />{{ t("leads.slotWatch") }}</label>
           <p class="text-xs text-muted">{{ t("leads.slotWatchHint") }}</p>
         </div></details>
-        <details class="border-y border-border/50 py-2">
-          <summary class="flex min-h-11 cursor-pointer items-center justify-between gap-2 text-sm font-semibold">
+        <details class="rounded-xl border border-border/50 bg-background/40 px-3.5 py-2.5">
+          <summary class="flex min-h-10 cursor-pointer items-center justify-between gap-2 text-sm font-semibold">
             {{ t("set.leadNotifyTitle") }}
             <ChevronDown :size="17" />
           </summary>
           <div class="mt-3 space-y-4">
             <p class="text-xs text-muted">{{ t("set.leadNotifyHint") }}</p>
-            <label class="flex min-h-11 items-center gap-3 text-sm">
+            <label class="flex min-h-10 items-center gap-3 text-sm">
               <input v-model="form.notificationEnabled" type="checkbox" />
               {{ t("set.enableChannel") }}
             </label>

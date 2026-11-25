@@ -65,17 +65,17 @@ function update<K extends keyof RiskSettings>(key: K, value: RiskSettings[K]) {
 }
 </script>
 <template>
-  <div class="space-y-5">
-    <fieldset v-for="(group, index) in groups" :key="group.title ?? 'single'" class="space-y-4" :class="{ 'border-b border-border/50 pb-5': group.title && index < groups.length - 1 }">
-      <legend v-if="group.title" class="section-title mb-4">{{ t(group.title) }}</legend>
+  <div class="space-y-4">
+    <fieldset v-for="group in groups" :key="group.title ?? 'single'" class="space-y-4" :class="group.title ? 'rounded-xl border border-border/50 bg-background/30 p-3.5 sm:p-4' : ''">
+      <legend v-if="group.title" class="section-title px-1">{{ t(group.title) }}</legend>
       <div v-if="group.switches.length" class="grid gap-3 sm:grid-cols-2">
-        <div v-for="key in group.switches" :key="key">
-          <label class="flex min-h-11 items-center gap-3 text-sm">
-            <input :checked="modelValue[key] === true" type="checkbox" :name="`${prefix}${key}`" :disabled="locked(key)" @change="update(key, ($event.target as HTMLInputElement).checked)" />{{ t(RISK_SWITCHES[key]) }}
+        <div v-for="key in group.switches" :key="key" class="rounded-lg border border-border/40 bg-surface/50 px-3 py-2">
+          <label class="flex min-h-9 items-center gap-2.5 text-sm font-medium">
+            <input :checked="modelValue[key] === true" role="switch" type="checkbox" :name="`${prefix}${key}`" :disabled="locked(key)" @change="update(key, ($event.target as HTMLInputElement).checked)" />{{ t(RISK_SWITCHES[key]) }}
             <span v-if="changed(key)" class="text-xs text-accent">{{ t("form.diffDefault") }}</span>
             <span v-if="modelValue[key] == null" class="text-warning">{{ t("state.UNKNOWN") }}</span>
           </label>
-          <p class="text-xs text-muted">{{ t(`riskHelp.${key}`) }}</p>
+          <p class="mt-1 text-xs leading-relaxed text-muted">{{ t(`riskHelp.${key}`) }}</p>
           <p v-if="errors?.[`${prefix}${key}`]" class="field-error" role="alert">{{ errors[`${prefix}${key}`] }}</p>
         </div>
       </div>

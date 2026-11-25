@@ -96,11 +96,12 @@ describe("带单员独立详情", () => {
     expect(page.find(".empty-state").exists()).toBe(true);
     page.unmount();
   });
-  it("今日没有动态时按需补取最近原始订单，保留真实开平方向", async () => {
+  it("今日没有动态时使用列表摘要的最近动作，不再逐个下载快照，保留真实开平方向", async () => {
     const cache = seed();
     const last = 1_800_000_000_000;
     cache.leads!.data[0].lastTradeTime = last;
     cache.leads!.data[1].lastTradeTime = null;
+    cache.leads!.data[0].latestAction = { time: last, symbol: "ETHUSDT", side: "SHORT", qty: 0.1, direction: "CLOSE_SHORT" };
     cache.board!.data.leads!.forEach(lead => { lead.todayEvents = []; });
     vi.mocked(cache.fetchLeadSnapshot).mockImplementation(async id => {
       const snapshot: LeadSnapshot = { profile: { lastTradeTime: last }, orders: [
@@ -114,7 +115,7 @@ describe("带单员独立详情", () => {
     await navigation.isReady();
     const page = mount(LeadsView, { global: { plugins: [navigation], stubs: { BaseModal: true } } });
     await flushPromises();
-    expect(cache.fetchLeadSnapshot).toHaveBeenCalledWith(1, false, 60_000);
+    expect(cache.fetchLeadSnapshot).not.toHaveBeenCalled();
     expect(page.text()).toContain("ETHUSDT");
     expect(page.text()).toContain(useI18n().t("dir.CLOSE_SHORT"));
     page.unmount();

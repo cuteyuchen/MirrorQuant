@@ -4,7 +4,7 @@ from app.core.time_util import to_utc_iso
 
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -109,17 +109,29 @@ async def update_proxy(
 async def delete_proxy(
     proxy_id: int,
     request: Request,
+    unassign: bool = Query(default=False),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_admin),
 ):
     node = await db.get(ProxyNode, proxy_id)
     if not node:
         raise HTTPException(status_code=404, detail="Proxy not found")
-    # SET NULL 会悄悄改为其他出口，仍被引用的代理必须先显式解绑。
-    referenced = await db.scalar(select(TradingAccount.id).where(TradingAccount.proxy_id == proxy_id).limit(1))
-    lead_reference = await db.scalar(select(LeadSource.id).where(LeadSource.proxy_id == proxy_id).limit(1))
-    if referenced is not None or lead_reference is not None:
-        raise HTTPException(status_code=409, detail="Proxy is assigned; explicitly reassign accounts and leads first")
+    # 只检查未软删除的活跃账户与带单员，忽略已删除历史行。
+    active_accounts = list((await db.scalars(select(TradingAccount).where(
+        TradingAccount.proxy_id == proxy_id, TradingAccount.deleted_at.is_(None)))).all())
+    active_leads = list((await db.scalars(select(LeadSource).where(
+        LeadSource.proxy_id == proxy_id, LeadSource.deleted_at.is_(None)))).all())
+    if active_accounts or active_leads:
+        if not unassign:
+            refs = [*(f"Account:{a.name}" for a in active_accounts), *(f"Lead:{l.name}" for l in active_leads)]
+            raise HTTPException(
+                status_code=409,
+                detail=f"Proxy is assigned; explicitly reassign accounts and leads first ({', '.join(refs[:5])})",
+            )
+        for acct in active_accounts:
+            acct.proxy_id = None
+        for lead in active_leads:
+            lead.proxy_id = None
     name = node.name
     previous_url = node.url
     await db.delete(node)

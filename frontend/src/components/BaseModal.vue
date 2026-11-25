@@ -83,13 +83,13 @@ onBeforeUnmount(cleanup);
 <template>
   <Teleport to="body">
     <!-- 详情抽屉沿用相同焦点与关闭规则，避免另一套弹层实现。 -->
-    <!-- 遮罩使用独立的 scrim 色：亮色主题下也是深色半透明，弹层始终从页面中浮出来。 -->
-    <div v-if="open" class="fixed inset-0 flex bg-scrim/70 p-3 backdrop-blur-sm sm:p-6" :style="{ zIndex: 50 + level }" :class="drawer ? 'items-start justify-end' : 'items-center justify-center'" @click.self="close">
+    <!-- 遮罩使用独立的 scrim 色：亮色主题下也是深色半透明；移动端常规弹层采用贴底抽屉式交互。 -->
+    <div v-if="open" class="fixed inset-0 flex bg-scrim/70 backdrop-blur-sm sm:p-6" :style="{ zIndex: 50 + level }" :class="drawer ? 'items-end sm:items-start justify-end p-0 sm:p-6' : 'items-end justify-center p-0 sm:items-center sm:p-6'" @click.self="close">
       <section ref="panel" role="dialog" aria-modal="true" :aria-labelledby="titleId" :aria-busy="busy"
-        tabindex="-1" class="max-h-[90vh] w-full overflow-y-auto rounded-2xl border border-border/70 bg-surface p-4 shadow-pop sm:p-6"
-        :class="drawer ? 'h-auto max-h-[90vh] sm:h-[90vh] max-w-2xl' : wide ? 'max-w-6xl' : 'max-w-xl'">
-        <header class="mb-4 flex items-center justify-between gap-3">
-          <h2 :id="titleId" class="text-lg font-bold tracking-tight">{{ title }}</h2>
+        tabindex="-1" class="max-h-[90vh] w-full overflow-y-auto border border-border/70 bg-surface p-4 shadow-pop sm:rounded-2xl sm:p-6"
+        :class="drawer ? 'h-auto max-h-[90vh] rounded-t-2xl sm:h-[90vh] max-w-2xl' : wide ? 'rounded-t-2xl max-w-6xl' : 'rounded-t-2xl max-w-xl'">
+        <header class="sticky -top-4 z-10 -mx-4 mb-4 flex items-center justify-between gap-3 border-b border-border/50 bg-surface/95 px-4 py-3 backdrop-blur sm:static sm:mx-0 sm:border-0 sm:bg-transparent sm:p-0">
+          <h2 :id="titleId" class="text-base sm:text-lg font-bold tracking-tight">{{ title }}</h2>
           <button type="button" class="icon-button shrink-0" :aria-label="t('common.close')" :title="t('common.close')" :disabled="busy" @click="close"><X :size="20" /></button>
         </header>
         <slot />

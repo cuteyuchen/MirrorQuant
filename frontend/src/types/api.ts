@@ -40,7 +40,9 @@ export type BoardEvent = NullableFields<{
 }>;
 export type BoardLead = NullableFields<{
   id: number; name: string; avatarUrl: string; status: string; enabled: boolean;
-  stale: boolean; snapshotAgeSec: number; positionShow: boolean; todayOpenCount: number;
+  stale: boolean; snapshotAgeSec: number; positionShow: boolean;
+  boundCount: number; activeBoundCount: number;
+  todayOpenCount: number;
   todayCloseCount: number; todayRealizedPnl: number; positions: BoardPosition[];
   orphans: BoardOrphan[]; todayEvents: BoardEvent[];
 }>;
@@ -61,8 +63,9 @@ export type ExecutionRecord = NullableFields<{
   positionSide: string; action: string; status: string; leadQty: number; leadPrice: number;
   leadNotional: number; myQty: number; myPrice: number; myNotional: number;
   slippagePct: number; spreadPct: number; orderId: string; details: string; createdAt: Timestamp;
-}> & { environment?: Environment | null };
-export type ExecutionsResponse = ListResponse<ExecutionRecord> & { total: number | null };
+}> & { environment?: Environment | null; bindingDeleted?: boolean | null; accountDeleted?: boolean | null };
+export type ExecutionGroupCounts = Record<"all" | "actionable" | "success" | "failed" | "skipped" | "blocked", number | null>;
+export type ExecutionsResponse = ListResponse<ExecutionRecord> & { total: number | null; counts?: ExecutionGroupCounts | null };
 export type SocketMessage = { type?: string; data?: ExecutionRecord | null };
 
 // 管理接口仍沿用现有序列化字段，与看板的新契约分开维护。
@@ -87,6 +90,7 @@ export interface Lead {
   status?: string | null; openPositionsCount?: number | null; openUnrealizedPnl?: number | null;
   stale?: boolean | null; snapshotAgeSec?: number | null; snapshot?: LeadSnapshot | null;
   positionsKnown?: boolean | null; snapshotIncomplete?: boolean | null;
+  latestAction?: { time: number | null; symbol: string | null; side: string | null; qty: number | null; direction: string | null } | null;
   notificationConfig?: NotificationSettings | null;
 }
 export interface PublicDashboardResponse {
@@ -136,6 +140,7 @@ export interface Binding {
   symbolWhitelist: string[] | null; symbolBlacklist: string[] | null; symbolMap: Record<string, string> | null;
   circuitBreakerTripped: boolean | null; circuitBreakerReason: string | null;
   consecutiveFailures: number | null; baselineSeeded: boolean | null; pendingDebtUsd: number | null;
+  todaySuccessCount?: number | null; todayFailedCount?: number | null;
 }
 export type BindingsResponse = ListResponse<Binding> & { globalKillSwitch: boolean | null };
 export interface ResilienceSettings {

@@ -123,7 +123,8 @@ async def get_user_subscriptions(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    leads = list((await db.scalars(select(LeadSource).order_by(LeadSource.id))).all())
+    leads = list((await db.scalars(select(LeadSource).where(
+        LeadSource.deleted_at.is_(None)).order_by(LeadSource.id))).all())
     subs = list((await db.scalars(
         select(UserLeadSubscription).where(UserLeadSubscription.user_id == current_user.id)
     )).all())
@@ -177,7 +178,7 @@ async def update_user_subscriptions(
 
     for item in payload.subscriptions:
         lead = await db.get(LeadSource, item.lead_id)
-        if not lead:
+        if not lead or lead.deleted_at is not None:
             continue
         sub = sub_map.get(item.lead_id)
         channels_str = json.dumps(item.channels) if item.channels is not None else None

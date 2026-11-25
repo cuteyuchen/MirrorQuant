@@ -5,10 +5,10 @@ defineProps<{ title: string; summary?: string }>();
 </script>
 <template>
   <header class="page-heading">
-    <!-- 窄屏标题区先占满一行，操作按钮换到下一行，避免摘要被按钮挤到只剩半行。 -->
-    <div class="min-w-0 flex-1 basis-full sm:basis-0">
+    <!-- 紧凑按钮与标题同行右对齐，长按钮组自动换行；避免单个刷新图标独占一整行。 -->
+    <div class="min-w-[11rem] flex-1">
       <h1 class="page-title">{{ title }}</h1>
-      <p v-if="summary" class="mt-1 text-sm text-muted" data-testid="page-summary">{{ summary }}</p>
+      <p v-if="summary" class="mt-0.5 text-xs sm:text-sm text-muted" data-testid="page-summary">{{ summary }}</p>
     </div>
     <div v-if="$slots.actions" class="flex shrink-0 flex-wrap items-center gap-2"><slot name="actions" /></div>
   </header>

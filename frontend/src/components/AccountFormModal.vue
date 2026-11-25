@@ -127,21 +127,21 @@ async function testConnection() {
         <label class="field-label">{{ t("accts.exchange") }}<select v-model="form.exchange" class="form-input mt-1"><option value="okx">{{ t("accts.exchangeOkx") }}</option><option value="binance">{{ t("accts.exchangeBinance") }}</option></select><span v-if="errors.exchange" class="field-error">{{ errors.exchange }}</span></label>
         <label class="field-label">{{ t("accts.environment") }}<select v-model="form.environment" class="form-input mt-1"><option value="demo">{{ t("accts.envDemo") }}</option><option value="live">{{ t("accts.envLive") }}</option></select><span v-if="errors.environment" class="field-error">{{ errors.environment }}</span></label>
       </div>
-      <section v-if="!currentAccount" class="space-y-4 border-t border-border/50 pt-4">
+      <section v-if="!currentAccount" class="space-y-4 rounded-xl border border-border/50 bg-background/40 p-3.5">
         <h3 class="section-title">{{ t("accts.credentials") }}</h3>
         <label class="field-label">{{ t("accts.apiKey") }} *<input v-model="form.apiKey" name="api_key" type="password" autocomplete="off" required minlength="4" maxlength="256" class="form-input mt-1" :aria-invalid="!!errors.api_key" /><span v-if="errors.api_key" class="field-error">{{ errors.api_key }}</span></label>
         <label class="field-label">{{ t("accts.secretKey") }} *<input v-model="form.secretKey" name="secret_key" type="password" autocomplete="new-password" required minlength="4" maxlength="256" class="form-input mt-1" :aria-invalid="!!errors.secret_key" /><span v-if="errors.secret_key" class="field-error">{{ errors.secret_key }}</span></label>
         <label v-if="form.exchange === 'okx'" class="field-label">{{ t("accts.passphrase") }} *<input v-model="form.passphrase" name="passphrase" type="password" autocomplete="off" required maxlength="256" class="form-input mt-1" :aria-invalid="!!errors.passphrase" /><span v-if="errors.passphrase" class="field-error">{{ errors.passphrase }}</span></label>
       </section>
       <label class="field-label">{{ t("accts.proxy") }}<select v-model="form.proxyId" class="form-input mt-1" :aria-invalid="!!errors.proxy_id"><option :value="null">{{ t("accts.direct") }}</option><option v-if="form.proxyId != null && !proxies.some(proxy => proxy.id === form.proxyId)" :value="form.proxyId">{{ t("accts.proxyUnavailable", { id: form.proxyId }) }}</option><option v-for="proxy in proxies" :key="proxy.id" :value="proxy.id">{{ proxy.name ?? t("common.unknown") }}</option></select><span v-if="errors.proxy_id" class="field-error">{{ errors.proxy_id }}</span></label>
-      <details v-if="!currentAccount" class="border-t border-border/50 pt-3" :open="!!errors.margin_mode || !!errors.position_mode">
+      <details v-if="!currentAccount" class="rounded-xl border border-border/50 bg-background/40 px-3.5 py-2.5" :open="!!errors.margin_mode || !!errors.position_mode">
         <summary class="cursor-pointer text-sm font-semibold">{{ t("accts.advanced") }}</summary>
-        <div class="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <div class="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
           <label class="field-label">{{ t("accts.marginMode") }}<select v-model="form.marginMode" class="form-input mt-1"><option value="cross">{{ t("accts.cross") }}</option><option value="isolated">{{ t("accts.isolated") }}</option></select><span v-if="errors.margin_mode" class="field-error">{{ errors.margin_mode }}</span></label>
           <label class="field-label">{{ t("accts.posMode") }}<select v-model="form.positionMode" class="form-input mt-1"><option value="hedge">{{ t("accts.hedge") }}</option><option value="one_way">{{ t("accts.oneWay") }}</option></select><span v-if="errors.position_mode" class="field-error">{{ errors.position_mode }}</span></label>
         </div>
       </details>
-      <section v-if="testResult" class="border-l-2 p-3 text-sm" :class="testResult.ok === true ? 'border-success bg-success/5' : 'border-warning bg-warning/5'" role="status">
+      <section v-if="testResult" class="rounded-xl border p-3.5 text-sm" :class="testResult.ok === true ? 'border-success/40 bg-success/5' : 'border-warning/40 bg-warning/5'" role="status">
         <p class="font-semibold" :class="testResult.ok === true ? 'text-success' : 'text-warning'">{{ t(testResult.ok === true ? "accts.testSuccess" : "accts.testFailure") }}</p>
         <p v-if="testResult.error" class="mt-1 break-words text-muted">{{ reasonText(testResult.error) }}</p>
         <dl v-if="testResult.ok === true" class="mt-2 grid grid-cols-2 gap-3"><div class="number"><dt class="text-xs text-muted">{{ t("accts.equity") }}</dt><dd>{{ formatUsd(testResult.totalEquity ?? testResult.usdtEquity) }}</dd></div><div class="number"><dt class="text-xs text-muted">{{ t("accts.posMode") }}</dt><dd>{{ ["long_short_mode", "hedge"].includes(testResult.posMode || "") ? t("accts.hedge") : ["net_mode", "one_way"].includes(testResult.posMode || "") ? t("accts.oneWay") : t("common.unknown") }}</dd></div></dl>

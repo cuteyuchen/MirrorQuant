@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_admin, get_current_user, owner_filter, record_audit, require_owner_or_admin
@@ -12,9 +13,11 @@ from app.api.exposure import require_binding_flat, require_binding_soft_deletabl
 from app.core.database import DEFAULT_SYSTEM_CONFIG, get_db
 from app.core.secret_mask import redact_error_urls, redact_proxy_userinfo
 from app.core.security import CredentialVault
+from app.core.time_util import BEIJING_TZ
 from app.models.domain import (
     BindingDebt,
     CopyBinding,
+    ExecutionRecord,
     LeadSource,
     ProxyNode,
     SystemConfig,
@@ -32,10 +35,18 @@ from app.services.proxy.manager import ProxyEgressError, ProxyManager
 router = APIRouter(prefix="/api/bindings", tags=["bindings"])
 
 
-async def _binding_out(db: AsyncSession, b: CopyBinding) -> dict:
-    lead = await db.get(LeadSource, b.lead_id)
-    acct = await db.get(TradingAccount, b.account_id)
-    debts = list((await db.scalars(select(BindingDebt).where(BindingDebt.binding_id == b.id))).all())
+_TODAY_SUCCESS_STATUSES = frozenset({"EXECUTED", "FILLED", "SUCCESS", "ADOPTED_POSITION"})
+_TODAY_FAILED_STATUSES = frozenset({"FAILED", "REJECTED", "UNFILLED"})
+
+
+def _serialize_binding(
+    b: CopyBinding,
+    lead: LeadSource | None,
+    acct: TradingAccount | None,
+    debts: list[BindingDebt],
+    today_success: int | None = None,
+    today_failed: int | None = None,
+) -> dict:
     total_debt = sum(d.pending_usd for d in debts)
     return {
         "id": b.id,
@@ -85,7 +96,16 @@ async def _binding_out(db: AsyncSession, b: CopyBinding) -> dict:
             for d in debts
             if d.pending_usd > 0
         ],
+        "todaySuccessCount": today_success,
+        "todayFailedCount": today_failed,
     }
+
+
+async def _binding_out(db: AsyncSession, b: CopyBinding) -> dict:
+    lead = await db.get(LeadSource, b.lead_id)
+    acct = await db.get(TradingAccount, b.account_id)
+    debts = list((await db.scalars(select(BindingDebt).where(BindingDebt.binding_id == b.id))).all())
+    return _serialize_binding(b, lead, acct, debts)
 
 
 @router.get("")
@@ -93,7 +113,52 @@ async def list_bindings(db: AsyncSession = Depends(get_db), _user: User = Depend
     rows = list((await db.scalars(select(CopyBinding).where(
         CopyBinding.deleted_at.is_(None),
         owner_filter(_user, CopyBinding.owner_user_id)).order_by(CopyBinding.id))).all())
-    items = [await _binding_out(db, b) for b in rows]
+    binding_ids = [b.id for b in rows]
+    lead_ids = {b.lead_id for b in rows}
+    account_ids = {b.account_id for b in rows}
+    leads_map = {
+        l.id: l for l in (await db.scalars(select(LeadSource).where(LeadSource.id.in_(lead_ids)))).all()
+    } if lead_ids else {}
+    accts_map = {
+        a.id: a for a in (await db.scalars(select(TradingAccount).where(TradingAccount.id.in_(account_ids)))).all()
+    } if account_ids else {}
+    debts_map: dict[int, list[BindingDebt]] = {bid: [] for bid in binding_ids}
+    if binding_ids:
+        for debt in (await db.scalars(select(BindingDebt).where(BindingDebt.binding_id.in_(binding_ids)))).all():
+            debts_map.setdefault(debt.binding_id, []).append(debt)
+    today_success: dict[int, int] = {bid: 0 for bid in binding_ids}
+    today_failed: dict[int, int] = {bid: 0 for bid in binding_ids}
+    if binding_ids:
+        today_start_utc = datetime.now(BEIJING_TZ).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ).astimezone(timezone.utc)
+        stat_rows = (await db.execute(
+            select(ExecutionRecord.binding_id, ExecutionRecord.status, func.count(ExecutionRecord.id))
+            .where(
+                ExecutionRecord.binding_id.in_(binding_ids),
+                ExecutionRecord.created_at >= today_start_utc,
+            )
+            .group_by(ExecutionRecord.binding_id, ExecutionRecord.status)
+        )).all()
+        for bid, status_val, cnt in stat_rows:
+            if bid is None:
+                continue
+            upper = str(status_val or "").upper()
+            if upper in _TODAY_SUCCESS_STATUSES:
+                today_success[bid] = today_success.get(bid, 0) + int(cnt)
+            elif upper in _TODAY_FAILED_STATUSES:
+                today_failed[bid] = today_failed.get(bid, 0) + int(cnt)
+    items = [
+        _serialize_binding(
+            b,
+            leads_map.get(b.lead_id),
+            accts_map.get(b.account_id),
+            debts_map.get(b.id, []),
+            today_success.get(b.id, 0),
+            today_failed.get(b.id, 0),
+        )
+        for b in rows
+    ]
     ks = await db.scalar(select(SystemConfig).where(SystemConfig.key == "global_kill_switch"))
     return {
         "items": items,
@@ -119,7 +184,7 @@ async def create_binding(
 ):
     lead = await db.get(LeadSource, payload.lead_id)
     acct = await db.get(TradingAccount, payload.account_id)
-    if not lead or not acct or acct.deleted_at is not None:
+    if not lead or lead.deleted_at is not None or not acct or acct.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Lead or TradingAccount not found")
     # 只能绑自己的账户；admin 可绑任何账户。
     require_owner_or_admin(current_user, acct.owner_user_id)
@@ -220,16 +285,18 @@ async def update_binding(
 async def delete_binding(
     binding_id: int,
     request: Request,
+    auto_disable: bool = Query(default=False),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     binding = await _get_owned_binding(db, binding_id, current_user)
-    if binding.is_enabled:
+    if binding.is_enabled and not auto_disable:
         raise HTTPException(status_code=409, detail="Disable the binding and drain exposure before deletion")
     await require_binding_soft_deletable(db, binding)
     name = binding.name
     # Logical delete: stamp deleted_at instead of removing the row, so the audit
     # ledger (intents, executions, allocations) stays queryable.
+    binding.is_enabled = False
     binding.deleted_at = utcnow()
     await record_audit(db, "DELETE_BINDING", "binding", str(binding_id), f"Soft-deleted binding {name}", current_user, request)
     await db.commit()
@@ -300,7 +367,7 @@ async def adopt_existing_positions(
     binding = await _get_owned_binding(db, binding_id, current_user)
     account = await db.get(TradingAccount, binding.account_id)
     lead = await db.get(LeadSource, binding.lead_id)
-    if not account or not lead:
+    if not account or account.deleted_at is not None or not lead or lead.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Lead or TradingAccount not found")
     if not binding.is_enabled or not account.is_enabled:
         raise HTTPException(status_code=409, detail="Binding or account is disabled")

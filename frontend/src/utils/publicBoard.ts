@@ -38,7 +38,8 @@ export function publicBoardLead(lead: Lead, now: number): BoardLead {
     stale: lead.stale ?? lead.snapshot?.meta?.stale ?? null,
     snapshotAgeSec: lead.snapshotAgeSec ?? lead.snapshot?.meta?.snapshotAgeSec ?? null,
     positionShow: lead.positionShow ?? lead.snapshot?.profile?.positionShow ?? null,
-    // 公开快照订单可能截断，不能据此宣称全天笔数或已实现总额。
+    // 公开快照订单可能截断，不能据此宣称全天笔数或已实现总额；绑定数始终为 null。
+    boundCount: null, activeBoundCount: null,
     todayOpenCount: null, todayCloseCount: null, todayRealizedPnl: null,
     positions, todayEvents: events, orphans: null,
   };

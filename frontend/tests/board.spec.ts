@@ -87,11 +87,42 @@ describe("跟单看板", () => {
     } });
     wrappers.push(wrapper);
     // 移动端横向滑动：卡片以 260px 为底宽、不压缩（容器横向滚动）；sm 及以上恢复 min-w-0 收缩。
-    expect(wrapper.find("section > div").classes()).toEqual(expect.arrayContaining(["min-w-[260px]", "shrink-0", "sm:min-w-0", "grid-cols-2"]));
+    expect(wrapper.find("section > div").classes()).toEqual(expect.arrayContaining(["sm:min-w-0", "grid-cols-2"]));
     const label = wrapper.find("span.font-semibold");
     expect(label.text()).toBe(name);
     expect(label.classes()).toEqual(expect.arrayContaining(["min-w-0", "flex-1", "[overflow-wrap:anywhere]"]));
     expect(wrapper.findAll("dl").every(item => item.classes().includes("number"))).toBe(true);
+  });
+
+  it("账户超过两个时手机端横向滑动，不超过两个时纵向铺满", () => {
+    const base = mockBoard.accounts![0];
+    const many = mount(AccountSummary, { props: { accounts: [base, { ...base, id: 98 }, { ...base, id: 99 }] } });
+    const few = mount(AccountSummary, { props: { accounts: [base, { ...base, id: 98 }] } });
+    wrappers.push(many, few);
+    expect(many.find("section > div").classes()).toEqual(expect.arrayContaining(["min-w-[260px]", "shrink-0"]));
+    expect(few.find("section > div").classes()).not.toContain("shrink-0");
+  });
+
+  it("未绑定带单员显示仅监控标记，不在每个持仓下重复“尚未绑定”", async () => {
+    const wrapper = comparison();
+    await wrapper.setProps({ lead: { ...mockBoard.leads![0], boundCount: 0, activeBoundCount: 0 } });
+    expect(wrapper.text()).toContain("仅监控 · 未绑定");
+    expect(wrapper.text()).not.toContain("我的持仓");
+    expect(wrapper.findAll("[data-position]").length).toBeGreaterThan(0);
+  });
+
+  it("空闲带单员默认折叠为一行摘要，展开后恢复持仓明细", async () => {
+    const wrapper = comparison();
+    await wrapper.setProps({ lead: mockBoard.leads![1], defaultCollapsed: true });
+    // defaultCollapsed 只影响初始状态，这里重新挂载以验证。
+    const collapsed = mount(LeadComparison, {
+      props: { lead: mockBoard.leads![1], accounts: mockBoard.accounts, receivedAt: Date.now(), defaultCollapsed: true },
+      global: { stubs: { RouterLink: { template: "<a><slot /></a>" } } },
+    });
+    wrappers.push(collapsed);
+    expect(collapsed.find('[data-testid="empty-positions"]').exists()).toBe(false);
+    await collapsed.find("button[aria-expanded]").trigger("click");
+    expect(collapsed.find('[data-testid="empty-positions"]').exists()).toBe(true);
   });
 
   it("只读对照表即使收到私有数据也不显示账户、残留仓或执行结果", async () => {

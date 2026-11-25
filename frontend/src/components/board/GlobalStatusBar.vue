@@ -78,29 +78,35 @@ function alertContext(leadId: number | null, accountId: number | null) {
 }
 </script>
 <template>
-  <!-- 吸顶状态条：急停、实时流、数据新鲜度、告警与急停按钮在任何页面都保持可见。 -->
+  <!-- 吸顶状态条：急停、实时流、数据新鲜度、告警与急停按钮在任何页面都保持可见；移动端单行紧凑排布。 -->
   <div ref="bar" class="sticky top-0 z-30 border-b backdrop-blur-md" :class="kill === true ? 'border-dangerSolid bg-dangerSolid text-white' : 'border-border/60 bg-surface/85'">
-    <div class="mx-auto flex w-full max-w-[1680px] flex-wrap items-center gap-x-4 gap-y-1 px-3 py-1.5 text-xs md:px-6">
-      <span class="flex items-center gap-1.5 font-semibold" :class="kill == null ? 'text-warning' : kill ? '' : 'text-muted'">
-        <AlertOctagon :size="16" aria-hidden="true" />{{ t(kill == null ? "board.killUnknown" : kill ? "board.killOn" : "board.killOff") }}
-      </span>
-      <span class="flex items-center gap-1.5 font-medium" :class="streamClass">
-        <span v-if="streamLive" class="live-dot" aria-hidden="true" /><Radio v-else :size="14" aria-hidden="true" />
-        {{ auth.authenticated ? t(`stream.${socket.state}`) : t("stream.authRequired") }}
-      </span>
-      <span class="flex items-center gap-1.5" :class="kill ? '' : 'text-muted'">{{ t("board.updated") }}<FreshnessStamp :timestamp="board.receivedAt" :warn-after="15" :critical-after="45" :stale="!!board.error" :class="kill ? '!text-white' : ''" /></span>
-      <span v-if="MOCK_MODE" class="rounded-full border px-2 py-0.5 font-semibold" :class="kill ? 'border-white/50 bg-white/15 text-white' : 'border-warning/40 bg-warning/10 text-warning'">{{ t("board.mock") }}</span>
-      <div class="ml-auto flex items-center gap-2">
+    <div class="mx-auto flex w-full max-w-[1680px] flex-wrap items-center justify-between gap-x-3 gap-y-1.5 px-3 py-1.5 text-xs md:px-6">
+      <div class="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
+        <span class="flex items-center gap-1.5 font-semibold" :class="kill == null ? 'text-warning' : kill ? '' : 'text-muted'">
+          <AlertOctagon :size="15" aria-hidden="true" />{{ t(kill == null ? "board.killUnknown" : kill ? "board.killOn" : "board.killOff") }}
+        </span>
+        <span class="flex items-center gap-1.5 font-medium" :class="streamClass">
+          <span v-if="streamLive" class="live-dot" aria-hidden="true" /><Radio v-else :size="13" aria-hidden="true" />
+          <span class="hidden sm:inline">{{ auth.authenticated ? t(`stream.${socket.state}`) : t("stream.authRequired") }}</span>
+        </span>
+        <span class="flex items-center gap-1" :class="kill ? '' : 'text-muted'">
+          <span class="hidden sm:inline">{{ t("board.updated") }}</span>
+          <FreshnessStamp :timestamp="board.receivedAt" :warn-after="15" :critical-after="45" :stale="!!board.error" :class="kill ? '!text-white' : ''" />
+        </span>
+        <span v-if="MOCK_MODE" class="rounded-full border px-2 py-0.5 font-semibold" :class="kill ? 'border-white/50 bg-white/15 text-white' : 'border-warning/40 bg-warning/10 text-warning'">{{ t("board.mock") }}</span>
+      </div>
+      <div class="ml-auto flex shrink-0 items-center gap-1.5 sm:gap-2">
         <span class="hidden items-center gap-1.5 font-mono tabular-nums lg:flex" :class="kill ? '' : 'text-muted'" :title="t('app.beijingTime')">
           <Clock :size="14" aria-hidden="true" />{{ formatClock(now) }}<span :class="kill ? 'opacity-80' : 'text-faint'">UTC+8</span>
         </span>
-        <button type="button" class="inline-flex min-h-10 items-center gap-1.5 rounded-lg border px-2.5 font-semibold transition md:min-h-8" :class="alertClass"
+        <button type="button" class="inline-flex min-h-8 items-center gap-1 rounded-lg border px-2 font-semibold transition"
+          :class="[alertClass, !(alerts?.length) && kill !== true ? 'opacity-75' : '']"
           :disabled="!auth.authenticated" :aria-label="t('board.alertList')" @click="showAlerts = true">
-          <Bell :size="15" aria-hidden="true" />{{ t("board.alerts", { n: alerts?.length ?? "—" }) }}
+          <Bell :size="14" aria-hidden="true" />{{ t("board.alerts", { n: alerts?.length ?? "—" }) }}
         </button>
-        <button v-if="auth.authenticated" type="button" data-testid="kill-switch" class="inline-flex min-h-10 items-center gap-1.5 rounded-lg px-3 font-bold shadow-sm transition md:min-h-8"
+        <button v-if="auth.authenticated" type="button" data-testid="kill-switch" class="inline-flex min-h-8 items-center gap-1 rounded-lg px-2.5 font-bold shadow-sm transition"
           :class="kill ? 'bg-white text-dangerSolid hover:bg-white/90' : 'bg-dangerSolid text-white hover:brightness-110'" :disabled="pending || kill == null" @click="toggleKillSwitch">
-          <RotateCcw v-if="kill" :size="15" aria-hidden="true" /><AlertOctagon v-else :size="15" aria-hidden="true" />{{ t(kill ? "board.resume" : "board.kill") }}
+          <RotateCcw v-if="kill" :size="14" aria-hidden="true" /><AlertOctagon v-else :size="14" aria-hidden="true" />{{ t(kill ? "board.resume" : "board.kill") }}
         </button>
       </div>
     </div>

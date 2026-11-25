@@ -50,5 +50,35 @@ function environment(intent: OrderIntent) {
       <p class="mt-1 break-all text-xs text-muted">{{ t("intents.source") }}: {{ row.sourceEventId ?? t("common.unknown") }}</p>
       <p class="mt-1 break-all text-xs text-muted">{{ t("intents.id") }}: {{ row.id ?? t("common.unknown") }}</p>
     </template>
+    <template #mobile-card="{ row }">
+      <div class="space-y-2.5">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <div class="flex min-w-0 flex-wrap items-center gap-1.5">
+            <strong class="text-sm">{{ row.instId ?? t("common.unknown") }}</strong>
+            <span class="text-xs text-muted">{{ sideLabel(row.posSide) }}</span>
+          </div>
+          <StatusBadge :state="row.state" />
+        </div>
+        <div class="flex flex-wrap items-center gap-1.5 text-xs text-muted">
+          <span class="font-medium text-foreground">{{ row.bindingName ?? t("common.unknown") }}</span>
+          <span>·</span>
+          <span>{{ row.accountName ?? t("common.unknown") }}</span>
+          <EnvBadge :environment="environment(row)" />
+          <FreshnessStamp class="ml-auto" :timestamp="row.createdAt" :warn-after="30" :critical-after="120" />
+        </div>
+        <div class="grid grid-cols-2 gap-3 rounded-lg bg-background/40 px-2.5 py-2 text-xs">
+          <div>
+            <span class="text-muted">{{ t("intents.quantities") }}</span>
+            <p class="mt-0.5 font-mono font-semibold tabular-nums">{{ formatQty(row.requestedQty) }} / {{ formatQty(row.filledQty) }}</p>
+          </div>
+          <div class="text-right">
+            <span class="text-muted">{{ t("intents.reduceOnly") }}</span>
+            <p class="mt-0.5 font-semibold">{{ t(row.reduceOnly == null ? "common.unknown" : row.reduceOnly ? "common.yes" : "common.no") }}</p>
+          </div>
+        </div>
+        <p class="text-xs text-warning">{{ t(row.state?.toUpperCase() === 'UNKNOWN' ? 'intents.unknownReason' : row.state?.toUpperCase() === 'SUBMITTING' ? 'intents.submittingReason' : 'common.unknown') }}</p>
+        <p class="truncate font-mono text-[11px] text-muted">{{ row.exchangeOrderId ?? row.id ?? t("common.unknown") }}</p>
+      </div>
+    </template>
   </DataTable>
 </template>

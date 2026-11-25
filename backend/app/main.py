@@ -123,7 +123,7 @@ def create_app() -> FastAPI:
             async with get_session_factory()() as db:
                 await asyncio.wait_for(db.execute(text("SELECT 1")), timeout=settings.readiness_db_timeout_sec)
                 enabled_leads = list((await asyncio.wait_for(db.scalars(select(LeadSource).where(
-                    LeadSource.is_enabled == True)), timeout=settings.readiness_db_timeout_sec)).all())
+                    LeadSource.is_enabled == True, LeadSource.deleted_at.is_(None))), timeout=settings.readiness_db_timeout_sec)).all())
                 if enabled_leads:
                     failed_ids = []
                     for lead in enabled_leads:

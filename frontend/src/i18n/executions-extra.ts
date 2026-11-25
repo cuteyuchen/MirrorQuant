@@ -1,11 +1,14 @@
 // 执行与待处理订单文案成对定义，状态码不直接展示给用户。
 export const executionsAdditions: Record<string, readonly [string, string]> = {
   "executions.summary": ["{total} 笔记录，{failed} 笔失败，{blocked} 笔拦截，{skipped} 笔跳过", "{total} records, {failed} failed, {blocked} blocked, {skipped} skipped"],
+  "executions.filter.actionable": ["有效记录", "Actionable"],
   "executions.filter.all": ["全部", "All"],
   "executions.filter.success": ["成功", "Successful"],
   "executions.filter.failed": ["失败", "Failed"],
   "executions.filter.skipped": ["跳过", "Skipped"],
   "executions.filter.blocked": ["拦截", "Blocked"],
+  "executions.deletedTag": ["已删除", "Deleted"],
+  "executions.rawAudit": ["底层审计信息", "Audit details"],
   "executions.filters": ["执行结果筛选", "Filter execution results"],
   "executions.historyTab": ["执行记录", "Executions"],
   "executions.intentsTab": ["待处理订单", "Pending orders"],
@@ -56,4 +59,13 @@ export const executionsAdditions: Record<string, readonly [string, string]> = {
   "action.RECONCILE_SOURCE": ["核对来源", "Reconcile source"],
   "action.ORPHAN_ALERT": ["遗留持仓告警", "Orphan position alert"],
   "action.PROTECTION_ALERT": ["保护单告警", "Protection order alert"],
+  "action.FULL_CLOSE": ["平仓", "Full close"],
+  "action.PARTIAL_REDUCE": ["减仓", "Partial reduce"],
+  "action.STOP_LOSS": ["止损平仓", "Stop loss"],
+  "action.TAKE_PROFIT": ["止盈平仓", "Take profit"],
+  "action.TRAILING_STOP": ["移动止损", "Trailing stop"],
+  "action.HARD_STOP": ["硬止损平仓", "Hard stop"],
+  "action.ORPHAN_CLOSE": ["残留仓平仓", "Orphan close"],
+  "action.BUY": ["买入", "Buy"],
+  "action.SELL": ["卖出", "Sell"],
 };

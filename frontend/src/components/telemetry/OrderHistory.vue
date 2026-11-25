@@ -168,6 +168,26 @@ function childNotional(order: TelemetryOrder) {
       <template #cell-counts="{ row }">{{ row.counts ?? t("common.unknown") }}</template>
       <template #cell-leverage="{ row }">{{ row.leverage ?? t("common.unknown") }}</template>
       <template #cell-pnl="{ row }"><strong :class="pnlClass(row.pnl)">{{ signedUsd(row.pnl) }}</strong></template>
+      <template #mobile-card="{ row }">
+        <div class="space-y-1.5">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <div class="flex min-w-0 flex-wrap items-center gap-1.5">
+              <strong class="text-sm">{{ row.symbol ?? t("common.unknown") }}</strong>
+              <span :class="row.badgeClass">{{ row.badge }}</span>
+              <span v-if="view === 'cycles' && row.status" class="pill" :class="row.status === 'OPEN' ? 'tone-accent' : ''">{{ statusLabel(row.status) }}</span>
+            </div>
+            <strong class="font-mono text-sm tabular-nums" :class="pnlClass(row.pnl)">{{ signedUsd(row.pnl) }}</strong>
+          </div>
+          <div class="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 font-mono text-xs tabular-nums text-muted">
+            <time>{{ formatDateTime(row.time, { short: true }) }}</time>
+            <span>
+              {{ formatPrice(row.entry) }}<template v-if="row.exit != null || row.status === 'OPEN'"> → {{ row.exit == null ? t("feed.holding") : formatPrice(row.exit) }}</template>
+            </span>
+            <span v-if="row.qty != null">{{ view === "closed" ? sizeText(row.qty, row.notional, row.entry) : formatQty(row.qty) }}</span>
+            <span v-if="row.duration != null">{{ duration(row.duration) }}</span>
+          </div>
+        </div>
+      </template>
       <template #select-label>{{ t("feed.toggleChildren") }}</template>
       <template #details="{ row }">
         <p class="mb-1 font-sans text-xs font-semibold text-muted">{{ t("feed.childOrders", { n: row.children.length }) }}</p>

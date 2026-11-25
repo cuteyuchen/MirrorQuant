@@ -18,6 +18,9 @@ function readPackageVersion(): string | null {
 }
 const APP_VERSION = readVersionFile() ?? readPackageVersion() ?? "dev";
 
+const API_TARGET = process.env.VITE_API_TARGET || "http://127.0.0.1:8000";
+const WS_TARGET = API_TARGET.replace(/^http/i, "ws");
+
 export default defineConfig({
   base: process.env.VITE_BASE_PATH || "/mq/",
   define: { __APP_VERSION__: JSON.stringify(APP_VERSION) },
@@ -30,26 +33,32 @@ export default defineConfig({
   },
   server: {
     port: 5173,
-    // 默认只监听本机；兼容部署前缀下的开发请求。
+    // 默认只监听本机；兼容部署前缀下的开发请求，支持 VITE_API_TARGET 指向远程后端。
     host: "localhost",
     proxy: {
       "/mq/api": {
-        target: "http://127.0.0.1:8000",
+        target: API_TARGET,
         changeOrigin: true,
+        secure: false,
         rewrite: (url) => url.replace(/^\/mq/, ""),
       },
       "/mq/ws": {
-        target: "ws://127.0.0.1:8000",
+        target: WS_TARGET,
         ws: true,
+        changeOrigin: true,
+        secure: false,
         rewrite: (url) => url.replace(/^\/mq/, ""),
       },
       "/api": {
-        target: "http://127.0.0.1:8000",
+        target: API_TARGET,
         changeOrigin: true,
+        secure: false,
       },
       "/ws": {
-        target: "ws://127.0.0.1:8000",
+        target: WS_TARGET,
         ws: true,
+        changeOrigin: true,
+        secure: false,
       },
     },
   },

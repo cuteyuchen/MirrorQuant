@@ -13,8 +13,8 @@ function update<K extends keyof ResilienceSettings>(key: K, value: ResilienceSet
 </script>
 <template>
   <section class="space-y-5">
-    <fieldset class="space-y-4 border-b border-border/50 pb-5">
-      <legend class="section-title mb-4">{{ t("set.resCatchup") }}</legend>
+    <fieldset class="space-y-4 rounded-xl border border-border/50 bg-background/30 p-3.5 sm:p-4">
+      <legend class="section-title px-1">{{ t("set.resCatchup") }}</legend>
       <p class="text-xs text-muted">{{ t("set.catchupNote") }}</p>
       <div class="grid gap-5 sm:grid-cols-2"><NumberField v-for="key in catchupKeys" :key="key" :rule="RESILIENCE_RULES[key]" :name="`resilience.${key}`" :model-value="modelValue[key]" :error="errors[`resilience.${key}`]" @update:model-value="update(key, $event)" /></div>
       <label class="field-label">{{ t("set.marginPolicy") }} *
@@ -22,15 +22,15 @@ function update<K extends keyof ResilienceSettings>(key: K, value: ResilienceSet
         <span class="mt-1 block text-xs text-muted">{{ t("resHelp.margin") }}</span><span v-if="errors['resilience.insufficient_margin_policy']" class="field-error">{{ errors["resilience.insufficient_margin_policy"] }}</span>
       </label>
     </fieldset>
-    <fieldset class="space-y-4">
-      <legend class="section-title mb-4">{{ t("set.resReconcile") }}</legend>
+    <fieldset class="space-y-4 rounded-xl border border-border/50 bg-background/30 p-3.5 sm:p-4">
+      <legend class="section-title px-1">{{ t("set.resReconcile") }}</legend>
       <div class="grid gap-5 sm:grid-cols-2"><NumberField v-for="key in reconcileKeys" :key="key" :rule="RESILIENCE_RULES[key]" :name="`resilience.${key}`" :model-value="modelValue[key]" :error="errors[`resilience.${key}`]" @update:model-value="update(key, $event)" /></div>
       <label class="field-label">{{ t("set.orphanPolicy") }} *
         <select :value="modelValue.auto_close_orphan_positions ?? ''" name="resilience.auto_close_orphan_positions" class="form-input mt-1" :aria-invalid="!!errors['resilience.auto_close_orphan_positions']" @change="update('auto_close_orphan_positions', ($event.target as HTMLSelectElement).value)"><option disabled value="">{{ t("state.UNKNOWN") }}</option><option value="alert_only">{{ t("resilience.alert_only") }}</option><option value="auto_close">{{ t("resilience.auto_close") }}</option></select>
         <span class="mt-1 block text-xs text-muted">{{ t("resHelp.orphans") }}</span><span v-if="errors['resilience.auto_close_orphan_positions']" class="field-error">{{ errors["resilience.auto_close_orphan_positions"] }}</span>
       </label>
     </fieldset>
-    <details class="border-t border-border/50 pt-4" :open="!!errors['resilience.clock_sync_interval_sec']">
+    <details class="rounded-xl border border-border/50 bg-background/30 px-3.5 py-3" :open="!!errors['resilience.clock_sync_interval_sec']">
       <summary class="cursor-pointer text-sm font-semibold">{{ t("set.resAdvanced") }}</summary>
       <div class="mt-4 space-y-4"><NumberField :rule="RESILIENCE_RULES.clock_sync_interval_sec" name="resilience.clock_sync_interval_sec" :model-value="modelValue.clock_sync_interval_sec" :error="errors['resilience.clock_sync_interval_sec']" @update:model-value="update('clock_sync_interval_sec', $event)" /><p class="text-xs text-muted">{{ t("resHelp.chronology") }}</p></div>
     </details>

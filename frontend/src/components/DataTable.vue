@@ -40,9 +40,15 @@ function select(event: Event, row: T) {
           </tbody>
         </table>
       </div>
-      <div class="space-y-3 md:hidden">
-        <article v-for="row in rows" :key="rowKey(row)" class="min-w-0 rounded-2xl border border-border/60 bg-surface p-3.5 shadow-card" :class="rowTone?.(row)">
-          <div class="grid min-w-0 grid-cols-2 gap-x-3 gap-y-3">
+      <div class="space-y-2.5 md:hidden">
+        <article v-for="row in rows" :key="rowKey(row)"
+          class="min-w-0 rounded-2xl border border-border/60 bg-surface p-3.5 shadow-card transition"
+          :class="[rowTone?.(row), selectable ? 'cursor-pointer active:bg-surface2/60' : '']"
+          @click="selectable && !$slots['select-label'] && select($event, row)">
+          <template v-if="$slots['mobile-card']">
+            <slot name="mobile-card" :row="row" />
+          </template>
+          <div v-else class="grid min-w-0 grid-cols-2 gap-x-3 gap-y-3">
             <!-- 手机卡片标签在值上方，一律左对齐：数字列的右对齐只属于桌面表格， -->
             <!-- 在卡片里会让标签和值分居两端、与相邻列基线错开。 -->
             <div v-for="column in columns" :key="column.key" class="min-w-0 [overflow-wrap:anywhere]" :class="[column.mobileWide ? 'col-span-2' : '']">
@@ -50,7 +56,7 @@ function select(event: Event, row: T) {
               <slot :name="`cell-${column.key}`" :row="row" />
             </div>
           </div>
-          <button v-if="selectable" class="button-secondary mt-3 w-full" :aria-expanded="expanded === rowKey(row)" @click="emit('select', row)"><slot name="select-label" /></button>
+          <button v-if="selectable && $slots['select-label']" type="button" class="button-secondary mt-3 w-full" :aria-expanded="expanded === rowKey(row)" @click="emit('select', row)"><slot name="select-label" /></button>
           <div v-if="expanded === rowKey(row)" class="mt-3 border-t border-border/50 pt-3"><slot name="details" :row="row" /></div>
         </article>
       </div>

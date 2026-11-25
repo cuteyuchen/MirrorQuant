@@ -93,7 +93,7 @@ async function test() {
         <span>{{ t(label) }}<span v-if="errors[`notifications.${key}`]" class="field-error block">{{ errors[`notifications.${key}`] }}</span></span>
       </label>
     </div>
-    <details v-for="channel in channels" :key="channel.id" class="rounded-lg border border-border/60 bg-surface p-4" :open="!!channel.fields.find(field => errors[`notifications.${field.key}`])">
+    <details v-for="channel in channels" :key="channel.id" class="rounded-xl border border-border/60 bg-surface p-3.5 sm:p-4" :open="!!channel.fields.find(field => errors[`notifications.${field.key}`])">
       <!-- 未知布尔值不能冒充停用，渠道摘要明确区分三态。 -->
       <summary class="cursor-pointer text-sm font-semibold"><span>{{ t(channel.label) }}</span><span class="ml-3 text-xs font-normal" :class="modelValue[channel.enabled] == null || !configured(channel) ? 'text-warning' : 'text-muted'">{{ t(configured(channel) ? "set.configured" : "set.notConfigured") }} · {{ t(modelValue[channel.enabled] == null ? "state.UNKNOWN" : modelValue[channel.enabled] ? "common.enable" : "common.disable") }}</span></summary>
       <div class="mt-4 space-y-4">
@@ -118,7 +118,7 @@ async function test() {
       </div>
     </details>
 
-    <div class="mt-6 rounded-lg border border-border/60 bg-surface p-4 space-y-4">
+    <div class="mt-6 space-y-4 rounded-xl border border-border/60 bg-surface p-3.5 sm:p-4">
       <div>
         <h3 class="text-sm font-semibold text-foreground">{{ t("set.subscriptionsTitle") }}</h3>
         <p class="text-xs text-muted mt-1">{{ t("set.subscriptionsHint") }}</p>
@@ -132,7 +132,7 @@ async function test() {
               <span class="text-sm font-medium text-foreground truncate">{{ sub.leadName }}</span>
               <span
                 class="inline-flex items-center px-1.5 py-0.5 rounded text-[11px] font-normal"
-                :class="sub.hasBinding ? 'bg-success/15 text-success' : 'bg-surface-elevated text-muted'"
+                :class="sub.hasBinding ? 'bg-success/15 text-success' : 'bg-surface2 text-muted'"
               >
                 {{ t(sub.hasBinding ? "set.subCopying" : "set.subWatching") }}
               </span>
@@ -142,6 +142,7 @@ async function test() {
           <label class="flex items-center gap-2 cursor-pointer text-sm">
             <input
               type="checkbox"
+              role="switch"
               :checked="sub.isEnabled"
               :disabled="subPending"
               @change="toggleSubscription(sub, ($event.target as HTMLInputElement).checked)"

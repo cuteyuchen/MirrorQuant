@@ -23,8 +23,8 @@ describe("页面骨架", () => {
     expect(wrapper.text()).toContain("3 个账户，1 个异常");
     expect(wrapper.find("button").text()).toBe("新建账户");
     // 窄屏标题区先占满一行，操作按钮换到下一行，不挤摘要。
-    expect(wrapper.find("header > div").classes()).toContain("basis-full");
-    expect(wrapper.find("header > div").classes()).toContain("sm:basis-0");
+    expect(wrapper.find("header > div").classes()).toContain("min-w-[11rem]");
+    expect(wrapper.find("header > div").classes()).toContain("flex-1");
   });
 
   it("表格分别呈现加载、空、错误与重试状态", async () => {
@@ -49,5 +49,18 @@ describe("页面骨架", () => {
     expect(cell.classes()).not.toContain("number");
     expect(cell.text()).toContain("$123,456,789,012,345.67");
     expect(wrapper.find("td").classes()).toContain("number");
+  });
+});
+
+describe("DataTable 自定义手机卡片", () => {
+  it("提供 mobile-card 插槽时手机卡片使用自定义内容，不再逐列平铺", () => {
+    const wrapper = mount(DataTable, {
+      props: { label: "账户列表", rows: [{ id: 1, name: "Alpha" }], columns: [{ key: "equity", label: "权益", numeric: true }], rowKey: (row: { id: number }) => row.id },
+      slots: { "cell-equity": "<strong>cell</strong>", "mobile-card": (scope: { row: { name: string } }) => `custom-${scope.row.name}` },
+    });
+    wrappers.push(wrapper);
+    expect(wrapper.find("article").text()).toContain("custom-Alpha");
+    expect(wrapper.find("article .grid").exists()).toBe(false);
+    expect(wrapper.find("td").text()).toContain("cell");
   });
 });

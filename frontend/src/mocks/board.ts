@@ -40,7 +40,8 @@ export const mockBoard: DashboardBoard = {
   ],
   leads: [
     { id: 1, name: "Atlas Momentum", avatarUrl: null, status: "healthy", enabled: true,
-      stale: false, snapshotAgeSec: 5, positionShow: true, todayOpenCount: 3, todayCloseCount: 1,
+      stale: false, snapshotAgeSec: 5, positionShow: true, boundCount: 2, activeBoundCount: 1,
+      todayOpenCount: 3, todayCloseCount: 1,
       todayRealizedPnl: 146.8,
       orphans: [{ ...mine({ bindingId: 12, accountId: 2, accountName: "Main Futures", environment: "live",
         state: "blocked", qty: 120, entryPrice: 0.452, pnl: -8.4, expectedQty: 0, reason: "ORPHAN_POSITION" }), symbol: "ADAUSDT", side: "LONG" }],
@@ -69,10 +70,12 @@ export const mockBoard: DashboardBoard = {
       ] },
     // 可见空仓与下一个未知仓位样例分开，过期快照仍显示独立警示。
     { id: 2, name: "Delta Range", avatarUrl: null, status: "stale", enabled: true, stale: true,
-      snapshotAgeSec: 145, positionShow: true, todayOpenCount: 0, todayCloseCount: 2,
+      snapshotAgeSec: 145, positionShow: true, boundCount: 1, activeBoundCount: 1,
+      todayOpenCount: 0, todayCloseCount: 2,
       todayRealizedPnl: -34.8, positions: [], orphans: [], todayEvents: [] },
     { id: 3, name: "New Portfolio", avatarUrl: null, status: null, enabled: null, stale: null,
-      snapshotAgeSec: null, positionShow: null, todayOpenCount: null, todayCloseCount: null,
+      snapshotAgeSec: null, positionShow: null, boundCount: 0, activeBoundCount: 0,
+      todayOpenCount: null, todayCloseCount: null,
       todayRealizedPnl: null, positions: null, orphans: null, todayEvents: null },
   ],
 };
@@ -305,10 +308,37 @@ export function mockResponse(endpoint: string): unknown {
   else if (url.pathname === "/api/dashboard/board") value = mockBoard;
   else if (url.pathname === "/api/dashboard/intents") value = { items: mockIntents };
   else if (url.pathname === "/api/dashboard/executions") {
-    const filtered = mockExecutions.filter(item => (!url.searchParams.get("binding_id") || String(item.bindingId) === url.searchParams.get("binding_id"))
-      && (!url.searchParams.get("status") || url.searchParams.get("status")!.split(",").includes(item.status ?? "")));
+    const byBinding = mockExecutions.filter(item => !url.searchParams.get("binding_id") || String(item.bindingId) === url.searchParams.get("binding_id"));
+    const isSkipped = (st: string) => st.startsWith("SKIPPED");
+    const isSuccess = (st: string) => ["EXECUTED", "FILLED", "SUCCESS", "ADOPTED_POSITION"].includes(st);
+    const isFailed = (st: string) => ["FAILED", "REJECTED", "UNFILLED"].includes(st);
+    const isBlocked = (st: string) => st.startsWith("BLOCKED");
+    const counts = {
+      all: byBinding.length,
+      actionable: byBinding.filter(item => !isSkipped((item.status ?? "").toUpperCase())).length,
+      success: byBinding.filter(item => isSuccess((item.status ?? "").toUpperCase())).length,
+      failed: byBinding.filter(item => isFailed((item.status ?? "").toUpperCase())).length,
+      skipped: byBinding.filter(item => isSkipped((item.status ?? "").toUpperCase())).length,
+      blocked: byBinding.filter(item => isBlocked((item.status ?? "").toUpperCase())).length,
+    };
+    const statusParam = url.searchParams.get("status");
+    const groupParam = url.searchParams.get("status_group");
+    const filtered = byBinding.filter(item => {
+      const st = (item.status ?? "").toUpperCase();
+      if (statusParam) return statusParam.split(",").includes(item.status ?? "");
+      if (groupParam === "actionable") return !isSkipped(st);
+      if (groupParam === "success") return isSuccess(st);
+      if (groupParam === "failed") return isFailed(st);
+      if (groupParam === "skipped") return isSkipped(st);
+      if (groupParam === "blocked") return isBlocked(st);
+      return true;
+    });
     const offset = Number(url.searchParams.get("offset") || 0);
-    value = { items: filtered.slice(offset, offset + Number(url.searchParams.get("limit") || 20)), total: filtered.length };
+    value = {
+      items: filtered.slice(offset, offset + Number(url.searchParams.get("limit") || 20)),
+      total: filtered.length,
+      counts,
+    };
   } else if (url.pathname === "/api/accounts") value = { items: mockAccounts };
   else if (url.pathname === "/api/leads") value = { items: mockLeads };
   else if (/\/api\/leads\/\d+\/snapshot$/.test(url.pathname)) {
@@ -320,6 +350,33 @@ export function mockResponse(endpoint: string): unknown {
   else if (url.pathname === "/api/proxies") value = { items: mockProxies };
   else if (url.pathname === "/api/settings/audit-logs") value = { items: mockAuditLogs };
   else if (url.pathname === "/api/settings/security-guards") value = { items: mockSecurityGuards };
+  else if (url.pathname === "/api/notifications/subscriptions") value = {
+    items: mockLeads.map((lead, idx) => ({
+      leadId: lead.id,
+      leadName: lead.name,
+      leadPlatform: lead.platform,
+      hasBinding: idx < 2,
+      isEnabled: idx === 0,
+    })),
+  };
+  else if (url.pathname === "/api/admin/users") value = {
+    items: [
+      { id: 1, username: "preview", role: "admin", isActive: true, createdAt: now - 864000000, lastLoginAt: now - 120000, accountCount: 4, bindingCount: 2, enabledBindingCount: 1, openPositionCount: 3, totalEquity: 40229.1 },
+      { id: 2, username: "trader_demo", role: "user", isActive: true, createdAt: now - 432000000, lastLoginAt: now - 3600000, accountCount: 1, bindingCount: 1, enabledBindingCount: 0, openPositionCount: 0, totalEquity: 1200 },
+    ],
+  };
+  else if (/^\/api\/admin\/users\/\d+$/.test(url.pathname)) value = {
+    user: { id: 1, username: "preview", role: "admin", isActive: true, createdAt: now - 864000000, lastLoginAt: now - 120000, accountCount: 4, bindingCount: 2, enabledBindingCount: 1, openPositionCount: 3, totalEquity: 40229.1 },
+    accounts: mockAccounts.map(a => ({ id: a.id, name: a.name, exchange: a.exchange, environment: a.environment, status: a.status, isEnabled: a.isEnabled, equity: a.totalEquity })),
+    bindings: mockBindings.map(b => ({ id: b.id, name: b.name, leadId: b.leadId, leadName: b.leadName, accountId: b.accountId, accountName: b.accountName, isEnabled: b.isEnabled, openPositions: [] })),
+    subscriptions: [{ leadId: 1, leadName: "Atlas Momentum", isEnabled: true }],
+  };
+  else if (url.pathname === "/api/admin/invite-codes") value = {
+    items: [
+      { id: 1, code: "MQ-ACTIVE-98K2Z1", createdByUserId: 1, createdByUsername: "preview", maxUses: 5, usedCount: 1, expiresAt: null, isRevoked: false, createdAt: now - 86400000, status: "active" },
+      { id: 2, code: "MQ-USED-77P4L9M2", createdByUserId: 1, createdByUsername: "preview", maxUses: 1, usedCount: 1, expiresAt: null, isRevoked: false, createdAt: now - 172800000, status: "exhausted" },
+    ],
+  };
   else throw new Error("Unsupported mock endpoint");
   return structuredClone(value);
 }

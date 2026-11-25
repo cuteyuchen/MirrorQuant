@@ -240,20 +240,19 @@ describe("确认与模态框", () => {
     expect(await confirmation).toBe(false);
   });
 
-  it("实盘确认需要勾选和输入，不可直接恢复交易", async () => {
+  it("实盘确认只需在弹窗点击确认，不需要勾选或输入", async () => {
     const ui = useUiStore();
-    void ui.ask({ title: "实盘", message: "实盘操作", environment: "live" });
+    const answer = ui.ask({ title: "实盘", message: "实盘操作", environment: "live" });
     const wrapper = mount(ConfirmDialog, { attachTo: document.body, global: { stubs: { Teleport: true } } });
     wrappers.push(wrapper);
     await flushPromises();
-    const button = wrapper.find("button.button-danger");
-    expect(button.attributes("disabled")).toBeDefined();
     expect(wrapper.text()).toContain("LIVE");
-    await wrapper.find('input[type="checkbox"]').setValue(true);
-    await wrapper.find('input[autocomplete="off"]').setValue("CONFIRM");
-    expect(wrapper.find('input[type="checkbox"]').element.checked).toBe(true);
-    expect((wrapper.find('input[autocomplete="off"]').element as HTMLInputElement).value).toBe("CONFIRM");
-    expect(wrapper.find("button.button-danger").attributes("disabled")).toBeUndefined();
+    expect(wrapper.find('input[type="checkbox"]').exists()).toBe(false);
+    expect(wrapper.find('input[autocomplete="off"]').exists()).toBe(false);
+    const button = wrapper.find("button.button-danger");
+    expect(button.attributes("disabled")).toBeUndefined();
+    await button.trigger("click");
+    await expect(answer).resolves.toBe(true);
     ui.close();
   });
 

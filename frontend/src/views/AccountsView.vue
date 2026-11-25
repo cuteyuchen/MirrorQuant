@@ -101,12 +101,29 @@ async function change(account: Account, operation: "toggle" | "delete", event?: 
   // 启用状态未知时不能通过取反猜测恢复交易。
   if (operation === "toggle" && account.isEnabled == null) return;
   const title = t(operation === "delete" ? "common.delete" : account.isEnabled ? "common.disable" : "common.enable");
-  await run(async () => {
-    if (operation === "delete") await api.delete(`/api/accounts/${account.id}`);
+  let canForceDelete = false;
+  const result = await run(async () => {
+    if (operation === "delete") await api.delete(`/api/accounts/${account.id}?auto_disable=true`);
     else await api.put(`/api/accounts/${account.id}`, { isEnabled: !account.isEnabled });
     await cache.fetchAccounts(true);
     await board.refresh(true);
-  }, { confirm: { title, message: t(operation === "delete" ? "confirm.delete" : "confirm.toggle", { name: account.name || "—", action: title }), environment: account.environment, strong: account.environment == null } });
+  }, {
+    confirm: { title, message: t(operation === "delete" ? "confirm.delete" : "confirm.toggle", { name: account.name || "—", action: title }), environment: account.environment, strong: account.environment == null },
+    onError: cause => {
+      if (operation === "delete" && cause instanceof ApiError && cause.status === 409) {
+        const detail = cause.data?.detail as Record<string, unknown> | undefined;
+        if (detail?.code === "EXCHANGE_UNREACHABLE_CAN_FORCE") canForceDelete = true;
+      }
+    },
+  });
+  if (!result.ok && canForceDelete) {
+    error.value = "";
+    await run(async () => {
+      await api.delete(`/api/accounts/${account.id}?auto_disable=true&force=true`);
+      await cache.fetchAccounts(true);
+      await board.refresh(true);
+    }, { confirm: { title: t("common.delete"), message: t("confirm.forceDeleteAccount"), environment: account.environment, strong: true } });
+  }
 }
 async function test(account: Account) {
   await run(async () => {
@@ -150,19 +167,79 @@ onActivated(() => { void load(); });
       <template #cell-sync="{ row }"><FreshnessStamp :timestamp="metrics(row).syncedAt" :warn-after="45" :critical-after="90" /><p class="mt-1 text-xs text-muted">{{ formatDateTime(metrics(row).syncedAt, { short: true, withSeconds: false }) }}</p></template>
       <template #cell-status="{ row }"><div class="flex flex-wrap items-center gap-2"><StatusBadge :state="row.isEnabled == null ? 'unknown' : row.isEnabled === false ? 'disabled' : metrics(row).status" /><label class="inline-flex min-h-11 items-center gap-2 text-xs"><input type="checkbox" role="switch" :checked="row.isEnabled === true" :aria-label="t('accts.enabledFor', { name: row.name ?? '—' })" :disabled="pending || row.isEnabled == null" @change="change(row, 'toggle', $event)" /><span>{{ t(row.isEnabled == null ? "state.UNKNOWN" : row.isEnabled ? "common.enabled" : "common.disabled") }}</span></label></div><p v-if="issue(row)" class="mt-1 break-words text-xs" :class="severity(row) === 2 ? 'text-danger' : 'text-warning'">{{ issue(row) }}</p></template>
       <template #cell-actions="{ row }"><div class="flex items-center justify-end gap-1"><button class="icon-button" :disabled="pending" :aria-label="t('common.edit')" :title="t('common.edit')" @click="edit(row)"><Pencil :size="17" /></button><MoreMenu><button class="menu-item" :disabled="pending" @click="test(row)"><Wifi :size="16" />{{ t("accts.test") }}</button><button class="menu-item" :disabled="pending" @click="sync(row)"><RefreshCw :size="16" />{{ t("accts.sync") }}</button><button class="menu-item text-danger" :disabled="pending" @click="change(row, 'delete')"><Trash2 :size="16" />{{ t("common.delete") }}</button></MoreMenu></div></template>
+      <template #mobile-card="{ row }">
+        <div class="space-y-3">
+          <div class="flex items-start justify-between gap-2">
+            <div class="min-w-0 flex-1">
+              <div class="flex items-center gap-2">
+                <span class="min-w-0 flex-1 font-semibold [overflow-wrap:anywhere]">{{ row.name ?? t("common.unknown") }}</span>
+                <EnvBadge :environment="row.environment" />
+              </div>
+              <div class="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted">
+                <span>{{ row.exchange?.toUpperCase() ?? t("common.unknown") }}</span>
+                <StatusBadge :state="row.isEnabled == null ? 'unknown' : row.isEnabled === false ? 'disabled' : metrics(row).status" />
+              </div>
+            </div>
+            <div class="flex shrink-0 items-center gap-1" @click.stop>
+              <label class="inline-flex min-h-9 items-center">
+                <input type="checkbox" role="switch" :checked="row.isEnabled === true" :aria-label="t('accts.enabledFor', { name: row.name ?? '—' })" :disabled="pending || row.isEnabled == null" @change="change(row, 'toggle', $event)" />
+              </label>
+              <button class="icon-button" :disabled="pending" :aria-label="t('common.edit')" :title="t('common.edit')" @click="edit(row)"><Pencil :size="16" /></button>
+              <MoreMenu><button class="menu-item" :disabled="pending" @click="test(row)"><Wifi :size="16" />{{ t("accts.test") }}</button><button class="menu-item" :disabled="pending" @click="sync(row)"><RefreshCw :size="16" />{{ t("accts.sync") }}</button><button class="menu-item text-danger" :disabled="pending" @click="change(row, 'delete')"><Trash2 :size="16" />{{ t("common.delete") }}</button></MoreMenu>
+            </div>
+          </div>
+          <div class="grid grid-cols-2 gap-3 rounded-lg bg-background/40 p-2.5 text-xs">
+            <dl class="number text-left">
+              <dt class="text-muted">{{ t("accts.funds") }}</dt>
+              <dd class="mt-0.5 text-sm font-bold">{{ formatUsd(equity(row)) }}</dd>
+              <dd class="text-muted">{{ t("accts.available") }} {{ formatUsd(metrics(row).available) }}</dd>
+            </dl>
+            <dl class="number">
+              <dt class="text-muted">{{ t("board.todayPnl") }}</dt>
+              <dd class="mt-0.5 text-sm font-bold" :class="pnlClass(accountBoard(row)?.todayPnl)">{{ signedUsd(accountBoard(row)?.todayPnl) }}</dd>
+              <dd :class="pnlClass(accountBoard(row)?.todayPnlPct)">{{ formatPct(accountBoard(row)?.todayPnlPct) }}</dd>
+            </dl>
+            <dl class="number text-left">
+              <dt class="text-muted">{{ t("board.unrealized") }}</dt>
+              <dd class="mt-0.5 font-semibold" :class="pnlClass(metrics(row).unrealized)">{{ signedUsd(metrics(row).unrealized) }}</dd>
+            </dl>
+            <dl class="number">
+              <dt class="text-muted">{{ t("accts.drawdown") }}</dt>
+              <dd class="mt-0.5 font-semibold" :class="(drawdown(row) ?? 0) >= 20 ? 'text-danger' : 'text-muted'">{{ formatPct(drawdown(row), 2, false) }}</dd>
+            </dl>
+          </div>
+          <p v-if="issue(row)" class="text-xs" :class="severity(row) === 2 ? 'text-danger' : 'text-warning'">{{ issue(row) }}</p>
+          <div class="flex items-center justify-between gap-2 text-xs text-muted">
+            <FreshnessStamp :timestamp="metrics(row).syncedAt" :warn-after="45" :critical-after="90" />
+            <span>{{ t("accts.positions") }} · {{ row.positions?.length ?? 0 }}</span>
+          </div>
+        </div>
+      </template>
       <template #select-label><ChevronDown :size="16" />{{ t("accts.positions") }}</template>
       <template #details="{ row }">
         <div class="space-y-4">
           <p v-if="row.riskEquityLegacyUnverified || accountBoard(row)?.riskLegacyUnverified" class="border-l-2 border-warning bg-warning/5 p-3 text-sm text-warning" role="alert">{{ t("accts.legacy") }}</p>
           <div class="flex flex-wrap items-center justify-between gap-3"><h2 class="section-title">{{ t("accts.positions") }}</h2><p v-if="showQuantity" class="text-xs text-muted">{{ row.exchange === "okx" ? t("accts.contractQty") : t("accts.baseQty") }}</p></div>
           <EmptyState v-if="!row.positions?.length" :title="t(row.positions == null ? 'accts.positionsUnknown' : 'accts.positionsEmpty')" />
-          <div v-else class="divide-y divide-border/50">
-            <article v-for="position in positionRows(row)" :key="position.key" class="grid items-center gap-3 py-3 md:grid-cols-[minmax(0,1.2fr)_repeat(4,minmax(0,1fr))]">
-              <div class="min-w-0"><h3 class="break-words text-sm font-semibold">{{ position.symbol ?? t("common.unknown") }}</h3><p class="text-xs text-muted">{{ position.side }} · {{ t("unit.leverage", { n: formatQty(position.leverage) }) }}</p></div>
-              <dl class="number"><dt class="text-xs text-muted">{{ sizeLabel }}</dt><dd>{{ sizeText(position.qty, null, position.price) }}</dd></dl>
-              <dl class="number"><dt class="text-xs text-muted">{{ t("board.entry") }}</dt><dd>{{ formatPrice(position.entry) }}</dd></dl>
-              <dl class="number"><dt class="text-xs text-muted">{{ t("board.mark") }}</dt><dd class="font-semibold">{{ formatPrice(position.price) }}</dd><dd v-if="position.priceSource === 'estimated' || position.priceSource === 'entry'" class="text-xs text-warning">{{ t(`accts.price_${position.priceSource}`) }}</dd></dl>
-              <dl class="number"><dt class="text-xs text-muted">{{ t("common.pnl") }}</dt><dd :class="pnlClass(position.pnl)">{{ signedUsd(position.pnl) }} <span class="text-xs">{{ formatPct(position.pnlPct) }}</span></dd></dl>
+          <div v-else class="space-y-2.5 md:space-y-0 divide-y md:divide-border/50">
+            <article v-for="position in positionRows(row)" :key="position.key"
+              class="rounded-xl border border-border/40 bg-background/40 p-2.5 md:grid md:items-center md:gap-3 md:rounded-none md:border-0 md:bg-transparent md:px-0 md:py-3 md:grid-cols-[minmax(0,1.2fr)_repeat(4,minmax(0,1fr))]">
+              <div class="flex min-w-0 items-center justify-between gap-2 md:block">
+                <div class="min-w-0">
+                  <h3 class="break-words text-sm font-bold">{{ position.symbol ?? t("common.unknown") }}</h3>
+                  <p class="text-xs text-muted">{{ position.side }} · {{ t("unit.leverage", { n: formatQty(position.leverage) }) }}</p>
+                </div>
+                <div class="shrink-0 text-right font-mono tabular-nums md:hidden">
+                  <p class="text-sm font-bold" :class="pnlClass(position.pnl)">{{ signedUsd(position.pnl) }}</p>
+                  <p class="text-xs font-semibold" :class="pnlClass(position.pnlPct)">{{ formatPct(position.pnlPct) }}</p>
+                </div>
+              </div>
+              <div class="mt-2 grid grid-cols-3 gap-2 border-t border-border/40 pt-2 text-xs md:contents">
+                <dl class="min-w-0 font-mono tabular-nums md:number"><dt class="font-sans text-[11px] text-muted">{{ sizeLabel }}</dt><dd class="mt-0.5 truncate font-semibold">{{ sizeText(position.qty, null, position.price) }}</dd></dl>
+                <dl class="min-w-0 font-mono tabular-nums md:number"><dt class="font-sans text-[11px] text-muted">{{ t("board.entry") }}</dt><dd class="mt-0.5 font-semibold">{{ formatPrice(position.entry) }}</dd></dl>
+                <dl class="min-w-0 text-right font-mono tabular-nums md:number"><dt class="font-sans text-[11px] text-muted">{{ t("board.mark") }}</dt><dd class="mt-0.5 font-semibold">{{ formatPrice(position.price) }}</dd><dd v-if="position.priceSource === 'estimated' || position.priceSource === 'entry'" class="text-[11px] text-warning">{{ t(`accts.price_${position.priceSource}`) }}</dd></dl>
+              </div>
+              <dl class="number hidden md:block"><dt class="text-xs text-muted">{{ t("common.pnl") }}</dt><dd :class="pnlClass(position.pnl)">{{ signedUsd(position.pnl) }} <span class="text-xs">{{ formatPct(position.pnlPct) }}</span></dd></dl>
             </article>
           </div>
         </div>

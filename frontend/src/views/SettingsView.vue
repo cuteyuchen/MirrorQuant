@@ -154,7 +154,7 @@ onActivated(() => { if (!dirty.value) void loadData(true); });
 <template>
   <div class="space-y-4">
     <PageHeader :title="t('nav.settings')" :summary="t(dirty ? 'set.unsaved' : 'set.summary')" />
-    <nav class="flex flex-wrap border-b border-border/50" role="tablist" :aria-label="t('nav.settings')">
+    <nav class="flex flex-nowrap overflow-x-auto border-b border-border/50 no-scrollbar" role="tablist" :aria-label="t('nav.settings')">
       <button v-for="tab in SETTINGS_TABS" :id="`settings-tab-${tab}`" :key="tab" class="tab-button" role="tab" :aria-selected="activeTab === tab" :aria-controls="`settings-panel-${tab}`" :disabled="pending || securityBusy" @click="switchTab(tab)">{{ t(`settingsTab.${tab}`) }}<span v-if="settingsDirty(baseline, settingsData, tab) || tab === 'security' && securityDirty" class="ml-2 text-warning" :aria-label="t('set.unsaved')">*</span></button>
     </nav>
     <ErrorState v-if="loadError" :message="loadError" :busy="loading" @retry="loadData(true)" />
@@ -169,7 +169,7 @@ onActivated(() => { if (!dirty.value) void loadData(true); });
           <ResilienceSettingsPanel v-else-if="activeTab === 'resilience' && settingsData.resilience" v-model="settingsData.resilience" :errors="errors" />
           <PublicSettingsPanel v-else-if="activeTab === 'public_monitoring_enabled'" v-model="settingsData.public_monitoring_enabled" :error="errors.public_monitoring_enabled" />
           <EmptyState v-else :title="t('set.sectionUnavailable')"><button v-if="activeTab !== 'notifications'" type="button" class="button-secondary" @click="restoreMissing">{{ t("set.loadDefaults") }}</button></EmptyState>
-          <footer v-if="sectionAvailable" class="flex flex-wrap items-center justify-between gap-3 border-t border-border/50 pt-4">
+          <footer v-if="sectionAvailable" class="flex flex-wrap items-center justify-between gap-3 border-t border-border/50 pt-4" :class="currentDirty ? 'sticky-save-bar' : ''">
             <p class="text-xs" :class="currentDirty ? 'text-warning' : 'text-muted'" role="status">{{ t(currentDirty ? "set.unsaved" : "set.savedState") }}</p>
             <div class="flex gap-2"><button type="button" class="button-secondary" :disabled="!currentDirty || pending" @click="discard"><RotateCcw :size="16" />{{ t("set.discard") }}</button><button type="submit" class="button-primary" :disabled="!currentDirty || pending"><Save :size="16" />{{ t(pending ? "common.working" : "common.save") }}</button></div>
           </footer>

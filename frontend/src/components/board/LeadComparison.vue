@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
-import { AlertTriangle, ArrowRight, Calculator } from "lucide-vue-next";
+import { AlertTriangle, ArrowRight, Calculator, ChevronDown, ChevronUp } from "lucide-vue-next";
 import type { BoardAccount, BoardLead, BoardPosition } from "@/types/api";
 import { useI18n } from "@/i18n";
 import { useDisplayUnit } from "@/composables/useDisplayUnit";
@@ -18,12 +18,15 @@ import LeadCalculator from "./LeadCalculator.vue";
 
 const props = withDefaults(defineProps<{
   lead: BoardLead; receivedAt: number | null; accounts: BoardAccount[] | null;
-  readOnly?: boolean; showDetails?: boolean;
-}>(), { readOnly: false, showDetails: true });
+  readOnly?: boolean; showDetails?: boolean; defaultCollapsed?: boolean;
+}>(), { readOnly: false, showDetails: true, defaultCollapsed: false });
 const { t } = useI18n();
 const { showQuantity, showNotional } = useDisplayUnit();
 // 看板里就地测算跟单仓位，不必跳到详情页；未展开时不请求快照。
 const calcOpen = ref(false);
+const collapsed = ref(props.defaultCollapsed);
+// 打开测算器时同时展开折叠的卡片，避免测算结果被藏起来。
+function toggleCalc() { calcOpen.value = !calcOpen.value; if (calcOpen.value) collapsed.value = false; }
 // 移动端折叠次要持仓明细（均价/数量/名义价值/止盈止损），默认紧凑收起、可展开。
 const expandedDetails = ref<Record<string, boolean>>({});
 function toggleDetails(key: string) { expandedDetails.value[key] = !expandedDetails.value[key]; }
@@ -32,7 +35,14 @@ function isDetailsExpanded(key: string) { return !!expandedDetails.value[key]; }
 const positions = computed(() => [...(props.lead.positions || [])].sort((a, b) =>
   Number(b.openedToday === true) - Number(a.openedToday === true) || (b.openedAt ?? -Infinity) - (a.openedAt ?? -Infinity)));
 function positionKey(position: BoardPosition) { return position.key || `${position.symbol}:${position.side}:${position.openedAt}`; }
-// 公开模式不渲染账户、执行结果、残留仓或私有详情入口；正在运行的绑定优先排在前列。
+// 未绑定时仅做市场监控，不在每个持仓下重复显示“尚未绑定”；有绑定时显示各跟单账户对齐情况。
+const isUnbound = computed(() => !props.readOnly && props.lead.boundCount === 0);
+const showMineSection = computed(() => !props.readOnly && !isUnbound.value);
+const showTimeline = computed(() => props.readOnly || (props.lead.todayEvents?.length ?? 0) > 0);
+const idleSummary = computed(() => {
+  if (props.lead.positions == null || props.lead.positionShow !== true) return t("board.unknownSummary");
+  return t("board.idleSummary", { open: props.lead.todayOpenCount ?? 0, close: props.lead.todayCloseCount ?? 0 });
+});
 function mineRows(position: BoardPosition) {
   if (props.readOnly || !position.mine?.length) return [null];
   return [...position.mine].sort((a, b) => Number(b.bindingEnabled !== false) - Number(a.bindingEnabled !== false));
@@ -67,27 +77,38 @@ const showToday = computed(() => !props.readOnly
   <section class="card card-accent" :data-testid="`lead-${lead.id}`" :class="readOnly ? 'public-comparison' : ''">
     <header class="card-header">
       <div class="flex min-w-0 flex-1 items-center gap-3">
-        <LeadAvatar :name="lead.name" :url="lead.avatarUrl" :size="44" />
-        <div class="min-w-0">
+        <LeadAvatar :name="lead.name" :url="lead.avatarUrl" :size="42" />
+        <div class="min-w-0 flex-1">
           <div class="flex flex-wrap items-center gap-x-2 gap-y-1">
-            <h2 class="text-lg font-bold tracking-tight">{{ lead.name ?? t("common.unknown") }}</h2>
-            <RouterLink v-if="!readOnly && showDetails && lead.id != null" :to="`/leads/${lead.id}`" class="inline-flex min-h-8 items-center gap-1 rounded-md px-1.5 text-xs font-semibold text-accent transition hover:bg-accent/10">{{ t("common.details") }}<ArrowRight :size="14" aria-hidden="true" /></RouterLink>
-            <button v-if="!readOnly && showDetails && lead.id != null" type="button" data-testid="calc-toggle" class="inline-flex min-h-8 items-center gap-1 rounded-md px-1.5 text-xs font-semibold text-accent transition hover:bg-accent/10" :aria-expanded="calcOpen" @click="calcOpen = !calcOpen"><Calculator :size="14" aria-hidden="true" />{{ t(calcOpen ? "board.calcClose" : "board.calcOpen") }}</button>
+            <h2 class="text-base font-bold tracking-tight sm:text-lg">{{ lead.name ?? t("common.unknown") }}</h2>
+            <span v-if="isUnbound" class="pill border-border/60 bg-surface2 text-muted">{{ t("board.watchOnly") }}</span>
+            <RouterLink v-if="isUnbound && showDetails" to="/bindings" class="inline-flex min-h-7 items-center gap-1 rounded-md px-1.5 text-xs font-semibold text-accent transition hover:bg-accent/10">{{ t("board.bindNow") }}<ArrowRight :size="13" aria-hidden="true" /></RouterLink>
+            <RouterLink v-if="!readOnly && showDetails && lead.id != null" :to="`/leads/${lead.id}`" class="inline-flex min-h-7 items-center gap-1 rounded-md px-1.5 text-xs font-semibold text-accent transition hover:bg-accent/10">{{ t("common.details") }}<ArrowRight :size="13" aria-hidden="true" /></RouterLink>
+            <button v-if="!readOnly && showDetails && lead.id != null" type="button" data-testid="calc-toggle" class="inline-flex min-h-7 items-center gap-1 rounded-md px-1.5 text-xs font-semibold text-accent transition hover:bg-accent/10" :aria-expanded="calcOpen" @click="toggleCalc"><Calculator :size="13" aria-hidden="true" />{{ t(calcOpen ? "board.calcClose" : "board.calcOpen") }}</button>
           </div>
-          <!-- 今天做了什么：开了几笔、平了几笔、已经落袋多少。 -->
-          <div v-if="showToday" class="mt-1.5 flex flex-wrap items-center gap-1.5 text-xs">
-            <span class="pill tone-accent font-semibold">{{ t("board.todayOpen", { n: lead.todayOpenCount ?? "—" }) }}</span>
-            <span class="pill">{{ t("board.todayClose", { n: lead.todayCloseCount ?? "—" }) }}</span>
-            <span class="pill">{{ t("board.realized") }} <strong class="font-mono tabular-nums" :class="pnlClass(lead.todayRealizedPnl)">{{ signedUsd(lead.todayRealizedPnl) }}</strong></span>
+          <!-- 折叠空仓/停用带单员时展示一行安静摘要；展开时展示今日关键开平与已实现盈亏。 -->
+          <div v-if="collapsed" class="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted">
+            <span>{{ idleSummary }}</span>
+            <span v-if="lead.todayRealizedPnl" class="font-mono font-semibold tabular-nums" :class="pnlClass(lead.todayRealizedPnl)">{{ signedUsd(lead.todayRealizedPnl) }}</span>
+          </div>
+          <div v-else-if="showToday" class="mt-1.5 flex flex-wrap items-center gap-1.5 text-xs">
+            <span class="pill" :class="(lead.todayOpenCount ?? 0) > 0 ? 'tone-accent font-semibold' : 'text-muted'">{{ t("board.todayOpen", { n: lead.todayOpenCount ?? "—" }) }}</span>
+            <span class="pill" :class="(lead.todayCloseCount ?? 0) > 0 ? 'font-medium text-foreground' : 'text-muted'">{{ t("board.todayClose", { n: lead.todayCloseCount ?? "—" }) }}</span>
+            <span class="pill" :class="lead.todayRealizedPnl ? '' : 'text-muted'">{{ t("board.realized") }} <strong class="font-mono tabular-nums" :class="lead.todayRealizedPnl ? pnlClass(lead.todayRealizedPnl) : 'text-muted'">{{ signedUsd(lead.todayRealizedPnl) }}</strong></span>
+            <span v-if="!readOnly && !(lead.todayEvents?.length)" class="pill text-muted">{{ t("board.noEventsShort") }}</span>
           </div>
         </div>
       </div>
       <div class="flex shrink-0 items-center gap-2 text-xs text-muted">
         <span v-if="lead.stale === false" class="live-dot text-success" aria-hidden="true" />
-        {{ t("board.snapshot") }}<FreshnessStamp :seconds="lead.snapshotAgeSec" :stale="lead.stale" :received-at="receivedAt" />
+        <span class="hidden sm:inline">{{ t("board.snapshot") }}</span><FreshnessStamp :seconds="lead.snapshotAgeSec" :stale="lead.stale" :received-at="receivedAt" />
+        <button v-if="!readOnly" type="button" class="inline-flex min-h-8 items-center gap-1 rounded-lg border border-border/50 px-2 text-xs font-medium text-muted transition hover:bg-surface2 hover:text-foreground" :aria-expanded="!collapsed" @click="collapsed = !collapsed">
+          <component :is="collapsed ? ChevronDown : ChevronUp" :size="14" aria-hidden="true" />
+          <span class="hidden sm:inline">{{ t(collapsed ? "board.expandLead" : "board.collapseLead") }}</span>
+        </button>
       </div>
     </header>
-    <div class="card-body">
+    <div v-if="!collapsed" class="card-body">
       <!-- 残留仓是需要立刻处理的风险，放在所有持仓之前。 -->
       <div v-if="!readOnly && lead.orphans?.length" class="mb-4 rounded-xl border border-danger/40 bg-danger/10 p-3 sm:p-4" data-testid="orphans" role="alert">
         <h3 class="flex items-center gap-2 text-sm font-bold text-danger"><AlertTriangle :size="17" aria-hidden="true" />{{ t("board.orphans") }}</h3>
@@ -107,15 +128,15 @@ const showToday = computed(() => !props.readOnly
           <p class="text-xs font-semibold text-danger md:text-right">{{ orphan.reason ? reasonText(orphan.reason) : t("board.orphanWarning") }}</p>
         </div>
       </div>
-      <div class="grid min-w-0 gap-5 xl:grid-cols-[minmax(0,1fr)_300px]">
+      <div class="grid min-w-0 gap-5" :class="showTimeline ? 'xl:grid-cols-[minmax(0,1fr)_300px]' : ''">
         <div class="min-w-0">
           <!-- 隐藏或未知仓位不是已确认空仓，不能显示无持仓。 -->
           <EmptyState v-if="!positions.length" :title="t(lead.positions == null || lead.positionShow !== true ? 'board.unknownPositions' : 'board.noPositions')" data-testid="empty-positions" />
-          <!-- 一个持仓一张卡：左边是带单员的现价 / 盈亏 / 止盈止损，右边紧挨着我的对应持仓。 -->
-          <div v-else class="grid min-w-0 gap-3" :class="readOnly ? 'lg:grid-cols-2' : ''">
+          <!-- 一个持仓一张卡：未绑定模式双列平铺，已绑定模式左边为带单盈亏与价位、右边为我的对应跟单状态。 -->
+          <div v-else class="grid min-w-0 gap-3" :class="!showMineSection ? 'lg:grid-cols-2' : ''">
             <article v-for="position in positions" :id="`pos-${position.symbol}`" :key="positionKey(position)" :data-position="position.key"
               class="min-w-0 rounded-xl border p-3 sm:p-4" :class="[cardTone(position), position.openedToday ? 'today-edge' : '']">
-              <div class="grid min-w-0 gap-3 sm:gap-4" :class="readOnly ? '' : 'lg:grid-cols-[minmax(0,1.15fr)_minmax(0,1fr)]'">
+              <div class="grid min-w-0 gap-3 sm:gap-4" :class="showMineSection ? 'lg:grid-cols-[minmax(0,1.15fr)_minmax(0,1fr)]' : ''">
                 <div class="min-w-0">
                   <div class="flex flex-wrap items-center gap-1.5">
                     <h3 class="text-base font-bold tracking-tight">{{ position.symbol ?? t("common.unknown") }}</h3>
@@ -124,15 +145,15 @@ const showToday = computed(() => !props.readOnly
                     <span v-if="position.openedToday" class="pill tone-accent font-semibold">{{ t("board.today") }}</span>
                     <time class="ml-auto font-mono text-xs tabular-nums text-muted" :title="t('board.openedAt')">{{ formatDateTime(position.openedAt, { short: true, withSeconds: false }) }}</time>
                   </div>
-                  <!-- 现价与浮动盈亏是最需要一眼看到的两个数，移动端字号适当降档以节省垂直空间。 -->
+                  <!-- 焦点强化：现价与浮动盈亏（ROE% + 金额）一眼可见。 -->
                   <div class="mt-2.5 flex flex-wrap items-end justify-between gap-x-4 gap-y-1.5 sm:mt-3">
                     <div class="min-w-0">
                       <p class="text-xs text-muted">{{ t("board.mark") }}</p>
-                      <p class="mt-0.5 font-mono font-bold leading-none tabular-nums tracking-tight [overflow-wrap:anywhere]" :class="readOnly ? 'text-2xl sm:text-3xl' : 'text-xl sm:text-2xl'" data-testid="mark-price">{{ formatPrice(position.markPrice) }}</p>
+                      <p class="mt-0.5 font-mono font-bold leading-none tabular-nums tracking-tight [overflow-wrap:anywhere]" :class="readOnly ? 'text-xl sm:text-2xl' : 'text-lg sm:text-2xl'" data-testid="mark-price">{{ formatPrice(position.markPrice) }}</p>
                     </div>
                     <div class="min-w-0 text-right">
-                      <p class="font-mono text-lg font-bold leading-none tabular-nums sm:text-xl" :class="pnlClass(position.pnlPct)">{{ formatPct(position.pnlPct) }}</p>
-                      <p class="mt-1 font-mono text-xs font-semibold tabular-nums sm:mt-1.5" :class="pnlClass(position.pnl)">{{ signedUsd(position.pnl) }}</p>
+                      <p class="font-mono text-xl font-bold leading-none tabular-nums sm:text-2xl" :class="pnlClass(position.pnlPct)">{{ formatPct(position.pnlPct) }}</p>
+                      <p class="mt-1 font-mono text-sm font-semibold tabular-nums" :class="pnlClass(position.pnl)">{{ signedUsd(position.pnl) }}</p>
                     </div>
                   </div>
                   <!-- 移动端紧凑摘要行：均价与数量一行呈现，次要信息默认收起、提供展开开关。 -->
@@ -166,7 +187,7 @@ const showToday = computed(() => !props.readOnly
                     </div>
                   </div>
                 </div>
-                <div v-if="!readOnly" class="min-w-0 border-t border-border/50 pt-2.5 sm:pt-3 lg:border-l lg:border-t-0 lg:pl-4 lg:pt-0">
+                <div v-if="showMineSection" class="min-w-0 border-t border-border/50 pt-2.5 sm:pt-3 lg:border-l lg:border-t-0 lg:pl-4 lg:pt-0">
                   <p class="eyebrow mb-2">{{ t("board.mine") }}</p>
                   <div class="space-y-2">
                     <MineCard v-for="mine in mineRows(position)" :key="mine?.bindingId || mine?.accountName || 'unbound'" :mine="mine" :class="mine?.bindingEnabled === false ? 'opacity-65' : ''" />
@@ -176,7 +197,7 @@ const showToday = computed(() => !props.readOnly
             </article>
           </div>
         </div>
-        <LeadTimeline class="border-t border-border/50 pt-4 xl:border-l xl:border-t-0 xl:pl-5 xl:pt-0" :events="lead.todayEvents" :positions="lead.positions" :accounts="readOnly ? null : accounts" :read-only="readOnly" />
+        <LeadTimeline v-if="showTimeline" class="border-t border-border/50 pt-4 xl:border-l xl:border-t-0 xl:pl-5 xl:pt-0" :events="lead.todayEvents" :positions="lead.positions" :accounts="readOnly ? null : accounts" :read-only="readOnly" />
       </div>
       <LeadCalculator v-if="calcOpen && !readOnly && lead.id != null" class="mt-5" :lead-id="lead.id" :name="lead.name" />
     </div>

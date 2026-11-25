@@ -199,6 +199,16 @@ onMounted(() => { void load(); });
         <template #cell-user="{ row }">{{ row.username ?? t("common.unknown") }}</template>
         <template #cell-action="{ row }">{{ reasonText(row.action) }}</template>
         <template #cell-details="{ row }"><span class="break-words text-xs text-muted">{{ reasonText(row.details) }}</span></template>
+        <template #mobile-card="{ row }">
+          <div class="space-y-1">
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <strong class="text-sm">{{ reasonText(row.action) }}</strong>
+              <time class="font-mono text-xs tabular-nums text-muted">{{ formatDateTime(row.createdAt, { short: true }) }}</time>
+            </div>
+            <p class="text-xs text-muted">{{ row.username ?? t("common.unknown") }}</p>
+            <p v-if="row.details" class="break-words text-xs text-muted">{{ reasonText(row.details) }}</p>
+          </div>
+        </template>
       </DataTable>
     </details>
   </div>

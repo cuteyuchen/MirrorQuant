@@ -165,9 +165,14 @@ function orderNotional(order: TelemetryOrder) {
                 <span v-if="openedToday(position)" class="pill tone-accent font-semibold">{{ t("board.today") }}</span>
                 <span v-if="position.fundingRate != null" class="pill font-mono tabular-nums">{{ t("pos.fundingRate", { rate: fundingText(position.fundingRate) }) }}</span>
               </div>
-              <a :href="`#pos-${position.symbol ?? position.instId}`" class="inline-flex min-h-8 items-center gap-1 text-xs font-semibold text-accent transition hover:underline">
-                {{ t("common.details") }} ↑
-              </a>
+              <div class="flex items-center gap-3">
+                <span class="text-right font-mono text-sm font-bold tabular-nums" :class="pnlClass(position.uPnL)">
+                  {{ signedUsd(position.uPnL) }}<span class="ml-1.5 text-xs font-semibold" :class="pnlClass(position.uPnLRoePct)">{{ formatPct(position.uPnLRoePct) }}</span>
+                </span>
+                <a :href="`#pos-${position.symbol ?? position.instId}`" class="inline-flex min-h-8 items-center gap-1 text-xs font-semibold text-accent transition hover:underline">
+                  {{ t("common.details") }} ↑
+                </a>
+              </div>
             </div>
             <div class="mt-3 space-y-3">
               <PriceActionPanel v-if="position.analysis?.ok" :analysis="position.analysis" />

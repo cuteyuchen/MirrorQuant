@@ -5,7 +5,7 @@ from app.core.time_util import to_utc_iso
 import json
 import math
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -171,24 +171,37 @@ async def update_account(
 async def delete_account(
     account_id: int,
     request: Request,
+    auto_disable: bool = Query(default=False),
+    force: bool = Query(default=False),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     acct = await _get_owned_account(db, account_id, current_user)
-    if acct.is_enabled:
+    if acct.is_enabled and not auto_disable:
         raise HTTPException(status_code=409, detail="Disable the account and drain exposure before deletion")
-    await require_account_soft_deletable(db, acct)
+    bindings = await require_account_soft_deletable(db, acct, auto_disable=auto_disable, force=force)
     name = acct.name
     # Logical delete: stamp deleted_at instead of removing the row, so the audit
-    # ledger (intents, executions, allocations) stays queryable. Setting the
-    # timestamp does not trigger the bindings cascade (no row is deleted).
+    # ledger (intents, executions, allocations) stays queryable. Clear encrypted
+    # credentials and proxy reference so deleted accounts never retain secrets
+    # or block proxy deletion.
     now = utcnow()
+    acct.is_enabled = False
+    acct.proxy_id = None
+    acct.encrypted_credentials = ""
     acct.deleted_at = now
-    bindings = list((await db.scalars(select(CopyBinding).where(
-        CopyBinding.account_id == account_id, CopyBinding.deleted_at.is_(None)))).all())
     for binding in bindings:
+        binding.is_enabled = False
         binding.deleted_at = now
-    await record_audit(db, "DELETE_ACCOUNT", "account", str(account_id), f"Soft-deleted account {name}", current_user, request)
+    await record_audit(
+        db,
+        "DELETE_ACCOUNT",
+        "account",
+        str(account_id),
+        f"Soft-deleted account {name}" + (" (forced)" if force else ""),
+        current_user,
+        request,
+    )
     await db.commit()
     await invalidate_account_adapter(account_id)
     return {"ok": True}

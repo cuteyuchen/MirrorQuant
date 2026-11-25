@@ -71,7 +71,7 @@ describe("执行筛选与全量计数", () => {
   it("状态计数取后端全量 total，而不是当前页数量", async () => {
     const request = vi.fn(async (endpoint: string) => strictResponse(endpoint));
     const counts = await readExecutionCounts(null, request);
-    expect(counts).toEqual({ all: 47, success: 12, failed: 12, skipped: 11, blocked: 6 });
+    expect(counts).toEqual({ actionable: 36, all: 47, success: 12, failed: 12, skipped: 11, blocked: 6 });
     for (const [endpoint] of request.mock.calls) {
       const query = new URL(endpoint, "http://local.test").searchParams;
       expect(query.get("limit")).toBe("1");
@@ -130,8 +130,8 @@ describe("执行记录页面", () => {
     const { wrapper } = await render();
     await wrapper.find(`button[aria-label="${t("common.next")}"]`).trigger("click");
     await flushPromises();
-    expect(wrapper.findAll("tbody > tr")).toHaveLength(20);
-    expect(wrapper.text()).toContain(t("common.page", { page: 2, total: 47 }));
+    expect(wrapper.findAll("tbody > tr")).toHaveLength(10);
+    expect(wrapper.text()).toContain(t("common.page", { page: 2, total: 30 }));
     await wrapper.find(`button[aria-label="${t("common.previous")}"]`).trigger("click");
     await flushPromises();
     await wrapper.find("tbody > tr").trigger("click");
@@ -178,5 +178,23 @@ describe("执行记录页面", () => {
   it("运行中的带单员状态显示为运行中而非未知", () => {
     expect(statusLabel("running")).toBe("运行中");
     expect(statusTone("running")).toBe("success");
+  });
+});
+
+describe("单请求快速路径与默认筛选", () => {
+  it("后端支持 status_group + counts 时一次请求返回分页与全部计数", async () => {
+    const counts = { actionable: 36, all: 47, success: 12, failed: 12, skipped: 11, blocked: 6 };
+    const request = vi.fn(async (_endpoint: string) => ({ items: mockExecutions.slice(0, 20), total: 36, counts }));
+    const page = await readExecutionPage({ filter: "actionable", page: 0, pageSize: 20, includeCounts: true }, request);
+    expect(request).toHaveBeenCalledTimes(1);
+    const query = new URL(request.mock.calls[0][0], "http://local.test").searchParams;
+    expect(query.get("status_group")).toBe("actionable");
+    expect(query.get("include_counts")).toBe("true");
+    expect(page.counts).toEqual(counts);
+    expect(page.total).toBe(36);
+  });
+  it("默认选中有效记录筛选", async () => {
+    const { wrapper } = await render();
+    expect(wrapper.find('[data-testid="filter-actionable"]').attributes("aria-pressed")).toBe("true");
   });
 });

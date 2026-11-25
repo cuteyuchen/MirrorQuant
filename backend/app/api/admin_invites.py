@@ -10,7 +10,7 @@ import secrets
 import string
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -38,15 +38,12 @@ def _invite_status(code: InviteCode, now: datetime) -> str:
     return "active"
 
 
-async def _invite_out(db: AsyncSession, code: InviteCode) -> dict:
-    creator = None
-    if code.created_by_user_id is not None:
-        creator = await db.get(User, code.created_by_user_id)
+def _invite_out_with_creator(code: InviteCode, creator_username: str | None) -> dict:
     return InviteCodeOut(
         id=code.id,
         code=code.code,
         created_by_user_id=code.created_by_user_id,
-        created_by_username=creator.username if creator else None,
+        created_by_username=creator_username,
         max_uses=code.max_uses,
         used_count=code.used_count,
         expires_at=code.expires_at,
@@ -54,6 +51,13 @@ async def _invite_out(db: AsyncSession, code: InviteCode) -> dict:
         created_at=code.created_at,
         status=_invite_status(code, datetime.now(timezone.utc)),
     ).model_dump(mode="json", by_alias=True)
+
+
+async def _invite_out(db: AsyncSession, code: InviteCode) -> dict:
+    creator = None
+    if code.created_by_user_id is not None:
+        creator = await db.get(User, code.created_by_user_id)
+    return _invite_out_with_creator(code, creator.username if creator else None)
 
 
 def _generate_code() -> str:
@@ -99,7 +103,11 @@ async def list_invite_codes(
     _user: User = Depends(get_current_admin),
 ):
     rows = list((await db.scalars(select(InviteCode).order_by(InviteCode.id.desc()))).all())
-    return {"items": [await _invite_out(db, code) for code in rows]}
+    creator_ids = {code.created_by_user_id for code in rows if code.created_by_user_id is not None}
+    creators = {}
+    if creator_ids:
+        creators = dict((await db.execute(select(User.id, User.username).where(User.id.in_(creator_ids)))).all())
+    return {"items": [_invite_out_with_creator(code, creators.get(code.created_by_user_id)) for code in rows]}
 
 
 @router.post("/{code_id}/revoke")
@@ -120,3 +128,43 @@ async def revoke_invite_code(
     await db.commit()
     await db.refresh(code)
     return {"item": await _invite_out(db, code)}
+
+
+@router.delete("/{code_id}")
+async def delete_invite_code(
+    code_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_admin),
+):
+    code = await db.get(InviteCode, code_id)
+    if code is None:
+        raise HTTPException(status_code=404, detail="Invite code not found")
+    code_text = code.code
+    await db.delete(code)
+    await record_audit(db, "DELETE_INVITE_CODE", "invite_code", str(code_id),
+                       f"Deleted invite code {code_text}", current_user, request)
+    await db.commit()
+    return {"ok": True}
+
+
+@router.delete("")
+async def cleanup_invite_codes(
+    request: Request,
+    inactive_only: bool = Query(default=True),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_admin),
+):
+    rows = list((await db.scalars(select(InviteCode))).all())
+    now = datetime.now(timezone.utc)
+    targets = [
+        code for code in rows
+        if not inactive_only or _invite_status(code, now) != "active"
+    ]
+    for code in targets:
+        await db.delete(code)
+    if targets:
+        await record_audit(db, "DELETE_INVITE_CODE", "invite_code", "bulk",
+                           f"Cleaned up {len(targets)} invite code(s)", current_user, request)
+    await db.commit()
+    return {"ok": True, "deletedCount": len(targets)}

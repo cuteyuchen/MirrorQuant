@@ -87,17 +87,33 @@ async function save() {
   });
   if (result.ok) { showModal.value = false; await load(true); }
 }
-function change(proxy: ProxyNode, operation: "toggle" | "delete", event?: Event) {
+async function change(proxy: ProxyNode, operation: "toggle" | "delete", event?: Event) {
   // 开关只有确认成功且列表刷新后才反映新状态。
   if (event) (event.target as HTMLInputElement).checked = proxy.isEnabled === true;
   if (operation === "toggle" && proxy.isEnabled == null) return;
   const title = t(operation === "delete" ? "common.delete" : proxy.isEnabled ? "common.disable" : "common.enable");
-  return run(async () => {
+  let needUnassign = false;
+  const result = await run(async () => {
     if (operation === "delete") await api.delete(`/api/proxies/${proxy.id}`);
     else await api.put(`/api/proxies/${proxy.id}`, { isEnabled: !proxy.isEnabled });
     await cache.fetchProxies(true);
-  }, { confirm: { title, message: t(operation === "delete" ? "confirm.delete" : "confirm.toggle", { name: proxy.name || "—", action: title }),
-    environments: environments(proxy.id), strong: !usageKnown.value || !cache.bindings } });
+  }, {
+    confirm: { title, message: t(operation === "delete" ? "confirm.delete" : "confirm.toggle", { name: proxy.name || "—", action: title }),
+      environments: environments(proxy.id), strong: !usageKnown.value || !cache.bindings },
+    onError: cause => {
+      if (operation === "delete" && cause instanceof ApiError && cause.status === 409) needUnassign = true;
+    },
+  });
+  if (!result.ok && needUnassign) {
+    error.value = "";
+    const refs = references(proxy.id);
+    const refNames = [...refs.accounts.map(a => a.name ?? String(a.id)), ...refs.leads.map(l => l.name ?? String(l.id))];
+    const refsText = refNames.length ? refNames.join("、") : (proxy.name || String(proxy.id));
+    await run(async () => {
+      await api.delete(`/api/proxies/${proxy.id}?unassign=true`);
+      await load(true);
+    }, { confirm: { title: t("common.delete"), message: t("confirm.unassignProxy", { refs: refsText }), environments: environments(proxy.id), strong: true } });
+  }
 }
 function test(proxy: ProxyNode) {
   batchResult.value = null;
@@ -144,6 +160,41 @@ onActivated(() => { void load(); });
       <template #cell-checked="{ row }"><FreshnessStamp :timestamp="row.lastCheckedAt" :warn-after="300" :critical-after="900" /><p class="mt-1 text-xs text-muted">{{ formatDateTime(row.lastCheckedAt, { short: true, withSeconds: false }) }}</p><p v-if="issue(row)" class="mt-1 break-words text-xs" :class="row.isHealthy === false || row.lastError ? 'text-danger' : 'text-warning'">{{ issue(row) }}</p></template>
       <template #cell-usage="{ row }"><p v-if="!usageKnown" class="text-xs text-warning">{{ t("proxy.usageUnknown") }}</p><div v-else class="space-y-2"><p v-for="account in references(row.id).accounts" :key="`account-${account.id}`" class="flex flex-wrap items-center gap-2 text-xs"><span>{{ t("accts.account") }} · {{ account.name ?? t("common.unknown") }}</span><EnvBadge :environment="account.environment" /></p><p v-for="lead in references(row.id).leads" :key="`lead-${lead.id}`" class="break-words text-xs">{{ t("nav.leads") }} · {{ lead.name ?? t("common.unknown") }}</p><p v-if="!references(row.id).accounts.length && !references(row.id).leads.length" class="text-xs text-muted">{{ t("proxy.unused") }}</p></div></template>
       <template #cell-actions="{ row }"><div class="flex flex-wrap items-center justify-end gap-1"><button class="icon-button" :disabled="pending" :aria-label="t('proxy.testLatency')" :title="t('proxy.testLatency')" @click="test(row)"><Wifi :size="17" /></button><button class="icon-button" :disabled="pending" :aria-label="t('common.edit')" :title="t('common.edit')" @click="edit(row)"><Pencil :size="17" /></button><MoreMenu><button class="menu-item text-danger" :disabled="pending" @click="change(row, 'delete')"><Trash2 :size="16" />{{ t("common.delete") }}</button></MoreMenu></div></template>
+      <template #mobile-card="{ row }">
+        <div class="space-y-2.5">
+          <div class="flex items-start justify-between gap-2">
+            <div class="min-w-0 flex-1">
+              <div class="flex flex-wrap items-center gap-2">
+                <h2 class="truncate text-sm font-bold">{{ row.name ?? t("common.unknown") }}</h2>
+                <StatusBadge :state="row.isHealthy == null ? 'unknown' : row.isHealthy ? 'healthy' : 'error'" />
+                <span class="font-mono text-xs tabular-nums text-muted">{{ row.latencyMs == null ? t("common.unknown") : t("proxy.latencyValue", { n: formatQty(row.latencyMs) }) }}</span>
+              </div>
+              <p class="mt-0.5 truncate font-mono text-xs text-muted">{{ safeAddress(row.url) }}</p>
+            </div>
+            <label class="inline-flex min-h-9 shrink-0 items-center">
+              <input type="checkbox" role="switch" :checked="row.isEnabled === true" :disabled="pending || row.isEnabled == null" :aria-label="t('proxy.enabledFor', { name: row.name ?? '—' })" @change="change(row, 'toggle', $event)" />
+            </label>
+          </div>
+          <div class="flex flex-wrap items-center gap-2 text-xs text-muted">
+            <span>{{ row.region ?? t("common.unknown") }} · {{ t("proxy.priority") }} <strong class="font-mono text-foreground">{{ formatQty(row.priority) }}</strong></span>
+            <FreshnessStamp class="ml-auto" :timestamp="row.lastCheckedAt" :warn-after="300" :critical-after="900" />
+          </div>
+          <p v-if="issue(row)" class="text-xs" :class="row.isHealthy === false || row.lastError ? 'text-danger' : 'text-warning'">{{ issue(row) }}</p>
+          <div class="rounded-lg bg-background/40 px-2.5 py-2 text-xs">
+            <p v-if="!usageKnown" class="text-warning">{{ t("proxy.usageUnknown") }}</p>
+            <div v-else-if="references(row.id).accounts.length || references(row.id).leads.length" class="flex flex-wrap gap-1.5">
+              <span v-for="account in references(row.id).accounts" :key="`m-account-${account.id}`" class="pill">{{ t("accts.account") }} · {{ account.name ?? t("common.unknown") }} <EnvBadge :environment="account.environment" /></span>
+              <span v-for="lead in references(row.id).leads" :key="`m-lead-${lead.id}`" class="pill">{{ t("nav.leads") }} · {{ lead.name ?? t("common.unknown") }}</span>
+            </div>
+            <p v-else class="text-muted">{{ t("proxy.unused") }}</p>
+          </div>
+          <div class="flex items-center justify-end gap-1.5 border-t border-border/40 pt-2">
+            <button type="button" class="button-secondary min-h-9 px-2.5 py-1 text-xs" :disabled="pending" @click="test(row)"><Wifi :size="14" />{{ t("proxy.testLatency") }}</button>
+            <button type="button" class="button-secondary min-h-9 px-2.5 py-1 text-xs" :disabled="pending" @click="edit(row)"><Pencil :size="14" />{{ t("common.edit") }}</button>
+            <button type="button" class="button-danger min-h-9 px-2.5 py-1 text-xs" :disabled="pending" @click="change(row, 'delete')"><Trash2 :size="14" />{{ t("common.delete") }}</button>
+          </div>
+        </div>
+      </template>
     </DataTable>
     <BaseModal :open="showModal" :title="t(editing ? 'proxy.editTitle' : 'proxy.modalTitle')" :busy="pending" @close="showModal = false">
       <form @submit.prevent="save" novalidate><fieldset class="space-y-4" :disabled="pending">

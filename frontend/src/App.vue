@@ -1,13 +1,13 @@
 <script setup lang="ts">
-import { computed, onUnmounted, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { Activity, ClipboardList, Ellipsis, GitFork, Globe, LayoutDashboard, LogOut, Network, Settings, UserCog, Users, Wallet } from "lucide-vue-next";
+import { Activity, ClipboardList, GitFork, Globe, LayoutDashboard, LogOut, Network, Settings, UserCog, Users, Wallet } from "lucide-vue-next";
+import { prefetchCoreRoutes, routeTransitioning } from "@/router";
 import { useAuthStore } from "@/stores/auth";
 import { useBoardStore } from "@/stores/board";
 import { useSocketStore } from "@/stores/socket";
 import { useDataCacheStore } from "@/stores/dataCache";
 import { useI18n } from "@/i18n";
-import BaseModal from "@/components/BaseModal.vue";
 import ConfirmDialog from "@/components/ConfirmDialog.vue";
 import GlobalStatusBar from "@/components/board/GlobalStatusBar.vue";
 import LangToggle from "@/components/LangToggle.vue";
@@ -22,7 +22,6 @@ const route = useRoute();
 const router = useRouter();
 const { t } = useI18n();
 const appVersion = __APP_VERSION__;
-const moreOpen = ref(false);
 const loggingOut = ref(false);
 const intentsError = ref(false);
 const showShell = computed(() => auth.authenticated && route.meta.fullscreen !== true);
@@ -32,9 +31,9 @@ const isAdmin = computed(() => auth.user?.role === "admin");
 const allNavItems = [
   { key: "dashboard", path: "/dashboard", icon: LayoutDashboard },
   { key: "executions", path: "/executions", icon: ClipboardList },
-  { key: "leads", path: "/leads", icon: Users },
   { key: "accounts", path: "/accounts", icon: Wallet },
   { key: "bindings", path: "/bindings", icon: GitFork },
+  { key: "leads", path: "/leads", icon: Users },
   { key: "proxies", path: "/proxies", icon: Network },
   { key: "settings", path: "/settings", icon: Settings },
   { key: "users", path: "/users", icon: UserCog },
@@ -46,8 +45,6 @@ const navGroups = computed(() => [
   { key: "configuration", items: navItems.value.filter(item => ["leads", "accounts", "bindings", "proxies"].includes(item.key)) },
   { key: "system", items: navItems.value.filter(item => ["settings", "users", "publicFeed"].includes(item.key)) },
 ]);
-const mobileItems = computed(() => navItems.value.filter(item => ["dashboard", "executions", "leads", "bindings"].includes(item.key)));
-const moreItems = computed(() => navItems.value.filter(item => !mobileItems.value.includes(item)));
 const pendingCount = computed(() => intentsError.value ? null : cache.intents?.data.length ?? null);
 // 侧栏底部的用户头像只取用户名首字符，不依赖外部头像服务。
 const userInitial = computed(() => (auth.user?.username?.trim() || "?").slice(0, 1).toUpperCase());
@@ -60,21 +57,41 @@ function refreshGlobal(force = false) {
   void cache.fetchIntents(force).then(() => { intentsError.value = false; }).catch(() => { intentsError.value = true; });
 }
 // 认证与错误页不启动私有轮询；待处理角标与执行页共享最新缓存。
+function startPolling() {
+  stop();
+  if (!showShell.value) return;
+  socket.connect();
+  refreshGlobal();
+  prefetchCoreRoutes();
+  pollTimer = setInterval(() => {
+    if (typeof document === "undefined" || document.visibilityState === "visible") {
+      refreshGlobal(true);
+    }
+  }, 6000);
+}
+function onVisibilityChange() {
+  if (!showShell.value || typeof document === "undefined") return;
+  if (document.visibilityState === "visible") refreshGlobal(true);
+}
 watch(showShell, active => {
   stop();
-  if (active) {
-    socket.connect(); refreshGlobal();
-    pollTimer = setInterval(() => { refreshGlobal(true); }, 6000);
-  } else { socket.disconnect(); board.clear(); }
+  if (active) startPolling();
+  else { socket.disconnect(); board.clear(); }
 }, { immediate: true });
+onMounted(() => {
+  if (typeof document !== "undefined") document.addEventListener("visibilitychange", onVisibilityChange);
+});
 // 有界事件数组满 50 条后仍由单调递增序号触发刷新。
 watch(() => socket.eventSequence, () => {
   if (!showShell.value) return;
   clearTimeout(eventTimer);
   eventTimer = setTimeout(() => { refreshGlobal(true); }, 200);
 });
-watch(() => route.fullPath, () => { moreOpen.value = false; });
-onUnmounted(() => { stop(); socket.disconnect(); });
+onUnmounted(() => {
+  stop();
+  socket.disconnect();
+  if (typeof document !== "undefined") document.removeEventListener("visibilitychange", onVisibilityChange);
+});
 async function logout() {
   if (loggingOut.value) return;
   loggingOut.value = true;
@@ -84,6 +101,9 @@ async function logout() {
 </script>
 <template>
   <div class="min-h-dvh">
+    <div v-if="routeTransitioning" class="pointer-events-none fixed inset-x-0 top-0 z-[80] h-0.5 overflow-hidden bg-accent/20" aria-hidden="true">
+      <div class="h-full w-1/2 animate-pulse bg-accent" />
+    </div>
     <a v-if="showShell" href="#main-content" class="sr-only focus:not-sr-only focus:fixed focus:left-3 focus:top-3 focus:z-50 focus:rounded-lg focus:bg-accent focus:p-3 focus:font-semibold focus:text-onAccent">{{ t("nav.skipToContent") }}</a>
     <div class="flex min-w-0">
       <!-- 桌面侧栏：整屏高度吸附，品牌在上、导航居中滚动、用户与主题 / 语言 / 登出固定在底部。 -->
@@ -142,27 +162,16 @@ async function logout() {
         </main>
       </div>
     </div>
-    <!-- 移动底栏：四个最常用入口 + “更多”，当前页用顶部指示条标出；紧凑高度释放首屏垂直视口。 -->
-    <nav v-if="showShell" :aria-label="t('nav.main')" class="pb-safe fixed inset-x-0 bottom-0 z-30 grid grid-cols-5 border-t border-border/60 bg-surface/90 backdrop-blur-md md:hidden">
-      <RouterLink v-for="item in mobileItems" :key="item.path" :to="item.path" class="relative flex min-h-12 min-w-0 flex-col items-center justify-center gap-0.5 px-1 py-1.5 text-[11px] font-medium transition"
-        :class="isActive(item.path) ? 'text-accent' : 'text-muted'" :aria-current="isActive(item.path) ? 'page' : undefined">
-        <span v-if="isActive(item.path)" class="absolute inset-x-5 top-0 h-0.5 rounded-full bg-accent" aria-hidden="true" />
-        <span class="relative"><component :is="item.icon" :size="18" aria-hidden="true" /><span v-if="item.key === 'executions' && pendingCount != null && pendingCount > 0" class="absolute -right-3 -top-2 min-w-4 rounded-full bg-warning px-1 text-center text-xs font-bold tabular-nums text-onAccent" :aria-label="t('nav.pendingCount', { n: pendingCount })">{{ pendingCount }}</span></span>
-        <span class="max-w-full truncate">{{ t(`nav.${item.key}`) }}</span>
+    <!-- 移动底栏：全部菜单横向单行直达，1 次点击切换页面，无需经由“更多”弹窗中转。 -->
+    <nav v-if="showShell" :aria-label="t('nav.main')" class="pb-safe fixed inset-x-0 bottom-0 z-30 flex items-stretch overflow-x-auto border-t border-border/60 bg-surface/95 backdrop-blur-md no-scrollbar md:hidden">
+      <RouterLink v-for="item in navItems" :key="item.path" :to="item.path"
+        class="relative flex min-h-12 flex-1 basis-[20%] shrink-0 flex-col items-center justify-center gap-0.5 px-1.5 py-1.5 text-[11px] font-medium transition"
+        :class="isActive(item.path) ? 'text-accent' : 'text-muted hover:text-foreground'" :aria-current="isActive(item.path) ? 'page' : undefined">
+        <span v-if="isActive(item.path)" class="absolute inset-x-3 top-0 h-0.5 rounded-full bg-accent" aria-hidden="true" />
+        <span class="relative"><component :is="item.icon" :size="18" aria-hidden="true" /><span v-if="item.key === 'executions' && pendingCount != null && pendingCount > 0" class="absolute -right-3 -top-2 min-w-4 rounded-full bg-warning px-1 text-center text-[10px] font-bold tabular-nums text-onAccent" :aria-label="t('nav.pendingCount', { n: pendingCount })">{{ pendingCount }}</span></span>
+        <span class="max-w-full truncate whitespace-nowrap">{{ t(`nav.${item.key}`) }}</span>
       </RouterLink>
-      <button type="button" class="relative flex min-h-12 flex-col items-center justify-center gap-0.5 text-[11px] font-medium transition" :class="moreItems.some(item => isActive(item.path)) ? 'text-accent' : 'text-muted'" :aria-expanded="moreOpen" @click="moreOpen = true">
-        <span v-if="moreItems.some(item => isActive(item.path))" class="absolute inset-x-5 top-0 h-0.5 rounded-full bg-accent" aria-hidden="true" />
-        <Ellipsis :size="18" aria-hidden="true" />{{ t("nav.more") }}
-      </button>
     </nav>
-    <BaseModal :open="moreOpen" :title="t('nav.more')" @close="moreOpen = false">
-      <nav class="grid gap-1">
-        <RouterLink v-for="item in moreItems" :key="item.path" :to="item.path" class="flex min-h-12 items-center gap-3 rounded-xl border px-3 text-sm font-medium transition"
-          :class="isActive(item.path) ? 'border-accent/25 bg-accent/10 text-accent' : 'border-transparent text-foreground hover:bg-surface2'" @click="moreOpen = false">
-          <component :is="item.icon" :size="20" aria-hidden="true" />{{ t(`nav.${item.key}`) }}
-        </RouterLink>
-      </nav>
-    </BaseModal>
     <ConfirmDialog /><ToastHost />
   </div>
 </template>

@@ -302,7 +302,7 @@ async def register(
         raise HTTPException(status_code=400, detail="Invite code has been fully used")
 
     username = payload.username.strip()
-    existing = await db.scalar(select(User).where(User.username == username))
+    existing = await db.scalar(select(User).where(User.username == username, User.deleted_at.is_(None)))
     if existing is not None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Username already taken")
 

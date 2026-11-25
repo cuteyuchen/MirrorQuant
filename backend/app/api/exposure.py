@@ -31,11 +31,14 @@ async def require_binding_flat(db: AsyncSession, binding: CopyBinding, *, deleti
         raise HTTPException(status_code=409, detail=detail)
 
 
-async def _verify_account_flat_on_exchange(db: AsyncSession, account: TradingAccount) -> None:
+async def _verify_account_flat_on_exchange(
+    db: AsyncSession, account: TradingAccount, *, allow_unreachable: bool = False
+) -> None:
     """Confirm the account holds no physical positions and no open orders on the exchange.
 
     Shared by the hard-delete flat check and the soft-delete check; a verification
-    failure is fail-closed (409) in both cases.
+    failure is fail-closed (409) in both cases unless allow_unreachable is explicitly
+    requested for a locally-flat account whose API key or exchange is unreachable.
     """
     try:
         credentials = CredentialVault().decrypt_dict(account.encrypted_credentials)
@@ -54,7 +57,15 @@ async def _verify_account_flat_on_exchange(db: AsyncSession, account: TradingAcc
         if any(not math.isfinite(float(position.pos)) for position in positions):
             raise ValueError("Invalid exchange position inventory")
     except Exception as exc:
-        raise HTTPException(status_code=409, detail="Cannot verify a flat account; keep it disabled until reconciliation succeeds") from exc
+        if allow_unreachable:
+            return
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "EXCHANGE_UNREACHABLE_CAN_FORCE",
+                "message": "Cannot verify a flat account; keep it disabled until reconciliation succeeds",
+            },
+        ) from exc
     if any(abs(position.pos) > 0 for position in positions) or orders:
         raise HTTPException(status_code=409, detail="Drain physical positions and pending orders before changing or deleting the account")
 
@@ -69,31 +80,66 @@ async def require_account_flat(db: AsyncSession, account: TradingAccount, *, del
 
 async def require_binding_soft_deletable(db: AsyncSession, binding: CopyBinding) -> None:
     """Gate for logical delete: the binding must be drained, but its terminal order
-    history is the retained ledger and does NOT block deletion."""
-    allocation = await db.scalar(select(PositionAllocation.id).where(
+    history is the retained ledger and does NOT block deletion.
+    Orphan PositionGuardState rows whose allocation is already flat are cleaned up.
+    """
+    live_allocs = list((await db.scalars(select(PositionAllocation).where(
         PositionAllocation.binding_id == binding.id, PositionAllocation.owned_qty > 0,
-    ).limit(1))
-    guard = await db.scalar(select(PositionGuardState.id).where(PositionGuardState.binding_id == binding.id).limit(1))
-    intent = await db.scalar(select(OrderIntent.id).where(
+    ))).all())
+    live_keys = {(a.inst_id, a.pos_side) for a in live_allocs}
+    guards = list((await db.scalars(select(PositionGuardState).where(
+        PositionGuardState.binding_id == binding.id,
+    ))).all())
+    stale_guards = [g for g in guards if (g.inst_id, g.pos_side) not in live_keys]
+    for g in stale_guards:
+        await db.delete(g)
+    live_guard = next((g for g in guards if (g.inst_id, g.pos_side) in live_keys), None)
+    intent = await db.scalar(select(OrderIntent).where(
         OrderIntent.binding_id == binding.id, OrderIntent.state.not_in(TERMINAL_ORDER_STATES),
     ).limit(1))
-    if allocation is not None or guard is not None or intent is not None:
+    if live_allocs or live_guard is not None or intent is not None:
+        details = []
+        if live_allocs:
+            details.append(", ".join(f"{a.inst_id}({a.pos_side})={a.owned_qty:g}" for a in live_allocs[:3]))
+        if intent is not None:
+            details.append(f"pending order {intent.inst_id} ({intent.state})")
+        suffix = f": {'; '.join(details)}" if details else ""
         raise HTTPException(
             status_code=409,
-            detail="Binding has live exposure, protection, or non-terminal order history; drain it before deletion",
+            detail=f"Binding has live exposure, protection, or non-terminal order history; drain it before deletion{suffix}",
         )
 
 
-async def require_account_soft_deletable(db: AsyncSession, account: TradingAccount) -> None:
+async def require_account_soft_deletable(
+    db: AsyncSession,
+    account: TradingAccount,
+    *,
+    auto_disable: bool = False,
+    force: bool = False,
+) -> list[CopyBinding]:
     """Gate for logical delete of an account: every live (non-deleted) binding must be
-    disabled and soft-deletable, and the account must be physically flat on the exchange."""
+    disabled (unless auto_disable=True) and soft-deletable, and the account must be
+    physically flat on the exchange (or force=True when exchange is unreachable and local ledger is flat).
+    """
+    from app.models.domain import ExecutionRecord
+
     bindings = list((await db.scalars(select(CopyBinding).where(
         CopyBinding.account_id == account.id, CopyBinding.deleted_at.is_(None)))).all())
     for binding in bindings:
-        if binding.is_enabled:
+        if binding.is_enabled and not auto_disable:
             raise HTTPException(
                 status_code=409,
                 detail="Disable all bindings before deleting the account",
             )
         await require_binding_soft_deletable(db, binding)
-    await _verify_account_flat_on_exchange(db, account)
+
+    if account.last_sync_at is None:
+        has_any_intent = await db.scalar(select(OrderIntent.id).where(
+            OrderIntent.account_id == account.id).limit(1))
+        has_any_exec = await db.scalar(select(ExecutionRecord.id).where(
+            ExecutionRecord.account_id == account.id).limit(1))
+        if has_any_intent is None and has_any_exec is None:
+            return bindings
+
+    await _verify_account_flat_on_exchange(db, account, allow_unreachable=force)
+    return bindings

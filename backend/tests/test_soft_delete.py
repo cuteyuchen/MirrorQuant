@@ -228,29 +228,27 @@ async def test_soft_delete_account_blocked_when_binding_has_live_exposure(async_
 
 
 @pytest.mark.asyncio
-async def test_lead_delete_blocked_by_soft_deleted_binding_history(async_client, soft_delete_state):
-    """A lead whose binding was soft-deleted (terminal history kept) must NOT be
-    physically deletable: the delete would cascade-destroy the retained ledger,
-    so the soft-deleted binding still blocks it with 409."""
+async def test_lead_soft_delete_with_soft_deleted_binding_retains_ledger_and_allows_recreate(async_client, soft_delete_state):
+    """A lead whose binding was soft-deleted can be soft-deleted while retaining the ledger,
+    disappearing from active lists, and allowing re-creation with the same portfolioId."""
     state = soft_delete_state
     ids = state.ids
     await _add_terminal_history(ids["binding"], ids["account"], ids["lead"])
     assert (await async_client.delete(f"/api/bindings/{ids['binding']}", headers=_auth(state))).status_code == 200
     response = await async_client.delete(f"/api/leads/{ids['lead']}", headers=_auth(state))
-    assert response.status_code == 409
-    # Lead and ledger both survive.
+    assert response.status_code == 200
+    # Ledger still survives.
     assert await _count(OrderIntent, binding_id=ids["binding"]) == 3
     listed = await async_client.get("/api/leads", headers=_auth(state))
-    assert ids["lead"] in [item["id"] for item in listed.json()["items"]]
+    assert ids["lead"] not in [item["id"] for item in listed.json()["items"]]
+    recreated = await async_client.post("/api/leads", json={
+        "name": "lead-recreated", "portfolioId": "portfolio", "platform": "binance_bapi",
+    }, headers=_auth(state))
+    assert recreated.status_code == 201
+    assert recreated.json()["item"]["id"] != ids["lead"]
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    reason="DB-level UNIQUE (lead_id, account_id) is enforced by sqlite_autoindex and "
-    "blocks re-creation while the soft-deleted row exists; removing it needs a "
-    "copy_bindings table rebuild, which is outside this change's migration scope",
-    strict=False,
-)
 async def test_create_binding_after_soft_delete_allowed(async_client, soft_delete_state):
     state = soft_delete_state
     ids = state.ids
@@ -266,3 +264,59 @@ async def test_create_binding_after_soft_delete_allowed(async_client, soft_delet
 
     listed = await async_client.get("/api/bindings", headers=_auth(state))
     assert [item["id"] for item in listed.json()["items"]] == [new_id]
+
+
+@pytest.mark.asyncio
+async def test_auto_disable_and_force_delete_and_proxy_ghost_fix(async_client, soft_delete_state, monkeypatch):
+    state = soft_delete_state
+    ids = state.ids
+    await _set_binding_enabled(ids["binding"], True)
+    async with get_session_factory()() as db:
+        acct = await db.get(TradingAccount, ids["account"])
+        acct.proxy_id = 1
+        acct.last_sync_at = acct.created_at
+        await db.commit()
+    # Proxy blocked while active account references it.
+    assert (await async_client.delete("/api/proxies/1", headers=_auth(state))).status_code == 409
+    # Enabled binding can be deleted with auto_disable=true when flat.
+    assert (await async_client.delete(f"/api/bindings/{ids['binding']}?auto_disable=true", headers=_auth(state))).status_code == 200
+    # Unreachable exchange check returns EXCHANGE_UNREACHABLE_CAN_FORCE, then force=true succeeds.
+    broken_adapter = SimpleNamespace(
+        get_positions=AsyncMock(side_effect=RuntimeError("401 unauthorized")),
+        get_open_orders=AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(exposure, "create_exchange_adapter", lambda *args, **kwargs: broken_adapter)
+    await _add_terminal_history(ids["binding"], ids["account"], ids["lead"])
+    res = await async_client.delete(f"/api/accounts/{ids['account']}?auto_disable=true", headers=_auth(state))
+    assert res.status_code == 409
+    assert res.json()["detail"]["code"] == "EXCHANGE_UNREACHABLE_CAN_FORCE"
+    res2 = await async_client.delete(f"/api/accounts/{ids['account']}?auto_disable=true&force=true", headers=_auth(state))
+    assert res2.status_code == 200
+    # Proxy can now be deleted without ghost reference from soft-deleted account!
+    assert (await async_client.delete("/api/proxies/1", headers=_auth(state))).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_executions_status_group_counts_and_soft_deleted_binding_info(async_client, soft_delete_state):
+    state = soft_delete_state
+    ids = state.ids
+    await _add_terminal_history(ids["binding"], ids["account"], ids["lead"])
+    async with get_session_factory()() as db:
+        db.add(ExecutionRecord(
+            binding_id=ids["binding"], lead_id=ids["lead"], account_id=ids["account"],
+            lead_name="lead", account_name="account", symbol="ETHUSDT", inst_id="ETHUSDT",
+            side="SELL", position_side="SHORT", action="PARTIAL_REDUCE", status="SKIPPED_NO_LOCAL_POS",
+            lead_qty=1.0, lead_price=3000.0, lead_notional=3000.0,
+            my_qty=0.0, my_price=0.0, my_notional=0.0, slippage_pct=0.0,
+        ))
+        await db.commit()
+    assert (await async_client.delete(f"/api/bindings/{ids['binding']}", headers=_auth(state))).status_code == 200
+    res = await async_client.get("/api/dashboard/executions?status_group=actionable&include_counts=true", headers=_auth(state))
+    assert res.status_code == 200
+    body = res.json()
+    assert body["counts"] == {"all": 3, "actionable": 2, "success": 2, "failed": 0, "skipped": 1, "blocked": 0}
+    assert body["total"] == 2
+    assert len(body["items"]) == 2
+    assert body["items"][0]["bindingName"] == "binding"
+    assert body["items"][0]["bindingDeleted"] is True
+    assert body["items"][0]["environment"] == "demo"

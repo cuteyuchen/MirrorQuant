@@ -391,7 +391,8 @@ async def build_board(db, *, now=None, owner_user_id=None):
     local = now.astimezone(BEIJING_TZ)
     start = local.replace(hour=0, minute=0, second=0, microsecond=0)
     now_ms, start_ms = milliseconds(now), milliseconds(start)
-    leads = list((await db.scalars(select(LeadSource).order_by(LeadSource.id))).all())
+    leads = list((await db.scalars(select(LeadSource).where(
+        LeadSource.deleted_at.is_(None)).order_by(LeadSource.id))).all())
     account_stmt = select(TradingAccount).where(TradingAccount.deleted_at.is_(None))
     binding_stmt = select(CopyBinding).where(CopyBinding.deleted_at.is_(None))
     if owner_user_id is not None:
@@ -570,6 +571,7 @@ async def build_board(db, *, now=None, owner_user_id=None):
             "id": lead.id, "name": lead.name, "avatarUrl": lead.avatar_url, "status": lead.status,
             "enabled": lead.is_enabled, "stale": fresh["stale"], "snapshotAgeSec": fresh["snapshotAgeSec"],
             "positionShow": position_show if isinstance(position_show, bool) else None,
+            "boundCount": len(bound), "activeBoundCount": sum(1 for b in bound if b.is_enabled),
             "todayOpenCount": sum(event["action"] == "OPEN" for event in events) if counts_known else None,
             "todayCloseCount": sum(event["action"] == "CLOSE" for event in events) if counts_known else None,
             "todayRealizedPnl": realized,

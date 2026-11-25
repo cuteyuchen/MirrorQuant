@@ -237,7 +237,9 @@ class EngineOrchestrator:
                     self._last_retention_cleanup = time.monotonic()
             proxies = list((await db.scalars(select(ProxyNode).order_by(ProxyNode.priority))).all())
             leads = list(
-                (await db.scalars(select(LeadSource).where(LeadSource.is_enabled == True))).all()  # noqa: E712
+                (await db.scalars(select(LeadSource).where(
+                    LeadSource.is_enabled == True,  # noqa: E712
+                    LeadSource.deleted_at.is_(None)))).all()
             )
             accounts = list(
                 (await db.scalars(select(TradingAccount).where(
@@ -288,7 +290,7 @@ class EngineOrchestrator:
             factory = get_session_factory()
             async with factory() as db:
                 lead = await db.get(LeadSource, lead_id)
-                if lead is None or not lead.is_enabled:
+                if lead is None or lead.deleted_at is not None or not lead.is_enabled:
                     return
                 await self.sync_lead(db, lead, proxies=None)
         except asyncio.CancelledError:

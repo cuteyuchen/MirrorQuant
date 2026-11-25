@@ -8,7 +8,7 @@ const { t } = useI18n();
 <template>
   <AuthLayout :title="t('notFound.title')" :description="t('notFound.description')" :badge="t('auth.notFoundCode')">
     <div class="space-y-5">
-      <FileQuestion :size="36" class="text-muted" />
+      <span class="flex h-14 w-14 items-center justify-center rounded-2xl bg-surface2"><FileQuestion :size="30" class="text-muted" /></span>
       <RouterLink to="/dashboard" class="button-primary w-full"><ArrowLeft :size="18" />{{ t("common.back") }}</RouterLink>
     </div>
   </AuthLayout>

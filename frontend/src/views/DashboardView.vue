@@ -101,6 +101,26 @@ const attentionTone = computed<Tone>(() => {
   if (stats?.attention == null) return "neutral";
   return stats.orphans > 0 ? "danger" : stats.misaligned > 0 ? "warning" : "success";
 });
+// 按优先级排序：有残留/未对齐最先 > 有效绑定且有持仓 > 纯观察有持仓 > 空仓或停用放最后。
+function leadPriority(lead: NonNullable<typeof board.data>["leads"] extends (infer T)[] | null | undefined ? T : never) {
+  const hasOrphan = (lead.orphans?.length ?? 0) > 0;
+  const hasMisaligned = !!lead.positions?.some(p => p.mine?.some(m => m.state !== "aligned"));
+  if (hasOrphan || hasMisaligned) return 0;
+  const hasPositions = (lead.positions?.length ?? 0) > 0;
+  const isBound = (lead.activeBoundCount ?? lead.boundCount ?? 0) > 0;
+  if (isBound && hasPositions) return 1;
+  if (hasPositions) return 2;
+  if (lead.enabled !== false && (lead.todayEvents?.length ?? 0) > 0) return 3;
+  return 4;
+}
+const sortedLeads = computed(() => {
+  const leads = board.data?.leads;
+  if (!leads?.length) return [];
+  return [...leads].sort((a, b) => leadPriority(a) - leadPriority(b));
+});
+function isIdleLead(lead: (typeof sortedLeads.value)[number]) {
+  return lead.enabled === false || (!lead.positions?.length && !lead.orphans?.length && !lead.todayEvents?.length);
+}
 // 全局 App 监听事件序号并轮询；看板本身只消费同一份权威数据。
 onMounted(() => { void board.refresh(); });
 onActivated(() => { void board.refresh(); });
@@ -111,30 +131,30 @@ onActivated(() => { void board.refresh(); });
     <ErrorState v-if="board.error" :message="`${t('board.loadError')} · ${board.error}`" :busy="board.loading" @retry="board.refresh(true)" />
     <LoadingSkeleton v-if="board.loading && !board.data" />
     <template v-else-if="board.data">
-      <!-- 首屏五个数：我的钱、今天赚亏、浮动盈亏、带单员手里有多少仓、哪里需要我处理。 -->
-      <section class="flex overflow-x-auto gap-2.5 pb-1 no-scrollbar md:grid md:grid-cols-3 xl:grid-cols-5" :aria-label="t('kpi.region')">
-        <KpiCard class="min-w-[170px] shrink-0 md:min-w-0 md:col-span-1" tone="accent" :icon="Wallet" :label="t(`kpi.equity.${scope}`)" :value="formatUsd(money?.main.equity.total)" :sub="equitySub">
+      <!-- 首屏五个数：移动端 2 列栅格（总权益通栏 Hero + 2x2 核心指标），桌面端 3/5 列平铺，避免横向截断。 -->
+      <section class="grid grid-cols-2 gap-2.5 md:grid-cols-3 xl:grid-cols-5" :aria-label="t('kpi.region')">
+        <KpiCard class="col-span-2 md:col-span-1" tone="accent" :icon="Wallet" :label="t(`kpi.equity.${scope}`)" :value="formatUsd(money?.main.equity.total)" :sub="equitySub">
           <p v-if="money?.main.equity.missing" class="mt-1 text-xs font-medium text-warning">{{ t("kpi.partial", { n: money.main.equity.missing }) }}</p>
         </KpiCard>
-        <KpiCard class="min-w-[150px] shrink-0 md:min-w-0" :tone="pnlTone(money?.main.todayPnl.total)" :icon="(money?.main.todayPnl.total ?? 0) < 0 ? TrendingDown : TrendingUp" :label="t(`kpi.todayPnl.${scope}`)"
+        <KpiCard :tone="pnlTone(money?.main.todayPnl.total)" :icon="(money?.main.todayPnl.total ?? 0) < 0 ? TrendingDown : TrendingUp" :label="t(`kpi.todayPnl.${scope}`)"
           :value="signedUsd(money?.main.todayPnl.total)" :value-class="pnlClass(money?.main.todayPnl.total)" :sub="todaySub">
           <p v-if="money?.main.todayPnl.missing" class="mt-1 text-xs font-medium text-warning">{{ t("kpi.partial", { n: money.main.todayPnl.missing }) }}</p>
         </KpiCard>
-        <KpiCard class="min-w-[150px] shrink-0 md:min-w-0" :tone="pnlTone(money?.main.unrealized.total)" :icon="Activity" :label="t(`kpi.unrealized.${scope}`)"
+        <KpiCard :tone="pnlTone(money?.main.unrealized.total)" :icon="Activity" :label="t(`kpi.unrealized.${scope}`)"
           :value="signedUsd(money?.main.unrealized.total)" :value-class="pnlClass(money?.main.unrealized.total)" :sub="unrealizedSub">
           <p v-if="money?.main.unrealized.missing" class="mt-1 text-xs font-medium text-warning">{{ t("kpi.partial", { n: money.main.unrealized.missing }) }}</p>
         </KpiCard>
-        <KpiCard class="min-w-[150px] shrink-0 md:min-w-0" tone="brand" :icon="Layers" :label="t('kpi.leadPositions')" :value="leadStats?.positions"
+        <KpiCard :tone="leadStats?.positions ? 'brand' : 'neutral'" :icon="Layers" :label="t('kpi.leadPositions')" :value="leadStats?.positions"
           :sub="t('kpi.todayFlow', { open: leadStats?.opened ?? '—', close: leadStats?.closed ?? '—' })">
           <p v-if="leadStats?.unknownLeads" class="mt-1 text-xs font-medium text-warning">{{ t("kpi.leadsUnknown", { n: leadStats.unknownLeads }) }}</p>
         </KpiCard>
-        <KpiCard class="min-w-[150px] shrink-0 md:min-w-0" :tone="attentionTone" :icon="attentionTone === 'success' ? CheckCircle2 : AlertTriangle" :label="t('kpi.attention')" :value="leadStats?.attention"
+        <KpiCard :tone="attentionTone" :icon="attentionTone === 'success' ? CheckCircle2 : AlertTriangle" :label="t('kpi.attention')" :value="leadStats?.attention"
           :value-class="attentionTone === 'danger' ? 'text-danger' : attentionTone === 'warning' ? 'text-warning' : attentionTone === 'success' ? 'text-success' : ''"
           :sub="leadStats?.attention === 0 ? t('kpi.allAligned') : leadStats?.attention == null ? '' : t('kpi.attentionDetail', { orphans: leadStats.orphans, misaligned: leadStats.misaligned })" />
       </section>
       <AccountSummary :accounts="board.data.accounts" />
       <EmptyState v-if="!board.data.leads?.length" class="card" :title="t(board.data.leads == null ? 'common.unknown' : 'board.noLeads')" />
-      <LeadComparison v-for="lead in board.data.leads || []" :key="lead.id || lead.name || 'lead'" :lead="lead" :received-at="board.receivedAt" :accounts="board.data.accounts" />
+      <LeadComparison v-for="lead in sortedLeads" :key="lead.id || lead.name || 'lead'" :lead="lead" :received-at="board.receivedAt" :accounts="board.data.accounts" :default-collapsed="isIdleLead(lead)" />
     </template>
   </div>
 </template>

@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from sqlalchemy import func, select, update
+from sqlalchemy import case, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_admin, record_audit
@@ -143,10 +143,56 @@ async def list_users(
 ):
     rows = list((await db.scalars(select(User).where(
         User.deleted_at.is_(None)).order_by(User.id))).all())
+    user_ids = [user.id for user in rows]
+    acct_stats: dict[int, tuple[int, float]] = {}
+    bind_stats: dict[int, tuple[int, int]] = {}
+    pos_stats: dict[int, int] = {}
+    if user_ids:
+        for uid, cnt, eq in (await db.execute(
+            select(
+                TradingAccount.owner_user_id,
+                func.count(TradingAccount.id),
+                func.coalesce(func.sum(TradingAccount.usdt_equity), 0.0),
+            )
+            .where(TradingAccount.owner_user_id.in_(user_ids), TradingAccount.deleted_at.is_(None))
+            .group_by(TradingAccount.owner_user_id)
+        )).all():
+            if uid is not None:
+                acct_stats[uid] = (int(cnt or 0), round(float(eq or 0.0), 2))
+        for uid, cnt, enabled_cnt in (await db.execute(
+            select(
+                CopyBinding.owner_user_id,
+                func.count(CopyBinding.id),
+                func.coalesce(func.sum(case((CopyBinding.is_enabled.is_(True), 1), else_=0)), 0),
+            )
+            .where(CopyBinding.owner_user_id.in_(user_ids), CopyBinding.deleted_at.is_(None))
+            .group_by(CopyBinding.owner_user_id)
+        )).all():
+            if uid is not None:
+                bind_stats[uid] = (int(cnt or 0), int(enabled_cnt or 0))
+        for uid, cnt in (await db.execute(
+            select(CopyBinding.owner_user_id, func.count(PositionAllocation.id))
+            .join(CopyBinding, CopyBinding.id == PositionAllocation.binding_id)
+            .where(
+                CopyBinding.owner_user_id.in_(user_ids),
+                CopyBinding.deleted_at.is_(None),
+                PositionAllocation.owned_qty != 0,
+            )
+            .group_by(CopyBinding.owner_user_id)
+        )).all():
+            if uid is not None:
+                pos_stats[uid] = int(cnt or 0)
     items = []
     for user in rows:
-        summary = await _follow_summary(db, user.id)
-        items.append(_summary_out(user, summary))
+        acct_cnt, eq = acct_stats.get(user.id, (0, 0.0))
+        bind_cnt, enabled_cnt = bind_stats.get(user.id, (0, 0))
+        items.append(_summary_out(user, {
+            "account_count": acct_cnt,
+            "binding_count": bind_cnt,
+            "enabled_binding_count": enabled_cnt,
+            "open_position_count": pos_stats.get(user.id, 0),
+            "total_equity": eq,
+        }))
     return {"items": items}
 
 

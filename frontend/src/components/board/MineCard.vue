@@ -37,9 +37,9 @@ const reason = computed(() => {
   <div
     v-else
     class="min-w-0 rounded-xl border p-2.5 sm:p-3"
-    :class="tone === 'danger' ? 'border-danger/40 bg-danger/5' : tone === 'success' ? 'border-border/50 bg-surface/70' : 'border-warning/40 bg-warning/5'"
+    :class="tone === 'danger' ? 'border-danger/40 bg-danger/5' : tone === 'success' ? 'border-border/40 bg-surface/50' : 'border-warning/40 bg-warning/5'"
   >
-    <!-- 顶行：账户名称、环境、跟单状态徽标，移动端将盈亏直接紧凑带出 -->
+    <!-- 顶行：账户名称、环境、跟单状态徽标；已跟上时视觉更安静，异常状态更突出。 -->
     <div class="flex flex-wrap items-center justify-between gap-1.5">
       <div class="flex min-w-0 flex-wrap items-center gap-1.5">
         <span class="min-w-0 text-sm font-semibold [overflow-wrap:anywhere]">{{ mine.accountName ?? t("common.unknown") }}</span>
@@ -51,12 +51,12 @@ const reason = computed(() => {
       </div>
     </div>
     <!-- 移动端紧凑一行呈现均价与数量摘要 -->
-    <div class="mt-1.5 flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-xs sm:hidden">
+    <div class="mt-1 flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-xs sm:hidden">
       <span class="text-muted">{{ qtyLabel }}: <strong class="font-mono text-foreground tabular-nums"><template v-if="showExpected">{{ sizeText(mine.qty, null, mine.entryPrice) }} / {{ sizeText(mine.expectedQty, null, mine.entryPrice) }}</template><template v-else>{{ sizeText(mine.qty, null, mine.entryPrice) }}</template></strong></span>
       <span class="text-muted">{{ t("board.entry") }}: <strong class="font-mono text-foreground tabular-nums">{{ formatPrice(mine.entryPrice) }}</strong></span>
     </div>
     <!-- 桌面端保留 3 列指标 -->
-    <dl class="mt-2.5 hidden grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)_minmax(0,0.9fr)] gap-2 text-xs sm:grid">
+    <dl class="mt-2 hidden grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)_minmax(0,0.9fr)] gap-2 text-xs sm:grid">
       <div class="min-w-0">
         <dt class="text-muted">{{ qtyLabel }}</dt>
         <dd class="mt-0.5 font-mono font-semibold tabular-nums" :class="unit === 'both' ? '' : 'whitespace-nowrap'">

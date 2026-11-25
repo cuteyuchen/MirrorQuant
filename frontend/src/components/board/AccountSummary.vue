@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { computed } from "vue";
 import { AlertTriangle } from "lucide-vue-next";
 import { useI18n } from "@/i18n";
 import type { BoardAccount } from "@/types/api";
@@ -6,16 +7,23 @@ import { formatPct, formatUsd, signedUsd } from "@/utils/format";
 import { pnlClass } from "@/utils/status";
 import EnvBadge from "@/components/EnvBadge.vue";
 import StatusBadge from "@/components/StatusBadge.vue";
-defineProps<{ accounts: BoardAccount[] | null }>();
+const props = defineProps<{ accounts: BoardAccount[] | null }>();
 const { t } = useI18n();
-// 每个跟单账户一张紧凑卡片：权益、今日盈亏、可用余额与未实现盈亏。
-// 未知资金仍显示破折号，不用零顶替。
+// 桌面端按实际账户数量自适应列数（<=2 占满两列、3 列对齐、>=4 恢复 4 列）；移动端 <=2 纵向展示避免半截裁切，>=3 横向滑动。
+const gridClass = computed(() => {
+  const count = props.accounts?.length ?? 0;
+  if (count <= 2) return "grid grid-cols-1 gap-2.5 sm:grid-cols-2";
+  if (count === 3) return "flex overflow-x-auto gap-3 pb-1 snap-x no-scrollbar sm:grid sm:grid-cols-2 lg:grid-cols-3";
+  return "flex overflow-x-auto gap-3 pb-1 snap-x no-scrollbar sm:grid sm:grid-cols-2 xl:grid-cols-4";
+});
 </script>
 <template>
-  <section :aria-label="t('nav.accounts')" class="flex overflow-x-auto gap-3 pb-1 snap-x no-scrollbar sm:grid sm:grid-cols-2 xl:grid-cols-4">
+  <section :aria-label="t('nav.accounts')" :class="gridClass">
     <div v-if="accounts == null || !accounts.length" class="card w-full sm:col-span-full px-4 py-6 text-center text-sm text-muted">{{ accounts == null ? t("common.unknown") : t("board.noAccounts") }}</div>
-    <!-- 卡片在移动端横向滑动对齐，桌面端恢复栅格；长名称和大额数字不撑开卡片。 -->
-    <div v-for="account in accounts || []" :key="account.id || account.name || 'account'" class="card grid min-w-[260px] shrink-0 snap-start grid-cols-2 gap-x-4 gap-y-2.5 p-3 sm:min-w-0 sm:shrink sm:p-3.5">
+    <!-- 长名称和大额数字不撑开卡片；>=3 个账户时移动端以 260px 横向滑动对齐。 -->
+    <div v-for="account in accounts || []" :key="account.id || account.name || 'account'"
+      class="card grid grid-cols-2 gap-x-4 gap-y-2 p-3 sm:min-w-0 sm:shrink sm:p-3.5"
+      :class="(accounts?.length ?? 0) >= 3 ? 'min-w-[260px] shrink-0 snap-start' : ''">
       <div class="col-span-2 min-w-0">
         <div class="flex flex-wrap items-center gap-2">
           <span class="min-w-0 flex-1 font-semibold [overflow-wrap:anywhere]">{{ account.name ?? t("common.unknown") }}</span>

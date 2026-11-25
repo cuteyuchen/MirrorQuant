@@ -193,6 +193,7 @@ SQLITE_MIGRATIONS: Dict[str, List[Tuple[str, str]]] = {
         ("notification_config_json", "TEXT"),
         ("created_by_user_id", "INTEGER"),
         ("slot_watch_enabled", "BOOLEAN NOT NULL DEFAULT 0"),
+        ("deleted_at", "DATETIME"),
     ],
     "notification_outbox": [
         ("execution_id", "INTEGER"),
@@ -329,6 +330,70 @@ def _relax_copy_binding_slippage_columns(sync_conn) -> None:
     sync_conn.execute(text(f"ALTER TABLE {new_table} RENAME TO {table}"))
 
 
+def _drop_legacy_table_unique_constraints(sync_conn) -> None:
+    """Rebuild users / lead_sources / copy_bindings if legacy full-table UNIQUE
+    constraints exist, so soft-deleted rows stop blocking re-creation.
+    """
+    for table in ("users", "lead_sources", "copy_bindings"):
+        info = sync_conn.execute(text(f"PRAGMA table_info({table})")).fetchall()
+        if not info:
+            continue
+        col_names = {row[1] for row in info}
+        if "deleted_at" not in col_names:
+            continue
+        legacy_unique = [
+            idx for idx in sync_conn.execute(text(f"PRAGMA index_list({table})")).fetchall()
+            if idx[2] == 1 and idx[3] == "u"
+        ]
+        if not legacy_unique:
+            continue
+        violations = sync_conn.execute(text(f"PRAGMA foreign_key_check({table})")).fetchall()
+        if violations:
+            logger.warning("Skipping %s unique-constraint migration: %d foreign-key violations", table, len(violations))
+            continue
+        col_defs = []
+        pk_cols = []
+        for row in info:
+            _cid, name, ctype, notnull, dflt, pk = row[0], row[1], row[2], row[3], row[4], row[5]
+            parts = [f'"{name}" {ctype}']
+            if notnull:
+                parts.append("NOT NULL")
+            if dflt is not None:
+                parts.append(f"DEFAULT {dflt}")
+            col_defs.append(" ".join(parts))
+            if pk:
+                pk_cols.append((pk, name))
+        if pk_cols:
+            pk_cols.sort()
+            col_defs.append("PRIMARY KEY (" + ", ".join(f'"{name}"' for _, name in pk_cols) + ")")
+        fk_groups = {}
+        for row in sync_conn.execute(text(f"PRAGMA foreign_key_list({table})")).fetchall():
+            _id, seq, ref_table, from_col, to_col, on_update, on_delete, match = row
+            fk_groups.setdefault(_id, []).append((seq, ref_table, from_col, to_col, on_update, on_delete, match))
+        for _id in sorted(fk_groups):
+            parts = sorted(fk_groups[_id])
+            ref_table = parts[0][1]
+            from_cols = ", ".join(f'"{p[2]}"' for p in parts)
+            to_cols = ", ".join(f'"{p[3]}"' for p in parts)
+            fk = f'FOREIGN KEY ({from_cols}) REFERENCES "{ref_table}" ({to_cols})'
+            on_update, on_delete, match = parts[0][4], parts[0][5], parts[0][6]
+            if on_update and str(on_update).upper() != "NO ACTION":
+                fk += f" ON UPDATE {on_update}"
+            if on_delete and str(on_delete).upper() != "NO ACTION":
+                fk += f" ON DELETE {on_delete}"
+            if match and str(match).upper() != "NONE":
+                fk += f" MATCH {match}"
+            col_defs.append(fk)
+        new_table = f"{table}_new_partial_unique"
+        col_list = ", ".join(f'"{row[1]}"' for row in info)
+        logger.info("Rebuilding SQLite table %s to replace legacy UNIQUE with partial unique index", table)
+        sync_conn.execute(text(f"DROP TABLE IF EXISTS {new_table}"))
+        sync_conn.execute(text(f"CREATE TABLE {new_table} ({', '.join(col_defs)})"))
+        sync_conn.execute(text(f"INSERT INTO {new_table} ({col_list}) SELECT {col_list} FROM {table}"))
+        sync_conn.execute(text(f"DROP TABLE {table}"))
+        sync_conn.execute(text(f"ALTER TABLE {new_table} RENAME TO {table}"))
+
+
 # 熬鹰资本的币安跟单组合 ID：名额监控的默认开启对象。
 SLOT_WATCH_SEED_PORTFOLIO_ID = "5075281354358777856"
 SLOT_WATCH_SEED_MARKER = "slot_watch_seeded"
@@ -411,6 +476,7 @@ def _apply_sqlite_migrations(sync_conn) -> None:
                     ), {"binding_id": binding_id, "event_id": event_id})
     # 补列完成后才放宽可空性：重建 copy_bindings 需要三列都已存在。
     _relax_copy_binding_slippage_columns(sync_conn)
+    _drop_legacy_table_unique_constraints(sync_conn)
     # 名额监控一次性种子：只给熬鹰资本默认开启，标记防重复。
     _seed_slot_watch(sync_conn)
     # create_all 不会为既有表补索引，升级时显式且幂等创建。
@@ -422,6 +488,28 @@ def _apply_sqlite_migrations(sync_conn) -> None:
                           ("notification_outbox", "created_at"), ("login_attempt_guards", "updated_at")):
         if column in {row[1] for row in sync_conn.execute(text(f"PRAGMA table_info({table})"))}:
             sync_conn.execute(text(f"CREATE INDEX IF NOT EXISTS ix_{table}_{column} ON {table} ({column})"))
+    # 部分唯一索引：软删除记录不再阻断重新创建。
+    for idx_name, table, cols in (
+        ("uq_users_username_active", "users", "username"),
+        ("uq_lead_platform_portfolio_active", "lead_sources", "platform, portfolio_id"),
+        ("uq_binding_lead_account_active", "copy_bindings", "lead_id, account_id"),
+    ):
+        if "deleted_at" in {row[1] for row in sync_conn.execute(text(f"PRAGMA table_info({table})"))}:
+            sync_conn.execute(text(
+                f"CREATE UNIQUE INDEX IF NOT EXISTS {idx_name} ON {table} ({cols}) WHERE deleted_at IS NULL"
+            ))
+    # 执行记录复合索引，加速分页与分组统计。
+    exec_cols = {row[1] for row in sync_conn.execute(text("PRAGMA table_info(execution_records)"))}
+    if {"binding_id", "account_id", "status", "created_at"} <= exec_cols:
+        sync_conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_exec_binding_created ON execution_records (binding_id, created_at DESC)"
+        ))
+        sync_conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_exec_account_created ON execution_records (account_id, created_at DESC)"
+        ))
+        sync_conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_exec_status_created ON execution_records (status, created_at DESC)"
+        ))
 
 
 async def init_db() -> None:

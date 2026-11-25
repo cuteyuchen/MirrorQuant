@@ -6,7 +6,7 @@ import json
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, not_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_admin, get_current_user, owner_filter
@@ -68,7 +68,8 @@ async def dashboard_overview(
     db: AsyncSession = Depends(get_db),
     _user: User = Depends(get_current_user),
 ):
-    leads = list((await db.scalars(select(LeadSource).order_by(LeadSource.id))).all())
+    leads = list((await db.scalars(select(LeadSource).where(
+        LeadSource.deleted_at.is_(None)).order_by(LeadSource.id))).all())
     # 普通用户只看自己的账户与绑定；带单员本身对所有登录用户可见。
     accounts = list((await db.scalars(select(TradingAccount).where(
         TradingAccount.deleted_at.is_(None),
@@ -201,41 +202,139 @@ async def dashboard_overview(
     }
 
 
+_EXEC_SUCCESS_STATUSES = ("EXECUTED", "FILLED", "SUCCESS", "ADOPTED_POSITION")
+_EXEC_FAILED_STATUSES = ("FAILED", "REJECTED", "UNFILLED")
+_EXEC_SKIPPED_STATUSES = (
+    "SKIPPED",
+    "SKIPPED_DISABLED",
+    "SKIPPED_STALE",
+    "SKIPPED_UNSUPPORTED",
+    "SKIPPED_CLOSED_CYCLE",
+    "SKIPPED_NO_LOCAL_POS",
+    "SKIPPED_BELOW_MIN",
+)
+_EXEC_BLOCKED_STATUSES = (
+    "BLOCKED_RISK",
+    "BLOCKED_KILL_SWITCH",
+    "BLOCKED_SOURCE_ORDERING",
+    "BLOCKED_COLLATERAL_BALANCE",
+    "BLOCKED_FILTER",
+    "BLOCKED_ALLOCATION_MISMATCH",
+    "BLOCKED_DRAWDOWN",
+    "BLOCKED_SPREAD",
+    "BLOCKED_SLIPPAGE",
+    "BLOCKED_CATCHUP_DRIFT",
+    "BLOCKED_RESTING_LIMIT",
+    "BLOCKED_LEVERAGE",
+    "BLOCKED_INSUFFICIENT_MARGIN",
+    "BLOCKED_ALLOCATION_DEFICIT",
+    "BLOCKED_ORPHAN_CLOSE_EVIDENCE",
+    "BLOCKED_ORPHAN_DETECTED",
+    "BLOCKED_PROTECTION_UNAVAILABLE",
+)
+
+
+def _exec_status_group_clause(status_group: str):
+    if status_group == "success":
+        return ExecutionRecord.status.in_(_EXEC_SUCCESS_STATUSES)
+    if status_group == "failed":
+        return ExecutionRecord.status.in_(_EXEC_FAILED_STATUSES)
+    if status_group == "skipped":
+        return or_(ExecutionRecord.status.in_(_EXEC_SKIPPED_STATUSES), ExecutionRecord.status.like("SKIPPED%"))
+    if status_group == "blocked":
+        return or_(ExecutionRecord.status.in_(_EXEC_BLOCKED_STATUSES), ExecutionRecord.status.like("BLOCKED%"))
+    if status_group == "actionable":
+        return not_(or_(ExecutionRecord.status.in_(_EXEC_SKIPPED_STATUSES), ExecutionRecord.status.like("SKIPPED%")))
+    return None
+
+
 @router.get("/executions")
 async def list_executions(
     binding_id: Optional[int] = None,
     status_filter: Optional[str] = Query(default=None, alias="status"),
+    status_group: Optional[str] = Query(default=None, pattern="^(all|actionable|success|failed|skipped|blocked)$"),
+    include_counts: bool = Query(default=True),
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db),
     _user: User = Depends(get_current_user),
 ):
-    stmt = select(ExecutionRecord).order_by(desc(ExecutionRecord.created_at), desc(ExecutionRecord.id))
+    base_filters = []
     if _user.role != "admin":
         own_account_ids = list((await db.scalars(select(TradingAccount.id).where(
             TradingAccount.owner_user_id == _user.id, TradingAccount.deleted_at.is_(None)))).all())
-        stmt = stmt.where(ExecutionRecord.account_id.in_(own_account_ids))
+        base_filters.append(ExecutionRecord.account_id.in_(own_account_ids))
         if binding_id is not None:
             binding = await db.get(CopyBinding, binding_id)
             if not binding or binding.owner_user_id != _user.id:
                 raise HTTPException(status_code=403, detail="Not your resource")
     if binding_id is not None:
-        stmt = stmt.where(ExecutionRecord.binding_id == binding_id)
+        base_filters.append(ExecutionRecord.binding_id == binding_id)
+
+    stmt = (
+        select(ExecutionRecord, CopyBinding, TradingAccount)
+        .outerjoin(CopyBinding, CopyBinding.id == ExecutionRecord.binding_id)
+        .outerjoin(TradingAccount, TradingAccount.id == ExecutionRecord.account_id)
+        .where(*base_filters)
+        .order_by(desc(ExecutionRecord.created_at), desc(ExecutionRecord.id))
+    )
     if status_filter:
         stmt = stmt.where(ExecutionRecord.status == status_filter)
-    rows = list((await db.scalars(stmt.offset(offset).limit(limit))).all())
-    # 总数使用相同过滤条件，不受分页影响。
-    total = await db.scalar(select(func.count()).select_from(stmt.order_by(None).subquery()))
+    elif status_group and status_group != "all":
+        clause = _exec_status_group_clause(status_group)
+        if clause is not None:
+            stmt = stmt.where(clause)
+
+    rows = (await db.execute(stmt.offset(offset).limit(limit))).all()
+    count_stmt = select(func.count(ExecutionRecord.id)).where(*base_filters)
+    if status_filter:
+        count_stmt = count_stmt.where(ExecutionRecord.status == status_filter)
+    elif status_group and status_group != "all":
+        clause = _exec_status_group_clause(status_group)
+        if clause is not None:
+            count_stmt = count_stmt.where(clause)
+    total = int(await db.scalar(count_stmt) or 0)
+
+    counts_out = None
+    if include_counts:
+        group_rows = (await db.execute(
+            select(ExecutionRecord.status, func.count(ExecutionRecord.id))
+            .where(*base_filters)
+            .group_by(ExecutionRecord.status)
+        )).all()
+        counts_map = {"all": 0, "actionable": 0, "success": 0, "failed": 0, "skipped": 0, "blocked": 0}
+        for st_raw, cnt_raw in group_rows:
+            cnt = int(cnt_raw or 0)
+            st = str(st_raw or "").upper()
+            counts_map["all"] += cnt
+            is_skipped = st in _EXEC_SKIPPED_STATUSES or st.startswith("SKIPPED")
+            if not is_skipped:
+                counts_map["actionable"] += cnt
+            if st in _EXEC_SUCCESS_STATUSES:
+                counts_map["success"] += cnt
+            elif st in _EXEC_FAILED_STATUSES:
+                counts_map["failed"] += cnt
+            elif is_skipped:
+                counts_map["skipped"] += cnt
+            elif st in _EXEC_BLOCKED_STATUSES or st.startswith("BLOCKED"):
+                counts_map["blocked"] += cnt
+        counts_out = counts_map
+
     return {
         "total": total,
+        "counts": counts_out,
         "items": [
             {
                 "id": r.id,
                 "bindingId": r.binding_id,
+                "bindingName": b.name if b is not None else None,
+                "bindingDeleted": bool(b is not None and b.deleted_at is not None),
                 "leadId": r.lead_id,
                 "accountId": r.account_id,
                 "leadName": r.lead_name,
                 "accountName": r.account_name,
+                "environment": a.environment if a is not None else None,
+                "accountDeleted": bool(a is not None and a.deleted_at is not None),
                 "symbol": r.symbol,
                 "instId": r.inst_id,
                 "side": r.side,
@@ -254,8 +353,8 @@ async def list_executions(
                 "details": redact_error_urls(r.details),
                 "createdAt": to_utc_iso(r.created_at),
             }
-            for r in rows
-        ]
+            for r, b, a in rows
+        ],
     }
 
 
@@ -277,6 +376,7 @@ async def public_lead_feed(db: AsyncSession = Depends(get_db)):
                 select(LeadSource).where(
                     LeadSource.is_enabled == True,  # noqa: E712
                     LeadSource.is_public_dashboard == True,  # noqa: E712
+                    LeadSource.deleted_at.is_(None),
                 )
             )
         ).all()
