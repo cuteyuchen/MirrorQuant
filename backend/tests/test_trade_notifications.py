@@ -247,6 +247,27 @@ async def test_fanout_keeps_source_identity_and_does_not_duplicate_messages(monk
                    for r in rows)
 
 
+@pytest.mark.parametrize("details,reason", [
+    ("牛来USDT not in whitelist", "该合约不在绑定白名单内"),
+    ("牛来USDT is blacklisted", "该合约在绑定黑名单内"),
+])
+def test_chinese_symbol_and_filter_reason_render_truthfully(details, reason):
+    # 币安中文名永续（牛来USDT）不能被符号清洗成“未知”，白/黑名单拦截也不能套订单过滤器文案。
+    rec = message_record()
+    rec.symbol = "牛来USDT"
+    rec.status = "BLOCKED_FILTER"
+    rec.details = details
+    rec.my_qty = 0
+    rec.my_price = 0
+    rec.my_notional = 0
+    rec.order_id = None
+    source = {"symbol": "牛来USDT", "side": "BUY", "positionSide": "LONG",
+              "qty": "480192", "avgPrice": "0.0417741", "notional": "20059.59"}
+    msg = trade_message(rec, SimpleNamespace(exchange="binance", environment="live"), source, 545083)
+    assert "牛来USDT 永续" in msg and "未知 永续" not in msg
+    assert reason in msg and "最小下单量或价格精度" not in msg
+
+
 @pytest.mark.parametrize("outcome", ["EXECUTED", "UNFILLED", "BLOCKED_CATCHUP_DRIFT", "BLOCKED_SPREAD", "SKIPPED_UNSUPPORTED"])
 async def test_actual_filled_unfilled_and_risk_paths_keep_terminal_states(workflow, outcome):
     t = workflow

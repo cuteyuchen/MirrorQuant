@@ -53,7 +53,8 @@ def _money(value: Any, *, allow_zero: bool = False) -> str:
 
 
 def _symbol(value: Any) -> str:
-    return value if isinstance(value, str) and re.fullmatch(r"[A-Z0-9_:/-]{1,64}", value) else "未知"
+    # \w 在 str 模式下含 Unicode 字母：币安已有中文名永续（如牛来USDT），不能清洗成未知。
+    return value if isinstance(value, str) and re.fullmatch(r"[\w:/-]{1,64}", value) else "未知"
 
 
 def _reference_line(notional: Any, lead_margin: Any) -> Optional[str]:
@@ -128,6 +129,8 @@ _BLOCK_SPREAD_RE = re.compile(
     r"^Orderbook spread ([0-9]+(?:\.[0-9]+)?)% exceeds guard ([0-9]+(?:\.[0-9]+)?)%$")
 _BLOCK_SLIPPAGE_RE = re.compile(
     r"^Slippage ([0-9]+(?:\.[0-9]+)?)% exceeds limit ([0-9]+(?:\.[0-9]+)?)%$")
+_BLOCK_WHITELIST_RE = re.compile(r"^.{1,64} not in whitelist$")
+_BLOCK_BLACKLIST_RE = re.compile(r"^.{1,64} is blacklisted$")
 _BLOCK_REASONS: dict[str, tuple[str, str]] = {
     "BLOCKED_CATCHUP_PRICE": ("补跟价格缺失或无效，无法核对偏离，未跟单",
                               "Catch-up reference or lead price missing or invalid; drift check impossible, order not placed"),
@@ -212,6 +215,13 @@ def _block_reason(status: str, record) -> Optional[str]:
             measured, limit = match.groups()
             return (f"📋 原因：滑点超出上限，实测 {measured}%，上限 {limit}% / "
                     f"Slippage exceeded the limit (measured {measured}%, limit {limit}%)")
+    if status == "BLOCKED_FILTER":
+        # BLOCKED_FILTER 实际只由品种白/黑名单过滤产生，不能套用订单过滤器的文案。
+        details = str(getattr(record, "details", "") or "")
+        if _BLOCK_WHITELIST_RE.fullmatch(details):
+            return "📋 原因：该合约不在绑定白名单内，未跟单 / Symbol not in the binding whitelist; order not placed"
+        if _BLOCK_BLACKLIST_RE.fullmatch(details):
+            return "📋 原因：该合约在绑定黑名单内，未跟单 / Symbol is blacklisted on the binding; order not placed"
     reason = _BLOCK_REASONS.get(status)
     if reason is None:
         return None
