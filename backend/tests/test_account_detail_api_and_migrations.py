@@ -47,7 +47,7 @@ from app.services.adapters.base import (
     ExchangeAPIError,
     ExchangePosition,
 )
-from app.services.account_detail import sync_account_detail
+from app.services.account_detail import due_detail_datasets, sync_account_detail
 from app.services.engine.orchestrator import EngineOrchestrator
 
 NOW_MS = 1_795_700_000_000
@@ -303,6 +303,48 @@ async def test_manual_sync_coalescing_rate_limit_and_orchestrator_fault_isolatio
     finally:
         await reset_db_engine()
         get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_detail_sync_cadence_keeps_inactive_accounts_slow_not_paused(tmp_path, monkeypatch):
+    await _setup_test_app(tmp_path, monkeypatch)
+    factory = get_session_factory()
+    async with factory() as db:
+        lead = LeadSource(id=1, name="LeadOne", platform="binance", portfolio_id="p100")
+        active_acct = TradingAccount(id=10, name="Active", exchange="binance", environment="demo", encrypted_credentials="x", api_key_masked="x****x")
+        inactive_acct = TradingAccount(id=11, name="Inactive", exchange="binance", environment="demo", encrypted_credentials="x", api_key_masked="x****x")
+        db.add_all([lead, active_acct, inactive_acct])
+        await db.flush()
+        db.add_all([
+            CopyBinding(id=20, name="ActiveBind", lead_id=1, account_id=10, is_enabled=True),
+            CopyBinding(id=21, name="InactiveBind", lead_id=1, account_id=11, is_enabled=False),
+        ])
+        for account_id in (10, 11):
+            db.add_all([
+                AccountDatasetSyncState(
+                    account_id=account_id, dataset="open_orders", status="ok",
+                    last_attempt_at_ms=NOW_MS - 30_000, last_success_at_ms=NOW_MS - 30_000,
+                ),
+                AccountDatasetSyncState(
+                    account_id=account_id, dataset="cashflow", status="ok",
+                    last_attempt_at_ms=NOW_MS - 1_000_000, last_success_at_ms=NOW_MS - 1_000_000,
+                ),
+                AccountDatasetSyncState(
+                    account_id=account_id, dataset="fills", status="rate_limited",
+                    last_attempt_at_ms=NOW_MS - 600_000, last_success_at_ms=NOW_MS - 600_000,
+                ),
+            ])
+        await db.commit()
+
+        active_due = await due_detail_datasets(db, 10, NOW_MS)
+        inactive_due = await due_detail_datasets(db, 11, NOW_MS)
+
+    assert "open_orders" in active_due
+    assert "open_orders" in inactive_due
+    assert "cashflow" in active_due
+    assert "cashflow" not in inactive_due
+    assert "fills" not in active_due
+    assert "fills" not in inactive_due
 
 
 @pytest.mark.asyncio

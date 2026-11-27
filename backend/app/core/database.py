@@ -500,7 +500,9 @@ def _apply_sqlite_migrations(sync_conn) -> None:
         ("uq_lead_platform_portfolio_active", "lead_sources", "platform, portfolio_id"),
         ("uq_binding_lead_account_active", "copy_bindings", "lead_id, account_id"),
     ):
-        if "deleted_at" in {row[1] for row in sync_conn.execute(text(f"PRAGMA table_info({table})"))}:
+        table_cols = {row[1] for row in sync_conn.execute(text(f"PRAGMA table_info({table})"))}
+        required_cols = {col.strip() for col in cols.split(",")} | {"deleted_at"}
+        if required_cols <= table_cols:
             sync_conn.execute(text(
                 f"CREATE UNIQUE INDEX IF NOT EXISTS {idx_name} ON {table} ({cols}) WHERE deleted_at IS NULL"
             ))

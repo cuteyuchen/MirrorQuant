@@ -165,17 +165,19 @@ async def test_persist_equity_writes_cash_flow_in_same_update():
         hwm_equity=0, day_start_equity=0, day_start_date=None,
     )
     balance = BalanceInfo(390.02, 330.0, 390.02, 33.17, "USDT")
+    today = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d")
+    start_ms, _ = beijing_day_window_ms(today)
     await persist_equity(
         None, account, balance,
-        cash_flow={"net_flow": 124.0, "date": TODAY, "updated_at_ms": START_MS + 1000},
+        cash_flow={"net_flow": 124.0, "date": today, "updated_at_ms": start_ms + 1000},
     )
     state = risk_state(account)
     assert state["assets"]["USDT"]["today_net_flow"] == pytest.approx(124.0)
-    assert state["assets"]["USDT"]["flow_date"] == TODAY
+    assert state["assets"]["USDT"]["flow_date"] == today
     row = _account_row(SimpleNamespace(
         id=3, name="带单", exchange="binance", environment="live", status="connected",
         risk_equity_json=account.risk_equity_json, usdt_equity=390.02, avail_equity=330.0,
-        last_sync_at=None, positions_json="[]"), TODAY)
+        last_sync_at=None, positions_json="[]"), today)
     # 日初由首个观测值建立（390.02），流水 124 仍被扣掉，不会算成盈利。
     assert row["todayPnl"] == pytest.approx(390.02 - 390.02 - 124.0)
 

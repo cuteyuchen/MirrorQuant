@@ -8,7 +8,7 @@ import logging
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_session_factory
@@ -68,6 +68,26 @@ DATASET_MAX_BACKFILL_DAYS = {
     "daily_snapshots": 30,
 }
 
+# Account-detail history is useful but must never starve the trading path.
+# Core live data (open orders / equity snapshots) keeps its cadence for every
+# enabled account. Historical datasets run one-at-a-time, one window per
+# background cycle, and inactive accounts (no enabled binding) use a longer
+# cadence instead of being paused.
+LOW_PRIORITY_DATASETS = (
+    "cashflow",
+    "orders",
+    "fills",
+    "force_orders",
+    "commission_rates",
+    "daily_snapshots",
+)
+INACTIVE_LOW_PRIORITY_MULTIPLIER = 6
+RATE_LIMIT_BACKOFF_SEC = 900
+OPEN_ORDERS_RATE_LIMIT_BACKOFF_SEC = 120
+BACKGROUND_MAX_WINDOWS = 1
+MANUAL_MAX_WINDOWS = 8
+WINDOW_PAUSE_SEC = 0.2
+
 _RATE_LIMIT_CODES = frozenset({"-1003", "-1015", "429", "50011", "50061", "10006", "10018", "RATE_LIMITED"})
 
 # Per-account coalescing maps keyed by (loop_id, account_id, scope)
@@ -98,6 +118,37 @@ def _get_account_lock(account_id: int) -> asyncio.Lock:
     return lock
 
 
+async def _account_has_enabled_binding(db: AsyncSession, account_id: int) -> bool:
+    binding_id = await db.scalar(
+        select(CopyBinding.id)
+        .where(
+            CopyBinding.account_id == account_id,
+            CopyBinding.is_enabled == True,  # noqa: E712
+            CopyBinding.deleted_at.is_(None),
+        )
+        .limit(1)
+    )
+    return binding_id is not None
+
+
+def _effective_cadence_sec(dataset: str, *, active: bool) -> int:
+    cadence = DATASET_CADENCE_SEC[dataset]
+    if not active and dataset in LOW_PRIORITY_DATASETS:
+        return cadence * INACTIVE_LOW_PRIORITY_MULTIPLIER
+    return cadence
+
+
+def _adapter_cooldown_remaining(adapter: Any) -> float:
+    try:
+        until_map = getattr(adapter, "_rate_limit_until", None)
+        key_fn = getattr(adapter, "_rate_limit_key", None)
+        if not isinstance(until_map, dict) or not callable(key_fn):
+            return 0.0
+        return max(0.0, float(until_map.get(key_fn(True), 0.0)) - time.monotonic())
+    except Exception:
+        return 0.0
+
+
 async def _get_or_create_sync_state(
     db: AsyncSession, account_id: int, dataset: str
 ) -> AccountDatasetSyncState:
@@ -124,10 +175,18 @@ async def _upsert_cashflows(db: AsyncSession, account_id: int, items: Sequence[C
         return 0
     existing_ext: Dict[Tuple[Optional[str], str], AccountCashflowEntry] = {}
     existing_dedupe: Dict[str, AccountCashflowEntry] = {}
+    dedupe_keys = [item.dedupe_key for item in items]
+    external_ids = [item.external_id for item in items if item.external_id is not None]
+    filters = [AccountCashflowEntry.dedupe_key.in_(dedupe_keys)]
+    if external_ids:
+        filters.append(AccountCashflowEntry.external_id.in_(external_ids))
     rows = list(
         (
             await db.scalars(
-                select(AccountCashflowEntry).where(AccountCashflowEntry.account_id == account_id)
+                select(AccountCashflowEntry).where(
+                    AccountCashflowEntry.account_id == account_id,
+                    or_(*filters),
+                )
             )
         ).all()
     )
@@ -168,10 +227,16 @@ async def _upsert_cashflows(db: AsyncSession, account_id: int, items: Sequence[C
 async def _upsert_fills(db: AsyncSession, account_id: int, items: Sequence[TradeFill]) -> int:
     if not items:
         return 0
+    fill_ids = [item.exchange_fill_id for item in items]
     existing = {
         row.exchange_fill_id: row
         for row in (
-            await db.scalars(select(AccountTradeFill).where(AccountTradeFill.account_id == account_id))
+            await db.scalars(
+                select(AccountTradeFill).where(
+                    AccountTradeFill.account_id == account_id,
+                    AccountTradeFill.exchange_fill_id.in_(fill_ids),
+                )
+            )
         ).all()
     }
     inserted = 0
@@ -212,9 +277,22 @@ async def _upsert_orders(
 ) -> int:
     if not items:
         return 0
+    dedupe_keys = [item.dedupe_key for item in items]
+    order_ids = [item.exchange_order_id for item in items if item.exchange_order_id]
+    algo_ids = [item.algo_id for item in items if getattr(item, "algo_id", None)]
+    filters = [AccountOrderHistory.dedupe_key.in_(dedupe_keys)]
+    if order_ids:
+        filters.append(AccountOrderHistory.exchange_order_id.in_(order_ids))
+    if algo_ids:
+        filters.append(AccountOrderHistory.algo_id.in_(algo_ids))
     rows = list(
         (
-            await db.scalars(select(AccountOrderHistory).where(AccountOrderHistory.account_id == account_id))
+            await db.scalars(
+                select(AccountOrderHistory).where(
+                    AccountOrderHistory.account_id == account_id,
+                    or_(*filters),
+                )
+            )
         ).all()
     )
     by_dedupe = {r.dedupe_key: r for r in rows}
@@ -328,6 +406,7 @@ async def _upsert_daily_snapshots(
 ) -> int:
     if not items:
         return 0
+    buckets = [beijing_day_start_ms(item.captured_at_ms or item.day_start_ms) for item in items]
     existing_days = {
         (r.currency, r.bucket_start_ms): r
         for r in (
@@ -335,6 +414,7 @@ async def _upsert_daily_snapshots(
                 select(AccountEquitySnapshot).where(
                     AccountEquitySnapshot.account_id == account_id,
                     AccountEquitySnapshot.resolution == "day",
+                    AccountEquitySnapshot.bucket_start_ms.in_(buckets),
                 )
             )
         ).all()
@@ -465,6 +545,16 @@ async def _sync_windowed_dataset(
         await db.commit()
         return state.status, state.last_error_message, []
 
+    cooldown = _adapter_cooldown_remaining(adapter)
+    if cooldown > 0:
+        state.status = "rate_limited"
+        state.last_error_code = "RATE_LIMITED"
+        state.last_error_message = sanitize_error_text(
+            f"Exchange cooldown active for {cooldown:.2f}s; detail sync deferred"
+        )
+        await db.commit()
+        return state.status, state.last_error_message, []
+
     max_days = DATASET_MAX_BACKFILL_DAYS[dataset]
     if cap is not None and cap.retention_days:
         max_days = min(max_days, cap.retention_days)
@@ -527,6 +617,8 @@ async def _sync_windowed_dataset(
                 partial_flag = True
                 break
             cur_end = chunk_start - 1
+            if windows_used < max_windows:
+                await asyncio.sleep(WINDOW_PAUSE_SEC)
 
         more_backfill = (state.coverage_start_ms is None) or (state.coverage_start_ms > target_start)
         if cap is not None and cap.retention_days and DATASET_MAX_BACKFILL_DAYS[dataset] > cap.retention_days:
@@ -636,7 +728,15 @@ async def _run_account_detail_sync(
             adapter._time_offset_ms = int(getattr(account, "clock_offset_ms", 0) or 0)
 
         results: Dict[str, Dict[str, Any]] = {}
-        max_windows = 60 if manual else 4
+        max_windows = MANUAL_MAX_WINDOWS if manual else BACKGROUND_MAX_WINDOWS
+        if not manual:
+            # Background detail sync is deliberately incremental: live open
+            # orders may run every cycle, but only one historical dataset is
+            # advanced per cycle so backfill cannot monopolize exchange quota.
+            low_priority = [name for name in LOW_PRIORITY_DATASETS if name in target_sets]
+            target_sets = {"open_orders"} & target_sets
+            if low_priority:
+                target_sets.add(low_priority[0])
 
         # 1. Open orders & risk/equity snapshot
         open_order_count: Optional[int] = None
@@ -734,7 +834,9 @@ async def _run_account_detail_sync(
             else:
                 await db.commit()
                 try:
-                    rates: List[CommissionRateInfo] = await adapter.get_commission_rates(symbols[:20])
+                    rates: List[CommissionRateInfo] = await adapter.get_commission_rates(
+                        symbols[:20 if manual else 8]
+                    )
                     state = await _get_or_create_sync_state(db, account.id, "commission_rates")
                     state.status = "ok"
                     state.last_success_at_ms = now_ms
@@ -894,8 +996,9 @@ async def due_detail_datasets(db: AsyncSession, account_id: int, now_ms: int) ->
             )
         ).all()
     }
+    active = await _account_has_enabled_binding(db, account_id)
     due: List[str] = []
-    for dataset, cadence_sec in DATASET_CADENCE_SEC.items():
+    for dataset in DATASET_CADENCE_SEC:
         st = states.get(dataset)
         if st is None:
             due.append(dataset)
@@ -906,6 +1009,14 @@ async def due_detail_datasets(db: AsyncSession, account_id: int, now_ms: int) ->
             if now_ms - last >= 86_400_000:
                 due.append(dataset)
             continue
+        cadence_sec = _effective_cadence_sec(dataset, active=active)
+        if st.status == "rate_limited":
+            backoff = (
+                OPEN_ORDERS_RATE_LIMIT_BACKOFF_SEC
+                if dataset == "open_orders"
+                else RATE_LIMIT_BACKOFF_SEC
+            )
+            cadence_sec = max(cadence_sec, backoff)
         last_try = st.last_attempt_at_ms or st.last_success_at_ms or 0
         if now_ms - last_try >= cadence_sec * 1000:
             due.append(dataset)

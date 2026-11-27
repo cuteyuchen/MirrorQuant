@@ -249,14 +249,15 @@ async def capture_equity_snapshot(
         else:
             margin_ratio = None
 
-        existing = await db.scalar(
-            select(AccountEquitySnapshot).where(
-                AccountEquitySnapshot.account_id == account.id,
-                AccountEquitySnapshot.currency == currency,
-                AccountEquitySnapshot.resolution == "raw",
-                AccountEquitySnapshot.bucket_start_ms == bucket_start_ms,
+        with db.no_autoflush:
+            existing = await db.scalar(
+                select(AccountEquitySnapshot).where(
+                    AccountEquitySnapshot.account_id == account.id,
+                    AccountEquitySnapshot.currency == currency,
+                    AccountEquitySnapshot.resolution == "raw",
+                    AccountEquitySnapshot.bucket_start_ms == bucket_start_ms,
+                )
             )
-        )
         if existing is None:
             row = AccountEquitySnapshot(
                 account_id=account.id,
@@ -322,12 +323,13 @@ async def capture_equity_snapshot(
             saved.append(existing)
 
     if saved:
-        sync_state = await db.scalar(
-            select(AccountDatasetSyncState).where(
-                AccountDatasetSyncState.account_id == account.id,
-                AccountDatasetSyncState.dataset == "equity",
+        with db.no_autoflush:
+            sync_state = await db.scalar(
+                select(AccountDatasetSyncState).where(
+                    AccountDatasetSyncState.account_id == account.id,
+                    AccountDatasetSyncState.dataset == "equity",
+                )
             )
-        )
         sync_status = "ok" if quality == "ok" else "partial"
         if sync_state is None:
             sync_state = AccountDatasetSyncState(

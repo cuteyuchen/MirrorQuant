@@ -159,6 +159,7 @@ class EngineOrchestrator:
         self._detail_sync_in_flight: Set[int] = set()
         self._detail_sync_tasks: Set[asyncio.Task] = set()
         self._detail_stagger_until: Dict[int, float] = {}
+        self._last_risk_snapshot_at: Dict[int, float] = {}
         self._last_full_sweep: Dict[int, float] = {}
         self._last_history_sync: Dict[int, float] = {}
         self._last_account_poll: Dict[int, float] = {}
@@ -324,12 +325,14 @@ class EngineOrchestrator:
         if stagger is None:
             stagger = self._detail_stagger_until = {}
 
+        if in_flight or tasks:
+            return
         now_ms = int(now * 1000)
         for idx, account in enumerate(accounts):
             if account.id in in_flight or inspect(account, raiseerr=False) is None:
                 continue
             if account.id not in stagger:
-                stagger[account.id] = now + (idx * 5.0)
+                stagger[account.id] = now + (idx * 15.0)
             if now < stagger[account.id]:
                 continue
             try:
@@ -346,6 +349,9 @@ class EngineOrchestrator:
             )
             tasks.add(task)
             task.add_done_callback(self._discard_detail_sync_task)
+            # Detail sync is background work: run one account at a time so
+            # historical backfill cannot burst exchange quota across accounts.
+            break
 
     async def _sync_detail_isolated(self, account_id: int, datasets: List[str]) -> None:
         """Background non-blocking account detail dataset sync; never alters trading state."""
@@ -365,6 +371,13 @@ class EngineOrchestrator:
     ) -> None:
         if not isinstance(db, AsyncSession) or inspect(account, raiseerr=False) is None:
             return
+        last_snapshot_at = getattr(self, "_last_risk_snapshot_at", None)
+        if last_snapshot_at is None:
+            last_snapshot_at = self._last_risk_snapshot_at = {}
+        now_mono = time.monotonic()
+        if now_mono - last_snapshot_at.get(account.id, 0.0) < 30.0:
+            return
+        last_snapshot_at[account.id] = now_mono
         try:
             state = risk_state(account)
             if not state.get("display_usdt_confirmed"):
@@ -397,6 +410,12 @@ class EngineOrchestrator:
                     now_ms=now_ms,
                 )
         except Exception as exc:
+            if "database is locked" in str(exc).lower():
+                logger.debug(
+                    "Risk-tick equity snapshot deferred for account %s: database locked",
+                    account.id,
+                )
+                return
             logger.warning(
                 "Risk-tick equity snapshot failed for account %s: %s",
                 account.id,
