@@ -51,10 +51,10 @@ OVERLAP_MS = 86_400_000
 DAY_MS = 86_400_000
 
 DATASET_CADENCE_SEC = {
-    "open_orders": 20,
-    "cashflow": 300,
-    "fills": 300,
-    "orders": 300,
+    "open_orders": 120,
+    "cashflow": 900,
+    "fills": 900,
+    "orders": 900,
     "force_orders": 3600,
     "commission_rates": 3600,
     "daily_snapshots": 86400,

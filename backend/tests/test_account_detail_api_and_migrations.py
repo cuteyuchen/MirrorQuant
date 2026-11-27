@@ -323,7 +323,7 @@ async def test_detail_sync_cadence_keeps_inactive_accounts_slow_not_paused(tmp_p
             db.add_all([
                 AccountDatasetSyncState(
                     account_id=account_id, dataset="open_orders", status="ok",
-                    last_attempt_at_ms=NOW_MS - 30_000, last_success_at_ms=NOW_MS - 30_000,
+                    last_attempt_at_ms=NOW_MS - 121_000, last_success_at_ms=NOW_MS - 121_000,
                 ),
                 AccountDatasetSyncState(
                     account_id=account_id, dataset="cashflow", status="ok",

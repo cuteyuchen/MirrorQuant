@@ -219,10 +219,9 @@ class BinanceAdapter(BaseExchangeAdapter):
         if currency not in ("USDT", "USDC"):
             raise ValueError("Unsupported Binance settlement currency")
         # updateTime 是余额变动时间；请求往返耗时才用于新鲜度判定。
+        # /fapi/v2/account 本身带 multiAssetsMargin，不再单独调高权重的
+        # /fapi/v1/multiAssetsMargin，避免每次余额检查多花一份限流额度。
         started = time.monotonic()
-        mode = await self._request("GET", "/fapi/v1/multiAssetsMargin")
-        if not isinstance(mode, dict) or mode.get("multiAssetsMargin") is not False:
-            raise ValueError("Binance single-asset collateral mode is not confirmed")
         data = await self._request("GET", "/fapi/v2/account")
         if not isinstance(data, dict) or data.get("multiAssetsMargin") is not False:
             raise ValueError("Binance account collateral mode is missing or contradictory")

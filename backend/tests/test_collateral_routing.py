@@ -24,7 +24,7 @@ ACCOUNT = {"multiAssetsMargin": False, "updateTime": NOW_MS, "assets": [
 
 async def test_single_asset_contract_balance_does_not_sum_usdc(trading):
     adapter = BinanceAdapter({})
-    adapter._request = AsyncMock(side_effect=[{"multiAssetsMargin": False}, copy.deepcopy(ACCOUNT)])
+    adapter._request = AsyncMock(side_effect=[copy.deepcopy(ACCOUNT)])
     balance = await adapter.get_contract_balance(trading.spec)
     assert balance.eq == 1000 and balance.avail_eq == 734.45
     assert balance.currency == "USDT"
@@ -36,10 +36,9 @@ async def test_single_asset_contract_balance_does_not_sum_usdc(trading):
 async def test_ambiguous_contract_balance_fails_closed(trading, issue):
     adapter = BinanceAdapter({})
     account = copy.deepcopy(ACCOUNT)
-    mode = {"multiAssetsMargin": False}
-    if issue == "mode_missing": mode = {}
-    elif issue == "mode_string": mode = {"multiAssetsMargin": "false"}
-    elif issue == "multi_assets": mode = {"multiAssetsMargin": True}
+    if issue == "mode_missing": del account["multiAssetsMargin"]
+    elif issue == "mode_string": account["multiAssetsMargin"] = "false"
+    elif issue == "multi_assets": account["multiAssetsMargin"] = True
     elif issue == "contradiction": account["multiAssetsMargin"] = True
     elif issue == "asset_missing": account["assets"] = [account["assets"][1]]
     elif issue == "asset_duplicate": account["assets"].append(copy.deepcopy(account["assets"][0]))
@@ -50,7 +49,7 @@ async def test_ambiguous_contract_balance_fails_closed(trading, issue):
     elif issue == "timestamp_invalid": account["updateTime"] = "unparseable"
     elif issue == "timestamp_future": account["updateTime"] = NOW_MS + 1
     elif issue == "timestamp_boolean": account["updateTime"] = False  # 布尔假值不能伪装成合法零时间戳。
-    adapter._request = AsyncMock(side_effect=[mode, account])
+    adapter._request = AsyncMock(side_effect=[account])
     with pytest.raises(ValueError):
         await adapter.get_contract_balance(trading.spec)
 
@@ -63,18 +62,15 @@ async def test_idle_collateral_timestamp_is_not_request_freshness(trading, times
     data["updateTime"] = timestamp
     for asset in data["assets"]:
         asset["updateTime"] = timestamp
-    adapter._request = AsyncMock(side_effect=[{"multiAssetsMargin": False}, data])
+    adapter._request = AsyncMock(side_effect=[data])
     assert (await adapter.get_contract_balance(trading.spec)).eq == 1000
 
 
 async def test_slow_collateral_request_still_fails_closed(trading, monkeypatch):
     # 超过三十秒的请求不能被闲置余额的例外放行。
     adapter = BinanceAdapter({})
-    adapter._request = AsyncMock(side_effect=[{"multiAssetsMargin": False}, copy.deepcopy(ACCOUNT)])
     clock = [10.0]
     async def response(method, path):
-        if path.endswith("multiAssetsMargin"):
-            return {"multiAssetsMargin": False}
         clock[0] = 40.001
         return copy.deepcopy(ACCOUNT)
     adapter._request = AsyncMock(side_effect=response)
@@ -114,9 +110,14 @@ async def test_routing_ambiguous_mode_has_no_intent_order_or_success(trading, mo
     sim, engine, _ = await prepare_simulation(t, monkeypatch)
     original = sim.respond
     def respond(request):
-        if request.url.path == "/fapi/v1/multiAssetsMargin":
+        if request.url.path == "/fapi/v2/account":
             import httpx
-            return httpx.Response(200, json={} if mode is None else {"multiAssetsMargin": mode})
+            data = original(request).json()
+            if mode is None:
+                data.pop("multiAssetsMargin", None)
+            else:
+                data["multiAssetsMargin"] = mode
+            return httpx.Response(200, json=data)
         return original(request)
     sim.respond = respond
     sim.event("BUY")
