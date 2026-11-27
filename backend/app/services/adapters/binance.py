@@ -1121,80 +1121,81 @@ class BinanceAdapter(BaseExchangeAdapter):
                 cur = w_end + 1
 
         # Conditional / algo order history
-        cur = effective_start
-        while cur <= end_ms:
-            w_end = min(end_ms, cur + self._MAX_HISTORY_WINDOW_MS)
-            page = 1
-            seen_algo_in_win: set[str] = set()
-            while True:
-                resp = await self._request(
-                    "GET",
-                    "/fapi/v1/allAlgoOrders",
-                    params={"startTime": cur, "endTime": w_end, "page": page, "pageSize": 100},
-                )
-                algo_rows = resp.get("orders") if isinstance(resp, dict) else resp
-                if not isinstance(algo_rows, list):
-                    raise ValueError("Malformed Binance allAlgoOrders response")
-                added_in_page = 0
-                for r in algo_rows:
-                    if not isinstance(r, dict):
-                        continue
-                    aid = str(r.get("algoId") or "").strip()
-                    if not aid or aid in seen_algo_in_win:
-                        continue
-                    seen_algo_in_win.add(aid)
-                    added_in_page += 1
-                    dedupe_key = f"algo:{aid}"
-                    if dedupe_key in seen_keys:
-                        continue
-                    seen_keys.add(dedupe_key)
-                    sym = str(r.get("symbol") or "").upper()
-                    raw_type = str(r.get("orderType") or r.get("type") or r.get("algoType") or "CONDITIONAL").upper()
-                    created_ms = int(r.get("createTime") or r.get("time") or r.get("updateTime") or 0)
-                    updated_ms = int(r.get("updateTime") or r.get("triggerTime") or created_ms)
-                    close_pos = bool(r.get("closePosition")) if r.get("closePosition") is not None else None
-                    qty = None if close_pos else safe_decimal(r.get("quantity"))
-                    trig_px = safe_decimal(r.get("triggerPrice"))
-                    if trig_px is not None and trig_px <= 0:
-                        trig_px = None
-                    limit_px = safe_decimal(r.get("price"))
-                    if limit_px is not None and limit_px <= 0:
-                        limit_px = None
-                    entries.append(
-                        OrderHistoryEntry(
-                            exchange="binance",
-                            dedupe_key=dedupe_key,
-                            exchange_order_id=None,
-                            client_order_id=None,
-                            algo_id=aid,
-                            client_algo_id=str(r.get("clientAlgoId") or "").strip() or None,
-                            category=self._classify_order_category(raw_type, algo=True),
-                            symbol=sym,
-                            inst_id=sym,
-                            side=str(r.get("side") or "").upper(),
-                            position_side=self._normalize_position_side(r.get("positionSide")),
-                            order_type=raw_type,
-                            status=str(r.get("algoStatus") or r.get("status") or "UNKNOWN").upper(),
-                            qty=qty,
-                            filled_qty=safe_decimal(r.get("executedQty")),
-                            avg_price=safe_decimal(r.get("avgPrice")),
-                            limit_price=limit_px,
-                            trigger_price=trig_px,
-                            reduce_only=bool(r.get("reduceOnly")) if r.get("reduceOnly") is not None else None,
-                            close_position=close_pos,
-                            working_type=str(r.get("workingType")) if r.get("workingType") else None,
-                            created_at_ms=created_ms,
-                            updated_at_ms=updated_ms or created_ms,
-                            metadata={
-                                "actualOrderId": str(r.get("actualOrderId")) if r.get("actualOrderId") else None,
-                                "algoType": r.get("algoType"),
-                            },
-                        )
+        for sym in clean_symbols:
+            cur = effective_start
+            while cur <= end_ms:
+                w_end = min(end_ms, cur + self._MAX_HISTORY_WINDOW_MS)
+                page = 1
+                seen_algo_in_win: set[str] = set()
+                while True:
+                    resp = await self._request(
+                        "GET",
+                        "/fapi/v1/allAlgoOrders",
+                        params={"symbol": sym, "startTime": cur, "endTime": w_end, "page": page, "pageSize": 100},
                     )
-                if len(algo_rows) < 100 or added_in_page == 0:
-                    break
-                page += 1
-            cur = w_end + 1
+                    algo_rows = resp.get("orders") if isinstance(resp, dict) else resp
+                    if not isinstance(algo_rows, list):
+                        raise ValueError("Malformed Binance allAlgoOrders response")
+                    added_in_page = 0
+                    for r in algo_rows:
+                        if not isinstance(r, dict):
+                            continue
+                        aid = str(r.get("algoId") or "").strip()
+                        if not aid or aid in seen_algo_in_win:
+                            continue
+                        seen_algo_in_win.add(aid)
+                        added_in_page += 1
+                        dedupe_key = f"algo:{aid}"
+                        if dedupe_key in seen_keys:
+                            continue
+                        seen_keys.add(dedupe_key)
+                        sym = str(r.get("symbol") or "").upper()
+                        raw_type = str(r.get("orderType") or r.get("type") or r.get("algoType") or "CONDITIONAL").upper()
+                        created_ms = int(r.get("createTime") or r.get("time") or r.get("updateTime") or 0)
+                        updated_ms = int(r.get("updateTime") or r.get("triggerTime") or created_ms)
+                        close_pos = bool(r.get("closePosition")) if r.get("closePosition") is not None else None
+                        qty = None if close_pos else safe_decimal(r.get("quantity"))
+                        trig_px = safe_decimal(r.get("triggerPrice"))
+                        if trig_px is not None and trig_px <= 0:
+                            trig_px = None
+                        limit_px = safe_decimal(r.get("price"))
+                        if limit_px is not None and limit_px <= 0:
+                            limit_px = None
+                        entries.append(
+                            OrderHistoryEntry(
+                                exchange="binance",
+                                dedupe_key=dedupe_key,
+                                exchange_order_id=None,
+                                client_order_id=None,
+                                algo_id=aid,
+                                client_algo_id=str(r.get("clientAlgoId") or "").strip() or None,
+                                category=self._classify_order_category(raw_type, algo=True),
+                                symbol=sym,
+                                inst_id=sym,
+                                side=str(r.get("side") or "").upper(),
+                                position_side=self._normalize_position_side(r.get("positionSide")),
+                                order_type=raw_type,
+                                status=str(r.get("algoStatus") or r.get("status") or "UNKNOWN").upper(),
+                                qty=qty,
+                                filled_qty=safe_decimal(r.get("executedQty")),
+                                avg_price=safe_decimal(r.get("avgPrice")),
+                                limit_price=limit_px,
+                                trigger_price=trig_px,
+                                reduce_only=bool(r.get("reduceOnly")) if r.get("reduceOnly") is not None else None,
+                                close_position=close_pos,
+                                working_type=str(r.get("workingType")) if r.get("workingType") else None,
+                                created_at_ms=created_ms,
+                                updated_at_ms=updated_ms or created_ms,
+                                metadata={
+                                    "actualOrderId": str(r.get("actualOrderId")) if r.get("actualOrderId") else None,
+                                    "algoType": r.get("algoType"),
+                                },
+                            )
+                        )
+                    if len(algo_rows) < 100 or added_in_page == 0:
+                        break
+                    page += 1
+                cur = w_end + 1
 
         entries.sort(key=lambda item: (item.updated_at_ms, item.dedupe_key))
         return DatasetPage(
