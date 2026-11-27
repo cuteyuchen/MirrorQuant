@@ -464,14 +464,14 @@ def _events(lead, snapshot, deliveries, records, day_start, now):
         if (o["tradeSide"], o["side"]) in (("SELL", "LONG"), ("BUY", "SHORT"))
         or (o["side"] in ("BOTH", "", None) and event_actions_by_id.get(o["id"]) in ("CLOSE", "REDUCE"))
     ]
-    # 只有订单历史覆盖今日且逐笔 PnL 都已知，才给出日内已实现收益。
-    covered = any(o["time"] and o["time"] < day_start for o in orders.values())
-    realized = number(sum(o["realizedPnl"] for o in exits)) if covered and known and all(
-        o["realizedPnl"] is not None for o in exits) else None
     result.sort(key=lambda event: (event["time"], event["id"]), reverse=True)
     # 只要今日有无法分类的来源事件，次数也是未知，不能显示伪造的零。
     classified = {event["id"] for event in result}
     classifications_complete = known and all(order["id"] in classified for order in day_orders)
+    # 只有订单历史覆盖今日且逐笔 PnL 都已知，才给出日内已实现收益；当日开平完整分类也可证明覆盖。
+    covered = (classifications_complete and bool(exits)) or any(o["time"] and o["time"] < day_start for o in orders.values())
+    realized = number(sum(o["realizedPnl"] for o in exits)) if covered and known and all(
+        o["realizedPnl"] is not None for o in exits) else None
     return result, realized, classifications_complete
 
 
@@ -485,7 +485,7 @@ async def build_board(db, *, now=None, owner_user_id=None):
     now = now or datetime.now(timezone.utc)
     local = now.astimezone(BEIJING_TZ)
     start = local.replace(hour=0, minute=0, second=0, microsecond=0)
-    now_ms, start_ms = milliseconds(now), milliseconds(start)
+    now_ms, start_ms = milliseconds(now), milliseconds(start) or 0
     leads = list((await db.scalars(select(LeadSource).where(
         LeadSource.deleted_at.is_(None)).order_by(LeadSource.id))).all())
     account_stmt = select(TradingAccount).where(TradingAccount.deleted_at.is_(None))

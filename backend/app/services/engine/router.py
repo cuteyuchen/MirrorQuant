@@ -8,6 +8,7 @@ import logging
 import math
 import time
 import hashlib
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_UP
 from typing import Any, Callable, Coroutine, Dict, List, Optional
