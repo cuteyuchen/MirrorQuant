@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import base64
-import fcntl
+import errno
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None  # type: ignore[assignment]
+    import msvcrt
 import json
 import os
 import secrets
 import stat
+import time
 from functools import lru_cache
 from ipaddress import ip_network
 from pathlib import Path
@@ -18,38 +24,83 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 def _ensure_secret_file(path: Path, generator, may_create: Optional[Callable[[], bool]] = None) -> str:
     """Serialize creation across processes and never overwrite an existing key."""
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    lock_fd = os.open(str(path) + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    if fcntl is not None:
+        lock_fd = os.open(str(path) + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(lock_fd, "r+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            except FileNotFoundError:
+                fd = None
+            if fd is not None:
+                with os.fdopen(fd, "r", encoding="utf-8") as existing:
+                    if not stat.S_ISREG(os.fstat(existing.fileno()).st_mode):
+                        raise RuntimeError("Secret path must be a regular file")
+                    value = existing.read().strip()
+                    if not value:
+                        raise RuntimeError("Empty secret file; restore the correct key")
+                    os.fchmod(existing.fileno(), 0o600)
+                    return value
+            if may_create is not None and not may_create():
+                raise RuntimeError("Key missing for an existing database; restore the original key")
+            value = generator()
+            if not isinstance(value, str) or not value.strip():
+                raise RuntimeError("Secret generator returned an empty key")
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as out:
+                out.write(value)
+                out.flush()
+                os.fsync(out.fileno())
+            parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
+            return value
+    lock_path = Path(str(path) + ".lock")
+    if lock_path.is_symlink():
+        raise OSError(errno.ELOOP, "Symlink not allowed", str(lock_path))
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
     with os.fdopen(lock_fd, "r+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        while True:
+            try:
+                os.lseek(lock.fileno(), 0, os.SEEK_SET)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                break
+            except OSError:
+                time.sleep(0.01)
         try:
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-        except FileNotFoundError:
-            fd = None
-        if fd is not None:
-            with os.fdopen(fd, "r", encoding="utf-8") as existing:
-                if not stat.S_ISREG(os.fstat(existing.fileno()).st_mode):
-                    raise RuntimeError("Secret path must be a regular file")
-                value = existing.read().strip()
-                if not value:
-                    raise RuntimeError("Empty secret file; restore the correct key")
-                os.fchmod(existing.fileno(), 0o600)
-                return value
-        if may_create is not None and not may_create():
-            raise RuntimeError("Key missing for an existing database; restore the original key")
-        value = generator()
-        if not isinstance(value, str) or not value.strip():
-            raise RuntimeError("Secret generator returned an empty key")
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as out:
-            out.write(value)
-            out.flush()
-            os.fsync(out.fileno())
-        parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(parent_fd)
+            if path.is_symlink():
+                raise RuntimeError("Secret path must be a regular file")
+            try:
+                fd = os.open(path, os.O_RDONLY)
+            except FileNotFoundError:
+                fd = None
+            if fd is not None:
+                with os.fdopen(fd, "r", encoding="utf-8") as existing:
+                    if not stat.S_ISREG(os.fstat(existing.fileno()).st_mode):
+                        raise RuntimeError("Secret path must be a regular file")
+                    value = existing.read().strip()
+                    if not value:
+                        raise RuntimeError("Empty secret file; restore the correct key")
+                    return value
+            if may_create is not None and not may_create():
+                raise RuntimeError("Key missing for an existing database; restore the original key")
+            value = generator()
+            if not isinstance(value, str) or not value.strip():
+                raise RuntimeError("Secret generator returned an empty key")
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as out:
+                out.write(value)
+                out.flush()
+                os.fsync(out.fileno())
+            return value
         finally:
-            os.close(parent_fd)
-        return value
+            try:
+                os.lseek(lock.fileno(), 0, os.SEEK_SET)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
 
 
 class Settings(BaseSettings):

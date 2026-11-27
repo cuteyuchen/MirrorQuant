@@ -8,7 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
-import fcntl
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None  # type: ignore[assignment]
+    import msvcrt
 import hashlib
 import os
 import tempfile
@@ -46,13 +50,23 @@ async def execution_lock():
             elif engine.dialect.name == "sqlite":
                 name = hashlib.sha256(str(engine.url).encode()).hexdigest()[:24]
                 path = os.path.join(tempfile.gettempdir(), f"mirrorquant-execution-{name}.lock")
-                fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-                while True:
-                    try:
-                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        break
-                    except BlockingIOError:
-                        await asyncio.sleep(0.05)
+                if fcntl is not None:
+                    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+                    while True:
+                        try:
+                            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            break
+                        except BlockingIOError:
+                            await asyncio.sleep(0.05)
+                else:
+                    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+                    while True:
+                        try:
+                            os.lseek(fd, 0, os.SEEK_SET)
+                            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                            break
+                        except OSError:
+                            await asyncio.sleep(0.05)
             else:
                 raise RuntimeError("Execution serialization requires SQLite or PostgreSQL")
             token = _owner.set(task)
@@ -61,6 +75,12 @@ async def execution_lock():
             if token is not None:
                 _owner.reset(token)
             if fd is not None:
+                if fcntl is None:
+                    try:
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                    except OSError:
+                        pass
                 os.close(fd)
             if conn is not None:
                 try:

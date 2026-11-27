@@ -4,7 +4,7 @@ import { AlertTriangle, ArrowRight, Calculator, ChevronDown, ChevronUp } from "l
 import type { BoardAccount, BoardLead, BoardPosition } from "@/types/api";
 import { useI18n } from "@/i18n";
 import { useDisplayUnit } from "@/composables/useDisplayUnit";
-import { finiteNumber, formatDateTime, formatPct, formatPrice, formatQty, formatUsd, signedUsd, type NumericValue } from "@/utils/format";
+import { formatDateTime, formatPct, formatPrice, formatQty, formatUsd, signedUsd, type NumericValue } from "@/utils/format";
 import { normalizeSide, pnlClass, sideLabel, statusTone } from "@/utils/status";
 import { reasonText } from "@/utils/errors";
 import { boardPositionsConfirmed } from "@/utils/positions";
@@ -12,7 +12,6 @@ import FreshnessStamp from "@/components/FreshnessStamp.vue";
 import EnvBadge from "@/components/EnvBadge.vue";
 import EmptyState from "@/components/EmptyState.vue";
 import LeadAvatar from "@/components/LeadAvatar.vue";
-import LevelTrack from "./LevelTrack.vue";
 import MineCard from "./MineCard.vue";
 import LeadTimeline from "./LeadTimeline.vue";
 import LeadCalculator from "./LeadCalculator.vue";
@@ -28,7 +27,7 @@ const calcOpen = ref(false);
 const collapsed = ref(props.defaultCollapsed);
 // 打开测算器时同时展开折叠的卡片，避免测算结果被藏起来。
 function toggleCalc() { calcOpen.value = !calcOpen.value; if (calcOpen.value) collapsed.value = false; }
-// 移动端折叠次要持仓明细（均价/数量/名义价值/止盈止损），默认紧凑收起、可展开。
+// 移动端折叠次要持仓明细（均价/数量/名义价值），默认紧凑收起、可展开。
 const expandedDetails = ref<Record<string, boolean>>({});
 function toggleDetails(key: string) { expandedDetails.value[key] = !expandedDetails.value[key]; }
 function isDetailsExpanded(key: string) { return !!expandedDetails.value[key]; }
@@ -70,16 +69,6 @@ function cardTone(position: BoardPosition) {
 function sideClass(side?: string | null, qty?: NumericValue) {
   const normalized = normalizeSide(side, qty);
   return normalized === "LONG" ? "side-long" : normalized === "SHORT" ? "side-short" : "side-unknown";
-}
-// 止盈 / 止损价距离现价多少个百分点；任一价格未知就返回未知，不用零顶替。
-function distancePct(level: NumericValue, mark: NumericValue) {
-  const price = finiteNumber(level);
-  const base = finiteNumber(mark);
-  return price == null || base == null || base === 0 ? null : (price - base) / base * 100;
-}
-// 止盈或止损至少有一项已知时才展示；全部未知时隐藏，不在移动端留出一整块破折号占位。
-function showLevels(position: BoardPosition) {
-  return position.takeProfitPrice != null || position.stopLossPrice != null;
 }
 // 公开页的“今日开 / 平 / 已实现”没有可靠来源时不渲染，避免一排破折号。
 const showToday = computed(() => !props.readOnly
@@ -140,10 +129,10 @@ const showToday = computed(() => !props.readOnly
           <p class="text-xs font-semibold text-danger md:text-right">{{ orphan.reason ? reasonText(orphan.reason) : t("board.orphanWarning") }}</p>
         </div>
       </div>
-      <div class="grid min-w-0 items-start gap-4" :class="outerGridClass">
+      <div class="grid min-w-0 gap-4" :class="outerGridClass">
         <div class="min-w-0">
           <!-- 隐藏或未知仓位不是已确认空仓，不能显示无持仓。 -->
-          <EmptyState v-if="!positions.length" :title="t(boardPositionsConfirmed(lead) ? 'board.noPositions' : 'board.unknownPositions')" data-testid="empty-positions" />
+          <EmptyState v-if="!positions.length" :class="showTimeline ? 'flex min-h-40 flex-col justify-center' : ''" :title="t(boardPositionsConfirmed(lead) ? 'board.noPositions' : 'board.unknownPositions')" data-testid="empty-positions" />
           <!-- 一个持仓一张卡：单持仓不拆半宽，2+ 持仓在 PC 上两列平铺，已绑定模式超宽屏才并排。 -->
           <div v-else class="grid min-w-0 gap-3" data-testid="positions-grid" :class="positionsGridClass">
             <article v-for="position in positions" :id="`pos-${position.symbol}`" :key="positionKey(position)" :data-position="position.key"
@@ -181,22 +170,6 @@ const showToday = computed(() => !props.readOnly
                       <div v-if="showQuantity" class="min-w-0"><dt class="text-muted">{{ t("common.quantity") }}</dt><dd class="mt-0.5 font-mono font-semibold tabular-nums">{{ formatQty(position.qty) }}</dd></div>
                       <div v-if="showNotional" class="min-w-0 text-right"><dt class="text-muted">{{ t("board.notional") }}</dt><dd class="mt-0.5 font-mono font-semibold tabular-nums">{{ formatUsd(position.notional, 0) }}</dd></div>
                     </dl>
-                    <!-- 止损在左、止盈在右，中间的位置条标出现价落在两者之间的哪里；仅在有已知止损或止盈时渲染。 -->
-                    <div v-if="showLevels(position)" class="mt-2.5 rounded-lg border border-border/40 bg-surface/70 p-2.5">
-                      <div class="flex items-start justify-between gap-3 text-xs">
-                        <div class="min-w-0">
-                          <p class="font-semibold text-danger">{{ t("board.stopLoss") }}</p>
-                          <p class="mt-0.5 font-mono font-semibold tabular-nums">{{ formatPrice(position.stopLossPrice) }}</p>
-                          <p class="font-mono tabular-nums text-muted">{{ t("board.fromMark") }} {{ formatPct(distancePct(position.stopLossPrice, position.markPrice)) }}</p>
-                        </div>
-                        <div class="min-w-0 text-right">
-                          <p class="font-semibold text-success">{{ t("board.takeProfit") }}</p>
-                          <p class="mt-0.5 font-mono font-semibold tabular-nums">{{ formatPrice(position.takeProfitPrice) }}</p>
-                          <p class="font-mono tabular-nums text-muted">{{ t("board.fromMark") }} {{ formatPct(distancePct(position.takeProfitPrice, position.markPrice)) }}</p>
-                        </div>
-                      </div>
-                      <LevelTrack class="mt-2" :mark="position.markPrice" :entry="position.entryPrice" :take-profit="position.takeProfitPrice" :stop-loss="position.stopLossPrice" />
-                    </div>
                   </div>
                 </div>
                 <div v-if="showMineSection" class="min-w-0 border-t border-border/50 pt-2.5 sm:pt-3 lg:border-l lg:border-t-0 lg:pl-4 lg:pt-0"
@@ -210,7 +183,12 @@ const showToday = computed(() => !props.readOnly
             </article>
           </div>
         </div>
-        <LeadTimeline v-if="showTimeline" class="border-t border-border/50 pt-3.5 xl:border-l xl:border-t-0 xl:pl-4 xl:pt-0" :events="lead.todayEvents" :positions="lead.positions" :accounts="readOnly ? null : accounts" :read-only="readOnly" :unbound="isUnbound" />
+        <!-- 桌面端通过 grid stretch + relative/absolute 让今日动态与左侧持仓高度完全同步、不写死高度。 -->
+        <div v-if="showTimeline" data-testid="timeline-cell" class="min-w-0 border-t border-border/50 pt-3.5 xl:border-l xl:border-t-0 xl:pl-4 xl:pt-0">
+          <div class="min-w-0 xl:relative xl:h-full">
+            <LeadTimeline class="xl:absolute xl:inset-0" :events="lead.todayEvents" :positions="lead.positions" :accounts="readOnly ? null : accounts" :read-only="readOnly" :unbound="isUnbound" />
+          </div>
+        </div>
       </div>
       <LeadCalculator v-if="calcOpen && !readOnly && lead.id != null" class="mt-5" :lead-id="lead.id" :name="lead.name" />
     </div>

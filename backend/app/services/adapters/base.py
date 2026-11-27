@@ -3,8 +3,9 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from email.utils import parsedate_to_datetime
+import json
 import math
 import hashlib
 import random
@@ -82,6 +83,16 @@ class BalanceInfo:
     usdt_eq: float = 0.0
     usdc_eq: float = 0.0
     asset_balances: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    wallet_balance: Optional[float] = None
+    initial_margin: Optional[float] = None
+    maintenance_margin: Optional[float] = None
+    margin_ratio: Optional[float] = None
+    can_trade: Optional[bool] = None
+    can_deposit: Optional[bool] = None
+    can_withdraw: Optional[bool] = None
+    multi_assets_margin: Optional[bool] = None
+    dual_side_position: Optional[bool] = None
+    as_of_ms: Optional[int] = None
 
 
 async def get_collateral_balance(adapter: Any, spec: Optional[InstrumentSpec] = None) -> BalanceInfo:
@@ -122,6 +133,14 @@ class ExchangePosition:
     c_time: int = 0
     u_time: int = 0
     margin_usd: float = 0.0
+    liquidation_price: Optional[float] = None
+    maintenance_margin: Optional[float] = None
+    initial_margin: Optional[float] = None
+    open_order_initial_margin: Optional[float] = None
+    break_even_price: Optional[float] = None
+    adl_quantile: Optional[int] = None
+    margin_ratio: Optional[float] = None
+    isolated_wallet: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -143,7 +162,232 @@ class ExchangePosition:
             "lever": self.lever,
             "cTime": self.c_time,
             "uTime": self.u_time,
+            "liquidationPrice": self.liquidation_price,
+            "maintenanceMargin": self.maintenance_margin,
+            "initialMargin": self.initial_margin,
+            "openOrderInitialMargin": self.open_order_initial_margin,
+            "breakEvenPrice": self.break_even_price,
+            "adlQuantile": self.adl_quantile,
+            "marginRatio": self.margin_ratio,
+            "isolatedWallet": self.isolated_wallet,
         }
+
+
+def safe_decimal(value: Any) -> Optional[Decimal]:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    try:
+        dec = value if isinstance(value, Decimal) else Decimal(str(value).strip())
+        return dec if dec.is_finite() else None
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+
+def safe_optional_float(value: Any, *, positive_only: bool = False) -> Optional[float]:
+    dec = safe_decimal(value)
+    if dec is None:
+        return None
+    if positive_only and dec <= 0:
+        return None
+    num = float(dec)
+    return num if math.isfinite(num) else None
+
+
+def make_dedupe_key(*parts: Any) -> str:
+    payload = json.dumps(parts, ensure_ascii=False, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:64]
+
+
+@dataclass
+class DatasetCapability:
+    dataset: str
+    supported: bool
+    complete: bool = True
+    retention_days: Optional[int] = None
+    note: Optional[str] = None
+
+
+@dataclass
+class DatasetPage:
+    items: List[Any]
+    complete: bool = True
+    coverage_start_ms: Optional[int] = None
+    coverage_end_ms: Optional[int] = None
+    next_cursor: Optional[Dict[str, Any]] = None
+    supported: bool = True
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
+
+
+@dataclass
+class AccountRiskInfo:
+    currency: str
+    equity: Optional[Decimal]
+    available_balance: Optional[Decimal]
+    wallet_balance: Optional[Decimal]
+    unrealized_pnl: Optional[Decimal]
+    initial_margin: Optional[Decimal] = None
+    maintenance_margin: Optional[Decimal] = None
+    margin_ratio: Optional[Decimal] = None
+    margin_ratio_source: Optional[str] = None
+    can_trade: Optional[bool] = None
+    can_deposit: Optional[bool] = None
+    can_withdraw: Optional[bool] = None
+    multi_assets_margin: Optional[bool] = None
+    dual_side_position: Optional[bool] = None
+    as_of_ms: Optional[int] = None
+    asset_balances: Dict[str, Dict[str, Optional[Decimal]]] = field(default_factory=dict)
+
+
+@dataclass
+class CashflowEntry:
+    exchange: str
+    external_id: Optional[str]
+    dedupe_key: str
+    asset: str
+    raw_type: str
+    category: str
+    signed_amount: Decimal
+    symbol: Optional[str]
+    occurred_at_ms: int
+    source: str = "exchange_income"
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class TradeFill:
+    exchange: str
+    exchange_fill_id: str
+    exchange_order_id: Optional[str]
+    client_order_id: Optional[str]
+    symbol: str
+    inst_id: str
+    side: str
+    position_side: str
+    qty: Decimal
+    price: Decimal
+    quote_qty: Optional[Decimal]
+    realized_pnl: Optional[Decimal]
+    commission_amount: Optional[Decimal]
+    commission_asset: Optional[str]
+    maker: Optional[bool]
+    occurred_at_ms: int
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class OrderHistoryEntry:
+    exchange: str
+    dedupe_key: str
+    exchange_order_id: Optional[str]
+    client_order_id: Optional[str]
+    algo_id: Optional[str]
+    client_algo_id: Optional[str]
+    category: str
+    symbol: str
+    inst_id: str
+    side: str
+    position_side: str
+    order_type: str
+    status: str
+    qty: Optional[Decimal]
+    filled_qty: Optional[Decimal]
+    avg_price: Optional[Decimal]
+    limit_price: Optional[Decimal]
+    trigger_price: Optional[Decimal]
+    reduce_only: Optional[bool]
+    close_position: Optional[bool]
+    working_type: Optional[str]
+    created_at_ms: int
+    updated_at_ms: int
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class OpenOrderEntry:
+    exchange: str
+    order_id: str
+    client_order_id: Optional[str]
+    algo_id: Optional[str]
+    category: str
+    symbol: str
+    inst_id: str
+    side: str
+    position_side: str
+    order_type: str
+    status: str
+    qty: Optional[Decimal]
+    filled_qty: Optional[Decimal]
+    limit_price: Optional[Decimal]
+    trigger_price: Optional[Decimal]
+    reduce_only: Optional[bool]
+    close_position: Optional[bool]
+    working_type: Optional[str]
+    created_at_ms: Optional[int]
+    updated_at_ms: Optional[int]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "exchange": self.exchange,
+            "orderId": self.order_id,
+            "clientOrderId": self.client_order_id,
+            "algoId": self.algo_id,
+            "category": self.category,
+            "symbol": self.symbol,
+            "instId": self.inst_id,
+            "side": self.side,
+            "positionSide": self.position_side,
+            "orderType": self.order_type,
+            "status": self.status,
+            "qty": str(self.qty) if self.qty is not None else None,
+            "filledQty": str(self.filled_qty) if self.filled_qty is not None else None,
+            "limitPrice": str(self.limit_price) if self.limit_price is not None else None,
+            "triggerPrice": str(self.trigger_price) if self.trigger_price is not None else None,
+            "reduceOnly": self.reduce_only,
+            "closePosition": self.close_position,
+            "workingType": self.working_type,
+            "createdAtMs": self.created_at_ms,
+            "updatedAtMs": self.updated_at_ms,
+        }
+
+
+@dataclass
+class ForceOrderEntry:
+    exchange: str
+    dedupe_key: str
+    exchange_order_id: Optional[str]
+    symbol: str
+    inst_id: str
+    side: str
+    position_side: str
+    order_type: str
+    status: str
+    qty: Optional[Decimal]
+    filled_qty: Optional[Decimal]
+    avg_price: Optional[Decimal]
+    occurred_at_ms: int
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class CommissionRateInfo:
+    symbol: str
+    inst_id: str
+    maker_rate: Optional[Decimal]
+    taker_rate: Optional[Decimal]
+
+
+@dataclass
+class DailyAccountSnapshotEntry:
+    currency: str
+    day_start_ms: int
+    captured_at_ms: int
+    equity: Decimal
+    wallet_balance: Optional[Decimal]
+    unrealized_pnl: Optional[Decimal]
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -388,6 +632,52 @@ class BaseExchangeAdapter(ABC):
     async def cancel_tp_sl(self, inst_id: str, pos_side: Optional[str] = None) -> bool:
         """Cancel pending conditional TP/SL orders for an instrument."""
         return False
+
+    def get_dataset_capabilities(self) -> Dict[str, DatasetCapability]:
+        return {
+            "equity": DatasetCapability("equity", True, True),
+            "open_orders": DatasetCapability("open_orders", False, False, note="Not implemented"),
+            "cashflow": DatasetCapability("cashflow", False, False, note="Not implemented"),
+            "fills": DatasetCapability("fills", False, False, note="Not implemented"),
+            "orders": DatasetCapability("orders", False, False, note="Not implemented"),
+            "force_orders": DatasetCapability("force_orders", False, False, note="Not implemented"),
+            "commission_rates": DatasetCapability("commission_rates", False, False, note="Not implemented"),
+            "daily_snapshots": DatasetCapability("daily_snapshots", False, False, note="Not implemented"),
+        }
+
+    async def get_account_risk_snapshot(self) -> AccountRiskInfo:
+        raise ExchangeAPIError(self.exchange, "UNSUPPORTED_DATASET", "Account risk snapshot unavailable")
+
+    async def get_cashflow_history(
+        self, start_ms: int, end_ms: int, cursor: Optional[Dict[str, Any]] = None
+    ) -> DatasetPage:
+        raise ExchangeAPIError(self.exchange, "UNSUPPORTED_DATASET", "Cashflow history unsupported")
+
+    async def get_trade_fills(
+        self, symbols: List[str], start_ms: int, end_ms: int, cursor: Optional[Dict[str, Any]] = None
+    ) -> DatasetPage:
+        raise ExchangeAPIError(self.exchange, "UNSUPPORTED_DATASET", "Trade fills unsupported")
+
+    async def get_order_history(
+        self,
+        start_ms: int,
+        end_ms: int,
+        cursor: Optional[Dict[str, Any]] = None,
+        symbols: Optional[List[str]] = None,
+    ) -> DatasetPage:
+        raise ExchangeAPIError(self.exchange, "UNSUPPORTED_DATASET", "Order history unsupported")
+
+    async def get_open_orders_normalized(self) -> List[OpenOrderEntry]:
+        raise ExchangeAPIError(self.exchange, "UNSUPPORTED_DATASET", "Normalized open orders unsupported")
+
+    async def get_force_orders(self, start_ms: int, end_ms: int) -> DatasetPage:
+        raise ExchangeAPIError(self.exchange, "UNSUPPORTED_DATASET", "Force orders unsupported")
+
+    async def get_commission_rates(self, symbols: List[str]) -> List[CommissionRateInfo]:
+        raise ExchangeAPIError(self.exchange, "UNSUPPORTED_DATASET", "Commission rates unsupported")
+
+    async def get_daily_account_snapshots(self, start_ms: int, end_ms: int) -> DatasetPage:
+        raise ExchangeAPIError(self.exchange, "UNSUPPORTED_DATASET", "Daily account snapshots unsupported")
 
     @abstractmethod
     def resolve_symbol(

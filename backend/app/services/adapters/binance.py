@@ -12,14 +12,27 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode
 
 from app.services.adapters.base import (
+    AccountRiskInfo,
     BalanceInfo,
     BaseExchangeAdapter,
+    CashflowEntry,
+    CommissionRateInfo,
+    DailyAccountSnapshotEntry,
+    DatasetCapability,
+    DatasetPage,
     ExchangeAPIError,
     ExchangePosition,
+    ForceOrderEntry,
     InstrumentSpec,
+    OpenOrderEntry,
     OrderBook,
+    OrderHistoryEntry,
     OrderResult,
+    TradeFill,
     api_error,
+    make_dedupe_key,
+    safe_decimal,
+    safe_optional_float,
 )
 from app.services.proxy.manager import ProxyManager
 
@@ -298,6 +311,15 @@ class BinanceAdapter(BaseExchangeAdapter):
                 margin_usd = float(p.get("isolatedWallet") or 0.0)
             if margin_usd <= 0 and notional > 0 and lever > 0:
                 margin_usd = notional / lever
+            liq_price = safe_optional_float(p.get("liquidationPrice"), positive_only=True)
+            maint_margin = safe_optional_float(p.get("maintMargin"))
+            init_margin = safe_optional_float(p.get("initialMargin") or p.get("positionInitialMargin"))
+            open_order_im = safe_optional_float(p.get("openOrderInitialMargin"))
+            break_even = safe_optional_float(p.get("breakEvenPrice"), positive_only=True)
+            iso_wallet = safe_optional_float(p.get("isolatedWallet"), positive_only=(mgn_mode != "isolated"))
+            pos_margin_ratio = safe_optional_float(p.get("marginRatio"))
+            if pos_margin_ratio is None and mgn_mode == "isolated" and maint_margin is not None and iso_wallet and iso_wallet > 0:
+                pos_margin_ratio = maint_margin / iso_wallet
             positions.append(
                 ExchangePosition(
                     inst_id=sym,
@@ -314,6 +336,13 @@ class BinanceAdapter(BaseExchangeAdapter):
                     lever=lever,
                     u_time=int(p.get("updateTime") or 0),
                     margin_usd=margin_usd,
+                    liquidation_price=liq_price,
+                    maintenance_margin=maint_margin,
+                    initial_margin=init_margin,
+                    open_order_initial_margin=open_order_im,
+                    break_even_price=break_even,
+                    margin_ratio=pos_margin_ratio,
+                    isolated_wallet=iso_wallet,
                 )
             )
         return positions
@@ -605,3 +634,795 @@ class BinanceAdapter(BaseExchangeAdapter):
             # 不把撤单失败伪装成无订单，且日志不携带签名 URL。
             logger.error("Protective cancellation failed for %s (%s)", inst_id, type(exc).__name__)
             raise
+
+    _MAX_HISTORY_WINDOW_MS = 7 * 86_400_000 - 1
+    _BINANCE_ORDER_RETENTION_DAYS = 90
+    _INCOME_CATEGORY_MAP = {
+        "REALIZED_PNL": "REALIZED_PNL",
+        "FUNDING_FEE": "FUNDING_FEE",
+        "SPECIAL_FUNDING_FEE": "SPECIAL_FUNDING_FEE",
+        "COMMISSION": "COMMISSION",
+        "COMMISSION_REBATE": "COMMISSION_REBATE",
+        "API_REBATE": "COMMISSION_REBATE",
+        "LIQUIDATION_FEE": "LIQUIDATION_FEE",
+        "INSURANCE_CLEAR": "INSURANCE_CLEAR",
+        "WELCOME_BONUS": "BONUS",
+        "CONTEST_REWARD": "BONUS",
+        "BONUS": "BONUS",
+        "REFERRAL_KICKBACK": "REFERRAL_REBATE",
+        "REFERRAL_REBATE": "REFERRAL_REBATE",
+        "DELIVERED_SETTELMENT": "OTHER_TRADING_INCOME",
+        "ADL_AUTO_CLOSE": "OTHER_TRADING_INCOME",
+        "AUTO_EXCHANGE": "OTHER_EXTERNAL_FLOW",
+        "COIN_SWAP_DEPOSIT": "OTHER_EXTERNAL_FLOW",
+        "COIN_SWAP_WITHDRAW": "OTHER_EXTERNAL_FLOW",
+    }
+
+    @classmethod
+    def _classify_order_category(cls, raw_type: str, *, algo: bool = False) -> str:
+        upper = (raw_type or "").upper()
+        if upper in ("STOP", "STOP_MARKET"):
+            return "stop_loss"
+        if upper in ("TAKE_PROFIT", "TAKE_PROFIT_MARKET"):
+            return "take_profit"
+        if upper in ("TRAILING_STOP", "TRAILING_STOP_MARKET"):
+            return "trailing_stop"
+        return "conditional" if algo else "ordinary"
+
+    @staticmethod
+    def _normalize_position_side(raw_ps: Any) -> str:
+        upper = str(raw_ps or "BOTH").upper()
+        if upper in ("LONG", "SHORT", "BOTH"):
+            return upper
+        return "BOTH"
+
+    def get_dataset_capabilities(self) -> Dict[str, DatasetCapability]:
+        return {
+            "equity": DatasetCapability("equity", True, True),
+            "open_orders": DatasetCapability("open_orders", True, True),
+            "cashflow": DatasetCapability("cashflow", True, True, retention_days=365),
+            "fills": DatasetCapability("fills", True, True, retention_days=90),
+            "orders": DatasetCapability(
+                "orders", True, True, retention_days=self._BINANCE_ORDER_RETENTION_DAYS,
+                note="Binance retains futures order history for 90 days",
+            ),
+            "force_orders": DatasetCapability("force_orders", True, True, retention_days=365),
+            "commission_rates": DatasetCapability("commission_rates", True, True),
+            "daily_snapshots": DatasetCapability(
+                "daily_snapshots",
+                supported=(self.environment == "live"),
+                complete=False,
+                retention_days=30,
+                note=(
+                    "SAPI accountSnapshot unavailable on Binance Futures Testnet"
+                    if self.environment == "demo"
+                    else "Requires SAPI wallet read permission"
+                ),
+            ),
+        }
+
+    async def get_adl_quantiles(self) -> Dict[tuple[str, str], int]:
+        data = await self._request("GET", "/fapi/v1/adlQuantile")
+        rows = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
+        quantiles: Dict[tuple[str, str], int] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            sym = str(row.get("symbol") or "").upper()
+            adl = row.get("adlQuantile")
+            if not sym or not isinstance(adl, dict):
+                continue
+            for side_key, val in adl.items():
+                if isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val):
+                    quantiles[(sym, str(side_key).lower())] = int(val)
+        return quantiles
+
+    async def get_account_risk_snapshot(self) -> AccountRiskInfo:
+        acct = await self._request("GET", "/fapi/v2/account")
+        if not isinstance(acct, dict):
+            raise ValueError("Invalid Binance account risk snapshot")
+        dual_side: Optional[bool] = None
+        try:
+            dual = await self._request("GET", "/fapi/v1/positionSide/dual")
+            if isinstance(dual, dict) and isinstance(dual.get("dualSidePosition"), bool):
+                dual_side = dual["dualSidePosition"]
+        except Exception:
+            dual_side = None
+
+        asset_balances: Dict[str, Dict[str, Optional[Decimal]]] = {}
+        raw_assets = acct.get("assets") or []
+        usdt_row: Dict[str, Any] = {}
+        for item in raw_assets:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("asset") or "").upper()
+            if not name:
+                continue
+            mb = safe_decimal(item.get("marginBalance"))
+            avail = safe_decimal(item.get("availableBalance"))
+            wb = safe_decimal(item.get("walletBalance"))
+            upl = safe_decimal(item.get("unrealizedProfit"))
+            im = safe_decimal(item.get("initialMargin"))
+            mm = safe_decimal(item.get("maintMargin"))
+            if name == "USDT":
+                usdt_row = item
+            if any(v is not None and v != 0 for v in (mb, avail, wb, upl, im, mm)) or name == "USDT":
+                asset_balances[name] = {
+                    "equity": mb,
+                    "available": avail,
+                    "wallet": wb,
+                    "upl": upl,
+                    "initialMargin": im,
+                    "maintenanceMargin": mm,
+                }
+
+        equity = safe_decimal(usdt_row.get("marginBalance"))
+        avail_bal = safe_decimal(usdt_row.get("availableBalance"))
+        wallet_bal = safe_decimal(usdt_row.get("walletBalance"))
+        upl_bal = safe_decimal(usdt_row.get("unrealizedProfit"))
+        init_margin = safe_decimal(usdt_row.get("initialMargin"))
+        maint_margin = safe_decimal(usdt_row.get("maintMargin"))
+        margin_ratio: Optional[Decimal] = None
+        margin_ratio_source: Optional[str] = None
+        if maint_margin is not None and equity is not None and equity > 0:
+            margin_ratio = maint_margin / equity
+            margin_ratio_source = "derived_from_exchange_mmr"
+
+        as_of_ms: Optional[int] = None
+        if acct.get("updateTime") not in (None, "", 0, "0"):
+            try:
+                as_of_ms = int(acct["updateTime"])
+            except (TypeError, ValueError):
+                as_of_ms = None
+
+        return AccountRiskInfo(
+            currency="USDT",
+            equity=equity,
+            available_balance=avail_bal,
+            wallet_balance=wallet_bal,
+            unrealized_pnl=upl_bal,
+            initial_margin=init_margin,
+            maintenance_margin=maint_margin,
+            margin_ratio=margin_ratio,
+            margin_ratio_source=margin_ratio_source,
+            can_trade=acct.get("canTrade") if isinstance(acct.get("canTrade"), bool) else None,
+            can_deposit=acct.get("canDeposit") if isinstance(acct.get("canDeposit"), bool) else None,
+            can_withdraw=acct.get("canWithdraw") if isinstance(acct.get("canWithdraw"), bool) else None,
+            multi_assets_margin=(
+                acct.get("multiAssetsMargin") if isinstance(acct.get("multiAssetsMargin"), bool) else None
+            ),
+            dual_side_position=dual_side,
+            as_of_ms=as_of_ms,
+            asset_balances=asset_balances,
+        )
+
+    async def _fetch_time_windows(
+        self,
+        path: str,
+        start_ms: int,
+        end_ms: int,
+        *,
+        limit: int,
+        time_field: str = "time",
+        extra_params: Optional[Dict[str, Any]] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        """Fetch time-windowed Binance endpoints without truncating full pages."""
+        if end_ms < start_ms:
+            return [], True
+        windows: List[tuple[int, int]] = []
+        cur = end_ms
+        while cur >= start_ms:
+            w_start = max(start_ms, cur - self._MAX_HISTORY_WINDOW_MS)
+            windows.append((w_start, cur))
+            cur = w_start - 1
+        windows.reverse()
+
+        collected: List[Dict[str, Any]] = []
+        complete = True
+        stack = list(reversed(windows))
+        while stack:
+            w_start, w_end = stack.pop()
+            params = {**(extra_params or {}), "startTime": w_start, "endTime": w_end, "limit": limit}
+            rows = await self._request("GET", path, params=params)
+            if not isinstance(rows, list):
+                raise ValueError(f"Malformed Binance response for {path}")
+            if len(rows) < limit:
+                collected.extend(r for r in rows if isinstance(r, dict))
+                continue
+            times = []
+            for r in rows:
+                if isinstance(r, dict) and r.get(time_field) is not None:
+                    try:
+                        times.append(int(r[time_field]))
+                    except (TypeError, ValueError):
+                        pass
+            if w_end <= w_start:
+                collected.extend(r for r in rows if isinstance(r, dict))
+                complete = False
+                continue
+            max_t = max(times) if times else w_start
+            min_t = min(times) if times else w_start
+            if min_t < max_t < w_end:
+                collected.extend(r for r in rows if isinstance(r, dict) and int(r.get(time_field) or 0) < max_t)
+                stack.append((max_t, w_end))
+            else:
+                mid = (w_start + w_end) // 2
+                stack.append((mid + 1, w_end))
+                stack.append((w_start, mid))
+        return collected, complete
+
+    async def get_cashflow_history(
+        self, start_ms: int, end_ms: int, cursor: Optional[Dict[str, Any]] = None
+    ) -> DatasetPage:
+        raw_rows, complete = await self._fetch_time_windows(
+            "/fapi/v1/income", start_ms, end_ms, limit=1000, time_field="time"
+        )
+        entries: List[CashflowEntry] = []
+        seen: set[tuple[Any, ...]] = set()
+        for entry in raw_rows:
+            raw_type = str(entry.get("incomeType") or "UNKNOWN").strip().upper() or "UNKNOWN"
+            asset = str(entry.get("asset") or "").strip().upper()
+            signed = safe_decimal(entry.get("income"))
+            try:
+                ts = int(entry["time"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not asset or signed is None:
+                continue
+            if raw_type in ("TRANSFER", "INTERNAL_TRANSFER", "CROSS_COLLATERAL_TRANSFER"):
+                category = "TRANSFER_IN" if signed >= 0 else "TRANSFER_OUT"
+            else:
+                category = self._INCOME_CATEGORY_MAP.get(raw_type, "UNKNOWN")
+            tran_id = entry.get("tranId")
+            trade_id = entry.get("tradeId")
+            tran_str = str(tran_id).strip() if tran_id not in (None, "") else ""
+            trade_str = str(trade_id).strip() if trade_id not in (None, "") else ""
+            external_id = f"{tran_str}:{trade_str}" if (tran_str and trade_str) else (tran_str or None)
+            symbol = str(entry.get("symbol") or "").strip().upper() or None
+            info_text = str(entry.get("info") or "")[:120]
+            dedupe_key = make_dedupe_key(
+                "binance", external_id, raw_type, asset, symbol, ts, str(signed), info_text
+            )
+            uniq = (external_id, raw_type) if external_id is not None else ("dedupe", dedupe_key)
+            if uniq in seen:
+                continue
+            seen.add(uniq)
+            entries.append(
+                CashflowEntry(
+                    exchange="binance",
+                    external_id=external_id,
+                    dedupe_key=dedupe_key,
+                    asset=asset,
+                    raw_type=raw_type,
+                    category=category,
+                    signed_amount=signed,
+                    symbol=symbol,
+                    occurred_at_ms=ts,
+                    source="exchange_income",
+                    metadata={
+                        "info": info_text,
+                        "tranId": tran_str or None,
+                        "tradeId": trade_str or None,
+                    },
+                )
+            )
+        entries.sort(key=lambda item: (item.occurred_at_ms, item.dedupe_key))
+        return DatasetPage(
+            items=entries,
+            complete=complete,
+            coverage_start_ms=start_ms,
+            coverage_end_ms=end_ms,
+        )
+
+    async def get_trade_fills(
+        self, symbols: List[str], start_ms: int, end_ms: int, cursor: Optional[Dict[str, Any]] = None
+    ) -> DatasetPage:
+        clean_symbols = sorted({s.strip().upper() for s in symbols if s and s.strip()})
+        if not clean_symbols or end_ms < start_ms:
+            return DatasetPage(items=[], complete=True, coverage_start_ms=start_ms, coverage_end_ms=end_ms)
+        fills: List[TradeFill] = []
+        seen_ids: set[str] = set()
+        complete = True
+
+        for sym in clean_symbols:
+            cur = start_ms
+            while cur <= end_ms:
+                w_end = min(end_ms, cur + self._MAX_HISTORY_WINDOW_MS)
+                rows = await self._request(
+                    "GET",
+                    "/fapi/v1/userTrades",
+                    params={"symbol": sym, "startTime": cur, "endTime": w_end, "limit": 1000},
+                )
+                if not isinstance(rows, list):
+                    raise ValueError(f"Malformed Binance userTrades response for {sym}")
+                batch = [r for r in rows if isinstance(r, dict)]
+                while True:
+                    for r in batch:
+                        try:
+                            ts = int(r["time"])
+                        except (KeyError, TypeError, ValueError):
+                            continue
+                        if ts < cur or ts > w_end:
+                            continue
+                        qty = safe_decimal(r.get("qty"))
+                        price = safe_decimal(r.get("price"))
+                        if qty is None or price is None or qty <= 0:
+                            continue
+                        raw_fid = r.get("id")
+                        fill_id = (
+                            str(raw_fid)
+                            if raw_fid not in (None, "")
+                            else make_dedupe_key(sym, r.get("orderId"), ts, str(qty), str(price), r.get("side"))
+                        )
+                        if fill_id in seen_ids:
+                            continue
+                        seen_ids.add(fill_id)
+                        side = str(r.get("side") or "").upper()
+                        if side not in ("BUY", "SELL"):
+                            side = "BUY" if r.get("buyer") else "SELL"
+                        comm = safe_decimal(r.get("commission"))
+                        quote_qty = safe_decimal(r.get("quoteQty"))
+                        if quote_qty is None:
+                            quote_qty = qty * price
+                        fills.append(
+                            TradeFill(
+                                exchange="binance",
+                                exchange_fill_id=fill_id,
+                                exchange_order_id=str(r["orderId"]) if r.get("orderId") not in (None, "") else None,
+                                client_order_id=None,
+                                symbol=sym,
+                                inst_id=sym,
+                                side=side,
+                                position_side=self._normalize_position_side(r.get("positionSide")),
+                                qty=qty,
+                                price=price,
+                                quote_qty=quote_qty,
+                                realized_pnl=safe_decimal(r.get("realizedPnl")),
+                                commission_amount=comm,
+                                commission_asset=(
+                                    str(r.get("commissionAsset")).upper()
+                                    if r.get("commissionAsset")
+                                    else None
+                                ),
+                                maker=r.get("maker") if isinstance(r.get("maker"), bool) else None,
+                                occurred_at_ms=ts,
+                                metadata={"buyer": r.get("buyer"), "marginAsset": r.get("marginAsset")},
+                            )
+                        )
+                    if len(batch) < 1000:
+                        break
+                    ids = [int(r["id"]) for r in batch if r.get("id") is not None]
+                    if not ids:
+                        complete = False
+                        break
+                    next_from_id = max(ids) + 1
+                    next_rows = await self._request(
+                        "GET",
+                        "/fapi/v1/userTrades",
+                        params={"symbol": sym, "fromId": next_from_id, "limit": 1000},
+                    )
+                    if not isinstance(next_rows, list):
+                        raise ValueError(f"Malformed Binance userTrades pagination for {sym}")
+                    batch = [r for r in next_rows if isinstance(r, dict)]
+                    if not batch:
+                        break
+                    if all(int(r.get("time") or 0) > w_end for r in batch):
+                        break
+                cur = w_end + 1
+
+        fills.sort(key=lambda item: (item.occurred_at_ms, item.exchange_fill_id))
+        return DatasetPage(
+            items=fills,
+            complete=complete,
+            coverage_start_ms=start_ms,
+            coverage_end_ms=end_ms,
+        )
+
+    async def get_order_history(
+        self,
+        start_ms: int,
+        end_ms: int,
+        cursor: Optional[Dict[str, Any]] = None,
+        symbols: Optional[List[str]] = None,
+    ) -> DatasetPage:
+        if end_ms < start_ms:
+            return DatasetPage(items=[], complete=True, coverage_start_ms=start_ms, coverage_end_ms=end_ms)
+        now_ms = int(time.time() * 1000) + self._time_offset_ms
+        retention_floor = now_ms - self._BINANCE_ORDER_RETENTION_DAYS * 86_400_000
+        effective_start = max(start_ms, retention_floor)
+        clean_symbols = sorted({s.strip().upper() for s in (symbols or []) if s and s.strip()})
+        entries: List[OrderHistoryEntry] = []
+        seen_keys: set[str] = set()
+        complete = effective_start == start_ms
+
+        for sym in clean_symbols:
+            cur = effective_start
+            while cur <= end_ms:
+                w_end = min(end_ms, cur + self._MAX_HISTORY_WINDOW_MS)
+                rows = await self._request(
+                    "GET",
+                    "/fapi/v1/allOrders",
+                    params={"symbol": sym, "startTime": cur, "endTime": w_end, "limit": 1000},
+                )
+                if not isinstance(rows, list):
+                    raise ValueError(f"Malformed Binance allOrders response for {sym}")
+                batch = [r for r in rows if isinstance(r, dict)]
+                while True:
+                    for r in batch:
+                        created_ms = int(r.get("time") or r.get("updateTime") or 0)
+                        updated_ms = int(r.get("updateTime") or r.get("time") or 0)
+                        if created_ms and (created_ms < cur or created_ms > w_end):
+                            continue
+                        oid = str(r.get("orderId") or "").strip() or None
+                        if not oid:
+                            continue
+                        dedupe_key = f"order:{oid}"
+                        if dedupe_key in seen_keys:
+                            continue
+                        seen_keys.add(dedupe_key)
+                        raw_type = str(r.get("type") or r.get("origType") or "LIMIT").upper()
+                        limit_px = safe_decimal(r.get("price"))
+                        if limit_px is not None and limit_px <= 0:
+                            limit_px = None
+                        trig_px = safe_decimal(r.get("stopPrice"))
+                        if trig_px is not None and trig_px <= 0:
+                            trig_px = None
+                        avg_px = safe_decimal(r.get("avgPrice"))
+                        if avg_px is not None and avg_px <= 0:
+                            avg_px = None
+                        close_pos = bool(r.get("closePosition")) if r.get("closePosition") is not None else None
+                        qty = None if close_pos else safe_decimal(r.get("origQty"))
+                        entries.append(
+                            OrderHistoryEntry(
+                                exchange="binance",
+                                dedupe_key=dedupe_key,
+                                exchange_order_id=oid,
+                                client_order_id=str(r.get("clientOrderId") or "").strip() or None,
+                                algo_id=None,
+                                client_algo_id=None,
+                                category=self._classify_order_category(raw_type, algo=False),
+                                symbol=sym,
+                                inst_id=sym,
+                                side=str(r.get("side") or "").upper(),
+                                position_side=self._normalize_position_side(r.get("positionSide")),
+                                order_type=raw_type,
+                                status=str(r.get("status") or "UNKNOWN").upper(),
+                                qty=qty,
+                                filled_qty=safe_decimal(r.get("executedQty")),
+                                avg_price=avg_px,
+                                limit_price=limit_px,
+                                trigger_price=trig_px,
+                                reduce_only=bool(r.get("reduceOnly")) if r.get("reduceOnly") is not None else None,
+                                close_position=close_pos,
+                                working_type=str(r.get("workingType")) if r.get("workingType") else None,
+                                created_at_ms=created_ms,
+                                updated_at_ms=updated_ms or created_ms,
+                                metadata={"timeInForce": r.get("timeInForce"), "origType": r.get("origType")},
+                            )
+                        )
+                    if len(batch) < 1000:
+                        break
+                    oids = [int(r["orderId"]) for r in batch if r.get("orderId") is not None]
+                    if not oids:
+                        complete = False
+                        break
+                    next_oid = max(oids) + 1
+                    next_rows = await self._request(
+                        "GET",
+                        "/fapi/v1/allOrders",
+                        params={"symbol": sym, "orderId": next_oid, "limit": 1000},
+                    )
+                    if not isinstance(next_rows, list):
+                        raise ValueError(f"Malformed Binance allOrders pagination for {sym}")
+                    batch = [r for r in next_rows if isinstance(r, dict)]
+                    if not batch:
+                        break
+                    if all(int(r.get("time") or r.get("updateTime") or 0) > w_end for r in batch):
+                        break
+                cur = w_end + 1
+
+        # Conditional / algo order history
+        cur = effective_start
+        while cur <= end_ms:
+            w_end = min(end_ms, cur + self._MAX_HISTORY_WINDOW_MS)
+            page = 1
+            seen_algo_in_win: set[str] = set()
+            while True:
+                resp = await self._request(
+                    "GET",
+                    "/fapi/v1/allAlgoOrders",
+                    params={"startTime": cur, "endTime": w_end, "page": page, "pageSize": 100},
+                )
+                algo_rows = resp.get("orders") if isinstance(resp, dict) else resp
+                if not isinstance(algo_rows, list):
+                    raise ValueError("Malformed Binance allAlgoOrders response")
+                added_in_page = 0
+                for r in algo_rows:
+                    if not isinstance(r, dict):
+                        continue
+                    aid = str(r.get("algoId") or "").strip()
+                    if not aid or aid in seen_algo_in_win:
+                        continue
+                    seen_algo_in_win.add(aid)
+                    added_in_page += 1
+                    dedupe_key = f"algo:{aid}"
+                    if dedupe_key in seen_keys:
+                        continue
+                    seen_keys.add(dedupe_key)
+                    sym = str(r.get("symbol") or "").upper()
+                    raw_type = str(r.get("orderType") or r.get("type") or r.get("algoType") or "CONDITIONAL").upper()
+                    created_ms = int(r.get("createTime") or r.get("time") or r.get("updateTime") or 0)
+                    updated_ms = int(r.get("updateTime") or r.get("triggerTime") or created_ms)
+                    close_pos = bool(r.get("closePosition")) if r.get("closePosition") is not None else None
+                    qty = None if close_pos else safe_decimal(r.get("quantity"))
+                    trig_px = safe_decimal(r.get("triggerPrice"))
+                    if trig_px is not None and trig_px <= 0:
+                        trig_px = None
+                    limit_px = safe_decimal(r.get("price"))
+                    if limit_px is not None and limit_px <= 0:
+                        limit_px = None
+                    entries.append(
+                        OrderHistoryEntry(
+                            exchange="binance",
+                            dedupe_key=dedupe_key,
+                            exchange_order_id=None,
+                            client_order_id=None,
+                            algo_id=aid,
+                            client_algo_id=str(r.get("clientAlgoId") or "").strip() or None,
+                            category=self._classify_order_category(raw_type, algo=True),
+                            symbol=sym,
+                            inst_id=sym,
+                            side=str(r.get("side") or "").upper(),
+                            position_side=self._normalize_position_side(r.get("positionSide")),
+                            order_type=raw_type,
+                            status=str(r.get("algoStatus") or r.get("status") or "UNKNOWN").upper(),
+                            qty=qty,
+                            filled_qty=safe_decimal(r.get("executedQty")),
+                            avg_price=safe_decimal(r.get("avgPrice")),
+                            limit_price=limit_px,
+                            trigger_price=trig_px,
+                            reduce_only=bool(r.get("reduceOnly")) if r.get("reduceOnly") is not None else None,
+                            close_position=close_pos,
+                            working_type=str(r.get("workingType")) if r.get("workingType") else None,
+                            created_at_ms=created_ms,
+                            updated_at_ms=updated_ms or created_ms,
+                            metadata={
+                                "actualOrderId": str(r.get("actualOrderId")) if r.get("actualOrderId") else None,
+                                "algoType": r.get("algoType"),
+                            },
+                        )
+                    )
+                if len(algo_rows) < 100 or added_in_page == 0:
+                    break
+                page += 1
+            cur = w_end + 1
+
+        entries.sort(key=lambda item: (item.updated_at_ms, item.dedupe_key))
+        return DatasetPage(
+            items=entries,
+            complete=complete,
+            coverage_start_ms=effective_start,
+            coverage_end_ms=end_ms,
+        )
+
+    async def get_open_orders_normalized(self) -> List[OpenOrderEntry]:
+        ordinary = await self._request("GET", "/fapi/v1/openOrders")
+        conditional = await self._request("GET", "/fapi/v1/openAlgoOrders")
+        if isinstance(conditional, dict):
+            conditional = conditional.get("orders")
+        if not isinstance(ordinary, list) or not isinstance(conditional, list):
+            raise ValueError("Incomplete Binance pending-order inventory")
+
+        entries: List[OpenOrderEntry] = []
+        for o in ordinary:
+            if not isinstance(o, dict):
+                continue
+            sym = str(o.get("symbol") or "").upper()
+            raw_type = str(o.get("type") or o.get("origType") or "LIMIT").upper()
+            close_pos = bool(o.get("closePosition")) if o.get("closePosition") is not None else False
+            qty = None if close_pos else safe_decimal(o.get("origQty"))
+            limit_px = safe_decimal(o.get("price"))
+            if limit_px is not None and limit_px <= 0:
+                limit_px = None
+            trig_px = safe_decimal(o.get("stopPrice"))
+            if trig_px is not None and trig_px <= 0:
+                trig_px = None
+            entries.append(
+                OpenOrderEntry(
+                    exchange="binance",
+                    order_id=str(o.get("orderId") or o.get("clientOrderId") or ""),
+                    client_order_id=str(o.get("clientOrderId") or "").strip() or None,
+                    algo_id=None,
+                    category=self._classify_order_category(raw_type, algo=False),
+                    symbol=sym,
+                    inst_id=sym,
+                    side=str(o.get("side") or "").upper(),
+                    position_side=self._normalize_position_side(o.get("positionSide")),
+                    order_type=raw_type,
+                    status=str(o.get("status") or "NEW").upper(),
+                    qty=qty,
+                    filled_qty=safe_decimal(o.get("executedQty")),
+                    limit_price=limit_px,
+                    trigger_price=trig_px,
+                    reduce_only=bool(o.get("reduceOnly")) if o.get("reduceOnly") is not None else None,
+                    close_position=close_pos,
+                    working_type=str(o.get("workingType")) if o.get("workingType") else None,
+                    created_at_ms=int(o["time"]) if o.get("time") else None,
+                    updated_at_ms=int(o["updateTime"]) if o.get("updateTime") else None,
+                )
+            )
+        for o in conditional:
+            if not isinstance(o, dict):
+                continue
+            sym = str(o.get("symbol") or "").upper()
+            raw_type = str(o.get("orderType") or o.get("type") or o.get("algoType") or "CONDITIONAL").upper()
+            close_pos = bool(o.get("closePosition")) if o.get("closePosition") is not None else False
+            qty = None if close_pos else safe_decimal(o.get("quantity"))
+            if qty is not None and qty <= 0:
+                qty = None
+            trig_px = safe_decimal(o.get("triggerPrice"))
+            if trig_px is not None and trig_px <= 0:
+                trig_px = None
+            limit_px = safe_decimal(o.get("price"))
+            if limit_px is not None and limit_px <= 0:
+                limit_px = None
+            aid = str(o.get("algoId") or "")
+            entries.append(
+                OpenOrderEntry(
+                    exchange="binance",
+                    order_id=aid or str(o.get("clientAlgoId") or ""),
+                    client_order_id=str(o.get("clientAlgoId") or "").strip() or None,
+                    algo_id=aid or None,
+                    category=self._classify_order_category(raw_type, algo=True),
+                    symbol=sym,
+                    inst_id=sym,
+                    side=str(o.get("side") or "").upper(),
+                    position_side=self._normalize_position_side(o.get("positionSide")),
+                    order_type=raw_type,
+                    status=str(o.get("algoStatus") or o.get("status") or "NEW").upper(),
+                    qty=qty,
+                    filled_qty=safe_decimal(o.get("executedQty")),
+                    limit_price=limit_px,
+                    trigger_price=trig_px,
+                    reduce_only=bool(o.get("reduceOnly")) if o.get("reduceOnly") is not None else None,
+                    close_position=close_pos,
+                    working_type=str(o.get("workingType")) if o.get("workingType") else None,
+                    created_at_ms=int(o["createTime"]) if o.get("createTime") else None,
+                    updated_at_ms=int(o["updateTime"]) if o.get("updateTime") else None,
+                )
+            )
+        return entries
+
+    async def get_force_orders(self, start_ms: int, end_ms: int) -> DatasetPage:
+        raw_rows, complete = await self._fetch_time_windows(
+            "/fapi/v1/forceOrders", start_ms, end_ms, limit=100, time_field="time"
+        )
+        items: List[ForceOrderEntry] = []
+        seen: set[str] = set()
+        for r in raw_rows:
+            sym = str(r.get("symbol") or "").upper()
+            ts = int(r.get("time") or r.get("updateTime") or 0)
+            if not sym or ts <= 0:
+                continue
+            oid = str(r.get("orderId") or "").strip() or None
+            qty = safe_decimal(r.get("origQty"))
+            filled = safe_decimal(r.get("executedQty"))
+            avg_px = safe_decimal(r.get("averagePrice") or r.get("avgPrice") or r.get("price"))
+            side = str(r.get("side") or "").upper()
+            pos_side = self._normalize_position_side(r.get("positionSide"))
+            dedupe_key = (
+                f"force:{oid}"
+                if oid
+                else f"force:{make_dedupe_key('binance', sym, side, pos_side, ts, str(qty), str(avg_px))}"
+            )
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            items.append(
+                ForceOrderEntry(
+                    exchange="binance",
+                    dedupe_key=dedupe_key,
+                    exchange_order_id=oid,
+                    symbol=sym,
+                    inst_id=sym,
+                    side=side,
+                    position_side=pos_side,
+                    order_type=str(r.get("origType") or r.get("type") or "LIQUIDATION").upper(),
+                    status=str(r.get("status") or "FILLED").upper(),
+                    qty=qty,
+                    filled_qty=filled,
+                    avg_price=avg_px,
+                    occurred_at_ms=ts,
+                    metadata={"timeInForce": r.get("timeInForce")},
+                )
+            )
+        items.sort(key=lambda item: (item.occurred_at_ms, item.dedupe_key))
+        return DatasetPage(
+            items=items,
+            complete=complete,
+            coverage_start_ms=start_ms,
+            coverage_end_ms=end_ms,
+        )
+
+    async def get_commission_rates(self, symbols: List[str]) -> List[CommissionRateInfo]:
+        rates: List[CommissionRateInfo] = []
+        for sym in sorted({s.strip().upper() for s in symbols if s and s.strip()}):
+            data = await self._request("GET", "/fapi/v1/commissionRate", params={"symbol": sym})
+            if not isinstance(data, dict):
+                continue
+            rates.append(
+                CommissionRateInfo(
+                    symbol=sym,
+                    inst_id=sym,
+                    maker_rate=safe_decimal(data.get("makerCommissionRate")),
+                    taker_rate=safe_decimal(data.get("takerCommissionRate")),
+                )
+            )
+        return rates
+
+    async def get_daily_account_snapshots(self, start_ms: int, end_ms: int) -> DatasetPage:
+        if self.environment == "demo":
+            return DatasetPage(
+                items=[],
+                complete=False,
+                supported=False,
+                error_code="UNSUPPORTED_ON_TESTNET",
+                error_message="SAPI accountSnapshot unavailable on testnet",
+            )
+        try:
+            resp = await self._request(
+                "GET",
+                "/sapi/v1/accountSnapshot",
+                params={"type": "FUTURES", "startTime": start_ms, "endTime": end_ms, "limit": 30},
+                base_url=self.sapi_url,
+            )
+        except ExchangeAPIError as exc:
+            if str(exc.code) in ("-1003", "-1015", "429", "RATE_LIMITED"):
+                raise
+            return DatasetPage(
+                items=[],
+                complete=False,
+                supported=False,
+                error_code=str(exc.code),
+                error_message=str(exc.msg),
+            )
+        vos = resp.get("snapshotVos") if isinstance(resp, dict) else None
+        if not isinstance(vos, list):
+            return DatasetPage(items=[], complete=False, supported=False, error_code="INVALID_SAPI_RESPONSE")
+        items: List[DailyAccountSnapshotEntry] = []
+        for vo in vos:
+            if not isinstance(vo, dict):
+                continue
+            ts = int(vo.get("updateTime") or 0)
+            data = vo.get("data") if isinstance(vo.get("data"), dict) else {}
+            assets = data.get("assets") if isinstance(data.get("assets"), list) else []
+            for asset_row in assets:
+                if not isinstance(asset_row, dict):
+                    continue
+                ccy = str(asset_row.get("asset") or "").upper()
+                if ccy not in ("USDT", "USDC"):
+                    continue
+                eq = safe_decimal(asset_row.get("marginBalance"))
+                wb = safe_decimal(asset_row.get("walletBalance"))
+                upl = safe_decimal(asset_row.get("unrealizedProfit"))
+                if eq is None:
+                    continue
+                if ccy == "USDC" and eq == 0 and (wb is None or wb == 0):
+                    continue
+                items.append(
+                    DailyAccountSnapshotEntry(
+                        currency=ccy,
+                        day_start_ms=ts,
+                        captured_at_ms=ts,
+                        equity=eq,
+                        wallet_balance=wb,
+                        unrealized_pnl=upl,
+                    )
+                )
+        return DatasetPage(
+            items=items,
+            complete=False,
+            coverage_start_ms=start_ms,
+            coverage_end_ms=end_ms,
+            supported=True,
+        )

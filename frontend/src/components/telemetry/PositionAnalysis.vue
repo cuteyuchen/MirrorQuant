@@ -230,11 +230,14 @@ function orderNotional(order: TelemetryOrder) {
 <template>
   <section class="card">
     <header class="card-header !py-2.5">
-      <div class="flex min-w-0 flex-1 flex-wrap items-center gap-x-2.5 gap-y-2">
-        <span class="section-icon" aria-hidden="true"><component :is="withCalculator ? Calculator : Layers" :size="18" /></span>
-        <h3 class="section-title min-w-0">{{ t(withCalculator ? "tel.openAndCalcTitle" : "tel.openSectionTitle") }}</h3>
-        <span v-if="source" class="pill" :class="source.tone">{{ source.label }}</span>
-        <span v-if="risk" class="pill font-semibold" :class="risk.tone">{{ risk.label }}</span>
+      <div class="min-w-0 flex-1">
+        <div class="flex flex-wrap items-center gap-x-2.5 gap-y-1.5">
+          <span class="section-icon" aria-hidden="true"><component :is="withCalculator ? Calculator : Layers" :size="18" /></span>
+          <h3 class="section-title min-w-0">{{ t(withCalculator ? "tel.openAndCalcTitle" : "tel.openSectionTitle") }}</h3>
+          <span v-if="source" class="pill" :class="source.tone">{{ source.label }}</span>
+          <span v-if="risk" class="pill font-semibold" :class="risk.tone">{{ risk.label }}</span>
+        </div>
+        <p data-testid="analysis-disclaimer" class="mt-1 text-xs font-medium text-warning/90">{{ t("tel.analysisDisclaimer") }}</p>
       </div>
       <div class="flex shrink-0 items-center gap-2">
         <button v-if="withCalculator && !flat && confirmed" type="button" class="button-secondary min-h-8 px-2.5 py-1 text-xs" :disabled="!sizing?.complete || copying" @click="copyPlan"><Copy :size="14" aria-hidden="true" />{{ t("calc.copyPlan") }}</button>

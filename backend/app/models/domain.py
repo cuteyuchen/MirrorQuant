@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 from sqlalchemy import (
@@ -12,8 +13,10 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    Numeric,
     String,
     Text,
+    TypeDecorator,
     UniqueConstraint,
     event,
     text,
@@ -25,6 +28,43 @@ from app.core.database import Base
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+class ExactDecimal(TypeDecorator):
+    """Store exact Decimal values as Numeric(36, 18) on Postgres and exact strings on SQLite."""
+
+    impl = String(64)
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect):
+        if dialect.name == "postgresql":
+            return dialect.type_descriptor(Numeric(36, 18))
+        return dialect.type_descriptor(String(64))
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise ValueError("Boolean is not a valid Decimal")
+        try:
+            dec = value if isinstance(value, Decimal) else Decimal(str(value))
+        except (InvalidOperation, ValueError, TypeError) as exc:
+            raise ValueError(f"Invalid Decimal value: {value!r}") from exc
+        if not dec.is_finite():
+            raise ValueError(f"Non-finite Decimal value: {value!r}")
+        if dialect.name == "postgresql":
+            return dec
+        rendered = format(dec, "f")
+        if "." in rendered:
+            rendered = rendered.rstrip("0").rstrip(".")
+        return "0" if rendered in ("", "-0") else rendered
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return None
+        if isinstance(value, Decimal):
+            return value
+        return Decimal(str(value))
 
 
 class User(Base):
@@ -571,3 +611,236 @@ class SystemConfig(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
     )
+
+
+class AccountEquitySnapshot(Base):
+    """Account equity & risk snapshot bucketed at raw (60s), hour, or day resolution."""
+
+    __tablename__ = "account_equity_snapshots"
+    __table_args__ = (
+        UniqueConstraint("account_id", "currency", "resolution", "bucket_start_ms", name="uq_acct_eq_snap_bucket"),
+        Index("ix_acct_eq_snap_captured", "account_id", "currency", "captured_at_ms"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    currency: Mapped[str] = mapped_column(String(16), default="USDT", nullable=False)
+    captured_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    bucket_start_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    resolution: Mapped[str] = mapped_column(String(16), nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    equity: Mapped[Decimal] = mapped_column(ExactDecimal(), nullable=False)
+    equity_min: Mapped[Optional[Decimal]] = mapped_column(ExactDecimal(), nullable=True)
+    equity_max: Mapped[Optional[Decimal]] = mapped_column(ExactDecimal(), nullable=True)
+    wallet_balance: Mapped[Optional[Decimal]] = mapped_column(ExactDecimal(), nullable=True)
+    available_balance: Mapped[Optional[Decimal]] = mapped_column(ExactDecimal(), nullable=True)
+    unrealized_pnl: Mapped[Optional[Decimal]] = mapped_column(ExactDecimal(), nullable=True)
+    total_notional: Mapped[Optional[Decimal]] = mapped_column(ExactDecimal(), nullable=True)
+    long_notional: Mapped[Optional[Decimal]] = mapped_column(ExactDecimal(), nullable=True)
+    short_notional: Mapped[Optional[Decimal]] = mapped_column(ExactDecimal(), nullable=True)
+    net_notional: Mapped[Optional[Decimal]] = mapped_column(ExactDecimal(), nullable=True)
+    initial_margin: Mapped[Optional[Decimal]] = mapped_column(ExactDecimal(), nullable=True)
+    maintenance_margin: Mapped[Optional[Decimal]] = mapped_column(ExactDecimal(), nullable=True)
+    margin_ratio: Mapped[Optional[Decimal]] = mapped_column(ExactDecimal(), nullable=True)
+    effective_leverage: Mapped[Optional[Decimal]] = mapped_column(ExactDecimal(), nullable=True)
+    position_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    open_order_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    balance_as_of_ms: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    positions_as_of_ms: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    data_quality: Mapped[str] = mapped_column(String(16), default="ok", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class AccountCashflowEntry(Base):
+    """Futures cashflow ledger (transfers, realized PnL, funding, commissions, rebates, etc.)."""
+
+    __tablename__ = "account_cashflow_entries"
+    __table_args__ = (
+        Index(
+            "uq_acct_cashflow_ext",
+            "account_id",
+            "exchange",
+            "external_id",
+            "raw_type",
+            unique=True,
+            sqlite_where=text("external_id IS NOT NULL"),
+            postgresql_where=text("external_id IS NOT NULL"),
+        ),
+        UniqueConstraint("account_id", "exchange", "dedupe_key", name="uq_acct_cashflow_dedupe"),
+        Index("ix_acct_cashflow_time", "account_id", "occurred_at_ms", "id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    exchange: Mapped[str] = mapped_column(String(32), nullable=False)
+    external_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    dedupe_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    asset: Mapped[str] = mapped_column(String(32), nullable=False)
+    raw_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    category: Mapped[str] = mapped_column(String(32), nullable=False)
+    signed_amount: Mapped[Decimal] = mapped_column(ExactDecimal(), nullable=False)
+    symbol: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    occurred_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    source: Mapped[str] = mapped_column(String(32), default="exchange_income", nullable=False)
+    metadata_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class AccountTradeFill(Base):
+    """Normalized exchange trade fills with system/manual attribution."""
+
+    __tablename__ = "account_trade_fills"
+    __table_args__ = (
+        UniqueConstraint("account_id", "exchange", "exchange_fill_id", name="uq_acct_trade_fill"),
+        Index("ix_acct_fill_time", "account_id", "occurred_at_ms", "id"),
+        Index("ix_acct_fill_sym_time", "account_id", "symbol", "occurred_at_ms"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    exchange: Mapped[str] = mapped_column(String(32), nullable=False)
+    exchange_fill_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    exchange_order_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
+    client_order_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    inst_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    side: Mapped[str] = mapped_column(String(16), nullable=False)
+    position_side: Mapped[str] = mapped_column(String(16), nullable=False)
+    qty: Mapped[Decimal] = mapped_column(ExactDecimal(), nullable=False)
+    price: Mapped[Decimal] = mapped_column(ExactDecimal(), nullable=False)
+    quote_qty: Mapped[Optional[Decimal]] = mapped_column(ExactDecimal(), nullable=True)
+    realized_pnl: Mapped[Optional[Decimal]] = mapped_column(ExactDecimal(), nullable=True)
+    commission_amount: Mapped[Optional[Decimal]] = mapped_column(ExactDecimal(), nullable=True)
+    commission_asset: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    maker: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    occurred_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    source_class: Mapped[str] = mapped_column(String(16), default="unknown", nullable=False)
+    attribution_confidence: Mapped[str] = mapped_column(String(16), default="unknown", nullable=False)
+    binding_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    execution_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    intent_id: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    metadata_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class AccountOrderHistory(Base):
+    """Normalized ordinary, conditional, TP/SL, trailing-stop, and force-liquidation orders."""
+
+    __tablename__ = "account_order_history"
+    __table_args__ = (
+        Index(
+            "uq_acct_order_hist_order_id",
+            "account_id",
+            "exchange",
+            "exchange_order_id",
+            unique=True,
+            sqlite_where=text("exchange_order_id IS NOT NULL"),
+            postgresql_where=text("exchange_order_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_acct_order_hist_algo_id",
+            "account_id",
+            "exchange",
+            "algo_id",
+            unique=True,
+            sqlite_where=text("algo_id IS NOT NULL"),
+            postgresql_where=text("algo_id IS NOT NULL"),
+        ),
+        UniqueConstraint("account_id", "exchange", "dedupe_key", name="uq_acct_order_hist_dedupe"),
+        Index("ix_acct_order_hist_time", "account_id", "updated_at_ms", "id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    exchange: Mapped[str] = mapped_column(String(32), nullable=False)
+    dedupe_key: Mapped[str] = mapped_column(String(160), nullable=False)
+    exchange_order_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    client_order_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    algo_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    client_algo_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    category: Mapped[str] = mapped_column(String(32), default="ordinary", nullable=False)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    inst_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    side: Mapped[str] = mapped_column(String(16), nullable=False)
+    position_side: Mapped[str] = mapped_column(String(16), nullable=False)
+    order_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    qty: Mapped[Optional[Decimal]] = mapped_column(ExactDecimal(), nullable=True)
+    filled_qty: Mapped[Optional[Decimal]] = mapped_column(ExactDecimal(), nullable=True)
+    avg_price: Mapped[Optional[Decimal]] = mapped_column(ExactDecimal(), nullable=True)
+    limit_price: Mapped[Optional[Decimal]] = mapped_column(ExactDecimal(), nullable=True)
+    trigger_price: Mapped[Optional[Decimal]] = mapped_column(ExactDecimal(), nullable=True)
+    reduce_only: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    close_position: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    working_type: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    source_class: Mapped[str] = mapped_column(String(16), default="unknown", nullable=False)
+    binding_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    execution_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    intent_id: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    created_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    metadata_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+
+class AccountOpenOrderSnapshot(Base):
+    """Last successfully fetched normalized open orders for an account."""
+
+    __tablename__ = "account_open_order_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(Integer, nullable=False, unique=True)
+    fetched_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    complete: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    order_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    orders_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+
+class AccountDatasetSyncState(Base):
+    """Per-account, per-dataset sync coverage, cursor, and error tracking."""
+
+    __tablename__ = "account_dataset_sync_states"
+    __table_args__ = (
+        UniqueConstraint("account_id", "dataset", name="uq_acct_dataset_sync"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    dataset: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="unavailable", nullable=False)
+    coverage_start_ms: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    coverage_end_ms: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    cursor_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    last_attempt_at_ms: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    last_success_at_ms: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    last_error_code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    last_error_message: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    record_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+
+class AccountAlertState(Base):
+    """Lifecycle tracking (first seen, last seen, resolved) for account-level alerts."""
+
+    __tablename__ = "account_alert_states"
+    __table_args__ = (
+        UniqueConstraint("account_id", "code", "scope_key", name="uq_acct_alert_state"),
+        Index("ix_acct_alert_active", "account_id", "status", "severity"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    code: Mapped[str] = mapped_column(String(64), nullable=False)
+    scope_key: Mapped[str] = mapped_column(String(160), default="", nullable=False)
+    severity: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="active", nullable=False)
+    first_seen_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    last_seen_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    resolved_at_ms: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    message_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    params_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    evidence_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

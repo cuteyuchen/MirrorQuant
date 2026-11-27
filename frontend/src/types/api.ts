@@ -348,3 +348,535 @@ export interface LeadSnapshot {
   orderBatches?: OrderBatch[] | null; tradeCycles?: TradeCycle[] | null;
   closed?: ClosedPosition[] | null; orders?: TelemetryOrder[] | null;
 }
+
+// 1.3.25 跟单账户只读详情 API 契约（未知指标一律保留 null，不补零）。
+export type DatasetStatus = "ok" | "stale" | "partial" | "unsupported" | "unavailable" | "rate_limited";
+
+export interface DatasetQualityInfo {
+  status: DatasetStatus;
+  fetchedAt?: number | null;
+  coverageStart?: number | null;
+  coverageEnd?: number | null;
+  errorCode?: string | null;
+  errorMessage?: string | null;
+}
+
+export interface DatasetSyncEntry {
+  dataset: string;
+  status: DatasetStatus;
+  rawStatus?: string | null;
+  stale?: boolean;
+  coverageStartMs?: number | null;
+  coverageEndMs?: number | null;
+  lastAttemptAtMs?: number | null;
+  lastSuccessAtMs?: number | null;
+  errorCode?: string | null;
+  errorMessage?: string | null;
+  recordCount: number;
+}
+
+export interface AccountDetailMeta {
+  id: number;
+  ownerUserId?: number | null;
+  name: string;
+  exchange: string;
+  environment: Environment;
+  apiKeyMasked: string;
+  isEnabled: boolean;
+  marginMode: string;
+  positionMode: string;
+  clockOffsetMs: number;
+  status: string;
+  lastSyncAt?: string | null;
+  lastSyncAtMs?: number | null;
+  lastError?: string | null;
+  createdAt?: string | null;
+  readOnly: boolean;
+}
+
+export interface AccountOtherAssetBalance {
+  currency: string;
+  equity: number | null;
+  available: number | null;
+  walletBalance: number | null;
+  unrealizedPnl: number | null;
+}
+
+export interface AccountDetailRisk {
+  currency: string;
+  riskLevel: "normal" | "warning" | "critical" | "unknown";
+  equity?: number | null;
+  walletBalance?: number | null;
+  availableBalance?: number | null;
+  unrealizedPnl?: number | null;
+  hwmEquity?: number | null;
+  drawdownPct?: number | null;
+  dayStartEquity?: number | null;
+  todayNetFlow?: number | null;
+  todayPnl?: number | null;
+  totalNotional?: number | null;
+  longNotional?: number | null;
+  shortNotional?: number | null;
+  netNotional?: number | null;
+  allocatedNotional?: number | null;
+  unallocatedNotional?: number | null;
+  maxSinglePositionSharePct?: number | null;
+  initialMargin?: number | null;
+  initialMarginRatio?: number | null;
+  initialMarginRatioPct?: number | null;
+  maintenanceMargin?: number | null;
+  marginRatio?: number | null;
+  marginRatioPct?: number | null;
+  marginRatioSource?: string | null;
+  effectiveLeverage?: number | null;
+  closestLiquidationDistancePct?: number | null;
+  closestLiquidationSymbol?: string | null;
+  positionCount?: number | null;
+  openOrderCount?: number | null;
+  canTrade?: boolean | null;
+  canDeposit?: boolean | null;
+  canWithdraw?: boolean | null;
+  multiAssetsMargin?: boolean | null;
+  dualSidePosition?: boolean | null;
+  otherAssets?: AccountOtherAssetBalance[];
+  snapshotAsOfMs?: number | null;
+  snapshotQuality?: string | null;
+  dataQuality: DatasetQualityInfo;
+}
+
+export interface AccountDetailPnl {
+  currency: string;
+  range: string;
+  startMs?: number | null;
+  endMs?: number | null;
+  cashflowStatus?: string | null;
+  cashflowCoverageComplete?: boolean;
+  cashflowCoverageStartMs?: number | null;
+  fillsStatus?: string | null;
+  fillsCoverageComplete?: boolean;
+  startEquity?: number | null;
+  endEquity?: number | null;
+  totalEquityChange?: number | null;
+  unrealizedPnlChange?: number | null;
+  deposits?: number | null;
+  withdrawals?: number | null;
+  netTransfers?: number | null;
+  nonTradingExternal?: number | null;
+  tradingNetPnl?: number | null;
+  tradingPnl?: number | null;
+  ledgerNetPnl?: number | null;
+  ledger?: {
+    realizedPnl?: number | null;
+    fundingFee?: number | null;
+    commission?: number | null;
+    commissionRebate?: number | null;
+    liquidationFee?: number | null;
+    insuranceClear?: number | null;
+    bonus?: number | null;
+    referralRebate?: number | null;
+    otherIncome?: number | null;
+    otherExternalFlow?: number | null;
+    unknownFlow?: number | null;
+  };
+  reconciled?: boolean | null;
+  reconciliationDelta?: number | null;
+  reconciliationResidual?: number | null;
+  attribution?: Record<"system" | "manual" | "unknown", {
+    fillCount: number;
+    grossRealizedPnlUsdt: number | null;
+    commissionUsdt: number | null;
+    netPnlUsdt: number | null;
+  }>;
+  bySymbol?: {
+    symbol: string;
+    fillCount: number;
+    realizedPnlUsdt: number | null;
+    commissionUsdt: number | null;
+    fundingFeeUsdt: number | null;
+    netPnlUsdt: number | null;
+  }[];
+  byBinding?: {
+    bindingId: number;
+    bindingName: string;
+    fillCount: number;
+    realizedPnlUsdt: number | null;
+    commissionUsdt: number | null;
+    netPnlUsdt: number | null;
+  }[];
+  nonUsdtFillCommissions?: Record<string, number | null>;
+  otherAssetCashflows?: { asset: string; categories: Record<string, number | null> }[];
+  dataQuality: DatasetQualityInfo;
+}
+
+export interface AccountDetailOpenOrder {
+  orderId: string;
+  algoId?: string | null;
+  clientOrderId?: string | null;
+  category: string;
+  symbol: string;
+  instId: string;
+  side: string;
+  positionSide: string;
+  orderType: string;
+  status: string;
+  qty?: number | null;
+  filledQty?: number | null;
+  limitPrice?: number | null;
+  triggerPrice?: number | null;
+  reduceOnly?: boolean | null;
+  closePosition?: boolean | null;
+  workingType?: string | null;
+  createdAtMs?: number | null;
+  updatedAtMs?: number | null;
+  sourceClass: string;
+  bindingId?: number | null;
+  bindingName?: string | null;
+}
+
+export interface AccountDetailPosition {
+  instId: string;
+  symbol: string;
+  currency: string;
+  posSide: string;
+  rawPosSide: string;
+  mgnMode: string;
+  qty: number | null;
+  availQty?: number | null;
+  avgPx?: number | null;
+  curPx?: number | null;
+  breakEvenPx?: number | null;
+  liquidationPx?: number | null;
+  liqDistancePct?: number | null;
+  upl?: number | null;
+  uplRatioPct?: number | null;
+  notionalUsd?: number | null;
+  initialMargin?: number | null;
+  maintenanceMargin?: number | null;
+  marginRatio?: number | null;
+  lever?: number | null;
+  adlQuantile?: number | null;
+  ownership: "system" | "manual" | "mixed" | "drift";
+  unallocatedClass: "none" | "manual" | "unallocated" | "orphan_risk";
+  allocatedQty?: number | null;
+  unallocatedQty?: number | null;
+  overAllocatedQty?: number | null;
+  requiresProtection?: boolean;
+  allocations: {
+    allocationId: number;
+    bindingId: number;
+    bindingName: string;
+    leadId?: number | null;
+    leadName?: string | null;
+    ownedQty?: number | null;
+    expectedQty?: number | null;
+    entryCost?: number | null;
+    cycleRatio?: number | null;
+    generation: number;
+    openedAtMs?: number | null;
+  }[];
+  protection: {
+    status: "protected" | "partial" | "software_only" | "unprotected" | "unknown";
+    hasTakeProfit: boolean;
+    hasStopLoss: boolean;
+    hasTrailingStop: boolean;
+    hasSoftwareGuard: boolean;
+    slCoveredQty?: number | null;
+    slCoveragePct?: number | null;
+    nearestSlPrice?: number | null;
+    tpCoveredQty?: number | null;
+    tpCoveragePct?: number | null;
+    nearestTpPrice?: number | null;
+    overCovered?: boolean;
+    protectiveOrderCount: number;
+    orders: AccountDetailOpenOrder[];
+  };
+}
+
+export interface AccountDetailBindingSummary {
+  id: number;
+  name: string;
+  leadId: number;
+  leadName: string;
+  isEnabled: boolean;
+  riskScale: number | null;
+  orderMode: string;
+  tpSlMode: string;
+  circuitBreakerTripped: boolean;
+  circuitBreakerReason?: string | null;
+  consecutiveFailures: number;
+  allocatedPositionsCount: number;
+  allocatedNotionalUsd: number | null;
+  periodNetPnlUsdt?: number | null;
+  periodFillCount?: number | null;
+}
+
+export interface AccountDetailAlert {
+  code: string;
+  scopeKey: string;
+  severity: "critical" | "warning" | "info";
+  messageKey: string;
+  params: Record<string, unknown>;
+  evidence?: Record<string, unknown>;
+  firstSeenAtMs?: number | null;
+  lastSeenAtMs?: number | null;
+  resolvedAtMs?: number | null;
+}
+
+export interface AccountDetailResponse {
+  account: AccountDetailMeta;
+  risk: AccountDetailRisk;
+  pnl: AccountDetailPnl;
+  positions: {
+    positionsKnown: boolean;
+    items: AccountDetailPosition[];
+    orphanAllocations: {
+      allocationId: number;
+      bindingId: number;
+      bindingName: string;
+      instId: string;
+      posSide: string;
+      ownedQty: number | null;
+      openedAtMs?: number | null;
+    }[];
+    allocatedNotionalUsdt: number | null;
+    unallocatedNotionalUsdt: number | null;
+    dataQuality: DatasetQualityInfo;
+  };
+  openOrdersSummary: {
+    openOrdersKnown: boolean;
+    openOrdersStale: boolean;
+    fetchedAtMs: number | null;
+    openOrdersStatus: string;
+    unprotectedCount: number | null;
+    partialProtectedCount: number | null;
+    totalOpenOrders: number | null;
+    byCategory: Record<string, number>;
+    dataQuality: DatasetQualityInfo;
+  };
+  bindings: { items: AccountDetailBindingSummary[]; dataQuality: DatasetQualityInfo };
+  alerts: {
+    active: AccountDetailAlert[];
+    recentResolved: AccountDetailAlert[];
+    criticalCount: number;
+    warningCount: number;
+    infoCount: number;
+    dataQuality: DatasetQualityInfo;
+  };
+  dataQuality: {
+    overallStatus: string;
+    accountSyncedAtMs: number | null;
+    accountSyncStale: boolean;
+    openOrdersFetchedAtMs: number | null;
+    openOrdersComplete: boolean;
+    datasets: Record<string, DatasetSyncEntry>;
+  };
+}
+
+export interface AccountEquityPoint {
+  tsMs: number;
+  bucketStartMs: number;
+  resolution: string;
+  source: string;
+  dataQuality: string;
+  gapBefore: boolean;
+  equity: number | null;
+  equityMin: number | null;
+  equityMax: number | null;
+  cumulativeTradingPnl: number | null;
+  twrIndex: number | null;
+  twrPct: number | null;
+  drawdownPct: number | null;
+  walletBalance: number | null;
+  availableBalance: number | null;
+  unrealizedPnl: number | null;
+  totalNotional: number | null;
+  marginRatio: number | null;
+  effectiveLeverage: number | null;
+}
+
+export interface AccountEquityTransfer {
+  id: number;
+  tsMs: number;
+  category: string;
+  signedAmount: number | null;
+  asset: string;
+}
+
+export interface AccountEquityCurveResponse {
+  currency: string;
+  range: string;
+  resolution: string;
+  cashflowCovered: boolean;
+  cashflowCoverageStartMs: number | null;
+  points: AccountEquityPoint[];
+  transfers: AccountEquityTransfer[];
+  currentDrawdownPct: number | null;
+  maxDrawdownPct: number | null;
+  summary: {
+    pointCount: number;
+    startEquity: number | null;
+    endEquity: number | null;
+    peakEquity: number | null;
+    twrPct: number | null;
+    currentDrawdownPct: number | null;
+    maxDrawdownPct: number | null;
+  };
+  dataQuality: DatasetQualityInfo;
+  cashflowQuality: DatasetQualityInfo;
+}
+
+export interface AccountCashflowItem {
+  id: number;
+  exchange: string;
+  externalId: string | null;
+  asset: string;
+  rawType: string;
+  category: string;
+  signedAmount: number | null;
+  signedAmountExact?: string | null;
+  symbol: string | null;
+  occurredAtMs: number;
+  source: string;
+  metadata?: Record<string, unknown> | null;
+}
+
+export interface AccountCashflowsResponse {
+  items: AccountCashflowItem[];
+  nextCursor: string | null;
+  hasMore: boolean;
+  dataQuality: DatasetQualityInfo;
+}
+
+export interface AccountTradeTimelineItem {
+  recordType: "fill" | "execution" | "order";
+  id: number;
+  occurredAtMs: number;
+  createdAtMs?: number | null;
+  symbol: string;
+  instId: string;
+  side: string;
+  positionSide: string;
+  action?: string | null;
+  category?: string | null;
+  orderType?: string | null;
+  qty: number | null;
+  filledQty?: number | null;
+  price: number | null;
+  quoteQty?: number | null;
+  realizedPnl?: number | null;
+  fee?: number | null;
+  feeAsset?: string | null;
+  funding?: number | null;
+  maker?: boolean | null;
+  slippagePct?: number | null;
+  spreadPct?: number | null;
+  status: string;
+  details?: string | null;
+  sourceClass: string;
+  attributionConfidence?: string | null;
+  bindingId?: number | null;
+  bindingName?: string | null;
+  leadName?: string | null;
+  executionId?: number | null;
+  intentId?: string | null;
+  exchangeOrderId?: string | null;
+  exchangeFillId?: string | null;
+  algoId?: string | null;
+  limitPrice?: number | null;
+  triggerPrice?: number | null;
+  reduceOnly?: boolean | null;
+  closePosition?: boolean | null;
+}
+
+export interface AccountTradesResponse {
+  items: AccountTradeTimelineItem[];
+  nextCursor: string | null;
+  hasMore: boolean;
+  dataQuality: DatasetQualityInfo;
+  ordersQuality: DatasetQualityInfo;
+}
+
+export interface AccountOrdersResponse {
+  state: "open" | "history";
+  openOrdersKnown?: boolean;
+  openOrdersStale?: boolean;
+  fetchedAtMs?: number | null;
+  items: (AccountDetailOpenOrder | AccountTradeTimelineItem)[];
+  nextCursor: string | null;
+  hasMore: boolean;
+  dataQuality: DatasetQualityInfo;
+}
+
+export interface AccountPerformanceResponse {
+  range: string;
+  fillsStatus: string;
+  fillsCoverageStartMs: number | null;
+  fillsCoverageEndMs: number | null;
+  ordersStatus: string;
+  tradeSummary: {
+    fillCount: number;
+    volumeUsd: number | null;
+    grossRealizedPnlUsdt: number | null;
+    commissionUsdt: number | null;
+    nonUsdtCommissions: Record<string, number | null>;
+    netRealizedPnlUsdt: number | null;
+    makerCount: number;
+    takerCount: number;
+    makerRatioPct: number | null;
+    closedCycleCount: number;
+    incompleteCycleCount: number;
+    winCount: number;
+    lossCount: number;
+    breakevenCount: number;
+    winRatePct: number | null;
+    payoffRatio: number | null;
+    profitFactor: number | null;
+    expectancyUsdt: number | null;
+    avgWinUsdt: number | null;
+    avgLossUsdt: number | null;
+    largestWinUsdt: number | null;
+    largestLossUsdt: number | null;
+    avgHoldingDurationMs: number | null;
+  };
+  executionQuality: {
+    totalExecutions: number;
+    executedCount: number;
+    failedCount: number;
+    blockedCount: number;
+    skippedCount: number;
+    successRatePct: number | null;
+    avgSlippagePct: number | null;
+    medianSlippagePct: number | null;
+    p95SlippagePct: number | null;
+    maxSlippagePct: number | null;
+    avgSpreadPct: number | null;
+    spreadSampleCount: number;
+    avgLatencyMs: number | null;
+    p95LatencyMs: number | null;
+    exactLatencyCount: number;
+    estimatedLatencyCount: number;
+    statusCounts: Record<string, number>;
+  };
+  commissionRates: { symbol: string; instId: string; makerRate: number | null; takerRate: number | null }[];
+  bySymbol: {
+    symbol: string;
+    fillCount: number;
+    volumeUsd: number | null;
+    realizedPnlUsdt: number | null;
+    commissionUsdt: number | null;
+    netPnlUsdt: number | null;
+    winCount: number;
+    lossCount: number;
+    winRatePct: number | null;
+    makerRatioPct: number | null;
+  }[];
+  dataQuality: DatasetQualityInfo;
+}
+
+export interface AccountDetailSyncResponse {
+  ok: boolean;
+  accountId: number;
+  syncedAtMs: number;
+  datasets: Record<string, DatasetSyncEntry>;
+  results: Record<string, { status: string; error?: string | null; count?: number }>;
+}

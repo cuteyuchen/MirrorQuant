@@ -11,14 +11,24 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode
 
 from app.services.adapters.base import (
+    AccountRiskInfo,
     BalanceInfo,
     BaseExchangeAdapter,
+    CashflowEntry,
+    DatasetCapability,
+    DatasetPage,
     ExchangeAPIError,
     ExchangePosition,
     InstrumentSpec,
+    OpenOrderEntry,
     OrderBook,
+    OrderHistoryEntry,
     OrderResult,
+    TradeFill,
     api_error,
+    make_dedupe_key,
+    safe_decimal,
+    safe_optional_float,
 )
 from app.services.proxy.manager import ProxyManager
 
@@ -196,12 +206,18 @@ class BitgetAdapter(BaseExchangeAdapter):
             margin_usd = float(p.get("marginSize") or p.get("margin") or 0.0)
             if margin_usd <= 0 and notional > 0 and lever > 0:
                 margin_usd = notional / lever
+            mgn_mode = "isolated" if str(p.get("marginMode") or "").lower() == "isolated" else "cross"
+            liq_price = safe_optional_float(p.get("liquidationPrice"), positive_only=True)
+            init_margin = safe_optional_float(p.get("marginSize") or p.get("margin"))
+            break_even = safe_optional_float(p.get("breakEvenPrice"), positive_only=True)
+            pos_mr = safe_optional_float(p.get("marginRatio"))
+            iso_wallet = safe_optional_float(p.get("marginSize")) if mgn_mode == "isolated" else None
             positions.append(
                 ExchangePosition(
                     inst_id=sym,
                     symbol=sym,
                     pos_side=hold_side,
-                    mgn_mode="isolated" if str(p.get("marginMode") or "").lower() == "isolated" else "cross",
+                    mgn_mode=mgn_mode,
                     pos=abs(sz),
                     avail_pos=abs(float(p["available"])) if p.get("available") not in (None, "") else 0.0,
                     avg_px=avg_px,
@@ -213,6 +229,11 @@ class BitgetAdapter(BaseExchangeAdapter):
                     c_time=int(p.get("cTime") or 0),
                     u_time=int(p.get("uTime") or 0),
                     margin_usd=margin_usd,
+                    liquidation_price=liq_price,
+                    initial_margin=init_margin,
+                    break_even_price=break_even,
+                    margin_ratio=pos_mr,
+                    isolated_wallet=iso_wallet,
                 )
             )
         return positions
@@ -450,3 +471,323 @@ class BitgetAdapter(BaseExchangeAdapter):
             return False
         except Exception:
             return False
+
+    @staticmethod
+    def _bitget_pos_side(row: Dict[str, Any]) -> str:
+        raw = str(row.get("posSide") or row.get("holdSide") or "").lower()
+        if raw in ("long", "buy"):
+            return "LONG"
+        if raw in ("short", "sell"):
+            return "SHORT"
+        return "BOTH"
+
+    def get_dataset_capabilities(self) -> Dict[str, DatasetCapability]:
+        return {
+            "equity": DatasetCapability("equity", True, True),
+            "open_orders": DatasetCapability("open_orders", True, True),
+            "cashflow": DatasetCapability("cashflow", True, False, retention_days=90, note="Bitget mix account bill retains ~90 days"),
+            "fills": DatasetCapability("fills", True, False, retention_days=90, note="Bitget mix fill history retains ~90 days"),
+            "orders": DatasetCapability("orders", True, False, retention_days=90, note="Bitget mix order history retains ~90 days"),
+            "force_orders": DatasetCapability("force_orders", False, False, note="Not supported separately on Bitget"),
+            "commission_rates": DatasetCapability("commission_rates", False, False, note="Not supported separately on Bitget"),
+            "daily_snapshots": DatasetCapability("daily_snapshots", False, False, note="Not supported on Bitget"),
+        }
+
+    async def get_account_risk_snapshot(self) -> AccountRiskInfo:
+        data = await self._request("GET", "/api/v2/mix/account/accounts", params={"productType": self.product_type})
+        asset_balances: Dict[str, Dict[str, Optional[Decimal]]] = {}
+        usdt_row: Dict[str, Any] = {}
+        for acct in data or []:
+            if not isinstance(acct, dict):
+                continue
+            ccy = str(acct.get("marginCoin") or "").upper()
+            if not ccy:
+                continue
+            eq = safe_decimal(acct.get("accountEquity") if acct.get("accountEquity") not in (None, "") else acct.get("usdtEquity"))
+            avail = safe_decimal(acct.get("crossedMaxAvailable") if self.margin_mode == "cross" else acct.get("available"))
+            upl = safe_decimal(acct.get("unrealizedPL"))
+            wb = (eq - upl) if (eq is not None and upl is not None) else eq
+            im = safe_decimal(acct.get("locked"))
+            norm = "USDT" if ccy in ("USDT", "SUSDT") else ccy
+            if norm == "USDT":
+                usdt_row = acct
+            asset_balances[norm] = {
+                "equity": eq, "available": avail, "wallet": wb,
+                "upl": upl, "initialMargin": im, "maintenanceMargin": None,
+            }
+        u_info = asset_balances.get("USDT") or {}
+        mr = safe_decimal(usdt_row.get("crossedRiskRate") or usdt_row.get("riskRate"))
+        return AccountRiskInfo(
+            currency="USDT",
+            equity=u_info.get("equity"),
+            available_balance=u_info.get("available"),
+            wallet_balance=u_info.get("wallet"),
+            unrealized_pnl=u_info.get("upl"),
+            initial_margin=u_info.get("initialMargin"),
+            maintenance_margin=None,
+            margin_ratio=mr,
+            margin_ratio_source="exchange" if mr is not None else None,
+            dual_side_position=(self.position_mode == "hedge"),
+            asset_balances=asset_balances,
+        )
+
+    async def get_open_orders_normalized(self) -> List[OpenOrderEntry]:
+        rows = await self.get_open_orders()
+        entries: List[OpenOrderEntry] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            sym = str(row.get("symbol") or "").upper()
+            oid = str(row.get("orderId") or row.get("clientOid") or "")
+            plan_type = str(row.get("planType") or "").lower()
+            side = str(row.get("side") or "").upper()
+            pos_side = self._bitget_pos_side(row)
+            created_ms = int(row["cTime"]) if row.get("cTime") else None
+            updated_ms = int(row["uTime"]) if row.get("uTime") else created_ms
+            qty = safe_decimal(row.get("size"))
+            if not plan_type:
+                lmt = safe_decimal(row.get("price"))
+                entries.append(OpenOrderEntry(
+                    exchange="bitget", order_id=oid, client_order_id=row.get("clientOid"),
+                    algo_id=None, category="ordinary", symbol=sym, inst_id=sym,
+                    side=side, position_side=pos_side,
+                    order_type=str(row.get("orderType") or "LIMIT").upper(),
+                    status=str(row.get("status") or row.get("state") or "NEW").upper(),
+                    qty=qty, filled_qty=safe_decimal(row.get("baseVolume")),
+                    limit_price=lmt if lmt and lmt > 0 else None, trigger_price=None,
+                    reduce_only=(str(row.get("tradeSide") or "").lower() == "close") if row.get("tradeSide") else None,
+                    close_position=False, working_type=None,
+                    created_at_ms=created_ms, updated_at_ms=updated_ms,
+                ))
+                continue
+            tp_px = safe_decimal(row.get("stopSurplusTriggerPrice"))
+            sl_px = safe_decimal(row.get("stopLossTriggerPrice"))
+            if plan_type == "profit_loss" and tp_px and tp_px > 0 and sl_px and sl_px > 0:
+                entries.append(OpenOrderEntry(
+                    exchange="bitget", order_id=f"{oid}:tp", client_order_id=row.get("clientOid"),
+                    algo_id=oid, category="take_profit", symbol=sym, inst_id=sym,
+                    side=side, position_side=pos_side, order_type="PROFIT_LOSS",
+                    status=str(row.get("planStatus") or "live").upper(), qty=qty, filled_qty=None,
+                    limit_price=None, trigger_price=tp_px, reduce_only=True,
+                    close_position=False, working_type=row.get("triggerType"),
+                    created_at_ms=created_ms, updated_at_ms=updated_ms,
+                ))
+                entries.append(OpenOrderEntry(
+                    exchange="bitget", order_id=f"{oid}:sl", client_order_id=row.get("clientOid"),
+                    algo_id=oid, category="stop_loss", symbol=sym, inst_id=sym,
+                    side=side, position_side=pos_side, order_type="PROFIT_LOSS",
+                    status=str(row.get("planStatus") or "live").upper(), qty=qty, filled_qty=None,
+                    limit_price=None, trigger_price=sl_px, reduce_only=True,
+                    close_position=False, working_type=row.get("triggerType"),
+                    created_at_ms=created_ms, updated_at_ms=updated_ms,
+                ))
+                continue
+            if plan_type in ("pos_profit", "profit_plan") or (tp_px and tp_px > 0):
+                category = "take_profit"
+                trig = tp_px or safe_decimal(row.get("triggerPrice"))
+            elif plan_type in ("pos_loss", "loss_plan") or (sl_px and sl_px > 0):
+                category = "stop_loss"
+                trig = sl_px or safe_decimal(row.get("triggerPrice"))
+            elif plan_type == "track_plan":
+                category = "trailing_stop"
+                trig = safe_decimal(row.get("triggerPrice"))
+            else:
+                category = "conditional"
+                trig = safe_decimal(row.get("triggerPrice"))
+            lmt = safe_decimal(row.get("executePrice"))
+            entries.append(OpenOrderEntry(
+                exchange="bitget", order_id=oid, client_order_id=row.get("clientOid"),
+                algo_id=oid, category=category, symbol=sym, inst_id=sym,
+                side=side, position_side=pos_side, order_type=plan_type.upper(),
+                status=str(row.get("planStatus") or "live").upper(), qty=qty, filled_qty=None,
+                limit_price=lmt if lmt and lmt > 0 else None,
+                trigger_price=trig if trig and trig > 0 else None,
+                reduce_only=(str(row.get("tradeSide") or "").lower() == "close") if row.get("tradeSide") else None,
+                close_position=False, working_type=row.get("triggerType"),
+                created_at_ms=created_ms, updated_at_ms=updated_ms,
+            ))
+        return entries
+
+    async def get_cashflow_history(
+        self, start_ms: int, end_ms: int, cursor: Optional[Dict[str, Any]] = None
+    ) -> DatasetPage:
+        margin_coin = "SUSDT" if self.is_demo else "USDT"
+        items: List[CashflowEntry] = []
+        seen: set[str] = set()
+        id_less: Optional[str] = None
+        seen_cursors: set[str] = set()
+        complete = True
+        while True:
+            params: Dict[str, Any] = {
+                "productType": self.product_type, "marginCoin": margin_coin,
+                "startTime": str(start_ms), "endTime": str(end_ms), "limit": "100",
+            }
+            if id_less:
+                params["idLessThan"] = id_less
+            res = await self._request("GET", "/api/v2/mix/account/bill", params=params)
+            bills = (res or {}).get("bills") if isinstance(res, dict) else (res if isinstance(res, list) else [])
+            if not isinstance(bills, list):
+                raise ValueError("Malformed Bitget account bill response")
+            for row in bills:
+                if not isinstance(row, dict):
+                    continue
+                bid = str(row.get("billId") or "").strip() or None
+                ts = int(row.get("cTime") or 0)
+                amt = safe_decimal(row.get("amount"))
+                fee = safe_decimal(row.get("fee"))
+                ccy = "USDT" if str(row.get("coin") or margin_coin).upper() == "SUSDT" else str(row.get("coin") or "USDT").upper()
+                raw_type = str(row.get("businessType") or "UNKNOWN").upper()
+                if amt is None or ts <= 0:
+                    continue
+                if "TRANSFER" in raw_type:
+                    category = "TRANSFER_IN" if amt >= 0 else "TRANSFER_OUT"
+                elif "FUND" in raw_type:
+                    category = "FUNDING_FEE"
+                elif "CLOSE" in raw_type or "PROFIT" in raw_type:
+                    category = "REALIZED_PNL"
+                else:
+                    category = "UNKNOWN"
+                sym = str(row.get("symbol") or "").upper() or None
+                dkey = make_dedupe_key("bitget", bid, raw_type, ccy, sym, ts, str(amt))
+                if dkey not in seen:
+                    seen.add(dkey)
+                    items.append(CashflowEntry(
+                        exchange="bitget", external_id=bid, dedupe_key=dkey,
+                        asset=ccy, raw_type=raw_type, category=category,
+                        signed_amount=amt, symbol=sym, occurred_at_ms=ts,
+                        source="exchange_bill", metadata={"fee": str(fee) if fee is not None else None},
+                    ))
+            end_id = (res or {}).get("endId") if isinstance(res, dict) else None
+            if len(bills) < 100 or not end_id:
+                break
+            if end_id in seen_cursors:
+                complete = False
+                break
+            seen_cursors.add(end_id)
+            id_less = str(end_id)
+        items.sort(key=lambda i: (i.occurred_at_ms, i.dedupe_key))
+        return DatasetPage(items=items, complete=complete, coverage_start_ms=start_ms, coverage_end_ms=end_ms)
+
+    async def get_trade_fills(
+        self, symbols: List[str], start_ms: int, end_ms: int, cursor: Optional[Dict[str, Any]] = None
+    ) -> DatasetPage:
+        items: List[TradeFill] = []
+        seen: set[str] = set()
+        id_less: Optional[str] = None
+        seen_cursors: set[str] = set()
+        complete = True
+        while True:
+            params: Dict[str, Any] = {
+                "productType": self.product_type,
+                "startTime": str(start_ms), "endTime": str(end_ms), "limit": "100",
+            }
+            if id_less:
+                params["idLessThan"] = id_less
+            res = await self._request("GET", "/api/v2/mix/order/fill-history", params=params)
+            rows = (res or {}).get("fillList") if isinstance(res, dict) else (res if isinstance(res, list) else [])
+            if not isinstance(rows, list):
+                raise ValueError("Malformed Bitget fill-history response")
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                sym = str(row.get("symbol") or "").upper()
+                qty = safe_decimal(row.get("baseVolume"))
+                px = safe_decimal(row.get("price"))
+                ts = int(row.get("cTime") or 0)
+                if not sym or qty is None or px is None or qty <= 0 or ts <= 0:
+                    continue
+                fid = str(row.get("tradeId") or "") or make_dedupe_key(sym, row.get("orderId"), ts, str(qty), str(px))
+                if fid in seen:
+                    continue
+                seen.add(fid)
+                fee_det = (row.get("feeDetail") or [{}])[0] if isinstance(row.get("feeDetail"), list) and row.get("feeDetail") else {}
+                raw_fee = safe_decimal(fee_det.get("totalFee") or row.get("fee"))
+                comm = abs(raw_fee) if raw_fee is not None else None
+                ccy = str(fee_det.get("feeCoin") or "USDT").upper()
+                if ccy == "SUSDT":
+                    ccy = "USDT"
+                items.append(TradeFill(
+                    exchange="bitget", exchange_fill_id=fid,
+                    exchange_order_id=str(row.get("orderId") or "") or None,
+                    client_order_id=None, symbol=sym, inst_id=sym,
+                    side=str(row.get("side") or "").upper(),
+                    position_side=self._bitget_pos_side(row),
+                    qty=qty, price=px, quote_qty=safe_decimal(row.get("quoteVolume")) or (qty * px),
+                    realized_pnl=safe_decimal(row.get("profit")),
+                    commission_amount=comm, commission_asset=ccy,
+                    maker=(str(row.get("tradeScope") or "").lower() == "maker") if row.get("tradeScope") else None,
+                    occurred_at_ms=ts, metadata={"tradeSide": row.get("tradeSide")},
+                ))
+            end_id = (res or {}).get("endId") if isinstance(res, dict) else None
+            if len(rows) < 100 or not end_id:
+                break
+            if end_id in seen_cursors:
+                complete = False
+                break
+            seen_cursors.add(end_id)
+            id_less = str(end_id)
+        items.sort(key=lambda i: (i.occurred_at_ms, i.exchange_fill_id))
+        return DatasetPage(items=items, complete=complete, coverage_start_ms=start_ms, coverage_end_ms=end_ms)
+
+    async def get_order_history(
+        self, start_ms: int, end_ms: int, cursor: Optional[Dict[str, Any]] = None, symbols: Optional[List[str]] = None
+    ) -> DatasetPage:
+        items: List[OrderHistoryEntry] = []
+        seen: set[str] = set()
+        id_less: Optional[str] = None
+        seen_cursors: set[str] = set()
+        complete = True
+        while True:
+            params: Dict[str, Any] = {
+                "productType": self.product_type,
+                "startTime": str(start_ms), "endTime": str(end_ms), "limit": "100",
+            }
+            if id_less:
+                params["idLessThan"] = id_less
+            res = await self._request("GET", "/api/v2/mix/order/orders-history", params=params)
+            rows = (res or {}).get("entrustedList") if isinstance(res, dict) else (res if isinstance(res, list) else [])
+            if not isinstance(rows, list):
+                raise ValueError("Malformed Bitget orders-history response")
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                oid = str(row.get("orderId") or "").strip()
+                sym = str(row.get("symbol") or "").upper()
+                if not oid or not sym:
+                    continue
+                dkey = f"order:{oid}"
+                if dkey in seen:
+                    continue
+                seen.add(dkey)
+                c_ms = int(row.get("cTime") or row.get("uTime") or 0)
+                u_ms = int(row.get("uTime") or c_ms)
+                lmt = safe_decimal(row.get("price"))
+                avg = safe_decimal(row.get("priceAvg"))
+                items.append(OrderHistoryEntry(
+                    exchange="bitget", dedupe_key=dkey, exchange_order_id=oid,
+                    client_order_id=str(row.get("clientOid") or "") or None,
+                    algo_id=None, client_algo_id=None, category="ordinary",
+                    symbol=sym, inst_id=sym,
+                    side=str(row.get("side") or "").upper(),
+                    position_side=self._bitget_pos_side(row),
+                    order_type=str(row.get("orderType") or "LIMIT").upper(),
+                    status=str(row.get("state") or "UNKNOWN").upper(),
+                    qty=safe_decimal(row.get("size")),
+                    filled_qty=safe_decimal(row.get("baseVolume")),
+                    avg_price=avg if avg and avg > 0 else None,
+                    limit_price=lmt if lmt and lmt > 0 else None,
+                    trigger_price=None,
+                    reduce_only=(str(row.get("tradeSide") or "").lower() == "close") if row.get("tradeSide") else None,
+                    close_position=False, working_type=None,
+                    created_at_ms=c_ms, updated_at_ms=u_ms, metadata={},
+                ))
+            end_id = (res or {}).get("endId") if isinstance(res, dict) else None
+            if len(rows) < 100 or not end_id:
+                break
+            if end_id in seen_cursors:
+                complete = False
+                break
+            seen_cursors.add(end_id)
+            id_less = str(end_id)
+        items.sort(key=lambda i: (i.updated_at_ms, i.dedupe_key))
+        return DatasetPage(items=items, complete=complete, coverage_start_ms=start_ms, coverage_end_ms=end_ms)

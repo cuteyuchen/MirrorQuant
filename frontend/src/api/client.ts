@@ -59,7 +59,9 @@ class ApiClient {
       options.signal?.removeEventListener("abort", abort);
     }
   }
-  get<T>(endpoint: string) { return this.request<T>(endpoint, { method: "GET" }); }
+  get<T>(endpoint: string, options: RequestInit = {}) {
+    return this.request<T>(endpoint, { ...options, method: "GET" });
+  }
   post<T = unknown>(endpoint: string, body?: unknown) {
     return this.request<T>(endpoint, { method: "POST", body: body === undefined ? undefined : JSON.stringify(body) });
   }

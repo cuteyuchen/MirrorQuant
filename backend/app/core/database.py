@@ -516,6 +516,27 @@ def _apply_sqlite_migrations(sync_conn) -> None:
         sync_conn.execute(text(
             "CREATE INDEX IF NOT EXISTS ix_exec_status_created ON execution_records (status, created_at DESC)"
         ))
+    # 账户详情新表索引幂等补建：兼容从历史副本升级。
+    for ddl in (
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_acct_eq_snap_bucket ON account_equity_snapshots (account_id, currency, resolution, bucket_start_ms)",
+        "CREATE INDEX IF NOT EXISTS ix_acct_eq_snap_captured ON account_equity_snapshots (account_id, currency, captured_at_ms)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_acct_cashflow_ext ON account_cashflow_entries (account_id, exchange, external_id, raw_type) WHERE external_id IS NOT NULL",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_acct_cashflow_dedupe ON account_cashflow_entries (account_id, exchange, dedupe_key)",
+        "CREATE INDEX IF NOT EXISTS ix_acct_cashflow_time ON account_cashflow_entries (account_id, occurred_at_ms, id)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_acct_trade_fill ON account_trade_fills (account_id, exchange, exchange_fill_id)",
+        "CREATE INDEX IF NOT EXISTS ix_acct_fill_time ON account_trade_fills (account_id, occurred_at_ms, id)",
+        "CREATE INDEX IF NOT EXISTS ix_acct_fill_sym_time ON account_trade_fills (account_id, symbol, occurred_at_ms)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_acct_order_hist_order_id ON account_order_history (account_id, exchange, exchange_order_id) WHERE exchange_order_id IS NOT NULL",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_acct_order_hist_algo_id ON account_order_history (account_id, exchange, algo_id) WHERE algo_id IS NOT NULL",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_acct_order_hist_dedupe ON account_order_history (account_id, exchange, dedupe_key)",
+        "CREATE INDEX IF NOT EXISTS ix_acct_order_hist_time ON account_order_history (account_id, updated_at_ms, id)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_acct_dataset_sync ON account_dataset_sync_states (account_id, dataset)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_acct_alert_state ON account_alert_states (account_id, code, scope_key)",
+        "CREATE INDEX IF NOT EXISTS ix_acct_alert_active ON account_alert_states (account_id, status, severity)",
+    ):
+        table_name = ddl.split(" ON ", 1)[1].split(" ", 1)[0]
+        if sync_conn.execute(text("SELECT 1 FROM sqlite_master WHERE type='table' AND name=:n"), {"n": table_name}).scalar():
+            sync_conn.execute(text(ddl))
 
 
 async def init_db() -> None:

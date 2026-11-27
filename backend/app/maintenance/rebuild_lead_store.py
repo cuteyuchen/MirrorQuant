@@ -48,16 +48,25 @@ def write_artifact(directory: Path, label: str, data: dict) -> Path:
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     path = directory / f"lead-{data['lead_id']}-{label}-{stamp}.json"
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as stream:
-        stream.write(encoded(data))
-        stream.flush()
-        os.fsync(stream.fileno())
-    parent_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(parent_fd)
-    finally:
-        os.close(parent_fd)
+    if os.name != "nt":
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(encoded(data))
+            stream.flush()
+            os.fsync(stream.fileno())
+        parent_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+    else:
+        if path.is_symlink():
+            raise OSError("Symlink not allowed")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(encoded(data))
+            stream.flush()
+            os.fsync(stream.fileno())
     logger.info("Lead %s %s artifact=%s", data["lead_id"], label, path)
     return path
 

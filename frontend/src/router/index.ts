@@ -16,6 +16,7 @@ export const routes: RouteRecordRaw[] = [
   { path: "/leads", component: loadLeads, meta: { requiresAuth: true } },
   { path: "/leads/:id", component: () => import("@/views/LeadDetailView.vue"), meta: { requiresAuth: true } },
   { path: "/accounts", component: loadAccounts, meta: { requiresAuth: true } },
+  { path: "/accounts/:id", component: () => import("@/views/AccountDetailView.vue"), meta: { requiresAuth: true } },
   { path: "/bindings", component: loadBindings, meta: { requiresAuth: true } },
   { path: "/executions", component: loadExecutions, meta: { requiresAuth: true } },
   // 旧入口保持兼容，待处理订单统一归入执行记录页签。

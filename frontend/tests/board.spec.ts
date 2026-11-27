@@ -91,6 +91,7 @@ describe("跟单看板", () => {
       routes: [
         { path: "/", component: { template: "<div />" } },
         { path: "/accounts", component: { template: "<div />" } },
+        { path: "/accounts/:id", component: { template: "<div />" } },
         { path: "/bindings", component: { template: "<div />" } },
         { path: "/leads/:id", component: { template: "<div />" } },
       ],
@@ -110,7 +111,7 @@ describe("跟单看板", () => {
 
     await wrapper.get('[data-testid="account-card-2"]').trigger("click");
     await flushPromises();
-    expect(router.currentRoute.value.fullPath).toBe("/accounts?account=2");
+    expect(router.currentRoute.value.fullPath).toBe("/accounts/2");
   });
 
   it("账户金额与百分比有正负号，实盘明确标记", () => {
@@ -149,6 +150,15 @@ describe("跟单看板", () => {
     expect(wrapper.text()).toContain("仅监控 · 未绑定");
     expect(wrapper.text()).not.toContain("我的持仓");
     expect(wrapper.findAll("[data-position]").length).toBeGreaterThan(0);
+  });
+
+  it("带单员持仓卡不渲染推算止盈止损价，今日动态随左侧持仓等高绑定", () => {
+    const wrapper = comparison();
+    expect(wrapper.text()).not.toContain("止盈价");
+    expect(wrapper.text()).not.toContain("止损价");
+    const cell = wrapper.get('[data-testid="timeline-cell"]');
+    expect(cell.find(".xl\\:relative.xl\\:h-full").exists()).toBe(true);
+    expect(cell.find("aside").classes()).toEqual(expect.arrayContaining(["xl:absolute", "xl:inset-0", "xl:flex", "xl:h-full", "xl:flex-col"]));
   });
 
   it("单持仓不拆半宽留白，多持仓在PC按两列平铺", async () => {
@@ -241,13 +251,17 @@ describe("今日动态", () => {
     expect(wrapper.text()).not.toContain("Confirmed cumulative");
     expect(wrapper.text()).toContain("盘口价差过大，实测 0.381%，上限 0.300%");
   });
-  it("动态列表高度封顶、内部滚动", () => {
+  it("动态列表高度与左侧同步且支持内部滚动", () => {
     const wrapper = timeline([
       { id: 1, time: Date.now(), symbol: "BTCUSDT", side: "SHORT", action: "OPEN", qty: 8.491, price: 64345.39, realizedPnl: null, mine: [] },
     ]);
     const scroller = wrapper.find("ol").element.parentElement;
     expect(scroller?.className).toContain("overflow-y-auto");
     expect(scroller?.className).toContain("max-h-");
+    expect(scroller?.className).toContain("xl:max-h-full");
+    expect(scroller?.className).not.toContain("xl:max-h-72");
+    expect(scroller?.className).not.toContain("overscroll-contain");
+    expect(scroller?.className).not.toContain("overscroll-none");
   });
   it("未绑定监控模式下不每条刷屏提示尚无对应执行结果，已绑定模式照常提示", () => {
     const events: BoardEvent[] = [

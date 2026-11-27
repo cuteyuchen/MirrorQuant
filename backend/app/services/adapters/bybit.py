@@ -11,14 +11,25 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode
 
 from app.services.adapters.base import (
+    AccountRiskInfo,
     BalanceInfo,
     BaseExchangeAdapter,
+    CashflowEntry,
+    CommissionRateInfo,
+    DatasetCapability,
+    DatasetPage,
     ExchangeAPIError,
     ExchangePosition,
     InstrumentSpec,
+    OpenOrderEntry,
     OrderBook,
+    OrderHistoryEntry,
     OrderResult,
+    TradeFill,
     api_error,
+    make_dedupe_key,
+    safe_decimal,
+    safe_optional_float,
 )
 from app.services.proxy.manager import ProxyManager
 
@@ -224,12 +235,19 @@ class BybitAdapter(BaseExchangeAdapter):
             margin_usd = float(p.get("positionIM") or 0.0)
             if margin_usd <= 0 and notional > 0 and lever > 0:
                 margin_usd = notional / lever
+            mgn_mode = "isolated" if int(p.get("tradeMode") or 0) == 1 else "cross"
+            liq_price = safe_optional_float(p.get("liqPrice"), positive_only=True)
+            maint_margin = safe_optional_float(p.get("positionMM"))
+            init_margin = safe_optional_float(p.get("positionIM"))
+            adl_q = int(p["adlRankIndicator"]) if p.get("adlRankIndicator") not in (None, "") else None
+            iso_wallet = safe_optional_float(p.get("positionBalance")) if mgn_mode == "isolated" else None
+            pos_mr = (maint_margin / iso_wallet) if (mgn_mode == "isolated" and maint_margin is not None and iso_wallet and iso_wallet > 0) else None
             positions.append(
                 ExchangePosition(
                     inst_id=sym,
                     symbol=sym,
                     pos_side=pos_side,
-                    mgn_mode="isolated" if int(p.get("tradeMode") or 0) == 1 else "cross",
+                    mgn_mode=mgn_mode,
                     pos=abs(sz),
                     avail_pos=abs(sz),
                     avg_px=avg_px,
@@ -241,6 +259,12 @@ class BybitAdapter(BaseExchangeAdapter):
                     c_time=int(p.get("createdTime") or 0),
                     u_time=int(p.get("updatedTime") or 0),
                     margin_usd=margin_usd,
+                    liquidation_price=liq_price,
+                    maintenance_margin=maint_margin,
+                    initial_margin=init_margin,
+                    adl_quantile=adl_q,
+                    margin_ratio=pos_mr,
+                    isolated_wallet=iso_wallet,
                 )
             )
         return positions
@@ -440,3 +464,280 @@ class BybitAdapter(BaseExchangeAdapter):
             return True
         except Exception:
             return False
+
+    @staticmethod
+    def _bybit_pos_side(position_idx: Any) -> str:
+        try:
+            idx = int(position_idx or 0)
+        except (TypeError, ValueError):
+            idx = 0
+        if idx == 1:
+            return "LONG"
+        if idx == 2:
+            return "SHORT"
+        return "BOTH"
+
+    def get_dataset_capabilities(self) -> Dict[str, DatasetCapability]:
+        return {
+            "equity": DatasetCapability("equity", True, True),
+            "open_orders": DatasetCapability("open_orders", True, True),
+            "cashflow": DatasetCapability("cashflow", True, False, retention_days=180, note="Bybit UTA transaction log window"),
+            "fills": DatasetCapability("fills", True, False, retention_days=180, note="Bybit execution history window"),
+            "orders": DatasetCapability("orders", True, False, retention_days=180, note="Bybit order history window"),
+            "force_orders": DatasetCapability("force_orders", False, False, note="Not supported separately on Bybit"),
+            "commission_rates": DatasetCapability("commission_rates", True, True),
+            "daily_snapshots": DatasetCapability("daily_snapshots", False, False, note="Not supported on Bybit"),
+        }
+
+    async def get_account_risk_snapshot(self) -> AccountRiskInfo:
+        res = await self._request("GET", "/v5/account/wallet-balance", params={"accountType": "UNIFIED"})
+        acct = (res.get("list") or [{}])[0]
+        coins = acct.get("coin") or []
+        asset_balances: Dict[str, Dict[str, Optional[Decimal]]] = {}
+        usdt: Dict[str, Any] = {}
+        single_collateral = all(c.get("coin") == "USDT" or (safe_decimal(c.get("equity")) or Decimal("0")) == 0 for c in coins)
+        for coin in coins:
+            if not isinstance(coin, dict):
+                continue
+            name = str(coin.get("coin") or "").upper()
+            if not name:
+                continue
+            eq = safe_decimal(coin.get("equity"))
+            wb = safe_decimal(coin.get("walletBalance"))
+            upl = safe_decimal(coin.get("unrealisedPnl"))
+            im = safe_decimal(coin.get("totalPositionIM"))
+            mm = safe_decimal(coin.get("totalPositionMM"))
+            if name == "USDT":
+                usdt = coin
+            if any(v is not None and v != 0 for v in (eq, wb, upl, im, mm)) or name == "USDT":
+                avail = safe_decimal(acct.get("totalAvailableBalance")) if (name == "USDT" and single_collateral) else None
+                asset_balances[name] = {
+                    "equity": eq, "available": avail, "wallet": wb,
+                    "upl": upl, "initialMargin": im, "maintenanceMargin": mm,
+                }
+        equity = safe_decimal(usdt.get("equity"))
+        avail_bal = safe_decimal(acct.get("totalAvailableBalance")) if single_collateral else None
+        wallet_bal = safe_decimal(usdt.get("walletBalance"))
+        upl_bal = safe_decimal(usdt.get("unrealisedPnl"))
+        init_margin = safe_decimal(usdt.get("totalPositionIM") or acct.get("totalInitialMargin"))
+        maint_margin = safe_decimal(usdt.get("totalPositionMM") or acct.get("totalMaintenanceMargin"))
+        margin_ratio = safe_decimal(acct.get("accountMMRate"))
+        source = "exchange" if margin_ratio is not None else None
+        if margin_ratio is None and maint_margin is not None and equity is not None and equity > 0:
+            margin_ratio = maint_margin / equity
+            source = "derived_from_exchange_mmr"
+        return AccountRiskInfo(
+            currency="USDT",
+            equity=equity,
+            available_balance=avail_bal,
+            wallet_balance=wallet_bal,
+            unrealized_pnl=upl_bal,
+            initial_margin=init_margin,
+            maintenance_margin=maint_margin,
+            margin_ratio=margin_ratio,
+            margin_ratio_source=source,
+            multi_assets_margin=(not single_collateral),
+            dual_side_position=(self.position_mode == "hedge"),
+            asset_balances=asset_balances,
+        )
+
+    async def get_open_orders_normalized(self) -> List[OpenOrderEntry]:
+        rows = await self.get_open_orders()
+        entries: List[OpenOrderEntry] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            sym = str(row.get("symbol") or "").upper()
+            stop_type = str(row.get("stopOrderType") or "")
+            if stop_type in ("TakeProfit", "PartialTakeProfit"):
+                category = "take_profit"
+            elif stop_type in ("StopLoss", "PartialStopLoss"):
+                category = "stop_loss"
+            elif stop_type == "TrailingStop":
+                category = "trailing_stop"
+            elif stop_type or row.get("triggerPrice") not in (None, "", "0"):
+                category = "conditional"
+            else:
+                category = "ordinary"
+            close_pos = str(row.get("tpslMode") or "").lower() == "full"
+            qty = None if close_pos else safe_decimal(row.get("qty"))
+            lmt = safe_decimal(row.get("price"))
+            trig = safe_decimal(row.get("triggerPrice"))
+            entries.append(OpenOrderEntry(
+                exchange="bybit",
+                order_id=str(row.get("orderId") or row.get("orderLinkId") or ""),
+                client_order_id=str(row.get("orderLinkId") or "") or None,
+                algo_id=str(row.get("orderId")) if category != "ordinary" and row.get("orderId") else None,
+                category=category,
+                symbol=sym,
+                inst_id=sym,
+                side=str(row.get("side") or "").upper(),
+                position_side=self._bybit_pos_side(row.get("positionIdx")),
+                order_type=str(row.get("orderType") or "LIMIT").upper(),
+                status=str(row.get("orderStatus") or "NEW").upper(),
+                qty=qty,
+                filled_qty=safe_decimal(row.get("cumExecQty")),
+                limit_price=lmt if lmt and lmt > 0 else None,
+                trigger_price=trig if trig and trig > 0 else None,
+                reduce_only=bool(row.get("reduceOnly")) if row.get("reduceOnly") is not None else None,
+                close_position=close_pos,
+                working_type=str(row.get("triggerBy")) if row.get("triggerBy") else None,
+                created_at_ms=int(row["createdTime"]) if row.get("createdTime") else None,
+                updated_at_ms=int(row["updatedTime"]) if row.get("updatedTime") else None,
+            ))
+        return entries
+
+    async def get_cashflow_history(
+        self, start_ms: int, end_ms: int, cursor: Optional[Dict[str, Any]] = None
+    ) -> DatasetPage:
+        items: List[CashflowEntry] = []
+        seen: set[str] = set()
+        window = 7 * 86_400_000 - 1
+        cur = start_ms
+        while cur <= end_ms:
+            w_end = min(end_ms, cur + window)
+            rows = await self._all_pages("/v5/account/transaction-log", {
+                "accountType": "UNIFIED", "category": "linear",
+                "startTime": cur, "endTime": w_end, "limit": 50,
+            })
+            for row in rows:
+                tx_id = str(row.get("id") or "").strip() or None
+                ts = int(row.get("transactionTime") or 0)
+                ccy = str(row.get("currency") or "").upper()
+                amt = safe_decimal(row.get("cashFlow"))
+                if amt is None:
+                    amt = safe_decimal(row.get("change"))
+                if not ccy or amt is None or ts <= 0:
+                    continue
+                raw_type = str(row.get("type") or "UNKNOWN").upper()
+                if "TRANSFER" in raw_type:
+                    category = "TRANSFER_IN" if amt >= 0 else "TRANSFER_OUT"
+                elif raw_type == "SETTLEMENT":
+                    category = "FUNDING_FEE"
+                elif raw_type == "TRADE":
+                    category = "REALIZED_PNL"
+                elif raw_type == "BONUS":
+                    category = "BONUS"
+                else:
+                    category = "UNKNOWN"
+                sym = str(row.get("symbol") or "").upper() or None
+                dkey = make_dedupe_key("bybit", tx_id, raw_type, ccy, sym, ts, str(amt))
+                if dkey in seen:
+                    continue
+                seen.add(dkey)
+                items.append(CashflowEntry(
+                    exchange="bybit", external_id=tx_id, dedupe_key=dkey,
+                    asset=ccy, raw_type=raw_type, category=category,
+                    signed_amount=amt, symbol=sym, occurred_at_ms=ts,
+                    source="exchange_income", metadata={"orderId": row.get("orderId")},
+                ))
+            cur = w_end + 1
+        items.sort(key=lambda i: (i.occurred_at_ms, i.dedupe_key))
+        return DatasetPage(items=items, complete=True, coverage_start_ms=start_ms, coverage_end_ms=end_ms)
+
+    async def get_trade_fills(
+        self, symbols: List[str], start_ms: int, end_ms: int, cursor: Optional[Dict[str, Any]] = None
+    ) -> DatasetPage:
+        items: List[TradeFill] = []
+        seen: set[str] = set()
+        window = 7 * 86_400_000 - 1
+        cur = start_ms
+        while cur <= end_ms:
+            w_end = min(end_ms, cur + window)
+            rows = await self._all_pages("/v5/execution/list", {
+                "category": "linear", "startTime": cur, "endTime": w_end, "limit": 100,
+            })
+            for row in rows:
+                sym = str(row.get("symbol") or "").upper()
+                qty = safe_decimal(row.get("execQty"))
+                px = safe_decimal(row.get("execPrice"))
+                ts = int(row.get("execTime") or 0)
+                if not sym or qty is None or px is None or qty <= 0 or ts <= 0:
+                    continue
+                fid = str(row.get("execId") or "") or make_dedupe_key(sym, row.get("orderId"), ts, str(qty), str(px))
+                if fid in seen:
+                    continue
+                seen.add(fid)
+                items.append(TradeFill(
+                    exchange="bybit", exchange_fill_id=fid,
+                    exchange_order_id=str(row.get("orderId") or "") or None,
+                    client_order_id=str(row.get("orderLinkId") or "") or None,
+                    symbol=sym, inst_id=sym,
+                    side=str(row.get("side") or "").upper(),
+                    position_side="BOTH",
+                    qty=qty, price=px, quote_qty=safe_decimal(row.get("execValue")) or (qty * px),
+                    realized_pnl=safe_decimal(row.get("execPnl")),
+                    commission_amount=safe_decimal(row.get("execFee")),
+                    commission_asset="USDT",
+                    maker=row.get("isMaker") if isinstance(row.get("isMaker"), bool) else None,
+                    occurred_at_ms=ts, metadata={"execType": row.get("execType")},
+                ))
+            cur = w_end + 1
+        items.sort(key=lambda i: (i.occurred_at_ms, i.exchange_fill_id))
+        return DatasetPage(items=items, complete=True, coverage_start_ms=start_ms, coverage_end_ms=end_ms)
+
+    async def get_order_history(
+        self, start_ms: int, end_ms: int, cursor: Optional[Dict[str, Any]] = None, symbols: Optional[List[str]] = None
+    ) -> DatasetPage:
+        items: List[OrderHistoryEntry] = []
+        seen: set[str] = set()
+        window = 7 * 86_400_000 - 1
+        cur = start_ms
+        while cur <= end_ms:
+            w_end = min(end_ms, cur + window)
+            rows = await self._all_pages("/v5/order/history", {
+                "category": "linear", "startTime": cur, "endTime": w_end, "limit": 50,
+            })
+            for row in rows:
+                oid = str(row.get("orderId") or "").strip()
+                sym = str(row.get("symbol") or "").upper()
+                if not oid or not sym:
+                    continue
+                dkey = f"order:{oid}"
+                if dkey in seen:
+                    continue
+                seen.add(dkey)
+                c_ms = int(row.get("createdTime") or row.get("updatedTime") or 0)
+                u_ms = int(row.get("updatedTime") or c_ms)
+                lmt = safe_decimal(row.get("price"))
+                trig = safe_decimal(row.get("triggerPrice"))
+                avg = safe_decimal(row.get("avgPrice"))
+                items.append(OrderHistoryEntry(
+                    exchange="bybit", dedupe_key=dkey, exchange_order_id=oid,
+                    client_order_id=str(row.get("orderLinkId") or "") or None,
+                    algo_id=None, client_algo_id=None,
+                    category="conditional" if row.get("stopOrderType") else "ordinary",
+                    symbol=sym, inst_id=sym,
+                    side=str(row.get("side") or "").upper(),
+                    position_side=self._bybit_pos_side(row.get("positionIdx")),
+                    order_type=str(row.get("orderType") or "LIMIT").upper(),
+                    status=str(row.get("orderStatus") or "UNKNOWN").upper(),
+                    qty=safe_decimal(row.get("qty")),
+                    filled_qty=safe_decimal(row.get("cumExecQty")),
+                    avg_price=avg if avg and avg > 0 else None,
+                    limit_price=lmt if lmt and lmt > 0 else None,
+                    trigger_price=trig if trig and trig > 0 else None,
+                    reduce_only=bool(row.get("reduceOnly")) if row.get("reduceOnly") is not None else None,
+                    close_position=str(row.get("tpslMode") or "").lower() == "full",
+                    working_type=str(row.get("triggerBy")) if row.get("triggerBy") else None,
+                    created_at_ms=c_ms, updated_at_ms=u_ms, metadata={},
+                ))
+            cur = w_end + 1
+        items.sort(key=lambda i: (i.updated_at_ms, i.dedupe_key))
+        return DatasetPage(items=items, complete=True, coverage_start_ms=start_ms, coverage_end_ms=end_ms)
+
+    async def get_commission_rates(self, symbols: List[str]) -> List[CommissionRateInfo]:
+        res = await self._request("GET", "/v5/account/fee-rate", params={"category": "linear"})
+        rows = res.get("list") or []
+        by_sym = {str(r.get("symbol") or "").upper(): r for r in rows if isinstance(r, dict)}
+        out: List[CommissionRateInfo] = []
+        for sym in sorted({s.strip().upper() for s in symbols if s and s.strip()}):
+            r = by_sym.get(sym) or (rows[0] if rows else {})
+            if not isinstance(r, dict):
+                continue
+            out.append(CommissionRateInfo(
+                symbol=sym, inst_id=sym,
+                maker_rate=safe_decimal(r.get("makerFeeRate")),
+                taker_rate=safe_decimal(r.get("takerFeeRate")),
+            ))
+        return out

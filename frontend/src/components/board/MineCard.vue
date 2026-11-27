@@ -42,7 +42,7 @@ const reason = computed(() => {
     <!-- 顶行：账户名称、环境、跟单状态徽标；已跟上时视觉更安静，异常状态更突出。 -->
     <div class="flex flex-wrap items-center justify-between gap-1.5">
       <div class="flex min-w-0 flex-wrap items-center gap-1.5">
-        <RouterLink v-if="mine.accountId != null" :to="`/accounts?account=${mine.accountId}`"
+        <RouterLink v-if="mine.accountId != null" :to="`/accounts/${mine.accountId}`"
           class="min-w-0 text-sm font-semibold hover:text-accent hover:underline [overflow-wrap:anywhere]">{{ mine.accountName ?? t("common.unknown") }}</RouterLink>
         <span v-else class="min-w-0 text-sm font-semibold [overflow-wrap:anywhere]">{{ mine.accountName ?? t("common.unknown") }}</span>
         <EnvBadge :environment="mine.environment" />

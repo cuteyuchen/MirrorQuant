@@ -4,7 +4,8 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import String, and_, cast, delete, exists, func, or_, select
 
 from app.core.config import get_settings
-from app.models.domain import AuditLog, BindingDelivery, ExecutionRecord, LoginAttemptGuard, NotificationOutbox, OrderIntent
+from app.models.domain import AccountAlertState, AuditLog, BindingDelivery, ExecutionRecord, LoginAttemptGuard, NotificationOutbox, OrderIntent
+from app.services.account_detail.snapshots import downsample_equity_snapshots
 from app.services.engine.serialization import serialized_execution
 
 
@@ -71,5 +72,22 @@ async def cleanup_retained_records(db, *, now=None):
     for model, condition in conditions:
         result = await db.execute(delete(model).where(condition).execution_options(synchronize_session=False))
         counts[model.__tablename__] = result.rowcount
+
+    # Purge only resolved alerts past 180d retention; active alerts are never deleted.
+    alert_cutoff_ms = int((now - timedelta(days=180)).timestamp() * 1000)
+    alert_res = await db.execute(
+        delete(AccountAlertState)
+        .where(
+            AccountAlertState.status == "resolved",
+            AccountAlertState.resolved_at_ms.is_not(None),
+            AccountAlertState.resolved_at_ms < alert_cutoff_ms,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if alert_res.rowcount:
+        counts[AccountAlertState.__tablename__] = alert_res.rowcount
+
+    # Idempotently downsample raw/hour equity snapshots and prune expired raw/hour buckets only after aggregation.
+    await downsample_equity_snapshots(db, now_ms=int(now.timestamp() * 1000))
     await db.commit()
     return counts

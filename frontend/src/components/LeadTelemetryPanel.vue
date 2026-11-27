@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
-import { Gauge, History, Layers, LineChart, PieChart, Zap } from "lucide-vue-next";
+import { computed, ref, useId } from "vue";
+import { Gauge, History, Layers, LineChart } from "lucide-vue-next";
 import type { LeadSnapshot } from "@/types/api";
 import { useI18n } from "@/i18n";
 import { useAgo } from "@/composables/useAgo";
 import { useNow } from "@/composables/useNow";
 import { formatDateTime, timestampMs } from "@/utils/format";
+import { positionsConfirmed } from "@/utils/positions";
 import LeadAvatar from "./LeadAvatar.vue";
 import StatTile from "./StatTile.vue";
 import AllocationCard from "./telemetry/AllocationCard.vue";
@@ -14,7 +15,7 @@ import PerformancePanel from "./telemetry/PerformancePanel.vue";
 import PositionAnalysis from "./telemetry/PositionAnalysis.vue";
 import RoiChart from "./telemetry/RoiChart.vue";
 
-// 带单员遥测面板：所有区块从上到下一次排开，不用页签把信息藏起来。
+// 带单员遥测面板：按页签分栏展示持仓测算、绩效、收益分布与交易历史，避免整页过长滚动；懒挂载后保留各页签交互状态。
 // embedded 表示外层页面已经展示了带单员的名称与头像（详情页），这里不再重复。
 const props = defineProps<{
   snapshot: LeadSnapshot; portfolioId?: string; displayName?: string; countdownSec?: number; embedded?: boolean;
@@ -46,37 +47,44 @@ const syncText = computed(() => {
 });
 const lastTradeText = computed(() => timestampMs(profile.value?.lastTradeTime) == null ? "" : formatDateTime(profile.value?.lastTradeTime));
 
-// 导航顺序就是页面上区块的顺序；“今日动态”只有外层传入时间线时才出现。
-const SECTIONS = [
-  { key: "positions", label: "telemetry.positions", icon: Layers },
-  { key: "timeline", label: "board.timeline", icon: Zap },
-  { key: "performance", label: "telemetry.performance", icon: Gauge },
-  { key: "returns", label: "telemetry.returns", icon: LineChart },
-  { key: "allocation", label: "telemetry.allocation", icon: PieChart },
-  { key: "history", label: "telemetry.history", icon: History },
-];
-const root = ref<HTMLElement | null>(null);
-// 滚动到指定区块；系统要求减少动效时直接定位，不做平滑滚动；嵌入模式下持仓可直达顶部权威持仓卡。
-function jump(key: string) {
-  if (props.embedded && key === "positions") {
-    const target = document.getElementById("canonical-positions");
-    if (target) {
-      target.scrollIntoView({
-        behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start",
-      });
-      return;
-    }
-  }
-  root.value?.querySelector(`[data-section="${key}"]`)?.scrollIntoView({
-    behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start",
-  });
+type TabKey = "positions" | "performance" | "returns" | "history";
+const uid = useId();
+const activeTab = ref<TabKey>("positions");
+const visited = ref<Set<TabKey>>(new Set(["positions"]));
+const tabs = computed<{ key: TabKey; label: string; icon: typeof Layers; count: number | null }[]>(() => {
+  const posCount = positionsConfirmed(props.snapshot) ? (props.snapshot.openPositions?.length ?? 0) : null;
+  const histCount = (props.snapshot.orderBatches?.length || null) ?? props.snapshot.orders?.length ?? null;
+  return [
+    { key: "positions", label: "tel.tabPositions", icon: Layers, count: posCount },
+    { key: "performance", label: "telemetry.performance", icon: Gauge, count: null },
+    { key: "returns", label: "tel.tabReturns", icon: LineChart, count: null },
+    { key: "history", label: "telemetry.history", icon: History, count: histCount },
+  ];
+});
+function selectTab(key: TabKey) {
+  if (!visited.value.has(key)) visited.value = new Set(visited.value).add(key);
+  activeTab.value = key;
+}
+function onTabKeydown(event: KeyboardEvent) {
+  const keys = tabs.value.map(tab => tab.key);
+  const current = keys.indexOf(activeTab.value);
+  let next = -1;
+  if (event.key === "ArrowRight") next = (current + 1) % keys.length;
+  else if (event.key === "ArrowLeft") next = (current - 1 + keys.length) % keys.length;
+  else if (event.key === "Home") next = 0;
+  else if (event.key === "End") next = keys.length - 1;
+  if (next < 0) return;
+  event.preventDefault();
+  const key = keys[next];
+  selectTab(key);
+  document.getElementById(`tel-tab-${uid}-${key}`)?.focus();
 }
 </script>
 <template>
-  <div ref="root" class="min-w-0 space-y-4">
-    <!-- 头部：身份与标签在左，最后交易与数据时效在右，底部一排按钮直达各区块。 -->
+  <div class="min-w-0 space-y-4">
+    <!-- 头部：身份与标签在左，最后交易与数据时效在右，底部切换四个深度分析页签。 -->
     <section class="card card-accent">
-      <div class="card-body flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+      <div class="card-body flex flex-col gap-4 !p-3.5 sm:!p-4 lg:flex-row lg:items-start lg:justify-between">
         <div class="flex min-w-0 flex-1 items-start gap-3.5">
           <LeadAvatar v-if="!embedded" :name="name" :url="profile?.avatarUrl" :size="56" />
           <div class="flex min-w-0 flex-1 flex-col gap-2">
@@ -106,28 +114,47 @@ function jump(key: string) {
           </p>
         </div>
       </div>
-      <!-- 手机上单行横向滑动，不占多行高度。 -->
-      <nav class="flex flex-nowrap items-center gap-1.5 overflow-x-auto border-t border-border/50 px-4 py-2.5 no-scrollbar sm:flex-wrap sm:px-5" :aria-label="t('tel.jumpNav')">
-        <template v-for="item in SECTIONS" :key="item.key">
-          <button v-if="item.key !== 'timeline' || $slots.aside" type="button" class="chip-button shrink-0 gap-1.5 whitespace-nowrap font-sans" @click="jump(item.key)">
-            <component :is="item.icon" :size="14" aria-hidden="true" />{{ t(item.label) }}
-          </button>
-        </template>
-      </nav>
+      <!-- 页签栏：手机横向滑动不折行，桌面端单行对齐，方向键可切换。 -->
+      <div role="tablist" :aria-label="t('tel.analysisTabs')" data-testid="telemetry-tablist"
+        class="flex flex-nowrap items-center gap-1.5 overflow-x-auto border-t border-border/50 bg-surface2/30 px-3 py-2 no-scrollbar sm:flex-wrap sm:px-4"
+        @keydown="onTabKeydown">
+        <button v-for="tab in tabs" :key="tab.key" :id="`tel-tab-${uid}-${tab.key}`" type="button" role="tab"
+          :data-testid="`telemetry-tab-${tab.key}`"
+          :aria-selected="activeTab === tab.key" :aria-controls="`tel-panel-${uid}-${tab.key}`"
+          :tabindex="activeTab === tab.key ? 0 : -1"
+          class="tab-button !min-h-9 !px-3 !py-1.5 text-xs sm:text-sm"
+          @click="selectTab(tab.key)">
+          <component :is="tab.icon" :size="15" aria-hidden="true" />
+          <span>{{ t(tab.label) }}</span>
+          <span v-if="tab.count != null" class="pill !px-1.5 !py-0 font-mono text-[11px] tabular-nums" :class="activeTab === tab.key ? 'tone-accent' : ''">{{ tab.count }}</span>
+        </button>
+      </div>
     </section>
-    <!-- 持仓分析与跟单开仓测算合一放最前；外层给了时间线（公开页的今日动态）时并排在右侧，滚动时跟随停留。 -->
-    <div v-if="$slots.aside" class="grid min-w-0 items-start gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
-      <PositionAnalysis :snapshot="snapshot" :embedded="embedded" with-calculator :display-name="displayName" data-section="positions" />
-      <section data-section="timeline" class="card xl:sticky xl:top-[var(--sticky-top,1rem)] xl:max-h-[calc(100dvh-var(--sticky-top,1rem)-1rem)] xl:overflow-y-auto">
-        <div class="card-body"><slot name="aside" /></div>
-      </section>
+    <!-- 持仓与测算默认首屏展示；公开看板右侧仍保留等高同步的今日动态时间线。 -->
+    <div v-if="visited.has('positions')" v-show="activeTab === 'positions'" :id="`tel-panel-${uid}-positions`" role="tabpanel"
+      :aria-labelledby="`tel-tab-${uid}-positions`" data-testid="telemetry-panel-positions">
+      <div v-if="$slots.aside" class="grid min-w-0 gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
+        <PositionAnalysis :snapshot="snapshot" :embedded="embedded" with-calculator :display-name="displayName" data-section="positions" />
+        <div class="min-w-0 xl:relative">
+          <section data-section="timeline" class="card xl:absolute xl:inset-0 xl:flex xl:flex-col xl:overflow-hidden">
+            <div class="card-body flex min-h-0 flex-1 flex-col !p-3 sm:!p-4"><slot name="aside" /></div>
+          </section>
+        </div>
+      </div>
+      <PositionAnalysis v-else :snapshot="snapshot" :embedded="embedded" with-calculator :display-name="displayName" data-section="positions" />
     </div>
-    <PositionAnalysis v-else :snapshot="snapshot" :embedded="embedded" with-calculator :display-name="displayName" data-section="positions" />
-    <PerformancePanel :snapshot="snapshot" data-section="performance" />
-    <div class="grid min-w-0 gap-4 xl:grid-cols-3">
+    <div v-if="visited.has('performance')" v-show="activeTab === 'performance'" :id="`tel-panel-${uid}-performance`" role="tabpanel"
+      :aria-labelledby="`tel-tab-${uid}-performance`" data-testid="telemetry-panel-performance">
+      <PerformancePanel :snapshot="snapshot" data-section="performance" />
+    </div>
+    <div v-if="visited.has('returns')" v-show="activeTab === 'returns'" :id="`tel-panel-${uid}-returns`" role="tabpanel"
+      :aria-labelledby="`tel-tab-${uid}-returns`" data-testid="telemetry-panel-returns" class="grid min-w-0 gap-4 xl:grid-cols-3">
       <RoiChart :points="snapshot.roiChart365D" data-section="returns" class="xl:col-span-2" />
       <AllocationCard :allocation="snapshot.allocation" data-section="allocation" />
     </div>
-    <section class="card" data-section="history"><div class="card-body"><OrderHistory :snapshot="snapshot" /></div></section>
+    <div v-if="visited.has('history')" v-show="activeTab === 'history'" :id="`tel-panel-${uid}-history`" role="tabpanel"
+      :aria-labelledby="`tel-tab-${uid}-history`" data-testid="telemetry-panel-history">
+      <section class="card" data-section="history"><div class="card-body"><OrderHistory :snapshot="snapshot" /></div></section>
+    </div>
   </div>
 </template>

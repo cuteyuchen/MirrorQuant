@@ -15,7 +15,7 @@ function isMine(account: BoardAccount) {
   return props.currentUserId != null && (account.ownerUserId === props.currentUserId || account.ownerUserId == null);
 }
 function goAccount(id?: number | null) {
-  if (id != null && router) void router.push(`/accounts?account=${id}`);
+  if (id != null && router) void router.push(`/accounts/${id}`);
 }
 // 桌面端按实际账户数量自适应列数（<=2 占满两列、3 列对齐、>=4 恢复 4 列）；移动端 <=2 纵向展示避免半截裁切，>=3 横向滑动。
 const gridClass = computed(() => {

@@ -1,4 +1,29 @@
-import type { Account, AuditLog, Binding, BoardEvent, BoardLead, BoardMine, CaptchaChallenge, DashboardBoard, ExecutionRecord, Lead, LeadSnapshot, LegacyPosition, NotificationSettings, OrderIntent, ProxyNode, SecurityGuard, SettingsResponse } from "@/types/api";
+import type {
+  Account,
+  AccountCashflowsResponse,
+  AccountDetailResponse,
+  AccountDetailSyncResponse,
+  AccountEquityCurveResponse,
+  AccountOrdersResponse,
+  AccountPerformanceResponse,
+  AccountTradesResponse,
+  AuditLog,
+  Binding,
+  BoardEvent,
+  BoardLead,
+  BoardMine,
+  CaptchaChallenge,
+  DashboardBoard,
+  ExecutionRecord,
+  Lead,
+  LeadSnapshot,
+  LegacyPosition,
+  NotificationSettings,
+  OrderIntent,
+  ProxyNode,
+  SecurityGuard,
+  SettingsResponse,
+} from "@/types/api";
 import { BINDING_RISK_FIELDS, DEFAULT_RESILIENCE, DEFAULT_RISK } from "@/constants/validation";
 
 // 样例只在 VITE_MOCK=1 时读取；覆盖异常、空仓、多账户和未知数值。
@@ -291,15 +316,273 @@ const captcha: CaptchaChallenge = {
   svg: '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="48"><rect width="160" height="48" fill="white"/><text x="16" y="32" fill="black" font-size="24">3 + 5 = ?</text></svg>',
 };
 export const mockAuthPreview = { username: "preview", lockRemainingSec: 45, captcha, errorCode: "NETWORK_ERROR" };
-// 预览模式下唯一可写的字段：带单员是否进公开看板（内存中生效，刷新即还原）。
+// 预览模式下唯一可写的字段：带单员是否进公开看板（内存中生效，刷新即还原）；额外允许只读详情手动同步模拟。
 export function mockWrite(endpoint: string, method: string, body: unknown): unknown {
-  const match = /^\/api\/leads\/(\d+)$/.exec(new URL(endpoint, "http://mock.local").pathname);
+  const pathname = new URL(endpoint, "http://mock.local").pathname;
+  const detailSyncMatch = /^\/api\/accounts\/(\d+)\/detail\/sync$/.exec(pathname);
+  if (method === "POST" && detailSyncMatch) {
+    const accountId = Number(detailSyncMatch[1]);
+    const res: AccountDetailSyncResponse = {
+      ok: true,
+      accountId,
+      syncedAtMs: Date.now(),
+      datasets: mockAccountDetail(accountId).dataQuality.datasets,
+      results: {
+        open_orders: { status: "ok", count: accountId === 2 ? 2 : 0 },
+        equity: { status: "ok" },
+        cashflow: { status: "ok" },
+        fills: { status: "ok" },
+        orders: { status: "ok" },
+        force_orders: { status: "ok" },
+        commission_rates: { status: "ok" },
+        daily_snapshots: { status: accountId === 1 ? "unsupported" : "ok" },
+      },
+    };
+    return structuredClone(res);
+  }
+  const match = /^\/api\/leads\/(\d+)$/.exec(pathname);
   const lead = match && mockLeads.find(item => item.id === Number(match[1]));
   if (method !== "PUT" || !lead || typeof body !== "string") return undefined;
   const patch = JSON.parse(body) as Record<string, unknown>;
   if (Object.keys(patch).length !== 1 || typeof patch.isPublicDashboard !== "boolean") return undefined;
   lead.isPublicDashboard = patch.isPublicDashboard;
   return structuredClone({ item: lead });
+}
+
+function mockAccountDetail(accountId: number): AccountDetailResponse {
+  const base = mockAccounts.find(a => a.id === accountId) ?? mockAccounts[0];
+  const isUninit = accountId === 4;
+  const isStaleErr = accountId === 3;
+  const isMixed = accountId === 2;
+  const fetchedAt = isUninit ? null : isStaleErr ? now - 240_000 : now - 5_000;
+  const covStart = now - 30 * 86_400_000;
+  return {
+    account: {
+      id: accountId,
+      ownerUserId: base.ownerUserId ?? 1,
+      name: base.name ?? `Account #${accountId}`,
+      exchange: base.exchange ?? "binance",
+      environment: (base.environment as Account["environment"]) ?? "live",
+      apiKeyMasked: "****4k9x",
+      isEnabled: base.isEnabled ?? true,
+      marginMode: "cross",
+      positionMode: "hedge",
+      clockOffsetMs: isStaleErr ? 1850 : -24,
+      status: base.status ?? "connected",
+      lastSyncAt: fetchedAt ? new Date(fetchedAt).toISOString() : null,
+      lastSyncAtMs: fetchedAt,
+      lastError: base.lastError ?? null,
+      readOnly: true,
+    },
+    risk: {
+      currency: "USDT",
+      riskLevel: isUninit ? "unknown" : isMixed ? "warning" : isStaleErr ? "critical" : "normal",
+      equity: isUninit ? null : (base.totalEquity ?? 24782.6),
+      walletBalance: isUninit ? null : (isMixed ? 24865.3 : 10300),
+      availableBalance: isUninit ? null : (base.availEquity ?? 20190.3),
+      unrealizedPnl: isUninit ? null : (base.unrealizedPnl ?? -82.7),
+      hwmEquity: isUninit ? null : 25400,
+      drawdownPct: isUninit ? null : (isMixed ? 2.43 : 0),
+      dayStartEquity: isUninit ? null : (isMixed ? 25000 : 10200),
+      todayNetFlow: isUninit ? null : (isMixed ? 200 : 0),
+      todayPnl: isUninit || isStaleErr ? null : (isMixed ? -417.4 : 226.5),
+      totalNotional: isUninit ? null : (isMixed ? 18420 : 1390),
+      longNotional: isUninit ? null : (isMixed ? 14220 : 1390),
+      shortNotional: isUninit ? null : (isMixed ? 4200 : 0),
+      netNotional: isUninit ? null : (isMixed ? 10020 : 1390),
+      allocatedNotional: isUninit ? null : (isMixed ? 14220 : 1390),
+      unallocatedNotional: isUninit ? null : (isMixed ? 4200 : 0),
+      maxSinglePositionSharePct: isUninit ? null : (isMixed ? 77.2 : 100),
+      initialMargin: isUninit ? null : (isMixed ? 3892.3 : 463.3),
+      initialMarginRatio: isUninit ? null : 0.157,
+      initialMarginRatioPct: isUninit ? null : 15.7,
+      maintenanceMargin: isUninit ? null : (isMixed ? 194.6 : 12.4),
+      marginRatio: isUninit ? null : (isMixed ? 0.52 : 0.12),
+      marginRatioPct: isUninit ? null : (isMixed ? 52.0 : 12.0),
+      marginRatioSource: isUninit ? null : "derived",
+      effectiveLeverage: isUninit ? null : (isMixed ? 0.74 : 0.13),
+      closestLiquidationDistancePct: isUninit ? null : (isMixed ? 8.4 : 42.1),
+      closestLiquidationSymbol: isUninit ? null : "SOLUSDT",
+      positionCount: isUninit ? null : (isMixed ? 2 : 1),
+      openOrderCount: isUninit ? null : (isMixed ? 2 : 1),
+      canTrade: isUninit ? null : !isStaleErr,
+      multiAssetsMargin: false,
+      dualSidePosition: true,
+      otherAssets: isMixed ? [{ currency: "USDC", equity: 320.5, available: 320.5, walletBalance: 320.5, unrealizedPnl: 0 }] : [],
+      snapshotAsOfMs: fetchedAt,
+      snapshotQuality: isUninit ? null : (isStaleErr ? "partial" : "ok"),
+      dataQuality: { status: isUninit ? "unavailable" : isStaleErr ? "stale" : "ok", fetchedAt, coverageStart: covStart, coverageEnd: fetchedAt },
+    },
+    pnl: {
+      currency: "USDT",
+      range: "30d",
+      startMs: covStart,
+      endMs: fetchedAt,
+      cashflowStatus: isUninit ? "unavailable" : "ok",
+      cashflowCoverageComplete: !isUninit && !isStaleErr,
+      cashflowCoverageStartMs: isUninit ? null : covStart,
+      fillsStatus: isUninit ? "unavailable" : "ok",
+      fillsCoverageComplete: !isUninit,
+      startEquity: isUninit ? null : 21500,
+      endEquity: isUninit ? null : (base.totalEquity ?? 24782.6),
+      totalEquityChange: isUninit ? null : 3282.6,
+      unrealizedPnlChange: isUninit ? null : -82.7,
+      deposits: isUninit ? null : 2000,
+      withdrawals: isUninit ? null : 500,
+      netTransfers: isUninit ? null : 1500,
+      nonTradingExternal: isUninit ? null : 25,
+      tradingNetPnl: isUninit ? null : 1757.6,
+      tradingPnl: isUninit ? null : 1757.6,
+      ledgerNetPnl: isUninit ? null : 1757.4,
+      ledger: {
+        realizedPnl: isUninit ? null : 1912.5,
+        fundingFee: isUninit ? null : -34.1,
+        commission: isUninit ? null : -42.3,
+        commissionRebate: isUninit ? null : 4.0,
+        liquidationFee: isUninit ? null : 0,
+        insuranceClear: isUninit ? null : 0,
+        bonus: isUninit ? null : 25,
+        referralRebate: isUninit ? null : 0,
+        otherIncome: isUninit ? null : 0,
+        otherExternalFlow: isUninit ? null : 0,
+        unknownFlow: isUninit ? null : 0,
+      },
+      reconciled: isUninit ? null : true,
+      reconciliationDelta: isUninit ? null : 0.2,
+      attribution: {
+        system: { fillCount: isUninit ? 0 : 12, grossRealizedPnlUsdt: isUninit ? null : 1680, commissionUsdt: isUninit ? null : 31.2, netPnlUsdt: isUninit ? null : 1648.8 },
+        manual: { fillCount: isUninit ? 0 : 3, grossRealizedPnlUsdt: isUninit ? null : 232.5, commissionUsdt: isUninit ? null : 11.1, netPnlUsdt: isUninit ? null : 221.4 },
+        unknown: { fillCount: 0, grossRealizedPnlUsdt: isUninit ? null : 0, commissionUsdt: isUninit ? null : 0, netPnlUsdt: isUninit ? null : 0 },
+      },
+      bySymbol: isUninit ? [] : [
+        { symbol: "BTCUSDT", fillCount: 10, realizedPnlUsdt: 1680, commissionUsdt: 31.2, fundingFeeUsdt: -21.0, netPnlUsdt: 1627.8 },
+        { symbol: "SOLUSDT", fillCount: 5, realizedPnlUsdt: 232.5, commissionUsdt: 11.1, fundingFeeUsdt: -13.1, netPnlUsdt: 208.3 },
+      ],
+      byBinding: isUninit ? [] : [{ bindingId: 12, bindingName: "Atlas / Live", fillCount: 12, realizedPnlUsdt: 1680, commissionUsdt: 31.2, netPnlUsdt: 1648.8 }],
+      nonUsdtFillCommissions: isMixed ? { BNB: 0.012 } : {},
+      otherAssetCashflows: [],
+      dataQuality: { status: isUninit ? "unavailable" : "ok", fetchedAt, coverageStart: covStart, coverageEnd: fetchedAt },
+    },
+    positions: {
+      positionsKnown: !isUninit,
+      allocatedNotionalUsdt: isUninit ? null : (isMixed ? 14220 : 1390),
+      unallocatedNotionalUsdt: isUninit ? null : (isMixed ? 4200 : 0),
+      orphanAllocations: [],
+      dataQuality: { status: isUninit ? "unavailable" : isStaleErr ? "stale" : "ok", fetchedAt },
+      items: isUninit ? [] : [
+        {
+          instId: "BTCUSDT", symbol: "BTCUSDT", currency: "USDT", posSide: "long", rawPosSide: "LONG", mgnMode: "cross",
+          qty: isMixed ? 0.2 : 0.02, availQty: isMixed ? 0.2 : 0.02, avgPx: 68420.5, curPx: 71100,
+          breakEvenPx: 68490, liquidationPx: 54120, liqDistancePct: 23.88, upl: 535.9, uplRatioPct: 12.1,
+          notionalUsd: isMixed ? 14220 : 1390, initialMargin: 2844, maintenanceMargin: 71.1, marginRatio: 0.08,
+          lever: 5, adlQuantile: 2, ownership: "system", unallocatedClass: "none",
+          allocatedQty: isMixed ? 0.2 : 0.02, unallocatedQty: 0, overAllocatedQty: 0, requiresProtection: true,
+          allocations: [{ allocationId: 1, bindingId: isMixed ? 12 : 11, bindingName: isMixed ? "Atlas / Live" : "Atlas / Paper", leadId: 1, leadName: "Atlas Momentum", ownedQty: isMixed ? 0.2 : 0.02, expectedQty: isMixed ? 0.2 : 0.02, entryCost: 13684, cycleRatio: 1, generation: 2, openedAtMs: now - 3 * 3_600_000 }],
+          protection: { status: "protected", hasTakeProfit: true, hasStopLoss: true, hasTrailingStop: false, hasSoftwareGuard: true, slCoveredQty: isMixed ? 0.2 : 0.02, slCoveragePct: 100, nearestSlPrice: 67200, tpCoveredQty: isMixed ? 0.2 : 0.02, tpCoveragePct: 100, nearestTpPrice: 73500, overCovered: false, protectiveOrderCount: 2, orders: [] },
+        },
+        ...(isMixed ? [{
+          instId: "SOLUSDT", symbol: "SOLUSDT", currency: "USDT", posSide: "short", rawPosSide: "SHORT", mgnMode: "isolated",
+          qty: 24.5, availQty: 24.5, avgPx: 171.4, curPx: 171.43, breakEvenPx: 171.3, liquidationPx: 185.83, liqDistancePct: 8.4,
+          upl: -18.4, uplRatioPct: -2.1, notionalUsd: 4200, initialMargin: 840, maintenanceMargin: 42, marginRatio: 0.52,
+          lever: 5, adlQuantile: 4, ownership: "manual" as const, unallocatedClass: "manual" as const,
+          allocatedQty: 0, unallocatedQty: 24.5, overAllocatedQty: 0, requiresProtection: false,
+          allocations: [],
+          protection: { status: "unprotected" as const, hasTakeProfit: false, hasStopLoss: false, hasTrailingStop: false, hasSoftwareGuard: false, slCoveredQty: 0, slCoveragePct: 0, nearestSlPrice: null, tpCoveredQty: 0, tpCoveragePct: 0, nearestTpPrice: null, overCovered: false, protectiveOrderCount: 0, orders: [] },
+        }] : []),
+      ],
+    },
+    openOrdersSummary: {
+      openOrdersKnown: !isUninit && !isStaleErr,
+      openOrdersStale: isStaleErr,
+      fetchedAtMs: fetchedAt,
+      openOrdersStatus: isUninit ? "unavailable" : isStaleErr ? "stale" : "ok",
+      unprotectedCount: isUninit || isStaleErr ? null : (isMixed ? 1 : 0),
+      partialProtectedCount: isUninit || isStaleErr ? null : 0,
+      totalOpenOrders: isUninit ? null : (isMixed ? 2 : 1),
+      byCategory: isUninit ? {} : { stop_loss: 1, take_profit: isMixed ? 1 : 0 },
+      dataQuality: { status: isUninit ? "unavailable" : isStaleErr ? "stale" : "ok", fetchedAt },
+    },
+    bindings: {
+      items: mockBindings.filter(b => b.accountId === accountId).map(b => ({
+        id: b.id, name: b.name ?? "", leadId: b.leadId ?? 0, leadName: b.leadName ?? "", isEnabled: Boolean(b.isEnabled),
+        riskScale: b.riskScale ?? 1, orderMode: b.orderMode ?? "ioc_then_market", tpSlMode: b.tpSlMode ?? "follow_lead",
+        circuitBreakerTripped: Boolean(b.circuitBreakerTripped), circuitBreakerReason: b.circuitBreakerReason ?? null,
+        consecutiveFailures: b.consecutiveFailures ?? 0, allocatedPositionsCount: 1, allocatedNotionalUsd: isMixed ? 14220 : 1390,
+        periodNetPnlUsdt: isUninit ? null : 1648.8, periodFillCount: isUninit ? 0 : 12,
+      })),
+      dataQuality: { status: "ok", fetchedAt: now },
+    },
+    alerts: {
+      active: isMixed ? [
+        { code: "LIQUIDATION_PROXIMITY", scopeKey: "SOLUSDT:short", severity: "warning", messageKey: "accountDetail.alert.liqProximityWarning", params: { symbol: "SOLUSDT", pct: 8.4 }, firstSeenAtMs: now - 300_000, lastSeenAtMs: now - 5_000 },
+        { code: "POSITION_UNPROTECTED", scopeKey: "SOLUSDT:short", severity: "warning", messageKey: "accountDetail.alert.positionUnprotected", params: { symbol: "SOLUSDT", side: "short" }, firstSeenAtMs: now - 300_000, lastSeenAtMs: now - 5_000 },
+      ] : isUninit ? [
+        { code: "ACCOUNT_SYNC_STALE", scopeKey: "", severity: "warning", messageKey: "accountDetail.alert.neverSynced", params: {} },
+      ] : [],
+      recentResolved: [],
+      criticalCount: 0,
+      warningCount: isMixed ? 2 : isUninit ? 1 : 0,
+      infoCount: 0,
+      dataQuality: { status: "ok", fetchedAt: now },
+    },
+    dataQuality: {
+      overallStatus: isUninit ? "degraded" : isMixed ? "partial" : "ok",
+      accountSyncedAtMs: fetchedAt,
+      accountSyncStale: isUninit || isStaleErr,
+      openOrdersFetchedAtMs: fetchedAt,
+      openOrdersComplete: !isUninit && !isStaleErr,
+      datasets: {
+        equity: { dataset: "equity", status: isUninit ? "unavailable" : isStaleErr ? "stale" : "ok", coverageStartMs: covStart, coverageEndMs: fetchedAt, lastSuccessAtMs: fetchedAt, recordCount: isUninit ? 0 : 120 },
+        open_orders: { dataset: "open_orders", status: isUninit ? "unavailable" : isStaleErr ? "stale" : "ok", lastSuccessAtMs: fetchedAt, recordCount: isUninit ? 0 : 2 },
+        cashflow: { dataset: "cashflow", status: isUninit ? "unavailable" : "ok", coverageStartMs: covStart, coverageEndMs: fetchedAt, lastSuccessAtMs: fetchedAt, recordCount: isUninit ? 0 : 18 },
+        fills: { dataset: "fills", status: isUninit ? "unavailable" : "ok", coverageStartMs: covStart, coverageEndMs: fetchedAt, lastSuccessAtMs: fetchedAt, recordCount: isUninit ? 0 : 15 },
+        orders: { dataset: "orders", status: isUninit ? "unavailable" : "ok", coverageStartMs: covStart, coverageEndMs: fetchedAt, lastSuccessAtMs: fetchedAt, recordCount: isUninit ? 0 : 18 },
+        force_orders: { dataset: "force_orders", status: isUninit ? "unavailable" : "ok", coverageStartMs: covStart, coverageEndMs: fetchedAt, lastSuccessAtMs: fetchedAt, recordCount: 0 },
+        commission_rates: { dataset: "commission_rates", status: isUninit ? "unavailable" : "ok", lastSuccessAtMs: fetchedAt, recordCount: 2 },
+        daily_snapshots: { dataset: "daily_snapshots", status: accountId === 1 ? "unsupported" : "ok", errorMessage: accountId === 1 ? "Demo mode" : null, recordCount: accountId === 1 ? 0 : 30 },
+      },
+    },
+  };
+}
+
+function mockAccountEquity(accountId: number, range: string): AccountEquityCurveResponse {
+  if (accountId === 4) {
+    return {
+      currency: "USDT", range, resolution: "raw", cashflowCovered: false, cashflowCoverageStartMs: null,
+      points: [], transfers: [], currentDrawdownPct: null, maxDrawdownPct: null,
+      summary: { pointCount: 0, startEquity: null, endEquity: null, peakEquity: null, twrPct: null, currentDrawdownPct: null, maxDrawdownPct: null },
+      dataQuality: { status: "unavailable" }, cashflowQuality: { status: "unavailable" },
+    };
+  }
+  const vals = [21500, 21950, 21200, 23200, 23680, 24100, 24782.6];
+  const stepMs = range === "24h" ? 3_600_000 : 86_400_000;
+  const points = vals.map((eq, idx) => ({
+    tsMs: now - (vals.length - 1 - idx) * stepMs,
+    bucketStartMs: now - (vals.length - 1 - idx) * stepMs,
+    resolution: range === "24h" ? "raw" : idx === 0 ? "day" : "hour",
+    source: idx === 0 ? "exchange_daily" : "account_sync",
+    dataQuality: idx === 0 ? "partial" : "ok",
+    gapBefore: idx === 4,
+    equity: eq,
+    equityMin: eq - 80,
+    equityMax: eq + 95,
+    cumulativeTradingPnl: eq - 21500 - (idx >= 3 ? 1500 : 0),
+    twrIndex: [1, 1.021, 0.986, 0.986, 1.006, 1.024, 1.053][idx],
+    twrPct: [0, 2.1, -1.4, -1.4, 0.6, 2.4, 5.3][idx],
+    drawdownPct: [0, 0, 3.43, 3.43, 1.47, 0, 0][idx],
+    walletBalance: eq - 20, availableBalance: eq * 0.8, unrealizedPnl: 20,
+    totalNotional: 18420, marginRatio: 0.14, effectiveLeverage: 0.74,
+  }));
+  return {
+    currency: "USDT", range, resolution: range === "24h" ? "raw" : "hour",
+    cashflowCovered: true, cashflowCoverageStartMs: now - 30 * 86_400_000,
+    points,
+    transfers: [{ id: 1, tsMs: points[3].tsMs - 10_000, category: "TRANSFER_IN", signedAmount: 2000, asset: "USDT" }],
+    currentDrawdownPct: 0, maxDrawdownPct: 3.43,
+    summary: { pointCount: points.length, startEquity: 21500, endEquity: 24782.6, peakEquity: 24782.6, twrPct: 5.3, currentDrawdownPct: 0, maxDrawdownPct: 3.43 },
+    dataQuality: { status: "ok", fetchedAt: now - 5000 },
+    cashflowQuality: { status: "ok", fetchedAt: now - 5000 },
+  };
 }
 export function mockResponse(endpoint: string): unknown {
   const url = new URL(endpoint, "http://mock.local");
@@ -341,6 +624,60 @@ export function mockResponse(endpoint: string): unknown {
       counts,
     };
   } else if (url.pathname === "/api/accounts") value = { items: mockAccounts };
+  else if (/^\/api\/accounts\/(\d+)\/detail$/.test(url.pathname)) {
+    const id = Number(url.pathname.split("/")[3]);
+    value = mockAccountDetail(id);
+  } else if (/^\/api\/accounts\/(\d+)\/equity$/.test(url.pathname)) {
+    const id = Number(url.pathname.split("/")[3]);
+    value = mockAccountEquity(id, url.searchParams.get("range") || "30d");
+  } else if (/^\/api\/accounts\/(\d+)\/cashflows$/.test(url.pathname)) {
+    const id = Number(url.pathname.split("/")[3]);
+    const cat = url.searchParams.get("category") || "";
+    const sym = (url.searchParams.get("symbol") || "").toUpperCase();
+    const rows: AccountCashflowsResponse["items"] = id === 4 ? [] : [
+      { id: 3, exchange: "binance", externalId: "tx-103", asset: "USDT", rawType: "REALIZED_PNL", category: "REALIZED_PNL", signedAmount: 420.5, symbol: "BTCUSDT", occurredAtMs: now - 3600_000, source: "exchange_income" },
+      { id: 2, exchange: "binance", externalId: "tx-102", asset: "USDT", rawType: "FUNDING_FEE", category: "FUNDING_FEE", signedAmount: -8.4, symbol: "SOLUSDT", occurredAtMs: now - 7200_000, source: "exchange_income" },
+      { id: 1, exchange: "binance", externalId: "tx-101", asset: "USDT", rawType: "TRANSFER", category: "TRANSFER_IN", signedAmount: 2000, symbol: null, occurredAtMs: now - 86_400_000, source: "exchange_income" },
+    ];
+    const filtered = rows.filter(r => (!cat || r.category === cat) && (!sym || r.symbol === sym));
+    value = { items: filtered, nextCursor: null, hasMore: false, dataQuality: { status: id === 4 ? "unavailable" : "ok", fetchedAt: now - 5000 } } satisfies AccountCashflowsResponse;
+  } else if (/^\/api\/accounts\/(\d+)\/trades$/.test(url.pathname)) {
+    const id = Number(url.pathname.split("/")[3]);
+    const rt = url.searchParams.get("recordType") || "";
+    const src = url.searchParams.get("source") || "";
+    const rows: AccountTradesResponse["items"] = id === 4 ? [] : [
+      { recordType: "fill", id: 20, occurredAtMs: now - 1800_000, symbol: "BTCUSDT", instId: "BTCUSDT", side: "sell", positionSide: "long", qty: 0.1, price: 70500, quoteQty: 7050, realizedPnl: 420.5, fee: 3.1, feeAsset: "USDT", maker: false, status: "FILLED", sourceClass: "system", attributionConfidence: "exact", bindingId: 12, bindingName: "Atlas / Live", executionId: 91, exchangeOrderId: "ord-20", exchangeFillId: "fill-20" },
+      { recordType: "execution", id: 21, occurredAtMs: now - 2400_000, symbol: "ETHUSDT", instId: "ETHUSDT", side: "buy", positionSide: "short", action: "CLOSE", qty: 0, price: 3720, status: "BLOCKED_SLIPPAGE", details: "Slippage 0.92% > 0.50%", sourceClass: "system", attributionConfidence: "exact", bindingId: 12, bindingName: "Atlas / Live", slippagePct: 0.92, spreadPct: 0.04 },
+      { recordType: "order", id: 22, occurredAtMs: now - 3600_000, symbol: "SOLUSDT", instId: "SOLUSDT", side: "sell", positionSide: "short", category: "ordinary", orderType: "LIMIT", qty: 24.5, filledQty: 24.5, price: 171.4, status: "FILLED", sourceClass: "manual", exchangeOrderId: "ord-22" },
+    ];
+    const filtered = rows.filter(r => (!rt || r.recordType === rt) && (!src || r.sourceClass === src));
+    value = { items: filtered, nextCursor: null, hasMore: false, dataQuality: { status: id === 4 ? "unavailable" : "ok" }, ordersQuality: { status: id === 4 ? "unavailable" : "ok" } } satisfies AccountTradesResponse;
+  } else if (/^\/api\/accounts\/(\d+)\/orders$/.test(url.pathname)) {
+    const id = Number(url.pathname.split("/")[3]);
+    const st = url.searchParams.get("state") || "open";
+    if (st === "open") {
+      value = {
+        state: "open", openOrdersKnown: id !== 4 && id !== 3, openOrdersStale: id === 3, fetchedAtMs: id === 4 ? null : now - 5000,
+        items: id === 4 ? [] : [
+          { orderId: "oo-1", algoId: "alg-1", category: "stop_loss", symbol: "BTCUSDT", instId: "BTCUSDT", side: "sell", positionSide: "long", orderType: "STOP_MARKET", status: "NEW", qty: 0.2, triggerPrice: 67200, reduceOnly: true, closePosition: false, sourceClass: "system", bindingId: 12, bindingName: "Atlas / Live" },
+          { orderId: "oo-2", algoId: "alg-2", category: "take_profit", symbol: "BTCUSDT", instId: "BTCUSDT", side: "sell", positionSide: "long", orderType: "TAKE_PROFIT_MARKET", status: "NEW", qty: 0.2, triggerPrice: 73500, reduceOnly: true, closePosition: false, sourceClass: "system", bindingId: 12, bindingName: "Atlas / Live" },
+        ],
+        nextCursor: null, hasMore: false, dataQuality: { status: id === 4 ? "unavailable" : id === 3 ? "stale" : "ok", fetchedAt: id === 4 ? null : now - 5000 },
+      } satisfies AccountOrdersResponse;
+    } else {
+      value = { state: "history", items: [], nextCursor: null, hasMore: false, dataQuality: { status: id === 4 ? "unavailable" : "ok" } } satisfies AccountOrdersResponse;
+    }
+  } else if (/^\/api\/accounts\/(\d+)\/performance$/.test(url.pathname)) {
+    const id = Number(url.pathname.split("/")[3]);
+    value = {
+      range: url.searchParams.get("range") || "90d",
+      fillsStatus: id === 4 ? "unavailable" : "ok", fillsCoverageStartMs: id === 4 ? null : now - 30 * 86_400_000, fillsCoverageEndMs: id === 4 ? null : now, ordersStatus: id === 4 ? "unavailable" : "ok",
+      tradeSummary: { fillCount: id === 4 ? 0 : 15, volumeUsd: id === 4 ? null : 142500, grossRealizedPnlUsdt: id === 4 ? null : 1912.5, commissionUsdt: id === 4 ? null : 42.3, nonUsdtCommissions: {}, netRealizedPnlUsdt: id === 4 ? null : 1870.2, makerCount: id === 4 ? 0 : 6, takerCount: id === 4 ? 0 : 9, makerRatioPct: id === 4 ? null : 40, closedCycleCount: id === 4 ? 0 : 8, incompleteCycleCount: id === 4 ? 0 : 1, winCount: id === 4 ? 0 : 6, lossCount: id === 4 ? 0 : 2, breakevenCount: 0, winRatePct: id === 4 ? null : 75, payoffRatio: id === 4 ? null : 2.1, profitFactor: id === 4 ? null : 4.2, expectancyUsdt: id === 4 ? null : 233.78, avgWinUsdt: id === 4 ? null : 362.5, avgLossUsdt: id === 4 ? null : 172.6, largestWinUsdt: id === 4 ? null : 740, largestLossUsdt: id === 4 ? null : -210, avgHoldingDurationMs: id === 4 ? null : 14_400_000 },
+      executionQuality: { totalExecutions: id === 4 ? 0 : 14, executedCount: id === 4 ? 0 : 11, failedCount: id === 4 ? 0 : 1, blockedCount: id === 4 ? 0 : 2, skippedCount: 0, successRatePct: id === 4 ? null : 78.57, avgSlippagePct: id === 4 ? null : 0.042, medianSlippagePct: id === 4 ? null : 0.031, p95SlippagePct: id === 4 ? null : 0.11, maxSlippagePct: id === 4 ? null : 0.14, avgSpreadPct: id === 4 ? null : 0.018, spreadSampleCount: id === 4 ? 0 : 11, avgLatencyMs: id === 4 ? null : 480, p95LatencyMs: id === 4 ? null : 920, exactLatencyCount: id === 4 ? 0 : 9, estimatedLatencyCount: id === 4 ? 0 : 2, statusCounts: id === 4 ? {} : { EXECUTED: 11, BLOCKED_SLIPPAGE: 2, FAILED: 1 } },
+      commissionRates: id === 4 ? [] : [{ symbol: "BTCUSDT", instId: "BTCUSDT", makerRate: 0.0002, takerRate: 0.0005 }],
+      bySymbol: [], dataQuality: { status: id === 4 ? "unavailable" : "ok" },
+    } satisfies AccountPerformanceResponse;
+  }
   else if (url.pathname === "/api/leads") value = { items: mockLeads };
   else if (/\/api\/leads\/\d+\/snapshot$/.test(url.pathname)) {
     const lead = mockBoard.leads?.find(item => item.id === Number(url.pathname.split("/")[3]));

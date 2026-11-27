@@ -11,14 +11,25 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from app.services.adapters.base import (
+    AccountRiskInfo,
     BalanceInfo,
     BaseExchangeAdapter,
+    CashflowEntry,
+    CommissionRateInfo,
+    DatasetCapability,
+    DatasetPage,
     ExchangeAPIError,
     ExchangePosition,
     InstrumentSpec,
+    OpenOrderEntry,
     OrderBook,
+    OrderHistoryEntry,
     OrderResult,
+    TradeFill,
     api_error,
+    make_dedupe_key,
+    safe_decimal,
+    safe_optional_float,
 )
 from app.services.proxy.manager import ProxyManager
 
@@ -197,12 +208,25 @@ class OKXAdapter(BaseExchangeAdapter):
             upl = float(p.get("upl") or 0.0)
             raw_upl_ratio = p.get("uplRatio")
             upl_ratio = float(raw_upl_ratio) if raw_upl_ratio not in (None, "") else ((upl / margin_usd) if margin_usd > 0 else 0.0)
+            mgn_mode = str(p.get("mgnMode") or "cross").lower()
+            liq_price = safe_optional_float(p.get("liqPx"), positive_only=True)
+            maint_margin = safe_optional_float(p.get("mmr"))
+            init_margin = safe_optional_float(p.get("imr") or p.get("margin"))
+            break_even = safe_optional_float(p.get("bePx"), positive_only=True)
+            raw_adl = str(p.get("adl") or "").strip()
+            adl_q = int(raw_adl) if raw_adl.isascii() and raw_adl.isdecimal() else None
+            iso_wallet = safe_optional_float(p.get("margin")) if mgn_mode == "isolated" else None
+            # OKX mgnRatio is equity / mmr (higher is safer); invert to fraction mmr / equity.
+            raw_mr = safe_optional_float(p.get("mgnRatio"), positive_only=True)
+            pos_margin_ratio = (1.0 / raw_mr) if raw_mr else None
+            if pos_margin_ratio is None and mgn_mode == "isolated" and maint_margin is not None and iso_wallet and iso_wallet > 0:
+                pos_margin_ratio = maint_margin / iso_wallet
             positions.append(
                 ExchangePosition(
                     inst_id=inst_id,
                     symbol=base_sym,
                     pos_side=logical_side,
-                    mgn_mode=str(p.get("mgnMode") or "cross").lower(),
+                    mgn_mode=mgn_mode,
                     pos=abs(pos_sz),
                     avail_pos=abs(float(p.get("availPos") or 0.0)),
                     avg_px=float(p.get("avgPx") or 0.0),
@@ -214,6 +238,13 @@ class OKXAdapter(BaseExchangeAdapter):
                     c_time=int(p.get("cTime") or 0),
                     u_time=int(p.get("uTime") or 0),
                     margin_usd=margin_usd,
+                    liquidation_price=liq_price,
+                    maintenance_margin=maint_margin,
+                    initial_margin=init_margin,
+                    break_even_price=break_even,
+                    adl_quantile=adl_q,
+                    margin_ratio=pos_margin_ratio,
+                    isolated_wallet=iso_wallet,
                 )
             )
         return positions
@@ -462,3 +493,370 @@ class OKXAdapter(BaseExchangeAdapter):
             except Exception:
                 continue
         return cancelled
+
+    @staticmethod
+    def _okx_symbol(inst_id: str) -> str:
+        if inst_id.endswith("-USDT-SWAP"):
+            return inst_id.removesuffix("-USDT-SWAP") + "USDT"
+        if inst_id.endswith("-USDC-SWAP"):
+            return inst_id.removesuffix("-USDC-SWAP") + "USDC"
+        return inst_id
+
+    @staticmethod
+    def _okx_pos_side(raw: Any) -> str:
+        val = str(raw or "net").lower()
+        if val == "long":
+            return "LONG"
+        if val == "short":
+            return "SHORT"
+        return "BOTH"
+
+    def get_dataset_capabilities(self) -> Dict[str, DatasetCapability]:
+        return {
+            "equity": DatasetCapability("equity", True, True),
+            "open_orders": DatasetCapability("open_orders", True, True),
+            "cashflow": DatasetCapability("cashflow", True, False, retention_days=90, note="OKX bills-archive retains up to 3 months"),
+            "fills": DatasetCapability("fills", True, False, retention_days=90, note="OKX fills-history retains up to 3 months"),
+            "orders": DatasetCapability("orders", True, False, retention_days=90, note="OKX orders-history-archive retains up to 3 months"),
+            "force_orders": DatasetCapability("force_orders", False, False, note="OKX does not expose a dedicated force-order endpoint"),
+            "commission_rates": DatasetCapability("commission_rates", True, True),
+            "daily_snapshots": DatasetCapability("daily_snapshots", False, False, note="Not supported on OKX"),
+        }
+
+    async def get_account_risk_snapshot(self) -> AccountRiskInfo:
+        bal_list = await self._request("GET", "/api/v5/account/balance")
+        cfg_list = []
+        try:
+            cfg_list = await self._request("GET", "/api/v5/account/config")
+        except Exception:
+            cfg_list = []
+        bal = bal_list[0] if isinstance(bal_list, list) and bal_list else {}
+        cfg = cfg_list[0] if isinstance(cfg_list, list) and cfg_list else {}
+        asset_balances: Dict[str, Dict[str, Optional[Decimal]]] = {}
+        usdt_det: Dict[str, Any] = {}
+        for det in bal.get("details", []) if isinstance(bal, dict) else []:
+            if not isinstance(det, dict):
+                continue
+            ccy = str(det.get("ccy") or "").upper()
+            if not ccy:
+                continue
+            eq = safe_decimal(det.get("eq"))
+            avail = safe_decimal(det.get("availEq"))
+            wb = safe_decimal(det.get("cashBal"))
+            upl = safe_decimal(det.get("upl"))
+            im = safe_decimal(det.get("imr"))
+            mm = safe_decimal(det.get("mmr"))
+            if ccy == "USDT":
+                usdt_det = det
+            if any(v is not None and v != 0 for v in (eq, avail, wb, upl, im, mm)) or ccy == "USDT":
+                asset_balances[ccy] = {
+                    "equity": eq, "available": avail, "wallet": wb,
+                    "upl": upl, "initialMargin": im, "maintenanceMargin": mm,
+                }
+        equity = safe_decimal(usdt_det.get("eq"))
+        avail_bal = safe_decimal(usdt_det.get("availEq"))
+        wallet_bal = safe_decimal(usdt_det.get("cashBal"))
+        upl_bal = safe_decimal(usdt_det.get("upl"))
+        init_margin = safe_decimal(usdt_det.get("imr"))
+        maint_margin = safe_decimal(usdt_det.get("mmr"))
+        margin_ratio: Optional[Decimal] = None
+        source: Optional[str] = None
+        if maint_margin is not None and equity is not None and equity > 0:
+            margin_ratio = maint_margin / equity
+            source = "derived_from_exchange_mmr"
+        else:
+            raw_mr = safe_decimal(usdt_det.get("mgnRatio") or (bal.get("mgnRatio") if isinstance(bal, dict) else None))
+            if raw_mr is not None and raw_mr > 0:
+                margin_ratio = Decimal("1") / raw_mr
+                source = "derived_from_exchange_mmr"
+        dual_side = True if cfg.get("posMode") == "long_short_mode" else (False if cfg.get("posMode") == "net_mode" else None)
+        as_of_ms = int(bal["uTime"]) if isinstance(bal, dict) and bal.get("uTime") else None
+        return AccountRiskInfo(
+            currency="USDT",
+            equity=equity,
+            available_balance=avail_bal,
+            wallet_balance=wallet_bal,
+            unrealized_pnl=upl_bal,
+            initial_margin=init_margin,
+            maintenance_margin=maint_margin,
+            margin_ratio=margin_ratio,
+            margin_ratio_source=source,
+            can_trade=True if cfg.get("acctLv") else None,
+            multi_assets_margin=(str(cfg.get("acctLv")) in ("3", "4")) if cfg.get("acctLv") is not None else None,
+            dual_side_position=dual_side,
+            as_of_ms=as_of_ms,
+            asset_balances=asset_balances,
+        )
+
+    async def get_open_orders_normalized(self) -> List[OpenOrderEntry]:
+        raw_rows = await self.get_open_orders()
+        entries: List[OpenOrderEntry] = []
+        for row in raw_rows:
+            if not isinstance(row, dict):
+                continue
+            inst_id = str(row.get("instId") or "")
+            sym = self._okx_symbol(inst_id)
+            side = str(row.get("side") or "").upper()
+            pos_side = self._okx_pos_side(row.get("posSide"))
+            close_fraction = str(row.get("closeFraction") or "").strip() == "1"
+            qty = None if close_fraction else safe_decimal(row.get("sz"))
+            created_ms = int(row["cTime"]) if row.get("cTime") else None
+            updated_ms = int(row["uTime"]) if row.get("uTime") else created_ms
+            if row.get("algoId"):
+                aid = str(row["algoId"])
+                ord_type = str(row.get("ordType") or "conditional").lower()
+                tp_trig = safe_decimal(row.get("tpTriggerPx"))
+                sl_trig = safe_decimal(row.get("slTriggerPx"))
+                if tp_trig is not None and tp_trig > 0 and sl_trig is not None and sl_trig > 0:
+                    tp_px = safe_decimal(row.get("tpOrdPx"))
+                    sl_px = safe_decimal(row.get("slOrdPx"))
+                    entries.append(OpenOrderEntry(
+                        exchange="okx", order_id=f"{aid}:tp", client_order_id=row.get("algoClOrdId"),
+                        algo_id=aid, category="take_profit", symbol=sym, inst_id=inst_id,
+                        side=side, position_side=pos_side, order_type=ord_type.upper(),
+                        status=str(row.get("state") or "live").upper(), qty=qty, filled_qty=None,
+                        limit_price=tp_px if tp_px is not None and tp_px > 0 else None,
+                        trigger_price=tp_trig, reduce_only=bool(row.get("reduceOnly")) if row.get("reduceOnly") is not None else True,
+                        close_position=close_fraction, working_type=row.get("tpTriggerPxType"),
+                        created_at_ms=created_ms, updated_at_ms=updated_ms,
+                    ))
+                    entries.append(OpenOrderEntry(
+                        exchange="okx", order_id=f"{aid}:sl", client_order_id=row.get("algoClOrdId"),
+                        algo_id=aid, category="stop_loss", symbol=sym, inst_id=inst_id,
+                        side=side, position_side=pos_side, order_type=ord_type.upper(),
+                        status=str(row.get("state") or "live").upper(), qty=qty, filled_qty=None,
+                        limit_price=sl_px if sl_px is not None and sl_px > 0 else None,
+                        trigger_price=sl_trig, reduce_only=bool(row.get("reduceOnly")) if row.get("reduceOnly") is not None else True,
+                        close_position=close_fraction, working_type=row.get("slTriggerPxType"),
+                        created_at_ms=created_ms, updated_at_ms=updated_ms,
+                    ))
+                    continue
+                if tp_trig is not None and tp_trig > 0:
+                    category, trig, lmt, wtype = "take_profit", tp_trig, safe_decimal(row.get("tpOrdPx")), row.get("tpTriggerPxType")
+                elif sl_trig is not None and sl_trig > 0:
+                    category, trig, lmt, wtype = "stop_loss", sl_trig, safe_decimal(row.get("slOrdPx")), row.get("slTriggerPxType")
+                elif "move" in ord_type:
+                    category, trig, lmt, wtype = "trailing_stop", safe_decimal(row.get("activePx")), None, None
+                else:
+                    category, trig, lmt, wtype = "conditional", safe_decimal(row.get("triggerPx")), safe_decimal(row.get("orderPx")), row.get("triggerPxType")
+                if lmt is not None and lmt <= 0:
+                    lmt = None
+                entries.append(OpenOrderEntry(
+                    exchange="okx", order_id=aid, client_order_id=row.get("algoClOrdId"),
+                    algo_id=aid, category=category, symbol=sym, inst_id=inst_id,
+                    side=side, position_side=pos_side, order_type=ord_type.upper(),
+                    status=str(row.get("state") or "live").upper(), qty=qty, filled_qty=None,
+                    limit_price=lmt, trigger_price=trig if trig and trig > 0 else None,
+                    reduce_only=bool(row.get("reduceOnly")) if row.get("reduceOnly") is not None else None,
+                    close_position=close_fraction, working_type=wtype,
+                    created_at_ms=created_ms, updated_at_ms=updated_ms,
+                ))
+            else:
+                oid = str(row.get("ordId") or row.get("clOrdId") or "")
+                lmt = safe_decimal(row.get("px"))
+                entries.append(OpenOrderEntry(
+                    exchange="okx", order_id=oid, client_order_id=row.get("clOrdId"),
+                    algo_id=None, category="ordinary", symbol=sym, inst_id=inst_id,
+                    side=side, position_side=pos_side,
+                    order_type=str(row.get("ordType") or "LIMIT").upper(),
+                    status=str(row.get("state") or "live").upper(), qty=qty,
+                    filled_qty=safe_decimal(row.get("accFillSz")),
+                    limit_price=lmt if lmt and lmt > 0 else None, trigger_price=None,
+                    reduce_only=bool(row.get("reduceOnly")) if row.get("reduceOnly") is not None else None,
+                    close_position=False, working_type=None,
+                    created_at_ms=created_ms, updated_at_ms=updated_ms,
+                ))
+        return entries
+
+    async def get_cashflow_history(
+        self, start_ms: int, end_ms: int, cursor: Optional[Dict[str, Any]] = None
+    ) -> DatasetPage:
+        items: List[CashflowEntry] = []
+        seen: set[str] = set()
+        after = None
+        seen_cursors: set[str] = set()
+        complete = True
+        while True:
+            params: Dict[str, Any] = {"instType": "SWAP", "begin": start_ms, "end": end_ms, "limit": 100}
+            if after:
+                params["after"] = after
+            page = await self._request("GET", "/api/v5/account/bills-archive", params=params)
+            if not isinstance(page, list):
+                raise ValueError("Malformed OKX bills-archive response")
+            for row in page:
+                if not isinstance(row, dict):
+                    continue
+                bill_id = str(row.get("billId") or "").strip() or None
+                ts = int(row.get("ts") or 0)
+                ccy = str(row.get("ccy") or "").upper()
+                amt = safe_decimal(row.get("balChg"))
+                if not ccy or amt is None or ts <= 0:
+                    continue
+                raw_type = f"OKX_{row.get('type')}_{row.get('subType')}".strip("_")
+                t_code = str(row.get("type") or "")
+                sub_code = str(row.get("subType") or "")
+                if t_code == "1":
+                    category = "TRANSFER_IN" if amt >= 0 else "TRANSFER_OUT"
+                elif t_code == "8":
+                    category = "FUNDING_FEE"
+                elif t_code == "2":
+                    category = "REALIZED_PNL"
+                elif t_code in ("5", "6"):
+                    category = "LIQUIDATION_FEE"
+                elif sub_code in ("173", "174"):
+                    category = "FUNDING_FEE"
+                else:
+                    category = "UNKNOWN"
+                inst_id = str(row.get("instId") or "") or None
+                sym = self._okx_symbol(inst_id) if inst_id else None
+                d_key = make_dedupe_key("okx", bill_id, raw_type, ccy, sym, ts, str(amt))
+                if d_key in seen:
+                    continue
+                seen.add(d_key)
+                items.append(CashflowEntry(
+                    exchange="okx", external_id=bill_id, dedupe_key=d_key,
+                    asset=ccy, raw_type=raw_type, category=category,
+                    signed_amount=amt, symbol=sym, occurred_at_ms=ts,
+                    source="exchange_bill", metadata={"ordId": row.get("ordId"), "subType": row.get("subType")},
+                ))
+            if len(page) < 100:
+                break
+            after = page[-1].get("billId")
+            if not after or after in seen_cursors:
+                complete = False
+                break
+            seen_cursors.add(after)
+        items.sort(key=lambda i: (i.occurred_at_ms, i.dedupe_key))
+        return DatasetPage(items=items, complete=complete, coverage_start_ms=start_ms, coverage_end_ms=end_ms)
+
+    async def get_trade_fills(
+        self, symbols: List[str], start_ms: int, end_ms: int, cursor: Optional[Dict[str, Any]] = None
+    ) -> DatasetPage:
+        items: List[TradeFill] = []
+        seen: set[str] = set()
+        after = None
+        seen_cursors: set[str] = set()
+        complete = True
+        while True:
+            params: Dict[str, Any] = {"instType": "SWAP", "begin": start_ms, "end": end_ms, "limit": 100}
+            if after:
+                params["after"] = after
+            page = await self._request("GET", "/api/v5/trade/fills-history", params=params)
+            if not isinstance(page, list):
+                raise ValueError("Malformed OKX fills-history response")
+            for row in page:
+                if not isinstance(row, dict):
+                    continue
+                inst_id = str(row.get("instId") or "")
+                sym = self._okx_symbol(inst_id)
+                qty = safe_decimal(row.get("fillSz"))
+                px = safe_decimal(row.get("fillPx"))
+                ts = int(row.get("fillTime") or row.get("ts") or 0)
+                if not inst_id or qty is None or px is None or qty <= 0 or ts <= 0:
+                    continue
+                fid = str(row.get("tradeId") or row.get("billId") or "") or make_dedupe_key(
+                    inst_id, row.get("ordId"), ts, str(qty), str(px), row.get("side")
+                )
+                if fid in seen:
+                    continue
+                seen.add(fid)
+                raw_fee = safe_decimal(row.get("fee"))
+                # OKX reports fee as negative for paid fees and positive for rebates; invert to positive-cost convention.
+                comm = (-raw_fee) if raw_fee is not None else None
+                exec_type = str(row.get("execType") or "").upper()
+                items.append(TradeFill(
+                    exchange="okx", exchange_fill_id=fid,
+                    exchange_order_id=str(row.get("ordId") or "") or None,
+                    client_order_id=str(row.get("clOrdId") or "") or None,
+                    symbol=sym, inst_id=inst_id,
+                    side=str(row.get("side") or "").upper(),
+                    position_side=self._okx_pos_side(row.get("posSide")),
+                    qty=qty, price=px, quote_qty=qty * px,
+                    realized_pnl=safe_decimal(row.get("fillPnl")),
+                    commission_amount=comm,
+                    commission_asset=str(row.get("feeCcy")).upper() if row.get("feeCcy") else None,
+                    maker=(exec_type == "M") if exec_type in ("M", "T") else None,
+                    occurred_at_ms=ts, metadata={"subType": row.get("subType")},
+                ))
+            if len(page) < 100:
+                break
+            after = page[-1].get("billId")
+            if not after or after in seen_cursors:
+                complete = False
+                break
+            seen_cursors.add(after)
+        items.sort(key=lambda i: (i.occurred_at_ms, i.exchange_fill_id))
+        return DatasetPage(items=items, complete=complete, coverage_start_ms=start_ms, coverage_end_ms=end_ms)
+
+    async def get_order_history(
+        self, start_ms: int, end_ms: int, cursor: Optional[Dict[str, Any]] = None, symbols: Optional[List[str]] = None
+    ) -> DatasetPage:
+        items: List[OrderHistoryEntry] = []
+        seen: set[str] = set()
+        after = None
+        seen_cursors: set[str] = set()
+        complete = True
+        while True:
+            params: Dict[str, Any] = {"instType": "SWAP", "begin": start_ms, "end": end_ms, "limit": 100}
+            if after:
+                params["after"] = after
+            page = await self._request("GET", "/api/v5/trade/orders-history-archive", params=params)
+            if not isinstance(page, list):
+                raise ValueError("Malformed OKX orders-history-archive response")
+            for row in page:
+                if not isinstance(row, dict):
+                    continue
+                oid = str(row.get("ordId") or "").strip()
+                inst_id = str(row.get("instId") or "")
+                if not oid or not inst_id:
+                    continue
+                dkey = f"order:{oid}"
+                if dkey in seen:
+                    continue
+                seen.add(dkey)
+                c_ms = int(row.get("cTime") or row.get("uTime") or 0)
+                u_ms = int(row.get("uTime") or c_ms)
+                lmt = safe_decimal(row.get("px"))
+                avg = safe_decimal(row.get("avgPx"))
+                items.append(OrderHistoryEntry(
+                    exchange="okx", dedupe_key=dkey, exchange_order_id=oid,
+                    client_order_id=str(row.get("clOrdId") or "") or None,
+                    algo_id=None, client_algo_id=None, category="ordinary",
+                    symbol=self._okx_symbol(inst_id), inst_id=inst_id,
+                    side=str(row.get("side") or "").upper(),
+                    position_side=self._okx_pos_side(row.get("posSide")),
+                    order_type=str(row.get("ordType") or "LIMIT").upper(),
+                    status=str(row.get("state") or "UNKNOWN").upper(),
+                    qty=safe_decimal(row.get("sz")),
+                    filled_qty=safe_decimal(row.get("accFillSz")),
+                    avg_price=avg if avg and avg > 0 else None,
+                    limit_price=lmt if lmt and lmt > 0 else None,
+                    trigger_price=None,
+                    reduce_only=bool(row.get("reduceOnly")) if row.get("reduceOnly") is not None else None,
+                    close_position=False, working_type=None,
+                    created_at_ms=c_ms, updated_at_ms=u_ms, metadata={},
+                ))
+            if len(page) < 100:
+                break
+            after = page[-1].get("ordId")
+            if not after or after in seen_cursors:
+                complete = False
+                break
+            seen_cursors.add(after)
+        items.sort(key=lambda i: (i.updated_at_ms, i.dedupe_key))
+        return DatasetPage(items=items, complete=complete, coverage_start_ms=start_ms, coverage_end_ms=end_ms)
+
+    async def get_commission_rates(self, symbols: List[str]) -> List[CommissionRateInfo]:
+        data = await self._request("GET", "/api/v5/account/trade-fee", params={"instType": "SWAP"})
+        row = data[0] if isinstance(data, list) and data else {}
+        maker = safe_decimal(row.get("makerU") or row.get("maker"))
+        taker = safe_decimal(row.get("takerU") or row.get("taker"))
+        # OKX trade-fee uses negative numbers to represent fee rate deduction.
+        if maker is not None:
+            maker = abs(maker)
+        if taker is not None:
+            taker = abs(taker)
+        return [
+            CommissionRateInfo(symbol=self._okx_symbol(sym), inst_id=sym, maker_rate=maker, taker_rate=taker)
+            for sym in sorted({s.strip().upper() for s in symbols if s and s.strip()})
+        ]

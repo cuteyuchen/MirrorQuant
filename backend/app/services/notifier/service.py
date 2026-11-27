@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import fcntl
+import errno
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None  # type: ignore[assignment]
+    import msvcrt
 import hashlib
 import hmac
 import json
@@ -71,29 +76,60 @@ class NotificationService:
         path = notification_outbox_path(str(path))  # 写入时再次验证，不能绕过 schema。
         root = Path(get_settings().data_dir).expanduser().resolve()
         relative = path.relative_to(root)
-        # 逐级持有目录句柄且禁止符号链接，避免校验后父目录被替换导致越界写入。
-        directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:
-            for part in relative.parts[:-1]:
-                try:
-                    os.mkdir(part, mode=0o700, dir_fd=directory)
-                except FileExistsError:
-                    pass
-                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+        if fcntl is not None:
+            # 逐级持有目录句柄且禁止符号链接，避免校验后父目录被替换导致越界写入。
+            directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                for part in relative.parts[:-1]:
+                    try:
+                        os.mkdir(part, mode=0o700, dir_fd=directory)
+                    except FileExistsError:
+                        pass
+                    child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+                    os.close(directory)
+                    directory = child
+                fd = os.open(relative.name, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW,
+                             0o600, dir_fd=directory)
+            finally:
                 os.close(directory)
-                directory = child
-            fd = os.open(relative.name, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW,
-                         0o600, dir_fd=directory)
-        finally:
-            os.close(directory)
+            with os.fdopen(fd, "a", encoding="utf-8") as f:
+                fcntl.flock(f, fcntl.LOCK_EX)
+                try:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+                finally:
+                    fcntl.flock(f, fcntl.LOCK_UN)
+            return
+        if root.is_symlink():
+            raise OSError(errno.ELOOP, "Symlink not allowed", str(root))
+        cur = root
+        for part in relative.parts[:-1]:
+            cur = cur / part
+            if cur.exists() and cur.is_symlink():
+                raise OSError(errno.ELOOP, "Symlink not allowed", str(cur))
+            cur.mkdir(mode=0o700, exist_ok=True)
+        if path.exists() and path.is_symlink():
+            raise OSError(errno.ELOOP, "Symlink not allowed", str(path))
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(fd, "a", encoding="utf-8") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
+            while True:
+                try:
+                    os.lseek(f.fileno(), 0, os.SEEK_SET)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.01)
             try:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
                 f.flush()
                 os.fsync(f.fileno())
             finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
+                try:
+                    os.lseek(f.fileno(), 0, os.SEEK_SET)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
 
     @staticmethod
     @_private_http_logs

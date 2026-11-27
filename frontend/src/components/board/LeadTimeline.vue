@@ -14,11 +14,10 @@ const props = withDefaults(defineProps<{
 }>(), { readOnly: false, unbound: false });
 const { t } = useI18n();
 const { sizeText } = useDisplayUnit();
-// 默认只展开最近几条，卡片高度不被一整天的动态撑开；其余一键展开。
+// 移动端默认只展开最近几条，卡片高度不被一整天的动态撑开；桌面端随左侧高度内部滚动查看全部。
 const PREVIEW = 5;
 const expanded = ref(false);
 const sorted = computed(() => [...(props.events || [])].sort((a, b) => (b.time ?? -Infinity) - (a.time ?? -Infinity)));
-const visible = computed(() => expanded.value ? sorted.value : sorted.value.slice(0, PREVIEW));
 function environment(bindingId: number | null, accountName: string | null) {
   const binding = props.positions?.flatMap(position => position.mine || []).find(mine => mine.bindingId === bindingId);
   return binding?.environment ?? props.accounts?.find(account => account.name === accountName)?.environment ?? null;
@@ -42,17 +41,18 @@ function executionDetail(execution: BoardExecution): string | null {
 // 每条带单事件紧挨自己的执行结果，保留失败和跳过的详情。
 </script>
 <template>
-  <aside class="min-w-0">
-    <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
+  <aside class="min-w-0 xl:flex xl:h-full xl:flex-col">
+    <div class="mb-2.5 flex shrink-0 flex-wrap items-center justify-between gap-2">
       <h3 class="eyebrow">{{ t("board.timeline") }}</h3>
       <span v-if="sorted.length" class="pill font-mono tabular-nums">{{ sorted.length }}</span>
     </div>
-    <p v-if="readOnly" class="mb-3 text-xs text-muted">{{ t("pub.knownEvents") }}</p>
+    <p v-if="readOnly" class="mb-2.5 shrink-0 text-xs text-muted">{{ t("pub.knownEvents") }}</p>
     <p v-if="!sorted.length" class="rounded-xl border border-dashed border-border/60 px-3 py-6 text-center text-xs text-muted">{{ events == null ? t("common.unknown") : t("board.noEvents") }}</p>
-    <!-- 桌面端动态列表高度封顶内部滚动，移动端取消内部滚动容器由整页统一滚动，杜绝嵌套滚动陷阱。 -->
-    <div v-else class="pr-1 xl:max-h-72 xl:overflow-y-auto xl:overscroll-contain">
+    <!-- 桌面端（xl+）高度严格对齐左侧持仓区域，有溢出时内部滚动且允许滚动链传递到整页。 -->
+    <div v-else class="min-h-0 flex-1 pr-1 xl:max-h-full xl:overflow-y-auto">
     <ol class="relative space-y-2.5 before:absolute before:bottom-2 before:left-[5px] before:top-2 before:w-px before:bg-border/70">
-      <li v-for="event in visible" :key="event.id || `${event.time}:${event.symbol}:${event.action}`" class="relative min-w-0 pl-6">
+      <li v-for="(event, idx) in sorted" :key="event.id || `${event.time}:${event.symbol}:${event.action}`" class="relative min-w-0 pl-6"
+        :class="idx >= PREVIEW && !expanded ? 'hidden xl:block' : ''">
         <span class="absolute left-0 top-1.5 h-[11px] w-[11px] rounded-full border-2 border-surface bg-accent" aria-hidden="true" />
         <div class="flex flex-wrap items-center justify-between gap-x-2 gap-y-1">
           <span class="flex min-w-0 flex-wrap items-center gap-1.5">
@@ -82,9 +82,9 @@ function executionDetail(execution: BoardExecution): string | null {
       </li>
     </ol>
     </div>
-    <button v-if="sorted.length > PREVIEW" type="button" class="button-ghost mt-2 w-full text-xs" :aria-expanded="expanded" @click="expanded = !expanded">
+    <button v-if="sorted.length > PREVIEW" type="button" class="button-ghost mt-2 w-full shrink-0 text-xs xl:hidden" :aria-expanded="expanded" @click="expanded = !expanded">
       <component :is="expanded ? ChevronUp : ChevronDown" :size="15" aria-hidden="true" />
-      {{ expanded ? t("feed.showLess") : t("feed.showMore", { shown: visible.length, total: sorted.length }) }}
+      {{ expanded ? t("feed.showLess") : t("feed.showMore", { shown: Math.min(PREVIEW, sorted.length), total: sorted.length }) }}
     </button>
   </aside>
 </template>

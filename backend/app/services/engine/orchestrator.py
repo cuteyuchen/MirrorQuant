@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
 
 from fastapi import WebSocket
-from sqlalchemy import JSON, cast, select, type_coerce
+from sqlalchemy import JSON, cast, inspect, select, type_coerce
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import DEFAULT_SYSTEM_CONFIG, get_session_factory
@@ -18,8 +18,11 @@ from app.core.security import CredentialVault
 from app.core.secret_mask import mask_sensitive_payload, redact_proxy_userinfo
 from app.models.domain import CopyBinding, LeadSource, NotificationOutbox, ProxyNode, TradingAccount
 from app.maintenance.retention import cleanup_retained_records
+from app.services.account_detail.serializers import dt_to_ms
+from app.services.account_detail.snapshots import capture_equity_snapshot
+from app.services.account_detail.sync import due_detail_datasets, sync_account_detail
 from app.services.adapters.factory import create_exchange_adapter
-from app.services.adapters.base import ExchangeAPIError, get_collateral_balance
+from app.services.adapters.base import BalanceInfo, ExchangeAPIError, get_collateral_balance
 from app.services.analysis.pa_analyzer import PAAnalyzer
 from app.services.engine.cashflow import cash_flow_is_fresh, fetch_today_net_flow
 from app.core.time_util import BEIJING_TZ
@@ -153,6 +156,9 @@ class EngineOrchestrator:
         self._last_lead_poll: Dict[int, float] = {}
         self._lead_sync_in_flight: Set[int] = set()
         self._lead_sync_tasks: Set[asyncio.Task] = set()
+        self._detail_sync_in_flight: Set[int] = set()
+        self._detail_sync_tasks: Set[asyncio.Task] = set()
+        self._detail_stagger_until: Dict[int, float] = {}
         self._last_full_sweep: Dict[int, float] = {}
         self._last_history_sync: Dict[int, float] = {}
         self._last_account_poll: Dict[int, float] = {}
@@ -184,9 +190,17 @@ class EngineOrchestrator:
             task.cancel()
         if self._lead_sync_tasks:
             await asyncio.gather(*self._lead_sync_tasks, return_exceptions=True)
+        for task in list(getattr(self, "_detail_sync_tasks", set())):
+            task.cancel()
+        if getattr(self, "_detail_sync_tasks", None):
+            await asyncio.gather(*self._detail_sync_tasks, return_exceptions=True)
         self._task = self._risk_task = None
         self._lead_sync_tasks.clear()
         self._lead_sync_in_flight.clear()
+        if hasattr(self, "_detail_sync_tasks"):
+            self._detail_sync_tasks.clear()
+        if hasattr(self, "_detail_sync_in_flight"):
+            self._detail_sync_in_flight.clear()
         logger.info("EngineOrchestrator stopped")
 
     @property
@@ -259,6 +273,9 @@ class EngineOrchestrator:
                     self._last_account_poll[account.id] = now
                     await self.sync_account(db, account, proxies, resilience_cfg=resilience_cfg)
 
+            if isinstance(db, AsyncSession):
+                await self._schedule_account_detail_syncs(db, accounts, now)
+
             for lead in leads:
                 last = self._last_lead_poll.get(lead.id, 0.0)
                 # 并行轮询：各 lead 独立会话并发同步，不再顺序等待。顺序轮询时
@@ -283,6 +300,108 @@ class EngineOrchestrator:
         exc = task.exception()
         if exc is not None:
             logger.exception("Lead sync task failed: %s", exc)
+
+    def _discard_detail_sync_task(self, task: asyncio.Task) -> None:
+        tasks = getattr(self, "_detail_sync_tasks", None)
+        if tasks is not None:
+            tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.warning("Account detail sync task error: %s", redact_proxy_userinfo(str(exc)))
+
+    async def _schedule_account_detail_syncs(
+        self, db: AsyncSession, accounts: List[TradingAccount], now: float
+    ) -> None:
+        in_flight = getattr(self, "_detail_sync_in_flight", None)
+        if in_flight is None:
+            in_flight = self._detail_sync_in_flight = set()
+        tasks = getattr(self, "_detail_sync_tasks", None)
+        if tasks is None:
+            tasks = self._detail_sync_tasks = set()
+        stagger = getattr(self, "_detail_stagger_until", None)
+        if stagger is None:
+            stagger = self._detail_stagger_until = {}
+
+        now_ms = int(now * 1000)
+        for idx, account in enumerate(accounts):
+            if account.id in in_flight or inspect(account, raiseerr=False) is None:
+                continue
+            if account.id not in stagger:
+                stagger[account.id] = now + (idx * 5.0)
+            if now < stagger[account.id]:
+                continue
+            try:
+                due = await due_detail_datasets(db, account.id, now_ms)
+            except Exception as exc:
+                logger.warning("Failed checking due detail datasets for account %s: %s", account.id, redact_proxy_userinfo(str(exc)))
+                continue
+            if not due:
+                continue
+            in_flight.add(account.id)
+            task = asyncio.create_task(
+                self._sync_detail_isolated(account.id, due),
+                name=f"mirrorquant-detail-sync-{account.id}",
+            )
+            tasks.add(task)
+            task.add_done_callback(self._discard_detail_sync_task)
+
+    async def _sync_detail_isolated(self, account_id: int, datasets: List[str]) -> None:
+        """Background non-blocking account detail dataset sync; never alters trading state."""
+        try:
+            await sync_account_detail(None, account_id, datasets=datasets, manual=False)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Account %s detail sync failed: %s", account_id, redact_proxy_userinfo(str(exc)))
+        finally:
+            in_flight = getattr(self, "_detail_sync_in_flight", None)
+            if in_flight is not None:
+                in_flight.discard(account_id)
+
+    async def _capture_risk_tick_snapshot(
+        self, db: AsyncSession, account: TradingAccount, live_positions: List[Any]
+    ) -> None:
+        if not isinstance(db, AsyncSession) or inspect(account, raiseerr=False) is None:
+            return
+        try:
+            state = risk_state(account)
+            if not state.get("display_usdt_confirmed"):
+                return
+            usdt_asset = (state.get("assets") or {}).get("USDT") or {}
+            eq_val = usdt_asset.get("equity", account.usdt_equity)
+            av_val = usdt_asset.get("available", account.avail_equity)
+            if eq_val is None:
+                return
+            bal_ms = dt_to_ms(account.last_sync_at)
+            now_ms = int(time.time() * 1000)
+            upl_total = sum(float(getattr(p, "upl", 0.0) or 0.0) for p in live_positions)
+            bal_proxy = BalanceInfo(
+                eq=float(eq_val),
+                avail_eq=float(av_val or 0.0),
+                cash_bal=None,  # type: ignore[arg-type]
+                upl=upl_total,
+                currency="USDT",
+                as_of_ms=bal_ms,
+            )
+            async with db.begin_nested():
+                await capture_equity_snapshot(
+                    db,
+                    account,
+                    bal_proxy,
+                    live_positions,
+                    source="risk_tick",
+                    balance_as_of_ms=bal_ms,
+                    positions_as_of_ms=now_ms,
+                    now_ms=now_ms,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Risk-tick equity snapshot failed for account %s: %s",
+                account.id,
+                redact_proxy_userinfo(str(exc)),
+            )
 
     async def _sync_lead_isolated(self, lead_id: int) -> None:
         """一个 lead 独占一个会话：与其他 lead 的同步并发跑，互不串会话。"""
@@ -336,6 +455,7 @@ class EngineOrchestrator:
                     await self._check_account_equity(db, binding, account, adapter)
                     if isinstance(live_positions, list) and all(hasattr(p, "to_dict") for p in live_positions):
                         await self._persist_account_positions(db, account, live_positions)
+                        await self._capture_risk_tick_snapshot(db, account, live_positions)
                     await self.router.check_position_guards(
                         db=db, lead=lead, account=account, binding=binding, adapter=adapter,
                         local_positions=live_positions, instruments=instruments,
@@ -800,6 +920,31 @@ class EngineOrchestrator:
             account.last_error = None
             account.status = "connected"
             await db.commit()
+
+            try:
+                now_ms = int(time.time() * 1000)
+                saved = await capture_equity_snapshot(
+                    db,
+                    account,
+                    bal,
+                    positions,
+                    source="account_sync",
+                    balance_as_of_ms=getattr(bal, "as_of_ms", None) or now_ms,
+                    positions_as_of_ms=now_ms,
+                    now_ms=now_ms,
+                )
+                if saved and isinstance(db, AsyncSession) and inspect(account, raiseerr=False) is not None:
+                    await db.commit()
+            except Exception as snap_exc:
+                try:
+                    await db.rollback()
+                except Exception:
+                    pass
+                logger.warning(
+                    "Account sync equity snapshot failed for %s: %s",
+                    account.id,
+                    redact_proxy_userinfo(str(snap_exc)),
+                )
 
             await self.ws_hub.broadcast(
                 {

@@ -3,12 +3,14 @@ import { settingsAdditions } from "./settings-extra";
 import { authExtraMessages } from "./auth-extra";
 import { bindingsAdditions } from "./bindings-extra";
 import { executionsAdditions } from "./executions-extra";
+import { accountDetailAdditions } from "./account-detail-extra";
 
 export const additions: Record<string, readonly [string, string]> = {
   ...settingsAdditions,
   ...authExtraMessages,
   ...bindingsAdditions,
   ...executionsAdditions,
+  ...accountDetailAdditions,
   "errors.invalidResponse": ["后端响应无法识别，请重试", "The backend response is invalid. Please retry."],
   "app.title": ["MirrorQuant · 跟单看板", "MirrorQuant · Copy Trading Board"],
   "app.name": ["MirrorQuant", "MirrorQuant"],
@@ -668,6 +670,10 @@ export const additions: Record<string, readonly [string, string]> = {
   "board.viewPositions": ["查看账户 {name} 持仓", "View positions for {name}"],
   "leadDetail.quickSwitch": ["切换带单员", "Switch lead trader"],
   "tel.openAndCalcTitle": ["当前持仓 · 跟单开仓测算与动态最优杠杆", "Open Positions · Sizing & Dynamic Leverage"],
+  "tel.analysisTabs": ["深度分析页签", "Analysis tabs"],
+  "tel.tabPositions": ["持仓与测算", "Positions & Sizing"],
+  "tel.tabReturns": ["收益与分布", "Returns & Allocation"],
+  "tel.analysisDisclaimer": ["以下开仓测算与 PA / SMC 技术点位均基于带单员当前持仓自动推算，仅供跟单风控与结构参考，不代表带单员的实际挂单、止盈止损或操作意图。", "Sizing estimates and PA / SMC technical levels below are automatically derived from the lead trader's current positions for reference only, and do not represent the lead trader's actual orders, TP/SL, or trading intentions."],
   "pa.notesToggle": ["结构解读", "Structure notes"],
   "calc.formulaToggle": ["公式与测算说明", "Formula & notes"],
   "accts.testShort": ["测连", "Test"],

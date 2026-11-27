@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, inject, nextTick, onActivated, onDeactivated, onMounted, onUnmounted, ref, watch } from "vue";
-import { routeLocationKey } from "vue-router";
-import { ChevronDown, Pencil, Plus, RefreshCw, Trash2, Wifi } from "lucide-vue-next";
+import { routeLocationKey, routerKey } from "vue-router";
+import { ArrowUpRight, ChevronDown, Pencil, Plus, RefreshCw, Trash2, Wifi } from "lucide-vue-next";
 import { api, ApiError, isCancelled } from "@/api/client";
 import { useDataCacheStore } from "@/stores/dataCache";
 import { useBoardStore } from "@/stores/board";
@@ -25,6 +25,10 @@ defineOptions({ name: "AccountsView" });
 const cache = useDataCacheStore();
 const board = useBoardStore();
 const route = inject(routeLocationKey, null);
+const router = inject(routerKey, null);
+function openDetail(id: number) {
+  if (router) void router.push(`/accounts/${id}`);
+}
 const now = useNow();
 const { t } = useI18n();
 const { unit, showQuantity, sizeText } = useDisplayUnit();
@@ -199,7 +203,7 @@ onUnmounted(() => { active.value = false; });
       <template #cell-drawdown="{ row }"><span :class="(drawdown(row) ?? 0) >= 20 ? 'text-danger' : 'text-muted'">{{ formatPct(drawdown(row), 2, false) }}</span></template>
       <template #cell-sync="{ row }"><FreshnessStamp :timestamp="metrics(row).syncedAt" :warn-after="45" :critical-after="90" /><p class="mt-1 text-xs text-muted">{{ formatDateTime(metrics(row).syncedAt, { short: true, withSeconds: false }) }}</p></template>
       <template #cell-status="{ row }"><div class="flex flex-wrap items-center gap-2"><StatusBadge :state="row.isEnabled == null ? 'unknown' : row.isEnabled === false ? 'disabled' : metrics(row).status" /><label class="inline-flex min-h-11 items-center gap-2 text-xs"><input type="checkbox" role="switch" :checked="row.isEnabled === true" :aria-label="t('accts.enabledFor', { name: row.name ?? '—' })" :disabled="pending || row.isEnabled == null" @change="change(row, 'toggle', $event)" /><span>{{ t(row.isEnabled == null ? "state.UNKNOWN" : row.isEnabled ? "common.enabled" : "common.disabled") }}</span></label></div><p v-if="issue(row)" class="mt-1 break-words text-xs" :class="severity(row) === 2 ? 'text-danger' : 'text-warning'">{{ issue(row) }}</p></template>
-      <template #cell-actions="{ row }"><div class="flex flex-wrap items-center justify-end gap-1" @click.stop><button type="button" class="button-secondary min-h-8 px-2 py-1 text-xs" :disabled="pending" :aria-label="t('common.edit')" @click="edit(row)"><Pencil :size="14" />{{ t("common.edit") }}</button><button type="button" class="button-secondary min-h-8 px-2 py-1 text-xs" :disabled="pending" :aria-label="t('accts.test')" @click="test(row)"><Wifi :size="14" />{{ t("accts.testShort") }}</button><button type="button" class="button-secondary min-h-8 px-2 py-1 text-xs" :disabled="pending" :aria-label="t('accts.sync')" @click="sync(row)"><RefreshCw :size="14" />{{ t("accts.syncShort") }}</button><button type="button" class="button-danger min-h-8 px-2 py-1 text-xs" :disabled="pending" :aria-label="t('common.delete')" @click="change(row, 'delete')"><Trash2 :size="14" />{{ t("common.delete") }}</button></div></template>
+      <template #cell-actions="{ row }"><div class="flex flex-wrap items-center justify-end gap-1" @click.stop><button type="button" class="button-secondary min-h-8 px-2 py-1 text-xs" :aria-label="t('accts.detail')" @click="openDetail(row.id)"><ArrowUpRight :size="14" />{{ t("accts.detail") }}</button><button type="button" class="button-secondary min-h-8 px-2 py-1 text-xs" :disabled="pending" :aria-label="t('common.edit')" @click="edit(row)"><Pencil :size="14" />{{ t("common.edit") }}</button><button type="button" class="button-secondary min-h-8 px-2 py-1 text-xs" :disabled="pending" :aria-label="t('accts.test')" @click="test(row)"><Wifi :size="14" />{{ t("accts.testShort") }}</button><button type="button" class="button-secondary min-h-8 px-2 py-1 text-xs" :disabled="pending" :aria-label="t('accts.sync')" @click="sync(row)"><RefreshCw :size="14" />{{ t("accts.syncShort") }}</button><button type="button" class="button-danger min-h-8 px-2 py-1 text-xs" :disabled="pending" :aria-label="t('common.delete')" @click="change(row, 'delete')"><Trash2 :size="14" />{{ t("common.delete") }}</button></div></template>
       <template #mobile-card="{ row }">
         <div class="space-y-3">
           <div class="flex items-start justify-between gap-2">
@@ -245,6 +249,7 @@ onUnmounted(() => { active.value = false; });
             <span>{{ t("accts.positions") }} · {{ row.positions?.length ?? 0 }}</span>
           </div>
           <div class="flex flex-wrap items-center justify-end gap-1.5 border-t border-border/40 pt-2" @click.stop>
+            <button type="button" class="button-secondary min-h-8 px-2.5 py-1 text-xs" :aria-label="t('accts.detail')" @click="openDetail(row.id)"><ArrowUpRight :size="14" />{{ t("accts.detail") }}</button>
             <button type="button" class="button-secondary min-h-8 px-2.5 py-1 text-xs" :disabled="pending" :aria-label="t('common.edit')" @click="edit(row)"><Pencil :size="14" />{{ t("common.edit") }}</button>
             <button type="button" class="button-secondary min-h-8 px-2.5 py-1 text-xs" :disabled="pending" :aria-label="t('accts.test')" @click="test(row)"><Wifi :size="14" />{{ t("accts.testShort") }}</button>
             <button type="button" class="button-secondary min-h-8 px-2.5 py-1 text-xs" :disabled="pending" :aria-label="t('accts.sync')" @click="sync(row)"><RefreshCw :size="14" />{{ t("accts.syncShort") }}</button>

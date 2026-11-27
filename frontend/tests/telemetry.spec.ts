@@ -165,6 +165,7 @@ describe("操作流倒序展示", () => {
     expect(panel.find('[data-testid="position-sizing-strip"]').exists()).toBe(true);
     expect(panel.findComponent(PositionCalculatorCard).exists()).toBe(false);
     expect(panel.text()).toContain(t("tel.openAndCalcTitle"));
+    expect(panel.get('[data-testid="analysis-disclaimer"]').text()).toBe(t("tel.analysisDisclaimer"));
     panel.unmount();
   });
 
@@ -187,5 +188,49 @@ describe("操作流倒序展示", () => {
     expect(page.get('[data-testid="analysis-positions-grid"]').classes()).toContain("xl:grid-cols-2");
     expect(page.find(".cq-single-split").exists()).toBe(false);
     page.unmount();
+  });
+
+  it("LeadTelemetryPanel 使用页签按需切换各深度分析模块，初始仅挂载持仓与测算", async () => {
+    setActivePinia(createPinia());
+    const snapshot: LeadSnapshot = {
+      profile: { nickname: "Tabbed Lead", positionShow: true, marginBalance: 10000 },
+      openPositionsSummary: { positionCount: 1, longCount: 1, marginBalance: 10000, totalMarkNotional: 20000, totalNotionalLeverage: 2 },
+      openPositions: [{ symbol: "BTCUSDT", positionSide: "LONG", qty: 0.4, avgEntry: 50000, currentPrice: 50000 }],
+      performance: { "7D": { roi: 5, pnl: 500, winRate: 60, winOrders: 3, totalOrder: 5, mdd: 1.2 } },
+      roiChart365D: [{ t: 1_800_000_000_000, v: 1 }, { t: 1_800_086_400_000, v: 3 }],
+      allocation: { items: [{ asset: "BTC", volume: 100 }] },
+      orders: [{ id: "1", time: 1_800_000_000_000, symbol: "BTCUSDT", dir: "OPEN_LONG", qty: 0.4, avgPrice: 50000 }],
+    };
+    const panel = mount(LeadTelemetryPanel, {
+      props: { snapshot, portfolioId: "p-tabs", displayName: "Tabbed Lead", embedded: true },
+      global: {
+        stubs: {
+          PerformancePanel: { template: '<section data-testid="stub-performance">perf</section>' },
+          RoiChart: { template: '<section data-testid="stub-roi">roi</section>' },
+          AllocationCard: { template: '<section data-testid="stub-alloc">alloc</section>' },
+          OrderHistory: { template: '<section data-testid="stub-history">history</section>' },
+        },
+      },
+    });
+    expect(panel.get('[data-testid="telemetry-tab-positions"]').attributes("aria-selected")).toBe("true");
+    expect(panel.find('[data-testid="telemetry-panel-positions"]').exists()).toBe(true);
+    expect(panel.find('[data-testid="stub-performance"]').exists()).toBe(false);
+    expect(panel.find('[data-testid="stub-roi"]').exists()).toBe(false);
+    expect(panel.find('[data-testid="stub-history"]').exists()).toBe(false);
+
+    await panel.get('[data-testid="telemetry-tab-performance"]').trigger("click");
+    expect(panel.get('[data-testid="telemetry-tab-performance"]').attributes("aria-selected")).toBe("true");
+    expect(panel.find('[data-testid="stub-performance"]').exists()).toBe(true);
+    expect(panel.get('[data-testid="telemetry-panel-positions"]').attributes("style")).toContain("display: none");
+
+    await panel.get('[data-testid="telemetry-tab-returns"]').trigger("click");
+    expect(panel.get('[data-testid="telemetry-tab-returns"]').attributes("aria-selected")).toBe("true");
+    expect(panel.find('[data-testid="stub-roi"]').exists()).toBe(true);
+    expect(panel.find('[data-testid="stub-alloc"]').exists()).toBe(true);
+
+    await panel.get('[data-testid="telemetry-tab-history"]').trigger("click");
+    expect(panel.get('[data-testid="telemetry-tab-history"]').attributes("aria-selected")).toBe("true");
+    expect(panel.find('[data-testid="stub-history"]').exists()).toBe(true);
+    panel.unmount();
   });
 });
