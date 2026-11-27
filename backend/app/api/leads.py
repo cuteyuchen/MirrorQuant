@@ -19,7 +19,12 @@ from app.models.domain import CopyBinding, LeadSource, ProxyNode, User, utcnow
 from app.schemas.api import LeadCreate, LeadUpdate
 from app.services.engine.orchestrator import orchestrator
 from app.services.engine.serialization import serialized_execution
-from app.services.lead_collector.binance_bapi import BinanceBapiCollector
+from app.services.lead_collector.binance_bapi import (
+    BinanceBapiCollector,
+    classify_order_actions,
+    expand_slim_order,
+    order_dedup_key,
+)
 from app.services.notifier.service import NotificationService
 from app.services.notifier.trade import resolve_display_unit
 from app.services.proxy.manager import ProxyEgressError, ProxyManager
@@ -52,6 +57,18 @@ def _extract_latest_action(lead: LeadSource, snap: Optional[dict]) -> Optional[d
         try:
             store = json.loads(lead.orders_store_json)
             if isinstance(store, dict):
+                snap_meta = (snap or {}).get("openPositionsMeta") or {}
+                positions_confirmed = bool(
+                    snap_meta.get("emptyVerified") is True
+                    or (snap_meta.get("authoritative") is True and snap_meta.get("complete") is True)
+                    or (snap_meta.get("reconstructed") is True and ((snap or {}).get("meta") or {}).get("orderHistoryComplete") is True)
+                )
+                classifications = classify_order_actions(
+                    list(store.values()),
+                    open_positions=(snap or {}).get("openPositions"),
+                    closed_rows=(snap or {}).get("closed") or [],
+                    positions_confirmed=positions_confirmed,
+                )
                 for raw in store.values():
                     if not isinstance(raw, dict):
                         continue
@@ -64,9 +81,19 @@ def _extract_latest_action(lead: LeadSource, snap: Optional[dict]) -> Optional[d
                         best_ts = ts_num
                         ps = raw.get("ps") or raw.get("positionSide")
                         trade_side = raw.get("side")
-                        direction = None
-                        if ps in ("LONG", "SHORT") and trade_side in ("BUY", "SELL"):
+                        direction = classifications.get(order_dedup_key(expand_slim_order(raw)))
+                        if direction is None and ps in ("LONG", "SHORT") and trade_side in ("BUY", "SELL"):
                             direction = ("OPEN_" if (trade_side, ps) in (("BUY", "LONG"), ("SELL", "SHORT")) else "REDUCE_") + ps
+                        elif direction is None and trade_side in ("BUY", "SELL"):
+                            pnl_val = raw.get("pnl") if raw.get("pnl") is not None else raw.get("totalPnl")
+                            try:
+                                pnl_nonzero = bool(pnl_val) and float(pnl_val) != 0.0
+                            except (TypeError, ValueError):
+                                pnl_nonzero = False
+                            if pnl_nonzero:
+                                direction = "REDUCE_SHORT" if trade_side == "BUY" else "REDUCE_LONG"
+                            else:
+                                direction = "OPEN_LONG" if trade_side == "BUY" else "OPEN_SHORT"
                         best = {
                             "time": ts_num if ts_num > 0 else None,
                             "symbol": raw.get("sym") or raw.get("symbol"),

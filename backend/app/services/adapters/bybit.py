@@ -220,6 +220,10 @@ class BybitAdapter(BaseExchangeAdapter):
             cur_px = float(p.get("markPrice") or p.get("lastPrice") or avg_px or 0.0)
             notional = abs(float(p.get("positionValue") or (sz * cur_px)))
             upl = float(p.get("unrealisedPnl") or 0.0)
+            lever = float(p.get("leverage") or 1.0)
+            margin_usd = float(p.get("positionIM") or 0.0)
+            if margin_usd <= 0 and notional > 0 and lever > 0:
+                margin_usd = notional / lever
             positions.append(
                 ExchangePosition(
                     inst_id=sym,
@@ -231,11 +235,12 @@ class BybitAdapter(BaseExchangeAdapter):
                     avg_px=avg_px,
                     cur_px=cur_px,
                     upl=upl,
-                    upl_ratio=(upl / notional) if notional > 0 else 0.0,
+                    upl_ratio=(upl / margin_usd) if margin_usd > 0 else 0.0,
                     notional_usd=notional,
-                    lever=float(p.get("leverage") or 1.0),
+                    lever=lever,
                     c_time=int(p.get("createdTime") or 0),
                     u_time=int(p.get("updatedTime") or 0),
+                    margin_usd=margin_usd,
                 )
             )
         return positions

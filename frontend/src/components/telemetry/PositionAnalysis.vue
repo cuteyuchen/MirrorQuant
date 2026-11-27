@@ -1,11 +1,14 @@
 <script setup lang="ts">
-import { computed } from "vue";
-import { Layers } from "lucide-vue-next";
+import { computed, ref, useId } from "vue";
+import { Calculator, Copy, Layers } from "lucide-vue-next";
 import type { LeadSnapshot, LegacyPosition, TelemetryOrder } from "@/types/api";
 import { useNow } from "@/composables/useNow";
 import { useAgo } from "@/composables/useAgo";
 import { useI18n } from "@/i18n";
 import { useDisplayUnit } from "@/composables/useDisplayUnit";
+import { useCopyCapital } from "@/composables/useCopyCapital";
+import { useUiStore } from "@/stores/ui";
+import { calculateSizing } from "@/utils/sizing";
 import { baseAsset, finiteNumber, formatDateTime, formatLeverage, formatPct, formatPrice, formatQty, formatUsd, signedUsd } from "@/utils/format";
 import { normalizeSide, pnlClass, sideLabel } from "@/utils/status";
 import { beijingDayStart, positionsConfirmed } from "@/utils/positions";
@@ -15,7 +18,12 @@ import EmptyState from "@/components/EmptyState.vue";
 import StatTile from "@/components/StatTile.vue";
 import PriceActionPanel from "./PriceActionPanel.vue";
 
-const props = withDefaults(defineProps<{ snapshot: LeadSnapshot; embedded?: boolean }>(), { embedded: false });
+const props = withDefaults(defineProps<{
+  snapshot: LeadSnapshot;
+  embedded?: boolean;
+  withCalculator?: boolean;
+  displayName?: string | null;
+}>(), { embedded: false, withCalculator: false });
 const { t } = useI18n();
 const { unit, showQuantity, showNotional, sizeText } = useDisplayUnit();
 const now = useNow();
@@ -27,6 +35,79 @@ const confirmed = computed(() => positionsConfirmed(props.snapshot));
 const flat = computed(() => confirmed.value && positions.value.length === 0);
 const marginBalance = computed(() => summary.value?.marginBalance ?? props.snapshot.profile?.marginBalance ?? null);
 const dayStart = computed(() => beijingDayStart(now.value));
+
+// 合并后的动态最优杠杆与跟单开仓测算（不在顶层调用 useUiStore，保持无 Pinia 独立测试可用）。
+const PRESETS = [500, 1000, 2000, 5000, 10000];
+const MODES = [
+  { value: 0.5, label: "calc.multDefensive" },
+  { value: 1, label: "calc.multProportional" },
+  { value: 1.2, label: "calc.multAggressive" },
+];
+const capitalId = useId();
+const capitalInput = useCopyCapital();
+const multiplier = ref(1);
+const copying = ref(false);
+const capital = computed(() => {
+  const value = finiteNumber(capitalInput.value);
+  return value != null && value > 0 && value <= 1e12 ? value : null;
+});
+const sizing = computed(() => props.withCalculator
+  ? calculateSizing(positions.value, finiteNumber(marginBalance.value), capital.value, multiplier.value, summary.value)
+  : null);
+type SizingRow = NonNullable<typeof sizing.value>["rows"][number];
+const marginPct = computed(() => share(sizing.value?.totalMargin ?? null));
+const overCommitted = computed(() => sizing.value?.freeCash != null && sizing.value.freeCash < 0);
+
+function share(value: number | null) { return value == null || capital.value == null ? null : value / capital.value * 100; }
+function shareText(value: number | null) {
+  const pct = share(value);
+  return pct == null ? "" : t("calc.capitalShare", { pct: formatPct(pct, 1, false) });
+}
+function ratioText(row: SizingRow) { return row.ratio == null ? "" : `r=${row.ratio.toFixed(4)}`; }
+function liqText(row: SizingRow) {
+  if (row.liquidation == null || row.mark == null) return "";
+  return `${t("board.fromMark")} ${formatPct((row.liquidation - row.mark) / row.mark * 100)}`;
+}
+function rowIssue(row: SizingRow) {
+  return row.targetQty != null ? "" : t(row.entry == null || row.mark == null ? "calc.missingPrice" : "calc.unverifiedSizing");
+}
+function sizingRow(index: number): SizingRow | null {
+  return sizing.value?.rows[index] ?? null;
+}
+function toastMessage(msg: string, tone?: "success" | "danger") {
+  try { useUiStore().toast(msg, tone); } catch { /* 独立测试挂载未初始化 Pinia 时忽略提示条。 */ }
+}
+async function copyPlan() {
+  const result = sizing.value;
+  if (!result?.complete || copying.value) return;
+  copying.value = true;
+  try {
+    const lines = [
+      t("calc.planTitle", { name: props.displayName ?? props.snapshot?.profile?.nickname ?? t("board.lead") }),
+      t("calc.estimated"),
+      `${t("calc.capitalLabel")}: ${formatUsd(capital.value)} · ${t("calc.multiplierLabel")}: ${multiplier.value}x`,
+      `${t("calc.totalNotional")}: ${formatUsd(result.totalNotional)} · ${t("calc.portfolioLev")}: ${formatLeverage(result.portfolioLeverage)}`,
+      `${t("calc.marginOccupied")}: ${formatUsd(result.totalMargin)} (${formatPct(marginPct.value, 2, false)}) · ${t("calc.freeCashCushion")}: ${formatUsd(result.freeCash)}`,
+      `${t("calc.buffer")}: ±${formatPct(result.buffer, 2, false)}`,
+      "",
+      ...result.rows.flatMap(row => [
+        t("calc.planLine", {
+          symbol: row.symbol ?? t("common.unknown"), side: sideLabel(row.side),
+          qty: formatQty(row.targetQty), price: formatPrice(row.entry), leverage: formatQty(row.leverage),
+        }),
+        t("calc.planDetail", {
+          notional: formatUsd(row.targetNotional), ratio: row.ratio == null ? t("common.unknown") : row.ratio.toFixed(4),
+          margin: formatUsd(row.initialMargin), liq: formatPrice(row.liquidation),
+        }),
+      ]),
+      "",
+      t("calc.estimateNotice"),
+    ];
+    await navigator.clipboard.writeText(lines.join("\n"));
+    toastMessage(t("calc.copied"));
+  } catch { toastMessage(t("calc.copyError"), "danger"); }
+  finally { copying.value = false; }
+}
 
 function sideOf(position: LegacyPosition) { return normalizeSide(position.positionSide ?? position.posSide, position.qty ?? position.pos); }
 function sideClass(position: LegacyPosition) {
@@ -141,23 +222,48 @@ function orderNotional(order: TelemetryOrder) {
   <section class="card">
     <header class="card-header">
       <div class="flex min-w-0 flex-1 flex-wrap items-center gap-x-2.5 gap-y-2">
-        <span class="section-icon" aria-hidden="true"><Layers :size="18" /></span>
-        <h3 class="section-title min-w-0">{{ t("tel.openSectionTitle") }}</h3>
+        <span class="section-icon" aria-hidden="true"><component :is="withCalculator ? Calculator : Layers" :size="18" /></span>
+        <h3 class="section-title min-w-0">{{ t(withCalculator ? "tel.openAndCalcTitle" : "tel.openSectionTitle") }}</h3>
         <span v-if="source" class="pill" :class="source.tone">{{ source.label }}</span>
         <span v-if="risk" class="pill font-semibold" :class="risk.tone">{{ risk.label }}</span>
       </div>
-      <FreshnessStamp :timestamp="snapshot.meta?.priceUpdatedAt ?? summary?.priceAsOf" :stale="snapshot.meta?.stale" />
+      <div class="flex shrink-0 items-center gap-2">
+        <button v-if="withCalculator && !flat && confirmed" type="button" class="button-secondary min-h-8 px-2.5 py-1 text-xs" :disabled="!sizing?.complete || copying" @click="copyPlan"><Copy :size="14" aria-hidden="true" />{{ t("calc.copyPlan") }}</button>
+        <FreshnessStamp :timestamp="snapshot.meta?.priceUpdatedAt ?? summary?.priceAsOf" :stale="snapshot.meta?.stale" />
+      </div>
     </header>
     <div class="card-body cq space-y-4">
       <dl class="cq-tiles-6">
         <StatTile v-for="tile in tiles" :key="tile.key" :label="tile.label" :value="tile.value" :sub="tile.sub" :value-class="tile.valueClass" :sub-class="tile.subClass" />
       </dl>
+      <!-- 合并测算控制栏：共享带单本金与持仓列表，避免与独立的仓位测算卡重复信息。 -->
+      <div v-if="withCalculator && confirmed && !flat" data-testid="merged-calculator-controls" data-section="calculator"
+        class="grid min-w-0 gap-4 rounded-xl border border-accent/25 bg-accent/[0.04] p-3 sm:p-4 lg:grid-cols-2">
+        <div class="min-w-0">
+          <label :for="capitalId" class="field-label mb-1">{{ t("calc.capitalLabel") }}</label>
+          <input :id="capitalId" v-model="capitalInput" type="number" inputmode="decimal" min="0" step="100" class="form-input font-mono tabular-nums"
+            :placeholder="t('calc.capitalPlaceholder')" :aria-invalid="capital == null" :aria-describedby="capital == null ? `${capitalId}-error` : undefined" />
+          <p v-if="capital == null" :id="`${capitalId}-error`" class="field-error" role="alert">{{ t("calc.capitalInvalid") }}</p>
+          <div class="mt-2 flex flex-wrap items-center gap-1.5" role="group" :aria-label="t('calc.quickPreset')">
+            <span class="text-xs text-muted">{{ t("calc.quickPreset") }}</span>
+            <button v-for="preset in PRESETS" :key="preset" type="button" class="chip-button" :aria-pressed="capital === preset" @click="capitalInput = preset">{{ preset.toLocaleString("en-US") }}</button>
+          </div>
+        </div>
+        <fieldset class="min-w-0">
+          <legend class="field-label mb-1">{{ t("calc.multiplierLabel") }}</legend>
+          <div class="tab-list" role="group">
+            <button v-for="mode in MODES" :key="mode.value" type="button" class="tab-button" :aria-pressed="multiplier === mode.value" @click="multiplier = mode.value">{{ t(mode.label) }}</button>
+          </div>
+          <p class="mt-2 text-xs text-faint">{{ t("calc.ratioFormula") }} · {{ t("calc.dynLevFormula") }}</p>
+        </fieldset>
+      </div>
       <EmptyState v-if="!confirmed" :title="t('board.unknownPositions')" />
       <EmptyState v-else-if="flat" :title="t('tel.noOpenPositions')" />
       <div v-else class="space-y-3">
-        <!-- 嵌入模式（详情页）：持仓已在顶部 LeadComparison 中权威展示，这里仅保留 SMC/PA 结构分析与建仓订单，不再重复渲染基础指标 -->
+        <p v-if="withCalculator && sizing && !sizing.complete" class="warning-banner" role="alert">{{ t("calc.incomplete") }}</p>
+        <!-- 嵌入模式（详情页）：持仓已在顶部 LeadComparison 中权威展示，这里仅保留 SMC/PA 结构分析、建仓订单与合并跟单测算 -->
         <template v-if="embedded">
-          <article v-for="position in positions" :key="positionKey(position)" class="cq min-w-0 rounded-xl border border-border/50 bg-background/40 p-3 sm:p-4" :class="openedToday(position) ? 'today-edge' : ''">
+          <article v-for="(position, idx) in positions" :key="positionKey(position)" class="cq min-w-0 rounded-xl border border-border/50 bg-background/40 p-3 sm:p-4" :class="openedToday(position) ? 'today-edge' : ''">
             <div class="flex flex-wrap items-center justify-between gap-2 border-b border-border/40 pb-2.5">
               <div class="flex flex-wrap items-center gap-1.5">
                 <h4 class="text-base font-bold tracking-tight">{{ position.symbol ?? position.instId ?? t("common.unknown") }}</h4>
@@ -175,6 +281,16 @@ function orderNotional(order: TelemetryOrder) {
               </div>
             </div>
             <div class="mt-3 space-y-3">
+              <div v-if="withCalculator && sizingRow(idx)" data-testid="position-sizing-strip" class="rounded-lg border border-accent/25 bg-accent/[0.04] p-2.5">
+                <p v-if="rowIssue(sizingRow(idx)!)" class="mb-2 text-xs font-medium text-warning">{{ rowIssue(sizingRow(idx)!) }}</p>
+                <dl class="grid grid-cols-2 gap-2.5 sm:grid-cols-5">
+                  <StatTile v-if="showQuantity" :boxed="false" :label="t('calc.colTargetQty')" :value="formatQty(sizingRow(idx)!.targetQty)" :sub="baseAsset(position.symbol)" value-class="text-accent" />
+                  <StatTile v-if="showNotional" :boxed="false" :label="t('calc.colTargetNotional')" :value="formatUsd(sizingRow(idx)!.targetNotional)" :sub="ratioText(sizingRow(idx)!)" />
+                  <StatTile :boxed="false" :label="t('calc.colOptLev')" :value="sizingRow(idx)!.leverage != null ? t('unit.leverage', { n: formatQty(sizingRow(idx)!.leverage) }) : t('common.unknown')" value-class="text-accent" :sub="ratioText(sizingRow(idx)!)" />
+                  <StatTile :boxed="false" :label="t('calc.colMarginReq')" :value="formatUsd(sizingRow(idx)!.initialMargin)" :sub="shareText(sizingRow(idx)!.initialMargin)" />
+                  <StatTile :boxed="false" :label="t('calc.colEstLiq')" :value="formatPrice(sizingRow(idx)!.liquidation)" :sub="liqText(sizingRow(idx)!)" value-class="text-warning" />
+                </dl>
+              </div>
               <PriceActionPanel v-if="position.analysis?.ok" :analysis="position.analysis" />
               <p v-else class="tile self-start text-xs text-muted">{{ t("pa.pending") }}</p>
               <details v-if="position.entryOrders?.length" class="rounded-lg border border-border/40 bg-surface/60">
@@ -193,7 +309,7 @@ function orderNotional(order: TelemetryOrder) {
         </template>
         <!-- 独立模式（公开看板等）：外层无权威持仓卡，渲染完整的持仓分析大卡 -->
         <template v-else>
-          <article v-for="position in positions" :key="positionKey(position)" class="cq min-w-0 rounded-xl border border-border/50 bg-background/40 p-3 sm:p-4" :class="openedToday(position) ? 'today-edge' : ''">
+          <article v-for="(position, idx) in positions" :key="positionKey(position)" class="cq min-w-0 rounded-xl border border-border/50 bg-background/40 p-3 sm:p-4" :class="openedToday(position) ? 'today-edge' : ''">
             <div class="cq-split">
               <div class="cq min-w-0">
                 <div class="flex flex-wrap items-center gap-1.5">
@@ -217,6 +333,16 @@ function orderNotional(order: TelemetryOrder) {
                 <dl class="cq-tiles mt-3.5">
                   <StatTile v-for="tile in positionTiles(position)" :key="tile.key" :label="tile.label" :value="tile.value" :sub="tile.sub" :value-class="tile.valueClass" />
                 </dl>
+                <div v-if="withCalculator && sizingRow(idx)" data-testid="position-sizing-strip" class="mt-3 rounded-lg border border-accent/25 bg-accent/[0.04] p-2.5">
+                  <p v-if="rowIssue(sizingRow(idx)!)" class="mb-2 text-xs font-medium text-warning">{{ rowIssue(sizingRow(idx)!) }}</p>
+                  <dl class="grid grid-cols-2 gap-2.5 sm:grid-cols-5">
+                    <StatTile v-if="showQuantity" :boxed="false" :label="t('calc.colTargetQty')" :value="formatQty(sizingRow(idx)!.targetQty)" :sub="baseAsset(position.symbol)" value-class="text-accent" />
+                    <StatTile v-if="showNotional" :boxed="false" :label="t('calc.colTargetNotional')" :value="formatUsd(sizingRow(idx)!.targetNotional)" :sub="ratioText(sizingRow(idx)!)" />
+                    <StatTile :boxed="false" :label="t('calc.colOptLev')" :value="sizingRow(idx)!.leverage != null ? t('unit.leverage', { n: formatQty(sizingRow(idx)!.leverage) }) : t('common.unknown')" value-class="text-accent" :sub="ratioText(sizingRow(idx)!)" />
+                    <StatTile :boxed="false" :label="t('calc.colMarginReq')" :value="formatUsd(sizingRow(idx)!.initialMargin)" :sub="shareText(sizingRow(idx)!.initialMargin)" />
+                    <StatTile :boxed="false" :label="t('calc.colEstLiq')" :value="formatPrice(sizingRow(idx)!.liquidation)" :sub="liqText(sizingRow(idx)!)" value-class="text-warning" />
+                  </dl>
+                </div>
                 <details v-if="position.entryOrders?.length" class="mt-3 rounded-lg border border-border/40 bg-surface/60">
                   <summary class="cursor-pointer rounded-lg px-3 py-2 text-xs font-semibold text-accent">{{ t("pos.entryFills") }} · {{ t("pos.entryOrdersCount", { n: position.entryOrders.length }) }}</summary>
                   <ul class="divide-y divide-border/40 px-3 pb-1.5 font-mono text-xs tabular-nums">
@@ -234,6 +360,26 @@ function orderNotional(order: TelemetryOrder) {
             </div>
           </article>
         </template>
+        <div v-if="withCalculator && sizing && sizing.rows.length" class="rounded-xl border border-border/50 bg-background/40 p-3 sm:p-4">
+          <h4 class="eyebrow mb-3">{{ t("calc.summaryTitle") }}</h4>
+          <dl class="grid grid-cols-2 gap-3 lg:grid-cols-4">
+            <StatTile :label="t('calc.totalNotional')" :value="formatUsd(sizing.totalNotional)" :sub="t('calc.positionCount', { n: sizing.rows.length })" />
+            <StatTile :label="t('calc.portfolioLev')" :value="formatLeverage(sizing.portfolioLeverage)" value-class="text-accent"
+              :sub="`${t('calc.leadLeverage')} ${formatLeverage(summary?.totalNotionalLeverage)}`" />
+            <StatTile :label="t('calc.marginOccupied')" :value="formatUsd(sizing.totalMargin)" :sub="shareText(sizing.totalMargin)" />
+            <StatTile :label="t('calc.freeCashCushion')" :value="formatUsd(sizing.freeCash)" :value-class="sizing.freeCash == null ? '' : overCommitted ? 'text-danger' : 'text-success'"
+              :sub="sizing.buffer == null ? '' : `${t('calc.buffer')} ±${formatPct(sizing.buffer, 2, false)}`" />
+          </dl>
+          <div v-if="marginPct != null" class="mt-3">
+            <div class="meter-track" aria-hidden="true"><span class="h-full rounded-full" :class="overCommitted ? 'bg-danger' : 'bg-accent'" :style="{ width: `${Math.min(100, Math.max(0, marginPct))}%` }" /></div>
+            <div class="mt-1.5 flex flex-wrap justify-between gap-2 text-xs">
+              <span :class="overCommitted ? 'font-semibold text-danger' : 'text-muted'">{{ overCommitted ? t("calc.overCommitted") : t("calc.barMargin", { pct: formatPct(marginPct, 1, false) }) }}</span>
+              <span class="text-muted">{{ t("calc.barFree", { pct: formatPct(Math.max(0, 100 - marginPct), 1, false) }) }}</span>
+            </div>
+          </div>
+          <p class="mt-3 text-xs text-muted">{{ t("calc.crossMarginNotice") }}</p>
+          <p class="mt-1 text-xs text-muted">{{ t("calc.estimateNotice") }}</p>
+        </div>
         <p class="text-xs leading-relaxed text-faint">{{ t("tel.formulaNote", { mb: formatUsd(marginBalance), src: mmrSource }) }}</p>
       </div>
     </div>

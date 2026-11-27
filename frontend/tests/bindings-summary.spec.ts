@@ -108,7 +108,7 @@ describe("绑定状态与页面摘要", () => {
     expect(page.get('[data-testid="binding-kill-banner"]').text()).toContain(t("bind.killBanner"));
     expect(page.get("tbody tr").classes()).toContain("bg-danger/10");
     expect(page.findAll("colgroup col")[1].attributes("style")).toContain("68px");
-    expect(page.findAll("colgroup col").at(-1)?.attributes("style")).toContain("68px");
+    expect(page.findAll("colgroup col").at(-1)?.attributes("style")).toContain("24%");
     page.unmount();
   });
   it("仅有敞口限制的保护项锁定，倍率和普通风控仍可编辑", () => {

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onActivated, onDeactivated, onMounted, onUnmounted, ref, watch } from "vue";
-import { AlertTriangle, ArrowRight, ChevronDown, Download, Pencil, Plus, RefreshCw, RotateCcw, Save, Trash2 } from "lucide-vue-next";
+import { AlertTriangle, ArrowRight, ChevronDown, Download, History, Pencil, Plus, RefreshCw, RotateCcw, Save, Trash2 } from "lucide-vue-next";
 import { api, isCancelled } from "@/api/client";
 import { useDataCacheStore } from "@/stores/dataCache";
 import { useAsyncAction } from "@/composables/useAsyncAction";
@@ -15,7 +15,6 @@ import BaseModal from "@/components/BaseModal.vue";
 import DataTable from "@/components/DataTable.vue";
 import EnvBadge from "@/components/EnvBadge.vue";
 import FreshnessStamp from "@/components/FreshnessStamp.vue";
-import MoreMenu from "@/components/MoreMenu.vue";
 import PageHeader from "@/components/PageHeader.vue";
 import StatusBadge from "@/components/StatusBadge.vue";
 import NumberField from "@/components/NumberField.vue";
@@ -42,14 +41,14 @@ const rows = computed(() => [...bindings.value].sort((a, b) => {
   return rank[status(a).tone] - rank[status(b).tone] || a.id - b.id;
 }));
 const columns = computed<TableColumn[]>(() => [
-  { key: "relationship", label: t("bind.relationship"), width: "25%", mobileWide: true },
+  { key: "relationship", label: t("bind.relationship"), width: "21%", mobileWide: true },
   // 开关与操作列固定触控尺寸，数字列留足不折行宽度。
   { key: "enabled", label: t("common.enable"), width: "68px" },
   { key: "scale", label: t("bind.riskScale"), width: "7%", numeric: true },
-  { key: "status", label: t("bind.runtimeStatus"), width: "21%", mobileWide: true },
-  { key: "positions", label: t("bind.positionsAndDebt"), width: "12%", numeric: true },
-  { key: "executions", label: t("bind.todayExecutions"), width: "15%", numeric: true },
-  { key: "actions", label: t("common.actions"), width: "68px", mobileWide: true },
+  { key: "status", label: t("bind.runtimeStatus"), width: "18%", mobileWide: true },
+  { key: "positions", label: t("bind.positionsAndDebt"), width: "11%", numeric: true },
+  { key: "executions", label: t("bind.todayExecutions"), width: "12%", numeric: true },
+  { key: "actions", label: t("common.actions"), width: "24%", mobileWide: true },
 ]);
 const loading = ref(false);
 const loadError = ref("");
@@ -226,7 +225,7 @@ onUnmounted(stop);
       <template #cell-status="{ row }"><StatusBadge :state="status(row).state" /><p v-for="reason in status(row).reasons" :key="reason" class="mt-1 break-words text-xs" :class="status(row).tone === 'danger' ? 'text-danger' : 'text-muted'">{{ reasonText(reason) }}</p><RouterLink v-if="status(row).pendingCount != null && status(row).pendingCount! > 0" to="/executions?tab=intents" class="mt-1 block text-xs text-warning">{{ t("bind.pendingCount", { n: status(row).pendingCount ?? t("common.unknown") }) }}</RouterLink></template>
       <template #cell-positions="{ row }"><p class="font-semibold">{{ t("bind.positionCount", { n: status(row).positionCount ?? t("common.unknown") }) }}</p><p class="mt-1 text-xs" :class="row.pendingDebtUsd != null && row.pendingDebtUsd > 0 ? 'text-warning' : 'text-muted'">{{ formatUsd(row.pendingDebtUsd) }}</p></template>
       <template #cell-executions="{ row }"><p class="whitespace-nowrap text-xs" :class="(execCounts(row)?.failed ?? 0) > 0 ? 'text-danger' : 'text-muted'">{{ execCounts(row) == null ? t("common.unknown") : t("bind.executionCounts", { success: execCounts(row)?.success ?? 0, failed: execCounts(row)?.failed ?? 0 }) }}</p></template>
-      <template #cell-actions="{ row }"><MoreMenu><button class="button-secondary justify-start" :disabled="pending" @click="open(row)"><Pencil :size="16" />{{ t("common.edit") }}</button><RouterLink :to="`/executions?binding_id=${row.id}`" class="button-secondary justify-start">{{ t("executions.title") }}</RouterLink><button class="button-secondary justify-start" :disabled="pending" @click="operate(row, 'adopt-existing')"><Download :size="16" />{{ t("bind.adoptExisting") }}</button><button v-if="row.circuitBreakerTripped === true" class="button-danger justify-start" :disabled="pending" @click="operate(row, 'reset-breaker')"><RotateCcw :size="16" />{{ t("bind.resetBreaker") }}</button><button v-if="row.pendingDebtUsd != null && row.pendingDebtUsd > 0" class="button-secondary justify-start text-warning" :disabled="pending" @click="operate(row, 'reset-debt')"><RotateCcw :size="16" />{{ t("bind.clearDebt", { amt: formatUsd(row.pendingDebtUsd) }) }}</button><button class="button-danger justify-start" :disabled="pending" @click="operate(row, 'delete')"><Trash2 :size="16" />{{ t("common.delete") }}</button></MoreMenu></template>
+      <template #cell-actions="{ row }"><div class="flex flex-wrap items-center justify-end gap-1" @click.stop><button type="button" class="button-secondary min-h-8 px-2 py-1 text-xs" :disabled="pending" @click="open(row)"><Pencil :size="14" />{{ t("common.edit") }}</button><RouterLink :to="`/executions?binding_id=${row.id}`" class="button-secondary min-h-8 px-2 py-1 text-xs"><History :size="14" />{{ t("executions.title") }}</RouterLink><button type="button" class="button-secondary min-h-8 px-2 py-1 text-xs" :disabled="pending" @click="operate(row, 'adopt-existing')"><Download :size="14" />{{ t("bind.adoptExisting") }}</button><button v-if="row.circuitBreakerTripped === true" type="button" class="button-danger min-h-8 px-2 py-1 text-xs" :disabled="pending" @click="operate(row, 'reset-breaker')"><RotateCcw :size="14" />{{ t("bind.resetBreaker") }}</button><button v-if="row.pendingDebtUsd != null && row.pendingDebtUsd > 0" type="button" class="button-secondary min-h-8 px-2 py-1 text-xs text-warning" :disabled="pending" @click="operate(row, 'reset-debt')"><RotateCcw :size="14" />{{ t("bind.clearDebt", { amt: formatUsd(row.pendingDebtUsd) }) }}</button><button type="button" class="button-danger min-h-8 px-2 py-1 text-xs" :disabled="pending" @click="operate(row, 'delete')"><Trash2 :size="14" />{{ t("common.delete") }}</button></div></template>
       <template #mobile-card="{ row }">
         <div class="space-y-2.5">
           <div class="flex items-start justify-between gap-2">
@@ -242,7 +241,6 @@ onUnmounted(stop);
             </div>
             <div class="flex shrink-0 items-center gap-1.5">
               <button class="inline-flex min-h-9 items-center" role="switch" :aria-checked="row.isEnabled === true" :disabled="pending || row.isEnabled == null" :aria-label="t('bind.enableSwitch', { name: row.name ?? t('common.unknown') })" @click="operate(row, 'toggle')"><span class="relative h-5 w-9 rounded-full" :class="row.isEnabled ? 'bg-accent' : 'bg-surface3'" aria-hidden="true"><span class="absolute top-1 h-3 w-3 rounded-full bg-foreground" :class="row.isEnabled ? 'right-1' : 'left-1'" /></span></button>
-              <MoreMenu><button class="button-secondary justify-start" :disabled="pending" @click="open(row)"><Pencil :size="16" />{{ t("common.edit") }}</button><RouterLink :to="`/executions?binding_id=${row.id}`" class="button-secondary justify-start">{{ t("executions.title") }}</RouterLink><button class="button-secondary justify-start" :disabled="pending" @click="operate(row, 'adopt-existing')"><Download :size="16" />{{ t("bind.adoptExisting") }}</button><button v-if="row.circuitBreakerTripped === true" class="button-danger justify-start" :disabled="pending" @click="operate(row, 'reset-breaker')"><RotateCcw :size="16" />{{ t("bind.resetBreaker") }}</button><button v-if="row.pendingDebtUsd != null && row.pendingDebtUsd > 0" class="button-secondary justify-start text-warning" :disabled="pending" @click="operate(row, 'reset-debt')"><RotateCcw :size="16" />{{ t("bind.clearDebt", { amt: formatUsd(row.pendingDebtUsd) }) }}</button><button class="button-danger justify-start" :disabled="pending" @click="operate(row, 'delete')"><Trash2 :size="16" />{{ t("common.delete") }}</button></MoreMenu>
             </div>
           </div>
           <div class="flex flex-wrap items-center gap-2">
@@ -264,6 +262,14 @@ onUnmounted(stop);
               <span class="text-muted">{{ t("bind.todayExecutions") }}</span>
               <p class="mt-0.5 whitespace-nowrap font-mono tabular-nums" :class="(execCounts(row)?.failed ?? 0) > 0 ? 'text-danger' : 'text-muted'">{{ execCounts(row) == null ? t("common.unknown") : t("bind.executionCounts", { success: execCounts(row)?.success ?? 0, failed: execCounts(row)?.failed ?? 0 }) }}</p>
             </div>
+          </div>
+          <div class="flex flex-wrap items-center justify-end gap-1.5 border-t border-border/40 pt-2" @click.stop>
+            <button type="button" class="button-secondary min-h-8 px-2 py-1 text-xs" :disabled="pending" @click="open(row)"><Pencil :size="14" />{{ t("common.edit") }}</button>
+            <RouterLink :to="`/executions?binding_id=${row.id}`" class="button-secondary min-h-8 px-2 py-1 text-xs"><History :size="14" />{{ t("executions.title") }}</RouterLink>
+            <button type="button" class="button-secondary min-h-8 px-2 py-1 text-xs" :disabled="pending" @click="operate(row, 'adopt-existing')"><Download :size="14" />{{ t("bind.adoptExisting") }}</button>
+            <button v-if="row.circuitBreakerTripped === true" type="button" class="button-danger min-h-8 px-2 py-1 text-xs" :disabled="pending" @click="operate(row, 'reset-breaker')"><RotateCcw :size="14" />{{ t("bind.resetBreaker") }}</button>
+            <button v-if="row.pendingDebtUsd != null && row.pendingDebtUsd > 0" type="button" class="button-secondary min-h-8 px-2 py-1 text-xs text-warning" :disabled="pending" @click="operate(row, 'reset-debt')"><RotateCcw :size="14" />{{ t("bind.clearDebt", { amt: formatUsd(row.pendingDebtUsd) }) }}</button>
+            <button type="button" class="button-danger min-h-8 px-2 py-1 text-xs" :disabled="pending" @click="operate(row, 'delete')"><Trash2 :size="14" />{{ t("common.delete") }}</button>
           </div>
         </div>
       </template>

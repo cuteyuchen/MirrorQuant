@@ -167,4 +167,23 @@ describe("带单员独立详情", () => {
     page.unmount();
     ui.clear();
   });
+
+  it("详情页顶部提供快捷带单员切换条，无需返回列表页直接切换", async () => {
+    seed();
+    const navigation = router();
+    await navigation.push("/leads/1");
+    await navigation.isReady();
+    const page = mount(LeadDetailView, { global: { plugins: [navigation],
+      stubs: { LeadComparison: true, LeadTelemetryPanel: true } } });
+    await flushPromises();
+
+    const switcher = page.get('[data-testid="lead-switcher"]');
+    expect(switcher.text()).toContain("Lead A");
+    expect(switcher.text()).toContain("Lead B");
+    const linkB = switcher.findAll("a").find(a => a.text().includes("Lead B"))!;
+    await linkB.trigger("click");
+    await flushPromises();
+    expect(navigation.currentRoute.value.path).toBe("/leads/2");
+    page.unmount();
+  });
 });

@@ -7,6 +7,7 @@ import { useDisplayUnit } from "@/composables/useDisplayUnit";
 import { finiteNumber, formatDateTime, formatPct, formatPrice, formatQty, formatUsd, signedUsd, type NumericValue } from "@/utils/format";
 import { normalizeSide, pnlClass, sideLabel, statusTone } from "@/utils/status";
 import { reasonText } from "@/utils/errors";
+import { boardPositionsConfirmed } from "@/utils/positions";
 import FreshnessStamp from "@/components/FreshnessStamp.vue";
 import EnvBadge from "@/components/EnvBadge.vue";
 import EmptyState from "@/components/EmptyState.vue";
@@ -40,7 +41,7 @@ const isUnbound = computed(() => !props.readOnly && props.lead.boundCount === 0)
 const showMineSection = computed(() => !props.readOnly && !isUnbound.value);
 const showTimeline = computed(() => props.readOnly || (props.lead.todayEvents?.length ?? 0) > 0);
 const idleSummary = computed(() => {
-  if (props.lead.positions == null || props.lead.positionShow !== true) return t("board.unknownSummary");
+  if (!boardPositionsConfirmed(props.lead)) return t("board.unknownSummary");
   return t("board.idleSummary", { open: props.lead.todayOpenCount ?? 0, close: props.lead.todayCloseCount ?? 0 });
 });
 function mineRows(position: BoardPosition) {
@@ -131,7 +132,7 @@ const showToday = computed(() => !props.readOnly
       <div class="grid min-w-0 gap-5" :class="showTimeline ? 'xl:grid-cols-[minmax(0,1fr)_300px]' : ''">
         <div class="min-w-0">
           <!-- 隐藏或未知仓位不是已确认空仓，不能显示无持仓。 -->
-          <EmptyState v-if="!positions.length" :title="t(lead.positions == null || lead.positionShow !== true ? 'board.unknownPositions' : 'board.noPositions')" data-testid="empty-positions" />
+          <EmptyState v-if="!positions.length" :title="t(boardPositionsConfirmed(lead) ? 'board.noPositions' : 'board.unknownPositions')" data-testid="empty-positions" />
           <!-- 一个持仓一张卡：未绑定模式双列平铺，已绑定模式左边为带单盈亏与价位、右边为我的对应跟单状态。 -->
           <div v-else class="grid min-w-0 gap-3" :class="!showMineSection ? 'lg:grid-cols-2' : ''">
             <article v-for="position in positions" :id="`pos-${position.symbol}`" :key="positionKey(position)" :data-position="position.key"

@@ -361,3 +361,94 @@ async def test_hidden_empty_snapshot_never_authorizes_orphan_close(workflow, exp
     await t.db.refresh(allocation)
     assert allocation.owned_qty == 1
     assert await t.db.scalar(select(OrderIntent)) is None
+
+
+async def test_hidden_oneway_both_open_short_reduce_and_flip_routes_cleanly(workflow, fixed_clock):
+    # 隐藏带单员单向持仓模式（positionSide=BOTH）：
+    # 1) SELL 1 ETH -> 重建 SHORT 1，跟单开空 1
+    # 2) BUY 0.4 ETH -> 重建 SHORT 0.6，跟单减空 0.4（剩 0.6）
+    # 3) BUY 1.0 ETH（跨零轴）-> 重建 LONG 0.4，路由拆分平空 0.6 + 开多 0.4
+    t = workflow
+    eth_spec = InstrumentSpec("ETHUSDT", Decimal("1"), Decimal("0.1"), Decimal("0.1"), Decimal("0.1"),
+                              min_notional=Decimal("5"), max_lvr=100)
+    t.adapter.get_instruments = AsyncMock(return_value={"BTCUSDT": t.spec, "ETHUSDT": eth_spec})
+    t.lead.seen_order_keys_json = json.dumps([])
+    held = {"short": Decimal("0"), "long": Decimal("0")}
+    t.adapter.get_positions = AsyncMock(side_effect=lambda: [
+        ExchangePosition("ETHUSDT", "ETHUSDT", side, "cross", float(qty), float(qty), 100.0, 0, 0, float(qty) * 100.0, 1)
+        for side, qty in held.items() if qty > 0
+    ])
+    recorded_orders = []
+
+    async def place_order(**order):
+        recorded_orders.append(order)
+        sz = Decimal(str(order["sz"]))
+        if order["reduce_only"]:
+            held[order["pos_side"]] = max(Decimal("0"), held[order["pos_side"]] - sz)
+        else:
+            held[order["pos_side"]] += sz
+        return OrderResult(f"ord-{len(recorded_orders)}", order["cl_ord_id"])
+
+    async def get_order(inst_id, cl_ord_id):
+        last = recorded_orders[-1]
+        return {"ordId": f"ord-{len(recorded_orders)}", "accFillSz": last["sz"], "avgPx": "100", "state": "filled"}
+
+    t.adapter.place_order.side_effect = place_order
+    t.adapter.get_order.side_effect = get_order
+
+    collector = BinanceBapiCollector()
+    collector.fetch_detail = AsyncMock(return_value={"positionShow": False, "marginBalance": 1000})
+    collector.fetch_position_history = AsyncMock(return_value={"list": [], "total": 0})
+    collector.fetch_holdings = AsyncMock(side_effect=AssertionError("Hidden holdings must not be fetched"))
+    collector.fetch_performance = AsyncMock(return_value={})
+    collector.fetch_roi_chart = AsyncMock(return_value=[])
+    collector.fetch_allocation = AsyncMock(return_value={})
+    collector.fetch_marks = AsyncMock(return_value={})
+    collector.fetch_brackets = AsyncMock(return_value={})
+
+    store = {}
+    history = []
+
+    async def sync_and_route(new_raw):
+        nonlocal history
+        history = [*new_raw, *history]
+        collector.fetch_order_history = AsyncMock(return_value=history)
+        snap = await collector.sync_snapshot("hidden-both", store, [], with_analysis=False)
+        t.lead.snapshot_json = json.dumps(snap)
+        t.lead.orders_store_json = json.dumps(store)
+        await t.db.commit()
+        await t.router.process_lead_events(t.db, t.lead, list(store.values()), [], snap, [t.proxy])
+        return snap
+
+    # 1. 开空 1 ETH
+    snap1 = await sync_and_route([{
+        "orderId": "ow-1", "orderTime": NOW_MS - 3000, "orderUpdateTime": NOW_MS - 3000,
+        "symbol": "ETHUSDT", "side": "SELL", "positionSide": "BOTH", "type": "MARKET",
+        "executedQty": "1", "avgPrice": "100", "totalPnl": "0", "pnlKnown": True,
+    }])
+    assert [(p["symbol"], p["positionSide"], p["qty"]) for p in snap1["openPositions"]] == [("ETHUSDT", "SHORT", 1.0)]
+    assert held == {"short": Decimal("1"), "long": Decimal("0")}
+
+    # 2. 减空 0.4 ETH
+    snap2 = await sync_and_route([{
+        "orderId": "ow-2", "orderTime": NOW_MS - 2000, "orderUpdateTime": NOW_MS - 2000,
+        "symbol": "ETHUSDT", "side": "BUY", "positionSide": "BOTH", "type": "MARKET",
+        "executedQty": "0.4", "avgPrice": "100", "totalPnl": "0", "pnlKnown": True,
+    }])
+    assert [(p["symbol"], p["positionSide"], p["qty"]) for p in snap2["openPositions"]] == [("ETHUSDT", "SHORT", 0.6)]
+    assert held == {"short": Decimal("0.6"), "long": Decimal("0")}
+
+    # 3. BUY 1.0 ETH 跨零轴：平余下 0.6 空并反手开 0.4 多
+    snap3 = await sync_and_route([{
+        "orderId": "ow-3", "orderTime": NOW_MS - 1000, "orderUpdateTime": NOW_MS - 1000,
+        "symbol": "ETHUSDT", "side": "BUY", "positionSide": "BOTH", "type": "MARKET",
+        "executedQty": "1.0", "avgPrice": "100", "totalPnl": "10", "pnlKnown": True,
+    }])
+    assert [(p["symbol"], p["positionSide"], p["qty"]) for p in snap3["openPositions"]] == [("ETHUSDT", "LONG", 0.4)]
+    assert held == {"short": Decimal("0.0"), "long": Decimal("0.4")}
+    assert [(o["pos_side"], o["side"], o["reduce_only"], Decimal(str(o["sz"]))) for o in recorded_orders] == [
+        ("short", "sell", False, Decimal("1.0")),
+        ("short", "buy", True, Decimal("0.4")),
+        ("short", "buy", True, Decimal("0.6")),
+        ("long", "buy", False, Decimal("0.4")),
+    ]

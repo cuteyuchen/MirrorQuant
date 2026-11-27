@@ -12,7 +12,6 @@ import { formatDateTime, formatQty } from "@/utils/format";
 import BaseModal from "@/components/BaseModal.vue";
 import PageHeader from "@/components/PageHeader.vue";
 import DataTable from "@/components/DataTable.vue";
-import MoreMenu from "@/components/MoreMenu.vue";
 import EnvBadge from "@/components/EnvBadge.vue";
 import FreshnessStamp from "@/components/FreshnessStamp.vue";
 import NumberField from "@/components/NumberField.vue";
@@ -147,19 +146,19 @@ onActivated(() => { void load(); });
     <p v-if="error && !showModal" class="error-banner" role="alert">{{ error }}</p>
     <p v-if="batchResult" class="text-sm" :class="batchResult.failed ? 'text-warning' : 'text-success'" role="status">{{ t("proxy.batchResult", batchResult) }}</p>
     <DataTable :rows="rows" :label="t('proxy.title')" :row-key="row => row.id" :row-tone="rowTone" :loading="loading" :error="loadError" :empty="t('proxy.emptyTitle')" @retry="load(true)" :columns="[
-      { key: 'node', label: t('proxy.node'), width: '25%', mobileWide: true },
-      { key: 'routing', label: t('proxy.routing'), width: '10%' },
-      { key: 'health', label: t('proxy.health'), width: '13%', numeric: true },
-      { key: 'checked', label: t('proxy.checked'), width: '19%', mobileWide: true },
-      { key: 'usage', label: t('proxy.usedBy'), width: '23%', mobileWide: true },
-      { key: 'actions', label: t('common.actions'), width: '10%' },
+      { key: 'node', label: t('proxy.node'), width: '21%', mobileWide: true },
+      { key: 'routing', label: t('proxy.routing'), width: '9%' },
+      { key: 'health', label: t('proxy.health'), width: '12%', numeric: true },
+      { key: 'checked', label: t('proxy.checked'), width: '17%', mobileWide: true },
+      { key: 'usage', label: t('proxy.usedBy'), width: '21%', mobileWide: true },
+      { key: 'actions', label: t('common.actions'), width: '20%' },
     ]">
       <template #cell-node="{ row }"><h2 class="break-words text-sm font-semibold">{{ row.name ?? t("common.unknown") }}</h2><p class="mt-1 break-all text-xs text-muted">{{ safeAddress(row.url) }}</p><label class="mt-1 inline-flex min-h-11 items-center gap-2 text-xs"><input type="checkbox" role="switch" :checked="row.isEnabled === true" :disabled="pending || row.isEnabled == null" :aria-label="t('proxy.enabledFor', { name: row.name ?? '—' })" @change="change(row, 'toggle', $event)" /><span>{{ t(row.isEnabled == null ? "state.UNKNOWN" : row.isEnabled ? "common.enabled" : "common.disabled") }}</span></label></template>
       <template #cell-routing="{ row }"><p>{{ row.region ?? t("common.unknown") }}</p><p class="mt-1 text-xs text-muted">{{ t("proxy.priority") }} <span class="tabular-nums">{{ formatQty(row.priority) }}</span></p></template>
       <template #cell-health="{ row }"><StatusBadge :state="row.isHealthy == null ? 'unknown' : row.isHealthy ? 'healthy' : 'error'" /><p class="mt-1 tabular-nums">{{ row.latencyMs == null ? t("common.unknown") : t("proxy.latencyValue", { n: formatQty(row.latencyMs) }) }}</p></template>
       <template #cell-checked="{ row }"><FreshnessStamp :timestamp="row.lastCheckedAt" :warn-after="300" :critical-after="900" /><p class="mt-1 text-xs text-muted">{{ formatDateTime(row.lastCheckedAt, { short: true, withSeconds: false }) }}</p><p v-if="issue(row)" class="mt-1 break-words text-xs" :class="row.isHealthy === false || row.lastError ? 'text-danger' : 'text-warning'">{{ issue(row) }}</p></template>
       <template #cell-usage="{ row }"><p v-if="!usageKnown" class="text-xs text-warning">{{ t("proxy.usageUnknown") }}</p><div v-else class="space-y-2"><p v-for="account in references(row.id).accounts" :key="`account-${account.id}`" class="flex flex-wrap items-center gap-2 text-xs"><span>{{ t("accts.account") }} · {{ account.name ?? t("common.unknown") }}</span><EnvBadge :environment="account.environment" /></p><p v-for="lead in references(row.id).leads" :key="`lead-${lead.id}`" class="break-words text-xs">{{ t("nav.leads") }} · {{ lead.name ?? t("common.unknown") }}</p><p v-if="!references(row.id).accounts.length && !references(row.id).leads.length" class="text-xs text-muted">{{ t("proxy.unused") }}</p></div></template>
-      <template #cell-actions="{ row }"><div class="flex flex-wrap items-center justify-end gap-1"><button class="icon-button" :disabled="pending" :aria-label="t('proxy.testLatency')" :title="t('proxy.testLatency')" @click="test(row)"><Wifi :size="17" /></button><button class="icon-button" :disabled="pending" :aria-label="t('common.edit')" :title="t('common.edit')" @click="edit(row)"><Pencil :size="17" /></button><MoreMenu><button class="menu-item text-danger" :disabled="pending" @click="change(row, 'delete')"><Trash2 :size="16" />{{ t("common.delete") }}</button></MoreMenu></div></template>
+      <template #cell-actions="{ row }"><div class="flex flex-wrap items-center justify-end gap-1" @click.stop><button type="button" class="button-secondary min-h-8 px-2 py-1 text-xs" :disabled="pending" :aria-label="t('proxy.testLatency')" @click="test(row)"><Wifi :size="14" />{{ t("proxy.testShort") }}</button><button type="button" class="button-secondary min-h-8 px-2 py-1 text-xs" :disabled="pending" :aria-label="t('common.edit')" @click="edit(row)"><Pencil :size="14" />{{ t("common.edit") }}</button><button type="button" class="button-danger min-h-8 px-2 py-1 text-xs" :disabled="pending" :aria-label="t('common.delete')" @click="change(row, 'delete')"><Trash2 :size="14" />{{ t("common.delete") }}</button></div></template>
       <template #mobile-card="{ row }">
         <div class="space-y-2.5">
           <div class="flex items-start justify-between gap-2">

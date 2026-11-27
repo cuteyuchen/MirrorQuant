@@ -190,6 +190,13 @@ class OKXAdapter(BaseExchangeAdapter):
             base_sym = inst_id.replace("-USDT-SWAP", "USDT") if inst_id.endswith("-USDT-SWAP") else inst_id
             raw_side = str(p.get("posSide") or "net").lower()
             logical_side = ("long" if pos_sz > 0 else "short") if raw_side == "net" else raw_side
+            lever = float(p.get("lever") or 1.0)
+            notional_val = abs(float(p.get("notionalUsd") or 0.0))
+            raw_margin = abs(float(p.get("imr") or p.get("margin") or 0.0))
+            margin_usd = raw_margin if raw_margin > 0 else ((notional_val / lever) if (notional_val > 0 and lever > 0) else 0.0)
+            upl = float(p.get("upl") or 0.0)
+            raw_upl_ratio = p.get("uplRatio")
+            upl_ratio = float(raw_upl_ratio) if raw_upl_ratio not in (None, "") else ((upl / margin_usd) if margin_usd > 0 else 0.0)
             positions.append(
                 ExchangePosition(
                     inst_id=inst_id,
@@ -200,12 +207,13 @@ class OKXAdapter(BaseExchangeAdapter):
                     avail_pos=abs(float(p.get("availPos") or 0.0)),
                     avg_px=float(p.get("avgPx") or 0.0),
                     cur_px=float(p.get("markPx") or p.get("last") or p.get("idxPx") or p.get("avgPx") or 0.0),
-                    upl=float(p.get("upl") or 0.0),
-                    upl_ratio=float(p.get("uplRatio") or 0.0),
-                    notional_usd=abs(float(p.get("notionalUsd") or 0.0)),
-                    lever=float(p.get("lever") or 1.0),
+                    upl=upl,
+                    upl_ratio=upl_ratio,
+                    notional_usd=notional_val,
+                    lever=lever,
                     c_time=int(p.get("cTime") or 0),
                     u_time=int(p.get("uTime") or 0),
+                    margin_usd=margin_usd,
                 )
             )
         return positions

@@ -78,6 +78,7 @@ async def board_state(async_client, monkeypatch):
         await db.flush()
         allocation = PositionAllocation(binding_id=binding.id, account_id=account.id, inst_id="BTCUSDT",
             pos_side="long", owned_qty=1, owned_qty_exact="1", entry_cost=100, entry_cost_exact="100",
+            cycle_ratio_exact="1", expected_qty_exact="1", lead_qty_exact="1",
             opened_at_ms=START_MS + 1000)
         db.add(allocation)
         await db.commit()
@@ -672,3 +673,65 @@ async def test_board_reconstructed_positions_without_full_evidence_stay_unknown(
     lead = (await build_board(t.db, now=NOW))["leads"][0]
     assert lead["positions"][0]["mine"][0]["state"] == "unknown"
     assert lead["orphans"] is None
+
+
+async def test_board_exposes_owner_positions_confirmed_and_oneway_events(board_state):
+    t = board_state
+    t.lead.snapshot_json = json.dumps({
+        "meta": {"generatedAt": NOW_MS, "orderHistoryComplete": True},
+        "profile": {"marginBalance": 1000, "positionShow": True},
+        "openPositions": [],
+        "openPositionsMeta": {"authoritative": True, "complete": True, "emptyVerified": True, "asOf": NOW_MS},
+    })
+    t.lead.orders_store_json = json.dumps({
+        "o1": {"h": "o1", "sym": "ETHUSDT", "ps": "BOTH", "side": "SELL", "q": "10", "p": "2000", "t": START_MS + 1000, "ot": START_MS + 1000, "pnl": 0, "pnlKnown": True},
+        "o2": {"h": "o2", "sym": "ETHUSDT", "ps": "BOTH", "side": "BUY", "q": "10", "p": "1950", "t": START_MS + 2000, "ot": START_MS + 2000, "pnl": 500, "pnlKnown": True},
+    })
+    await t.db.commit()
+    board = await build_board(t.db, now=NOW)
+    assert "ownerUserId" in board["accounts"][0]
+    lead = board["leads"][0]
+    assert lead["positionsConfirmed"] is True
+    assert [e["action"] for e in lead["todayEvents"]] == ["CLOSE", "OPEN"]
+    assert all(e["side"] == "SHORT" for e in lead["todayEvents"])
+    assert lead["todayOpenCount"] == 1 and lead["todayCloseCount"] == 1
+    assert lead["todayRealizedPnl"] == 500
+
+    # Incomplete / unverified lead must report positionsConfirmed=False
+    t.lead.snapshot_json = json.dumps({"meta": {"generatedAt": NOW_MS}, "openPositions": []})
+    await t.db.commit()
+    lead_unverified = (await build_board(t.db, now=NOW))["leads"][0]
+    assert lead_unverified["positionsConfirmed"] is False
+
+
+async def test_board_equity_drop_from_1000_to_800_keeps_existing_position_aligned(board_state):
+    # 开仓锁定 1 BTC（权益 1000）；其他仓亏损使权益跌到 800、带单量仍是 1 BTC 时，
+    # 看板按锁定应有量判定为已对齐，不能误报数量偏离（partial）。
+    t = board_state
+    risk = json.loads(t.account.risk_equity_json)
+    risk["assets"]["USDT"]["equity"] = 800
+    t.account.risk_equity_json = json.dumps(risk)
+    t.account.usdt_equity = 800
+    await t.db.commit()
+    mine = (await build_board(t.db, now=NOW))["leads"][0]["positions"][0]["mine"][0]
+    assert mine["state"] == "aligned"
+    assert mine["qty"] == 1
+    assert mine["expectedQty"] == 1
+    assert mine["reason"] is None
+
+
+async def test_board_legacy_allocation_without_locked_ratio_reports_unknown_not_partial(board_state):
+    # 旧仓位没有锁定比例字段时，不应按当前权益重算误报偏离，而应显示未知。
+    t = board_state
+    t.allocation.cycle_ratio_exact = None
+    t.allocation.expected_qty_exact = None
+    t.allocation.lead_qty_exact = None
+    risk = json.loads(t.account.risk_equity_json)
+    risk["assets"]["USDT"]["equity"] = 800
+    t.account.risk_equity_json = json.dumps(risk)
+    t.account.usdt_equity = 800
+    await t.db.commit()
+    mine = (await build_board(t.db, now=NOW))["leads"][0]["positions"][0]["mine"][0]
+    assert mine["state"] == "unknown"
+    assert mine["expectedQty"] is None
+    assert "缺少锁定比例" in (mine["reason"] or "")

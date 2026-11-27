@@ -180,6 +180,9 @@ SQLITE_MIGRATIONS: Dict[str, List[Tuple[str, str]]] = {
     "position_allocations": [
         ("owned_qty_exact", "VARCHAR(100)"),
         ("entry_cost_exact", "VARCHAR(100)"),
+        ("cycle_ratio_exact", "VARCHAR(100)"),
+        ("expected_qty_exact", "VARCHAR(100)"),
+        ("lead_qty_exact", "VARCHAR(100)"),
         ("generation", "INTEGER NOT NULL DEFAULT 0"),
         ("opened_at_ms", "BIGINT NOT NULL DEFAULT 0"),
     ],
@@ -188,7 +191,10 @@ SQLITE_MIGRATIONS: Dict[str, List[Tuple[str, str]]] = {
                       ("reporting_complete", "BOOLEAN NOT NULL DEFAULT 0"),
                       ("expires_at_ms", "BIGINT"),
                       ("limit_px", "VARCHAR(100)"),
-                      ("sizing_px", "VARCHAR(100)")],
+                      ("sizing_px", "VARCHAR(100)"),
+                      ("expected_delta_qty", "VARCHAR(100)"),
+                      ("lead_delta_qty", "VARCHAR(100)"),
+                      ("cycle_ratio_exact", "VARCHAR(100)")],
     "lead_sources": [
         ("notification_config_json", "TEXT"),
         ("created_by_user_id", "INTEGER"),

@@ -140,3 +140,16 @@ async def test_overview_and_accounts_expose_current_price_and_lead_health(async_
     # Reading legacy data must not rewrite its saved snapshot.
     async with get_session_factory()() as db:
         assert json.loads((await db.get(TradingAccount, account_id)).positions_json) == positions
+
+
+def test_with_current_price_uses_actual_margin_for_upl_ratio():
+    # Margin ROE = upl / marginUsd (or upl / (notionalUsd / lever))
+    p1 = {"symbol": "ETHUSDT", "pos": 1, "avgPx": 2000, "markPrice": 2100, "notionalUsd": 2100, "upl": 100, "marginUsd": 420, "lever": 5, "uplRatio": 0.0476}
+    out1 = with_current_price(p1, "binance")
+    assert out1["marginUsd"] == 420
+    assert out1["uplRatio"] == pytest.approx(100 / 420)
+
+    p2 = {"symbol": "SOLUSDT", "pos": 10, "avgPx": 100, "markPrice": 110, "notionalUsd": 1100, "upl": 100, "lever": 10}
+    out2 = with_current_price(p2, "bybit")
+    assert out2["marginUsd"] == pytest.approx(110.0)
+    assert out2["uplRatio"] == pytest.approx(100 / 110.0)

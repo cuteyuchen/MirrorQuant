@@ -192,6 +192,10 @@ class BitgetAdapter(BaseExchangeAdapter):
             mark_px = float(p.get("markPrice") or avg_px)
             notional = abs(sz * mark_px)
             upl = float(p.get("unrealizedPL") or 0.0)
+            lever = float(p.get("leverage") or 1.0)
+            margin_usd = float(p.get("marginSize") or p.get("margin") or 0.0)
+            if margin_usd <= 0 and notional > 0 and lever > 0:
+                margin_usd = notional / lever
             positions.append(
                 ExchangePosition(
                     inst_id=sym,
@@ -203,11 +207,12 @@ class BitgetAdapter(BaseExchangeAdapter):
                     avg_px=avg_px,
                     cur_px=mark_px,
                     upl=upl,
-                    upl_ratio=(upl / notional) if notional > 0 else 0.0,
+                    upl_ratio=(upl / margin_usd) if margin_usd > 0 else 0.0,
                     notional_usd=notional,
-                    lever=float(p.get("leverage") or 1.0),
+                    lever=lever,
                     c_time=int(p.get("cTime") or 0),
                     u_time=int(p.get("uTime") or 0),
+                    margin_usd=margin_usd,
                 )
             )
         return positions

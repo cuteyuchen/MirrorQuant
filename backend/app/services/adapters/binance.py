@@ -291,21 +291,29 @@ class BinanceAdapter(BaseExchangeAdapter):
             mark = float(p.get("markPrice") or entry)
             notional = abs(float(p.get("notional") or (amt * mark)))
             upl = float(p.get("unRealizedProfit") or 0.0)
+            lever = float(p.get("leverage") or 1.0)
+            mgn_mode = str(p.get("marginType") or "cross").lower()
+            margin_usd = float(p.get("initialMargin") or p.get("positionInitialMargin") or 0.0)
+            if margin_usd <= 0 and mgn_mode == "isolated":
+                margin_usd = float(p.get("isolatedWallet") or 0.0)
+            if margin_usd <= 0 and notional > 0 and lever > 0:
+                margin_usd = notional / lever
             positions.append(
                 ExchangePosition(
                     inst_id=sym,
                     symbol=sym,
                     pos_side=pos_side,
-                    mgn_mode=str(p.get("marginType") or "cross").lower(),
+                    mgn_mode=mgn_mode,
                     pos=abs(amt),
                     avail_pos=abs(amt),
                     avg_px=entry,
                     cur_px=mark,
                     upl=upl,
-                    upl_ratio=(upl / notional) if notional > 0 else 0.0,
+                    upl_ratio=(upl / margin_usd) if margin_usd > 0 else 0.0,
                     notional_usd=notional,
-                    lever=float(p.get("leverage") or 1.0),
+                    lever=lever,
                     u_time=int(p.get("updateTime") or 0),
+                    margin_usd=margin_usd,
                 )
             )
         return positions

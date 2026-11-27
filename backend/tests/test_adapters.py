@@ -180,3 +180,47 @@ def test_adapter_factory_registration():
         assert hasattr(ad, "place_tp_sl")
         assert hasattr(ad, "cancel_tp_sl")
         assert hasattr(ad, "sync_time")
+
+
+async def test_adapters_compute_margin_based_upl_ratio():
+    bn = BinanceAdapter(credentials={"api_key": "k", "secret_key": "s"})
+    bn._request = AsyncMock(return_value=[{
+        "symbol": "ETHUSDT", "positionSide": "LONG", "positionAmt": "2",
+        "entryPrice": "2000", "markPrice": "2100", "notional": "4200",
+        "unRealizedProfit": "200", "leverage": "10", "marginType": "cross",
+        "initialMargin": "420",
+    }])
+    bn_pos = await bn.get_positions()
+    assert len(bn_pos) == 1
+    assert bn_pos[0].margin_usd == pytest.approx(420.0)
+    assert bn_pos[0].upl_ratio == pytest.approx(200.0 / 420.0)
+
+    by = BybitAdapter(credentials={"api_key": "k", "secret_key": "s"})
+    by._all_pages = AsyncMock(return_value=[{
+        "symbol": "ETHUSDT", "side": "Buy", "positionIdx": 1, "size": "2",
+        "avgPrice": "2000", "markPrice": "2100", "positionValue": "4200",
+        "unrealisedPnl": "200", "leverage": "10", "tradeMode": 0, "positionIM": "420",
+    }])
+    by_pos = await by.get_positions()
+    assert by_pos[0].margin_usd == pytest.approx(420.0)
+    assert by_pos[0].upl_ratio == pytest.approx(200.0 / 420.0)
+
+    bg = BitgetAdapter(credentials={"api_key": "k", "secret_key": "s", "passphrase": "p"})
+    bg._request = AsyncMock(return_value=[{
+        "symbol": "ETHUSDT", "holdSide": "long", "total": "2", "available": "2",
+        "openPriceAvg": "2000", "markPrice": "2100", "unrealizedPL": "200",
+        "leverage": "10", "marginMode": "crossed", "marginSize": "420",
+    }])
+    bg_pos = await bg.get_positions()
+    assert bg_pos[0].margin_usd == pytest.approx(420.0)
+    assert bg_pos[0].upl_ratio == pytest.approx(200.0 / 420.0)
+
+    okx = OKXAdapter(credentials={"api_key": "k", "secret_key": "s", "passphrase": "p"})
+    okx._request = AsyncMock(return_value=[{
+        "instId": "ETH-USDT-SWAP", "posSide": "long", "pos": "2", "availPos": "2",
+        "avgPx": "2000", "markPx": "2100", "notionalUsd": "4200", "upl": "200",
+        "lever": "10", "mgnMode": "cross", "imr": "420",
+    }])
+    okx_pos = await okx.get_positions()
+    assert okx_pos[0].margin_usd == pytest.approx(420.0)
+    assert okx_pos[0].upl_ratio == pytest.approx(200.0 / 420.0)

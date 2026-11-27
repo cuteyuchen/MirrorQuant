@@ -16,7 +16,7 @@ export type BoardAccount = NullableFields<{
   id: number; name: string; exchange: string; environment: Environment; status: string;
   equity: number; available: number; unrealizedPnl: number; todayPnl: number;
   todayPnlPct: number; lastSyncAt: number; riskLegacyUnverified: boolean;
-}>;
+}> & { ownerUserId?: number | null };
 export type BoardMine = NullableFields<{
   bindingId: number; bindingName: string; accountId: number; accountName: string;
   environment: Environment; bindingEnabled: boolean; breakerTripped: boolean;
@@ -45,7 +45,7 @@ export type BoardLead = NullableFields<{
   todayOpenCount: number;
   todayCloseCount: number; todayRealizedPnl: number; positions: BoardPosition[];
   orphans: BoardOrphan[]; todayEvents: BoardEvent[];
-}>;
+}> & { positionsConfirmed?: boolean | null };
 export type DashboardBoard = NullableFields<{
   serverTime: number; dayStart: number; globalKillSwitch: boolean;
   alerts: BoardAlert[]; accounts: BoardAccount[]; leads: BoardLead[];
@@ -72,6 +72,7 @@ export type SocketMessage = { type?: string; data?: ExecutionRecord | null };
 export interface Account {
   id: number; name: string | null; exchange: string | null; environment: Environment | null;
   proxyId: number | null; isEnabled: boolean | null; status: string | null;
+  ownerUserId?: number | null;
   apiKeyMasked?: string | null; marginMode?: string | null; positionMode?: string | null;
   totalEquity?: number | null; usdtEquity?: number | null; usdcEquity?: number | null;
   availEquity?: number | null; unrealizedPnl?: number | null; lastSyncAt?: Timestamp | null;
@@ -288,9 +289,10 @@ export interface PriceAnalysis {
 }
 export interface TelemetryOrder {
   id?: string | number | null; orderId?: string | number | null; symbol?: string | null;
-  dir?: string | null; time?: number | null; t?: number | null; ty?: string | null;
-  qty?: number | null; q?: number | null; avgPrice?: number | null; price?: number | null;
-  p?: number | null; pnl?: number | null; type?: string | null;
+  dir?: string | null; side?: string | null; positionSide?: string | null; ps?: string | null;
+  time?: number | null; t?: number | null; orderTime?: number | null; ot?: number | null;
+  ty?: string | null; qty?: number | null; q?: number | null; avgPrice?: number | null; price?: number | null;
+  p?: number | null; pnl?: number | null; pnlKnown?: boolean | null; isClose?: boolean | null; type?: string | null;
 }
 export interface LegacyPosition {
   symbol?: string | null; instId?: string | null; positionSide?: string | null; posSide?: string | null;
@@ -305,7 +307,7 @@ export interface LegacyPosition {
   mmr?: { maxLev?: number | null; mmrPct?: number | null; tier?: number | null; exact?: boolean | null } | null;
   // 账户仓位接口的原始字段；uplRatio 是比例而非百分数。
   avgPx?: number | null; curPx?: number | null; markPx?: number | null;
-  upl?: number | null; uplRatio?: number | null; notionalUsd?: number | null; lever?: number | null;
+  upl?: number | null; uplRatio?: number | null; notionalUsd?: number | null; marginUsd?: number | null; lever?: number | null;
   cTime?: Timestamp | null; uTime?: Timestamp | null; mgnMode?: string | null;
   availPos?: number | null; priceSource?: string | null;
 }
@@ -319,7 +321,8 @@ export interface TradeCycle {
   avgEntryPrice?: number | null; avgEntry?: number | null; avgExitPrice?: number | null; avgClose?: number | null;
   entryCount?: number | null; entryOrdersCount?: number | null; scaleInCount?: number | null;
   exitCount?: number | null; exitOrdersCount?: number | null; durationMs?: number | null; durationSec?: number | null;
-  realizedPnl?: number | null; openedAt?: number | null;
+  totalEntryQty?: number | null; totalExitQty?: number | null;
+  realizedPnl?: number | null; openedAt?: number | null; startTime?: number | null; endTime?: number | null;
 }
 export interface ClosedPosition {
   id?: number | string | null; symbol?: string | null; side?: string | null; closed?: number | null;
@@ -332,8 +335,14 @@ export interface LeadSnapshot {
   meta?: {
     generatedAt?: number | null; priceUpdatedAt?: number | null; portfolioId?: string | null;
     fetchMs?: number | null; orderStoreSize?: number | null; stale?: boolean | null; snapshotAgeSec?: number | null;
+    orderHistoryComplete?: boolean | null; closedHistoryComplete?: boolean | null; detailOk?: boolean | null;
   } | null;
-  openPositionsSummary?: PositionSummary | null; openPositionsMeta?: { source?: string | null; authoritative?: boolean | null; complete?: boolean | null; emptyVerified?: boolean | null; partial?: boolean | null } | null;
+  openPositionsSummary?: PositionSummary | null;
+  openPositionsMeta?: {
+    source?: string | null; authoritative?: boolean | null; complete?: boolean | null;
+    emptyVerified?: boolean | null; partial?: boolean | null;
+    reconstructed?: boolean | null; derived?: boolean | null; positionShow?: boolean | null; asOf?: number | null;
+  } | null;
   openPositions?: LegacyPosition[] | null; roiChart365D?: { t: number | null; v: number | null }[] | null;
   allocation?: { updateTime?: number | null; items?: { asset: string | null; volume: number | null }[] | null } | null;
   orderBatches?: OrderBatch[] | null; tradeCycles?: TradeCycle[] | null;

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onActivated, onMounted, ref } from "vue";
-import { Check, Copy, KeyRound, Plus, RefreshCw, Trash2 } from "lucide-vue-next";
+import { Check, Copy, KeyRound, Plus, Power, RefreshCw, Shield, Trash2 } from "lucide-vue-next";
 import { api, ApiError, isCancelled } from "@/api/client";
 import { useAsyncAction } from "@/composables/useAsyncAction";
 import { useUiStore } from "@/stores/ui";
@@ -246,11 +246,11 @@ onActivated(() => { void load(); });
       <template #cell-equity="{ row }"><strong>{{ formatUsd(row.totalEquity) }}</strong></template>
       <template #cell-lastLogin="{ row }"><span class="text-sm text-muted">{{ formatDateTime(row.lastLoginAt, { short: true, withSeconds: false }) }}</span></template>
       <template #cell-actions="{ row }">
-        <div class="flex flex-wrap items-center justify-end gap-1">
-          <button type="button" class="button-secondary min-h-8 whitespace-nowrap px-2.5 py-1 text-xs" :disabled="pending" @click="toggleActive(row)">{{ t(row.isActive === true ? "common.disable" : "common.enable") }}</button>
-          <button type="button" class="button-secondary min-h-8 whitespace-nowrap px-2.5 py-1 text-xs" :disabled="pending" @click="changeRole(row)">{{ t(row.role === "admin" ? "users.makeUser" : "users.makeAdmin") }}</button>
-          <button type="button" class="icon-button h-8 w-8" :disabled="pending" :aria-label="t('users.resetPassword')" :title="t('users.resetPassword')" @click="openReset(row)"><KeyRound :size="16" /></button>
-          <button type="button" class="icon-button h-8 w-8 text-danger" :disabled="pending" :aria-label="t('common.delete')" :title="t('common.delete')" @click="deleteUser(row)"><Trash2 :size="16" /></button>
+        <div class="flex flex-wrap items-center justify-end gap-1" @click.stop>
+          <button type="button" class="button-secondary min-h-8 whitespace-nowrap px-2 py-1 text-xs" :disabled="pending" @click="toggleActive(row)"><Power :size="14" />{{ t(row.isActive === true ? "common.disable" : "common.enable") }}</button>
+          <button type="button" class="button-secondary min-h-8 whitespace-nowrap px-2 py-1 text-xs" :disabled="pending" @click="changeRole(row)"><Shield :size="14" />{{ t(row.role === "admin" ? "users.makeUser" : "users.makeAdmin") }}</button>
+          <button type="button" class="button-secondary min-h-8 whitespace-nowrap px-2 py-1 text-xs" :disabled="pending" :aria-label="t('users.resetPassword')" @click="openReset(row)"><KeyRound :size="14" />{{ t("users.resetPassword") }}</button>
+          <button type="button" class="button-danger min-h-8 whitespace-nowrap px-2 py-1 text-xs" :disabled="pending" :aria-label="t('common.delete')" @click="deleteUser(row)"><Trash2 :size="14" />{{ t("common.delete") }}</button>
         </div>
       </template>
       <template #select-label>{{ t("common.details") }}</template>
@@ -281,10 +281,10 @@ onActivated(() => { void load(); });
             </div>
           </div>
           <div class="flex flex-wrap items-center justify-end gap-1.5 border-t border-border/40 pt-2" @click.stop>
-            <button type="button" class="button-secondary min-h-8 px-2.5 py-1 text-xs" :disabled="pending" @click="toggleActive(row)">{{ t(row.isActive === true ? "common.disable" : "common.enable") }}</button>
-            <button type="button" class="button-secondary min-h-8 px-2.5 py-1 text-xs" :disabled="pending" @click="changeRole(row)">{{ t(row.role === "admin" ? "users.makeUser" : "users.makeAdmin") }}</button>
-            <button type="button" class="icon-button h-8 w-8" :disabled="pending" :aria-label="t('users.resetPassword')" :title="t('users.resetPassword')" @click="openReset(row)"><KeyRound :size="15" /></button>
-            <button type="button" class="icon-button h-8 w-8 text-danger" :disabled="pending" :aria-label="t('common.delete')" :title="t('common.delete')" @click="deleteUser(row)"><Trash2 :size="15" /></button>
+            <button type="button" class="button-secondary min-h-8 px-2.5 py-1 text-xs" :disabled="pending" @click="toggleActive(row)"><Power :size="14" />{{ t(row.isActive === true ? "common.disable" : "common.enable") }}</button>
+            <button type="button" class="button-secondary min-h-8 px-2.5 py-1 text-xs" :disabled="pending" @click="changeRole(row)"><Shield :size="14" />{{ t(row.role === "admin" ? "users.makeUser" : "users.makeAdmin") }}</button>
+            <button type="button" class="button-secondary min-h-8 px-2.5 py-1 text-xs" :disabled="pending" :aria-label="t('users.resetPassword')" @click="openReset(row)"><KeyRound :size="14" />{{ t("users.resetPassword") }}</button>
+            <button type="button" class="button-danger min-h-8 px-2.5 py-1 text-xs" :disabled="pending" :aria-label="t('common.delete')" @click="deleteUser(row)"><Trash2 :size="14" />{{ t("common.delete") }}</button>
           </div>
         </div>
       </template>

@@ -1,9 +1,13 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mount, type VueWrapper } from "@vue/test-utils";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { flushPromises, mount, type VueWrapper } from "@vue/test-utils";
 import { createPinia, setActivePinia } from "pinia";
+import { createMemoryHistory, createRouter } from "vue-router";
+import DashboardView from "@/views/DashboardView.vue";
 import LeadComparison from "@/components/board/LeadComparison.vue";
 import LeadTimeline from "@/components/board/LeadTimeline.vue";
 import AccountSummary from "@/components/board/AccountSummary.vue";
+import { useAuthStore } from "@/stores/auth";
+import { useBoardStore } from "@/stores/board";
 import { useDataCacheStore } from "@/stores/dataCache";
 import { mockBoard, mockResponse, mockSettings } from "@/mocks/board";
 import { normalizeSide } from "@/utils/status";
@@ -58,19 +62,55 @@ describe("跟单看板", () => {
   it("空仓和未知仓位分别表达", async () => {
     const wrapper = comparison();
     await wrapper.setProps({ lead: mockBoard.leads![1] });
-    expect(wrapper.find('[data-testid="empty-positions"]').text()).toContain("当前带单员暂未开仓");
+    expect(wrapper.find('[data-testid="empty-positions"]').text()).toContain("当前暂无持仓");
     await wrapper.setProps({ lead: mockBoard.leads![2] });
-    expect(wrapper.find('[data-testid="empty-positions"]').text()).not.toContain("当前带单员暂未开仓");
+    expect(wrapper.find('[data-testid="empty-positions"]').text()).not.toContain("当前暂无持仓");
   });
 
-  // 隐藏持仓返回空数组时仍然没有证据证明已平仓。
-  it("持仓未公开或公开状态未知时不把空数组解释成空仓", async () => {
+  // 隐藏持仓返回空数组时如果没有确认标记则仍报未知；已确认空仓（如后端重建或直连证实）则显示当前暂无持仓。
+  it("持仓未公开或公开状态未知时不把空数组解释成空仓，但已确认空仓显式展示暂无持仓", async () => {
     const wrapper = comparison();
     for (const positionShow of [false, null]) {
-      await wrapper.setProps({ lead: { ...mockBoard.leads![1], positionShow, positions: [] } });
+      await wrapper.setProps({ lead: { ...mockBoard.leads![1], positionShow, positionsConfirmed: undefined, positions: [] } });
       expect(wrapper.find('[data-testid="empty-positions"]').text()).toContain("持仓数据尚不可用");
-      expect(wrapper.find('[data-testid="empty-positions"]').text()).not.toContain("当前带单员暂未开仓");
+      expect(wrapper.find('[data-testid="empty-positions"]').text()).not.toContain("当前暂无持仓");
     }
+    await wrapper.setProps({ lead: { ...mockBoard.leads![1], positionShow: false, positionsConfirmed: true, positions: [] } });
+    expect(wrapper.find('[data-testid="empty-positions"]').text()).toContain("当前暂无持仓");
+  });
+
+  it("管理员看板同时显示全部账户与自己绑定账户的盈亏，且账户卡片支持点击跳转", async () => {
+    const auth = useAuthStore();
+    auth.authenticated = true;
+    auth.user = { id: 1, username: "admin", role: "admin" };
+    useDataCacheStore().board = { data: structuredClone(mockBoard), fetchedAt: Date.now() };
+    const board = useBoardStore();
+    vi.spyOn(board, "refresh").mockResolvedValue(undefined);
+    const router = createRouter({
+      history: createMemoryHistory(),
+      routes: [
+        { path: "/", component: { template: "<div />" } },
+        { path: "/accounts", component: { template: "<div />" } },
+        { path: "/bindings", component: { template: "<div />" } },
+        { path: "/leads/:id", component: { template: "<div />" } },
+      ],
+    });
+    await router.push("/");
+    await router.isReady();
+    const wrapper = mount(DashboardView, { global: { plugins: [router] } });
+    wrappers.push(wrapper);
+    await flushPromises();
+
+    expect(wrapper.text()).toContain("全部账户");
+    const ownSection = wrapper.get('[data-testid="admin-own-kpis"]');
+    expect(ownSection.text()).toContain("我的实盘权益");
+    expect(ownSection.text()).toContain("$24,782.60");
+    expect(wrapper.get('[data-testid="account-card-1"]').text()).toContain("我的");
+    expect(wrapper.get('[data-testid="account-card-3"]').text()).not.toContain("我的");
+
+    await wrapper.get('[data-testid="account-card-2"]').trigger("click");
+    await flushPromises();
+    expect(router.currentRoute.value.fullPath).toBe("/accounts?account=2");
   });
 
   it("账户金额与百分比有正负号，实盘明确标记", () => {

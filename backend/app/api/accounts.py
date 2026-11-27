@@ -36,6 +36,7 @@ def _account_out(a: TradingAccount) -> dict:
             pass
     return {
         "id": a.id,
+        "ownerUserId": a.owner_user_id,
         "name": a.name,
         "exchange": a.exchange,
         "environment": a.environment,

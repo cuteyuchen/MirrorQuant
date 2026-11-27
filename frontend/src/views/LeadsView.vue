@@ -12,10 +12,10 @@ import { POLL_RULE, validateNumber } from "@/constants/validation";
 import { telemetryDirectionLabel, telemetrySide } from "@/constants/telemetry";
 import { errorMessage, fieldErrors, reasonText } from "@/utils/errors";
 import { formatDateTime, formatQty, signedUsd, timestampMs } from "@/utils/format";
+import { boardPositionsConfirmed, positionsConfirmed } from "@/utils/positions";
 import { actionLabel, pnlClass, sideLabel } from "@/utils/status";
 import BaseModal from "@/components/BaseModal.vue";
 import DataTable from "@/components/DataTable.vue";
-import MoreMenu from "@/components/MoreMenu.vue";
 import PageHeader from "@/components/PageHeader.vue";
 import StatusBadge from "@/components/StatusBadge.vue";
 import FreshnessStamp from "@/components/FreshnessStamp.vue";
@@ -34,10 +34,11 @@ const formElement = ref<HTMLFormElement | null>(null);
 function boardLead(lead: Lead) { return cache.board?.data.leads?.find(item => item.id === lead.id); }
 function positionCount(lead: Lead): number | null {
   const current = boardLead(lead);
-  if (current) return current.positions == null || (current.positionShow !== true && !current.positions.length) ? null : current.positions.length;
-  // 列表摘要可能把缺失快照记作零；缺少看板时只相信实际仓位列表。
+  if (current) return !boardPositionsConfirmed(current) || current.positions == null ? null : current.positions.length;
+  // 列表摘要可能把缺失快照记作零；缺少看板时只相信已确认的真实仓位列表。
   const snapshot = cache.leadSnapshots[lead.id]?.data ?? lead.snapshot;
   const positions = snapshot?.openPositions;
+  if (snapshot && positionsConfirmed(snapshot)) return positions?.length ?? 0;
   return positions == null || ((snapshot?.profile?.positionShow ?? lead.positionShow) !== true && !positions.length)
     ? null : positions.length;
 }
@@ -62,18 +63,18 @@ const summary = computed(() => t("leads.summary", {
   unknown: leads.value.filter(lead => stale(lead) == null || positionCount(lead) == null || lead.isEnabled == null).length,
 }));
 const columns = computed<TableColumn[]>(() => [
-  { key: "name", label: t("common.name"), width: "17%", mobileWide: true },
+  { key: "name", label: t("common.name"), width: "16%", mobileWide: true },
   // 开关与数字列留足不折行宽度，避免 1280px 桌面上数字折行或横向溢出。
   { key: "enabled", label: t("common.enable"), width: "54px", mobileWide: true },
   { key: "positions", label: t("leads.openPositions"), width: "7%", numeric: true, mobileWide: true },
   { key: "today", label: t("leads.todayActivity"), width: "8%", numeric: true, mobileWide: true },
   { key: "pnl", label: t("leads.todayRealized"), width: "10%", numeric: true, mobileWide: true },
-  { key: "action", label: t("leads.latestAction"), width: "14%", mobileWide: true },
-  { key: "freshness", label: t("board.snapshot"), width: "13%", mobileWide: true },
+  { key: "action", label: t("leads.latestAction"), width: "13%", mobileWide: true },
+  { key: "freshness", label: t("board.snapshot"), width: "12%", mobileWide: true },
   { key: "followers", label: t("leads.followerAccounts"), width: "6%", numeric: true, mobileWide: true },
   { key: "public", label: t("leads.publicCol"), width: "54px", mobileWide: true },
   { key: "slotWatch", label: t("leads.slotWatchCol"), width: "54px", mobileWide: true },
-  { key: "actions", label: t("common.actions"), width: "54px", mobileWide: true },
+  { key: "actions", label: t("common.actions"), width: "180px", mobileWide: true },
 ]);
 interface LatestAction { time: number | null; symbol: string | null; side: string | null; qty: number | null; action: string | null; direction: string | null }
 function latestAction(lead: Lead): LatestAction | null {
@@ -265,7 +266,7 @@ onUnmounted(stop);
       <template #cell-action="{ row }"><template v-if="latestAction(row)"><p class="break-words text-xs font-medium">{{ latestAction(row)?.symbol ?? t("common.unknown") }} · {{ sideLabel(latestAction(row)?.side, latestAction(row)?.qty) }}</p><p v-if="latestAction(row)?.action || latestAction(row)?.direction" class="mt-1 text-xs text-muted">{{ latestAction(row)?.direction ?? actionLabel(latestAction(row)?.action) }}</p><time class="mt-1 block text-xs tabular-nums text-muted">{{ formatDateTime(latestAction(row)?.time, { short: true, withSeconds: false }) }}</time></template><span v-else class="text-xs text-muted">{{ t("leads.noRecentAction") }}</span></template>
       <template #cell-freshness="{ row }"><div class="flex flex-wrap items-center gap-2"><StatusBadge :state="row.isEnabled === false ? 'DISABLED' : stale(row) === true ? 'STALE' : row.status" /><FreshnessStamp v-if="boardLead(row)" :seconds="boardLead(row)?.snapshotAgeSec" :received-at="cache.board?.fetchedAt" :stale="stale(row)" /><FreshnessStamp v-else-if="row.snapshotAgeSec != null" :seconds="row.snapshotAgeSec" :received-at="cache.leads?.fetchedAt" :stale="row.stale" /><FreshnessStamp v-else :timestamp="row.lastSyncAt" :stale="row.stale" /></div><p v-if="row.lastError" class="mt-1 break-words text-xs text-danger">{{ reasonText(row.lastError) }}</p></template>
       <template #cell-followers="{ row }"><span>{{ formatQty(followerCount(row)) }}</span></template>
-      <template #cell-actions="{ row }"><MoreMenu><button class="button-secondary justify-start" :disabled="pending" @click="edit(row)"><Pencil :size="16" />{{ t("common.edit") }}</button><button class="button-secondary justify-start" :disabled="pending" @click="sync(row)"><RefreshCw :size="16" />{{ t("leads.syncNow") }}</button><button class="button-danger justify-start" :disabled="pending" @click="operate(row, 'delete')"><Trash2 :size="16" />{{ t("common.delete") }}</button></MoreMenu></template>
+      <template #cell-actions="{ row }"><div class="flex flex-wrap items-center justify-end gap-1" @click.stop><button type="button" class="button-secondary min-h-8 px-2 py-1 text-xs" :disabled="pending" :aria-label="t('common.edit')" @click="edit(row)"><Pencil :size="14" />{{ t("common.edit") }}</button><button type="button" class="button-secondary min-h-8 px-2 py-1 text-xs" :disabled="pending" @click="sync(row)"><RefreshCw :size="14" />{{ t("leads.syncNow") }}</button><button type="button" class="button-danger min-h-8 px-2 py-1 text-xs" :disabled="pending" :aria-label="t('common.delete')" @click="operate(row, 'delete')"><Trash2 :size="14" />{{ t("common.delete") }}</button></div></template>
       <template #mobile-card="{ row }">
         <div class="space-y-3">
           <div class="flex items-start gap-3">
@@ -322,8 +323,10 @@ onUnmounted(stop);
                 <span class="text-muted">{{ t("leads.slotWatchCol") }}</span>
               </label>
             </div>
-            <div @click.stop>
-              <MoreMenu><button class="button-secondary justify-start" :disabled="pending" @click="edit(row)"><Pencil :size="16" />{{ t("common.edit") }}</button><button class="button-secondary justify-start" :disabled="pending" @click="sync(row)"><RefreshCw :size="16" />{{ t("leads.syncNow") }}</button><button class="button-danger justify-start" :disabled="pending" @click="operate(row, 'delete')"><Trash2 :size="16" />{{ t("common.delete") }}</button></MoreMenu>
+            <div class="flex flex-wrap items-center justify-end gap-1.5" @click.stop>
+              <button type="button" class="button-secondary min-h-8 px-2 py-1 text-xs" :disabled="pending" :aria-label="t('common.edit')" @click="edit(row)"><Pencil :size="14" />{{ t("common.edit") }}</button>
+              <button type="button" class="button-secondary min-h-8 px-2 py-1 text-xs" :disabled="pending" @click="sync(row)"><RefreshCw :size="14" />{{ t("leads.syncNow") }}</button>
+              <button type="button" class="button-danger min-h-8 px-2 py-1 text-xs" :disabled="pending" :aria-label="t('common.delete')" @click="operate(row, 'delete')"><Trash2 :size="14" />{{ t("common.delete") }}</button>
             </div>
           </div>
         </div>

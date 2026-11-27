@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { computed, onActivated, onMounted } from "vue";
 import { Activity, AlertTriangle, CheckCircle2, Layers, RefreshCw, TrendingDown, TrendingUp, Wallet } from "lucide-vue-next";
+import { useAuthStore } from "@/stores/auth";
 import { useBoardStore } from "@/stores/board";
 import { useI18n } from "@/i18n";
 import type { BoardAccount } from "@/types/api";
 import { finiteNumber, formatPct, formatUsd, signedUsd, type NumericValue } from "@/utils/format";
+import { boardPositionsConfirmed } from "@/utils/positions";
 import { pnlClass } from "@/utils/status";
 import AccountSummary from "@/components/board/AccountSummary.vue";
 import LeadComparison from "@/components/board/LeadComparison.vue";
@@ -14,8 +16,10 @@ import EmptyState from "@/components/EmptyState.vue";
 import ErrorState from "@/components/ErrorState.vue";
 import LoadingSkeleton from "@/components/LoadingSkeleton.vue";
 defineOptions({ name: "DashboardView" });
+const auth = useAuthStore();
 const board = useBoardStore();
 const { t } = useI18n();
+const isAdmin = computed(() => auth.user?.role === "admin" && auth.user?.id != null);
 const subtitle = computed(() => t("board.subtitle", {
   leads: board.data?.leads?.length ?? "—", accounts: board.data?.accounts?.length ?? "—",
 }));
@@ -39,34 +43,47 @@ function tally(accounts: BoardAccount[]) {
   };
 }
 // 实盘与模拟盘的钱不相加：有实盘账户时首屏只汇总实盘，其余账户作为补充说明。
-const money = computed(() => {
-  const all = board.data?.accounts;
-  if (!all?.length) return null;
-  const live = all.filter(account => account.environment === "live");
-  const rest = all.filter(account => account.environment !== "live");
+function summarizeAccounts(list: BoardAccount[] | null | undefined) {
+  if (!list?.length) return null;
+  const live = list.filter(account => account.environment === "live");
+  const rest = list.filter(account => account.environment !== "live");
   if (!live.length) {
     // 未知环境不冒充模拟盘：全部确认是模拟盘才用“模拟盘”标签。
-    return { scope: all.every(account => account.environment === "demo") ? "demo" : "all", accounts: all, main: tally(all), rest: null, restKey: "" };
+    return { scope: list.every(account => account.environment === "demo") ? "demo" : "all", accounts: list, main: tally(list), rest: null, restKey: "" };
   }
   return {
     scope: "live", accounts: live, main: tally(live), rest: rest.length ? tally(rest) : null,
     restKey: rest.every(account => account.environment === "demo") ? "kpi.demoShare" : "kpi.otherShare",
   };
-});
+}
+const money = computed(() => summarizeAccounts(board.data?.accounts));
 const scope = computed(() => money.value?.scope ?? "all");
 // 次要分组（模拟盘 / 其他账户）的一行补充；其中有未知值时照实标出。
-function restText(sum: { total: number | null; missing: number } | undefined, format: (value: NumericValue) => string) {
-  if (!money.value?.rest || !sum) return "";
-  return t(money.value.restKey, { value: format(sum.total) }) + (sum.missing ? t("kpi.restMissing", { n: sum.missing }) : "");
+function restText(summary: ReturnType<typeof summarizeAccounts>, sum: { total: number | null; missing: number } | undefined, format: (value: NumericValue) => string) {
+  if (!summary?.rest || !sum) return "";
+  return t(summary.restKey, { value: format(sum.total) }) + (sum.missing ? t("kpi.restMissing", { n: sum.missing }) : "");
 }
 function joined(...parts: string[]) { return parts.filter(Boolean).join(" · "); }
-const equitySub = computed(() => money.value
-  ? joined(t("kpi.accountCount", { n: money.value.main.count }), restText(money.value.rest?.equity, formatUsd))
+const rawEquitySub = computed(() => money.value
+  ? joined(t("kpi.accountCount", { n: money.value.main.count }), restText(money.value, money.value.rest?.equity, formatUsd))
   : t(board.data?.accounts == null ? "common.unknown" : "board.noAccounts"));
+const equitySub = computed(() => money.value && isAdmin.value ? t("kpi.allScopePrefix", { sub: rawEquitySub.value }) : rawEquitySub.value);
 // 不在浏览器里合并收益率：只有恰好一个主账户时直接采用后端给出的百分比。
 const todayPct = computed(() => money.value?.accounts.length === 1 ? formatPct(money.value.accounts[0].todayPnlPct) : "");
-const todaySub = computed(() => joined(todayPct.value, restText(money.value?.rest?.todayPnl, signedUsd)));
-const unrealizedSub = computed(() => restText(money.value?.rest?.unrealized, signedUsd));
+const todaySub = computed(() => joined(todayPct.value, restText(money.value, money.value?.rest?.todayPnl, signedUsd)));
+const unrealizedSub = computed(() => restText(money.value, money.value?.rest?.unrealized, signedUsd));
+
+// 管理员除了全局汇总外，还可以单独查看自己名下绑定的账户盈亏（含未标记归属的历史自有账户）。
+const ownAccounts = computed(() => !isAdmin.value ? []
+  : (board.data?.accounts ?? []).filter(account => account.ownerUserId === auth.user!.id || account.ownerUserId == null));
+const ownMoney = computed(() => summarizeAccounts(ownAccounts.value));
+const ownScope = computed(() => ownMoney.value?.scope ?? "all");
+const ownEquitySub = computed(() => ownMoney.value
+  ? joined(t("kpi.accountCount", { n: ownMoney.value.main.count }), restText(ownMoney.value, ownMoney.value.rest?.equity, formatUsd))
+  : t("kpi.noOwnAccounts"));
+const ownTodayPct = computed(() => ownMoney.value?.accounts.length === 1 ? formatPct(ownMoney.value.accounts[0].todayPnlPct) : "");
+const ownTodaySub = computed(() => joined(ownTodayPct.value, restText(ownMoney.value, ownMoney.value?.rest?.todayPnl, signedUsd)));
+const ownUnrealizedSub = computed(() => restText(ownMoney.value, ownMoney.value?.rest?.unrealized, signedUsd));
 type Tone = "success" | "danger" | "warning" | "neutral";
 function pnlTone(value: number | null | undefined): Tone { return value == null || value === 0 ? "neutral" : value > 0 ? "success" : "danger"; }
 
@@ -80,7 +97,7 @@ const leadStats = computed(() => {
   let misaligned = 0;
   let attentionKnown = false;
   for (const lead of leads) {
-    if (lead.positions != null && (lead.positions.length > 0 || lead.positionShow === true)) positions = (positions ?? 0) + lead.positions.length;
+    if (boardPositionsConfirmed(lead) && lead.positions != null) positions = (positions ?? 0) + lead.positions.length;
     else unknownLeads += 1;
     if (lead.orphans != null) { orphans += lead.orphans.length; attentionKnown = true; }
     if (lead.positions != null) {
@@ -152,7 +169,23 @@ onActivated(() => { void board.refresh(); });
           :value-class="attentionTone === 'danger' ? 'text-danger' : attentionTone === 'warning' ? 'text-warning' : attentionTone === 'success' ? 'text-success' : ''"
           :sub="leadStats?.attention === 0 ? t('kpi.allAligned') : leadStats?.attention == null ? '' : t('kpi.attentionDetail', { orphans: leadStats.orphans, misaligned: leadStats.misaligned })" />
       </section>
-      <AccountSummary :accounts="board.data.accounts" />
+      <section v-if="isAdmin" data-testid="admin-own-kpis" class="grid grid-cols-1 gap-2.5 sm:grid-cols-3" :aria-label="t('kpi.myRegion')">
+        <div v-if="!ownAccounts.length" class="card sm:col-span-full px-4 py-3 text-sm text-muted">{{ t("kpi.noOwnAccounts") }}</div>
+        <template v-else>
+          <KpiCard tone="accent" :icon="Wallet" :label="t(`kpi.myEquity.${ownScope}`)" :value="formatUsd(ownMoney?.main.equity.total)" :sub="ownEquitySub">
+            <p v-if="ownMoney?.main.equity.missing" class="mt-1 text-xs font-medium text-warning">{{ t("kpi.partial", { n: ownMoney.main.equity.missing }) }}</p>
+          </KpiCard>
+          <KpiCard :tone="pnlTone(ownMoney?.main.todayPnl.total)" :icon="(ownMoney?.main.todayPnl.total ?? 0) < 0 ? TrendingDown : TrendingUp" :label="t(`kpi.myTodayPnl.${ownScope}`)"
+            :value="signedUsd(ownMoney?.main.todayPnl.total)" :value-class="pnlClass(ownMoney?.main.todayPnl.total)" :sub="ownTodaySub">
+            <p v-if="ownMoney?.main.todayPnl.missing" class="mt-1 text-xs font-medium text-warning">{{ t("kpi.partial", { n: ownMoney.main.todayPnl.missing }) }}</p>
+          </KpiCard>
+          <KpiCard :tone="pnlTone(ownMoney?.main.unrealized.total)" :icon="Activity" :label="t(`kpi.myUnrealized.${ownScope}`)"
+            :value="signedUsd(ownMoney?.main.unrealized.total)" :value-class="pnlClass(ownMoney?.main.unrealized.total)" :sub="ownUnrealizedSub">
+            <p v-if="ownMoney?.main.unrealized.missing" class="mt-1 text-xs font-medium text-warning">{{ t("kpi.partial", { n: ownMoney.main.unrealized.missing }) }}</p>
+          </KpiCard>
+        </template>
+      </section>
+      <AccountSummary :accounts="board.data.accounts" :current-user-id="isAdmin ? (auth.user?.id ?? null) : null" />
       <EmptyState v-if="!board.data.leads?.length" class="card" :title="t(board.data.leads == null ? 'common.unknown' : 'board.noLeads')" />
       <LeadComparison v-for="lead in sortedLeads" :key="lead.id || lead.name || 'lead'" :lead="lead" :received-at="board.receivedAt" :accounts="board.data.accounts" :default-collapsed="isIdleLead(lead)" />
     </template>

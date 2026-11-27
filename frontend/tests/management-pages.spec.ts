@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 import { createPinia, setActivePinia } from "pinia";
+import { createMemoryHistory, createRouter } from "vue-router";
 import AccountsView from "@/views/AccountsView.vue";
 import ProxiesView from "@/views/ProxiesView.vue";
 import NotificationSettingsPanel from "@/components/settings/NotificationSettingsPanel.vue";
@@ -64,8 +65,37 @@ describe("账户列表", () => {
     expect(awaiting.text()).not.toContain("$0.00");
     const paper = rows.find(row => row.text().includes("Paper Alpha"))!;
     await paper.trigger("click");
-    expect(rendered.find("table").text()).toContain("+1.58%");
+    expect(rendered.find("table").text()).toContain("+4.66%");
     expect(rendered.find("table").text()).toContain(useI18n().t("accts.contractQty"));
+  });
+
+  it("支持 ?account= 参数直达展开持仓、跟随看板刷新同步持仓及内联操作按钮", async () => {
+    const cache = useDataCacheStore();
+    const board = useBoardStore();
+    const { t } = useI18n();
+    const router = createRouter({
+      history: createMemoryHistory(),
+      routes: [{ path: "/accounts", component: AccountsView }],
+    });
+    await router.push("/accounts?account=2");
+    await router.isReady();
+    wrapper = mount(AccountsView, { global: { plugins: [router], stubs: { Teleport: true } } });
+    await flushPromises();
+
+    // 自动展开 2 号账户持仓（ADAUSDT）且直接展示内联图标+短字按钮
+    const tableText = wrapper.find("table").text();
+    expect(tableText).toContain("ADAUSDT");
+    expect(tableText).toContain(t("accts.testShort"));
+    expect(tableText).toContain(t("accts.syncShort"));
+    expect(tableText).toContain(t("common.delete"));
+
+    // 看板时间戳推进时，账户持仓随账户盈亏一起重新拉取
+    const callsBefore = vi.mocked(cache.fetchAccounts).mock.calls.length;
+    cache.board = { data: structuredClone(mockBoard), fetchedAt: Date.now() + 5000 };
+    await flushPromises();
+    expect(vi.mocked(cache.fetchAccounts).mock.calls.length).toBeGreaterThan(callsBefore);
+    expect(vi.mocked(cache.fetchAccounts)).toHaveBeenLastCalledWith(true);
+    void board;
   });
 
   it("取消启用确认时checkbox与服务器现态一致", async () => {

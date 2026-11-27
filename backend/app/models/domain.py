@@ -341,6 +341,9 @@ class PositionAllocation(Base):
     entry_cost: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     owned_qty_exact: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     entry_cost_exact: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    cycle_ratio_exact: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    expected_qty_exact: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    lead_qty_exact: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     # Generations keep old history/stop intents from closing a reopened allocation.
     generation: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     opened_at_ms: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
@@ -411,6 +414,9 @@ class OrderIntent(Base):
     limit_px: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     # 下单定价（开仓 sizing 用的参考价）；待补金额按此结算，旧意图为空时回退成交均价。
     sizing_px: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    expected_delta_qty: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    lead_delta_qty: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    cycle_ratio_exact: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     # 终态账本及通知证据确认后不再逐轮扫描，历史缺口仍阻断投递。
     reporting_complete: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)

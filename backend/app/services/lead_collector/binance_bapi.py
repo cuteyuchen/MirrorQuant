@@ -182,6 +182,321 @@ def direction_label(side: Optional[str], ps: Optional[str], closing: bool) -> st
     return side or "UNKNOWN"
 
 
+_CLASSIFY_EPS = Decimal("1e-7")
+
+
+def _action_from_oneway_state(before: Decimal, after: Decimal, side: str) -> str:
+    if before > _CLASSIFY_EPS or after > _CLASSIFY_EPS:
+        if side == "BUY":
+            return "OPEN_LONG" if before <= _CLASSIFY_EPS else "ADD_LONG"
+        return "CLOSE_LONG" if after <= _CLASSIFY_EPS else "REDUCE_LONG"
+    if side == "SELL":
+        return "OPEN_SHORT" if before >= -_CLASSIFY_EPS else "ADD_SHORT"
+    return "CLOSE_SHORT" if after >= -_CLASSIFY_EPS else "REDUCE_SHORT"
+
+
+def classify_order_actions(
+    orders: Sequence[Dict[str, Any]],
+    *,
+    open_positions: Optional[Sequence[Dict[str, Any]]] = None,
+    closed_rows: Sequence[Dict[str, Any]] = (),
+    positions_confirmed: bool = False,
+) -> Dict[str, str]:
+    """Infer granular order actions (OPEN/ADD/REDUCE/CLOSE LONG/SHORT).
+
+    Supports both Hedge mode (LONG/SHORT) and One-Way mode (BOTH/empty), including
+    when the trader currently holds zero open positions.
+    """
+    normalized: List[Dict[str, Any]] = []
+    for raw in orders:
+        if not isinstance(raw, dict):
+            continue
+        norm = expand_slim_order(raw)
+        sym = norm.get("symbol") or ""
+        side = str(norm.get("side") or "").upper()
+        ps = str(norm.get("positionSide") or "").upper()
+        q = exact(norm.get("executedQty") or 0)
+        if not sym or side not in ("BUY", "SELL") or q <= 0:
+            continue
+        ot = int(norm.get("orderTime") or norm.get("orderUpdateTime") or 0)
+        ut = int(norm.get("orderUpdateTime") or ot)
+        pnl = _realized_pnl(norm.get("totalPnl")) if norm.get("pnlKnown") is True else None
+        normalized.append({
+            "key": order_dedup_key(norm),
+            "sym": sym,
+            "side": side,
+            "ps": ps,
+            "q": q,
+            "ot": ot,
+            "ut": ut,
+            "pnl": pnl,
+        })
+
+    if not normalized:
+        return {}
+
+    closed_by_sym: Dict[str, List[Tuple[int, int, str]]] = defaultdict(list)
+    for row in closed_rows:
+        if not isinstance(row, dict):
+            continue
+        sym = row.get("symbol")
+        c_ps = str(row.get("side") or "").upper()
+        interval = closed_interval(row)
+        if isinstance(sym, str) and c_ps in ("LONG", "SHORT") and interval is not None:
+            closed_by_sym[sym].append((interval[0], interval[1], c_ps))
+
+    open_hedge: Dict[Tuple[str, str], Decimal] = defaultdict(Decimal)
+    open_oneway: Dict[str, Decimal] = defaultdict(Decimal)
+    if positions_confirmed and open_positions is not None:
+        for pos in open_positions:
+            if not isinstance(pos, dict):
+                continue
+            sym = pos.get("symbol")
+            p_ps = str(pos.get("positionSide") or "").upper()
+            q = exact(pos.get("qtyExact") if pos.get("qtyExact") is not None else (pos.get("qty") or 0))
+            if not isinstance(sym, str) or q <= 0 or p_ps not in ("LONG", "SHORT"):
+                continue
+            open_hedge[(sym, p_ps)] += q
+            open_oneway[sym] += q if p_ps == "LONG" else -q
+
+    out: Dict[str, str] = {}
+
+    # 1. Hedge mode groups: (sym, LONG/SHORT)
+    hedge_groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
+    oneway_groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for item in normalized:
+        if item["ps"] in ("LONG", "SHORT"):
+            hedge_groups[(item["sym"], item["ps"])].append(item)
+        else:
+            oneway_groups[item["sym"]].append(item)
+
+    for (sym, ps), items in hedge_groups.items():
+        items.sort(key=lambda x: (x["ut"], x["ot"], x["key"]))
+        if positions_confirmed:
+            after = open_hedge.get((sym, ps), Decimal("0"))
+            for item in reversed(items):
+                opening = is_open_leg(item["side"], ps)
+                if opening:
+                    before = after - item["q"]
+                    if before < -_CLASSIFY_EPS:
+                        break
+                    out[item["key"]] = f"OPEN_{ps}" if before <= _CLASSIFY_EPS else f"ADD_{ps}"
+                    after = max(Decimal("0"), before)
+                else:
+                    out[item["key"]] = f"CLOSE_{ps}" if after <= _CLASSIFY_EPS else f"REDUCE_{ps}"
+                    after = after + item["q"]
+
+        # Fill any unresolved hedge orders via closed cycle intervals or forward simulation
+        net = Decimal("0")
+        sym_cycles = [c for c in closed_by_sym.get(sym, []) if c[2] == ps]
+        for idx, item in enumerate(items):
+            opening = is_open_leg(item["side"], ps)
+            ts = item["ut"] or item["ot"]
+            if item["key"] not in out:
+                for c_open, c_close, _ in sym_cycles:
+                    if c_open - 2000 <= ts <= c_close + 2000:
+                        if opening:
+                            out[item["key"]] = f"OPEN_{ps}" if abs(item["ot"] - c_open) <= 2000 else f"ADD_{ps}"
+                        else:
+                            out[item["key"]] = f"CLOSE_{ps}" if abs(ts - c_close) <= 2000 else f"REDUCE_{ps}"
+                        break
+            if item["key"] not in out:
+                if opening:
+                    out[item["key"]] = f"OPEN_{ps}" if net <= _CLASSIFY_EPS else f"ADD_{ps}"
+                else:
+                    next_net = net - item["q"]
+                    if net > _CLASSIFY_EPS:
+                        out[item["key"]] = f"CLOSE_{ps}" if next_net <= _CLASSIFY_EPS else f"REDUCE_{ps}"
+                    else:
+                        # No entry seen yet in window: check if a subsequent exit occurs before next open
+                        has_later_exit = any(
+                            not is_open_leg(later["side"], ps)
+                            for later in items[idx + 1:]
+                            if is_open_leg(later["side"], ps) is False
+                        ) and not any(
+                            is_open_leg(later["side"], ps) for later in items[idx + 1:]
+                        )
+                        out[item["key"]] = f"REDUCE_{ps}" if has_later_exit else f"CLOSE_{ps}"
+            if opening:
+                net += item["q"]
+            else:
+                net = max(Decimal("0"), net - item["q"])
+
+    # 2. One-Way mode groups: (sym, ps in ("BOTH", ""))
+    for sym, items in oneway_groups.items():
+        items.sort(key=lambda x: (x["ut"], x["ot"], x["key"]))
+        sym_cycles = closed_by_sym.get(sym, [])
+
+        # Complete history starting from flat: classify directly via forward signed net position.
+        total_delta = sum(((it["q"] if it["side"] == "BUY" else -it["q"]) for it in items), Decimal("0"))
+        if positions_confirmed and abs(total_delta - open_oneway.get(sym, Decimal("0"))) <= _CLASSIFY_EPS:
+            cur_net = Decimal("0")
+            for it in items:
+                delta = it["q"] if it["side"] == "BUY" else -it["q"]
+                nxt = cur_net + delta
+                if cur_net == 0:
+                    out[it["key"]] = "OPEN_LONG" if delta > 0 else "OPEN_SHORT"
+                elif (cur_net > 0 and delta > 0) or (cur_net < 0 and delta < 0):
+                    out[it["key"]] = "ADD_LONG" if cur_net > 0 else "ADD_SHORT"
+                elif (cur_net > 0 and nxt < 0) or (cur_net < 0 and nxt > 0):
+                    out[it["key"]] = "OPEN_LONG" if nxt > 0 else "OPEN_SHORT"
+                else:
+                    eff_ps = "LONG" if cur_net > 0 else "SHORT"
+                    out[it["key"]] = f"CLOSE_{eff_ps}" if abs(nxt) <= _CLASSIFY_EPS else f"REDUCE_{eff_ps}"
+                cur_net = Decimal("0") if abs(nxt) <= _CLASSIFY_EPS else nxt
+            continue
+
+        # Pre-index closed cycle endpoints so closed-position boundaries serve as after=0 anchors
+        def _closed_match(item: Dict[str, Any]) -> Optional[Tuple[str, bool, bool]]:
+            ts = item["ut"] or item["ot"]
+            ot = item["ot"] or ts
+            for c_open, c_close, c_ps in sym_cycles:
+                if c_open - 2000 <= ot <= c_close + 2000 or c_open - 2000 <= ts <= c_close + 2000:
+                    opening = (c_ps == "LONG" and item["side"] == "BUY") or (c_ps == "SHORT" and item["side"] == "SELL")
+                    at_open = opening and abs(ot - c_open) <= 2000
+                    at_close = (not opening) and abs(ts - c_close) <= 2000
+                    if opening:
+                        return (f"OPEN_{c_ps}" if at_open else f"ADD_{c_ps}", True, False)
+                    return (f"CLOSE_{c_ps}" if at_close else f"REDUCE_{c_ps}", False, at_close)
+            return None
+
+        # Backward walk starting from confirmed current signed position (0 when flat),
+        # and also resetting to 0 whenever encountering a confirmed closed_rows cycle boundary.
+        after: Optional[Decimal] = open_oneway.get(sym, Decimal("0")) if positions_confirmed else None
+        for item in reversed(items):
+            if after is None:
+                matched = _closed_match(item)
+                if matched:
+                    act, _, at_close = matched
+                    out[item["key"]] = act
+                    if at_close:
+                        after = Decimal("0")
+                        delta = item["q"] if item["side"] == "BUY" else -item["q"]
+                        after = after - delta
+                    continue
+                continue
+
+            delta = item["q"] if item["side"] == "BUY" else -item["q"]
+            before = after - delta
+            pnl = item["pnl"]
+
+            # Zero-PnL sign-flip indicates an uncaptured history gap before an open/add leg.
+            if (
+                ((before > _CLASSIFY_EPS and after < -_CLASSIFY_EPS) or (before < -_CLASSIFY_EPS and after > _CLASSIFY_EPS))
+                and pnl is not None and pnl == 0
+            ):
+                out[item["key"]] = "OPEN_SHORT" if item["side"] == "SELL" else "OPEN_LONG"
+                after = None
+                continue
+
+            # Non-zero PnL closing an empty window gap where after=0 wouldn't fit? Handled normally since before has opposite sign.
+            if abs(before) <= _CLASSIFY_EPS and abs(after) <= _CLASSIFY_EPS:
+                after = before
+                continue
+            out[item["key"]] = _action_from_oneway_state(before, after, item["side"])
+            after = before
+
+        # Forward pass for any remaining unclassified One-Way orders (using pnl + closed_rows cues)
+        net = Decimal("0")
+        for idx, item in enumerate(items):
+            key = item["key"]
+            side = item["side"]
+            q = item["q"]
+            pnl = item["pnl"]
+            if key in out:
+                act = out[key]
+                if act in ("OPEN_LONG", "ADD_LONG", "CLOSE_SHORT", "REDUCE_SHORT"):
+                    if act == "CLOSE_SHORT":
+                        net = Decimal("0")
+                    elif act == "REDUCE_SHORT":
+                        net = net + q if net < -_CLASSIFY_EPS else net
+                    else:
+                        net = q if act == "OPEN_LONG" else (net + q)
+                elif act in ("OPEN_SHORT", "ADD_SHORT", "CLOSE_LONG", "REDUCE_LONG"):
+                    if act == "CLOSE_LONG":
+                        net = Decimal("0")
+                    elif act == "REDUCE_LONG":
+                        net = net - q if net > _CLASSIFY_EPS else net
+                    else:
+                        net = -q if act == "OPEN_SHORT" else (net - q)
+                continue
+
+            matched = _closed_match(item)
+            if matched:
+                out[key] = matched[0]
+                if matched[2]:
+                    net = Decimal("0")
+                else:
+                    delta = q if side == "BUY" else -q
+                    net += delta
+                continue
+
+            if side == "BUY":
+                if net < -_CLASSIFY_EPS and (pnl is None or pnl != 0):
+                    next_net = net + q
+                    if next_net < -_CLASSIFY_EPS:
+                        out[key] = "REDUCE_SHORT"
+                        net = next_net
+                    elif abs(next_net) <= _CLASSIFY_EPS:
+                        out[key] = "CLOSE_SHORT"
+                        net = Decimal("0")
+                    else:
+                        has_more_short_activity = any(
+                            (later["side"] == "BUY" and later["pnl"] is not None and later["pnl"] != 0)
+                            for later in items[idx + 1:idx + 4]
+                        ) and any(
+                            later["side"] == "SELL" and (later["pnl"] is None or later["pnl"] == 0)
+                            for later in items[idx + 1:idx + 3]
+                        )
+                        out[key] = "REDUCE_SHORT" if has_more_short_activity else "CLOSE_SHORT"
+                        net = Decimal("0")
+                elif pnl is not None and pnl != 0:
+                    next_closes_same = (
+                        idx + 1 < len(items)
+                        and items[idx + 1]["side"] == "BUY"
+                        and items[idx + 1]["pnl"] is not None
+                        and items[idx + 1]["pnl"] != 0
+                    )
+                    out[key] = "REDUCE_SHORT" if next_closes_same else "CLOSE_SHORT"
+                    net = Decimal("0")
+                else:
+                    out[key] = "OPEN_LONG" if net <= _CLASSIFY_EPS else "ADD_LONG"
+                    net = max(Decimal("0"), net) + q
+            else:
+                if net > _CLASSIFY_EPS and (pnl is None or pnl != 0):
+                    next_net = net - q
+                    if next_net > _CLASSIFY_EPS:
+                        out[key] = "REDUCE_LONG"
+                        net = next_net
+                    elif abs(next_net) <= _CLASSIFY_EPS:
+                        out[key] = "CLOSE_LONG"
+                        net = Decimal("0")
+                    else:
+                        has_more_long_activity = any(
+                            (later["side"] == "SELL" and later["pnl"] is not None and later["pnl"] != 0)
+                            for later in items[idx + 1:idx + 4]
+                        ) and any(
+                            later["side"] == "BUY" and (later["pnl"] is None or later["pnl"] == 0)
+                            for later in items[idx + 1:idx + 3]
+                        )
+                        out[key] = "REDUCE_LONG" if has_more_long_activity else "CLOSE_LONG"
+                        net = Decimal("0")
+                elif pnl is not None and pnl != 0:
+                    next_closes_same = (
+                        idx + 1 < len(items)
+                        and items[idx + 1]["side"] == "SELL"
+                        and items[idx + 1]["pnl"] is not None
+                        and items[idx + 1]["pnl"] != 0
+                    )
+                    out[key] = "REDUCE_LONG" if next_closes_same else "CLOSE_LONG"
+                    net = Decimal("0")
+                else:
+                    out[key] = "OPEN_SHORT" if net >= -_CLASSIFY_EPS else "ADD_SHORT"
+                    net = min(Decimal("0"), net) - q
+
+    return out
+
+
 def _realized_pnl(value: Any) -> Optional[Decimal]:
     # 收益字段只作展示证据；损坏、溢出或浮点下溢均不补成零。
     if isinstance(value, bool) or not isinstance(value, (str, int, float, Decimal)):
@@ -278,38 +593,87 @@ def reconstruct_open_positions(
     store: Dict[str, Dict[str, Any]],
     closed_rows: Sequence[Dict[str, Any]] = (),
 ) -> List[Dict[str, Any]]:
-    """Walk net position chronologically per (symbol, positionSide) and reconcile with position-history."""
+    """Walk net position chronologically per (symbol, positionSide) or One-Way symbol and reconcile with position-history."""
     orders = sorted(store.values(), key=lambda o: (o.get("ot") or o.get("t") or 0, o.get("h") or ""))
     net: Dict[Tuple[str, str], Decimal] = defaultdict(Decimal)
     pv: Dict[Tuple[str, str], Decimal] = defaultdict(Decimal)
     legs: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
     open_time: Dict[Tuple[str, str], int] = {}
 
+    ow_net: Dict[str, Decimal] = defaultdict(Decimal)
+    ow_pv: Dict[str, Decimal] = defaultdict(Decimal)
+    ow_legs: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    ow_open_time: Dict[str, int] = {}
+
     for o in orders:
         sym = o.get("sym")
-        ps = o.get("ps")
+        ps = str(o.get("ps") or "").upper()
         if not sym or not ps:
             continue
-        k = (sym, ps)
         q, p = validate_source_fill(o.get("q"), o.get("p"))
         t = int(o.get("ot") or o.get("t") or 0)
-        if is_open_leg(o.get("side"), ps):
-            if net[k] == 0:
-                open_time[k] = t
-                legs[k] = []
-            net[k] += q
-            pv[k] += q * p
-            legs[k].append({"t": t, "q": float(q), "p": float(p)})
+        if ps in ("LONG", "SHORT"):
+            k = (sym, ps)
+            if is_open_leg(o.get("side"), ps):
+                if net[k] == 0:
+                    open_time[k] = t
+                    legs[k] = []
+                net[k] += q
+                pv[k] += q * p
+                legs[k].append({"t": t, "q": float(q), "p": float(p)})
+            else:
+                previous = net[k]
+                removed = min(q, previous)
+                if previous > 0:
+                    pv[k] *= (previous - removed) / previous
+                net[k] = max(Decimal("0"), previous - q)
+                if net[k] == 0:
+                    pv[k] = Decimal("0")
+                    legs[k] = []
+                    open_time.pop(k, None)
         else:
-            previous = net[k]
-            removed = min(q, previous)
-            if previous > 0:
-                pv[k] *= (previous - removed) / previous
-            net[k] = max(Decimal("0"), previous - q)
-            if net[k] == 0:
-                pv[k] = Decimal("0")
-                legs[k] = []
-                open_time.pop(k, None)
+            side = str(o.get("side") or "").upper()
+            if side not in ("BUY", "SELL"):
+                continue
+            delta = q if side == "BUY" else -q
+            prev = ow_net[sym]
+            # Same sign or opening from flat
+            if prev == 0 or (prev > 0 and delta > 0) or (prev < 0 and delta < 0):
+                if prev == 0:
+                    ow_open_time[sym] = t
+                    ow_legs[sym] = []
+                ow_net[sym] = prev + delta
+                ow_pv[sym] += q * p
+                ow_legs[sym].append({"t": t, "q": float(q), "p": float(p)})
+            else:
+                # Reducing, closing, or reversing across zero
+                prev_abs = abs(prev)
+                if q < prev_abs:
+                    ow_pv[sym] *= (prev_abs - q) / prev_abs
+                    ow_net[sym] = prev + delta
+                elif q == prev_abs:
+                    ow_net[sym] = Decimal("0")
+                    ow_pv[sym] = Decimal("0")
+                    ow_legs[sym] = []
+                    ow_open_time.pop(sym, None)
+                else:
+                    # Cross zero: close prior position and open remainder in opposite direction
+                    rem = q - prev_abs
+                    ow_net[sym] = rem if side == "BUY" else -rem
+                    ow_pv[sym] = rem * p
+                    ow_open_time[sym] = t
+                    ow_legs[sym] = [{"t": t, "q": float(rem), "p": float(p)}]
+
+    for sym, signed_q in ow_net.items():
+        if abs(signed_q) <= Decimal("1e-7"):
+            continue
+        ps = "LONG" if signed_q > 0 else "SHORT"
+        k = (sym, ps)
+        net[k] = abs(signed_q)
+        pv[k] = ow_pv[sym]
+        legs[k] = ow_legs[sym]
+        if sym in ow_open_time:
+            open_time[k] = ow_open_time[sym]
 
     out: List[Dict[str, Any]] = []
     for k, q in net.items():
@@ -323,7 +687,7 @@ def reconstruct_open_positions(
                 interval = closed_interval(c)
                 if (
                     c.get("symbol") == sym
-                    and str(c.get("side") or "").upper() == ps
+                    and str(c.get("side") or c.get("positionSide") or "").upper() == ps
                     and interval is not None and interval[0] <= ot <= interval[1]
                 ):
                     stale = True
@@ -337,6 +701,7 @@ def reconstruct_open_positions(
                 "baseAsset": sym[:-4] if sym.endswith(("USDT", "USDC")) else sym,  # 只移除结算币后缀。
                 "positionSide": ps,
                 "qty": float(q),
+                "qtyExact": decimal_identity(q),
                 "avgEntry": float(avg) if avg else None,
                 "notional": float(q * avg) if avg else None,
                 "openTime": ot,
@@ -475,8 +840,8 @@ def positions_have_close_evidence(
         added_qty = Decimal("0")
         intervals = []
         for order in orders:
-            if (order.get("symbol", order.get("sym")) != symbol
-                    or str(order.get("positionSide", order.get("ps")) or "").upper() != side):
+            order_ps = str(order.get("positionSide", order.get("ps")) or "").upper()
+            if order.get("symbol", order.get("sym")) != symbol or order_ps not in (side, "BOTH"):
                 continue
             interval = event_interval(order.get("orderTime", order.get("ot", order.get("time", order.get("t")))),
                                       order.get("orderUpdateTime", order.get("t")))
@@ -552,12 +917,22 @@ def is_routable_snapshot(snapshot: Dict[str, Any], now_ms: Optional[int] = None,
     return 0 <= age <= max_age_ms
 
 
-def group_orders_into_batches(orders: Sequence[Dict[str, Any]], gap_ms: int = BATCH_GAP_MS) -> List[Dict[str, Any]]:
+def group_orders_into_batches(
+    orders: Sequence[Dict[str, Any]],
+    gap_ms: int = BATCH_GAP_MS,
+    *,
+    classifications: Optional[Dict[str, str]] = None,
+    initial_oneway_net: Optional[Dict[str, Decimal]] = None,
+) -> List[Dict[str, Any]]:
     """Group contiguous same-symbol/side/positionSide orders within gap_ms."""
     normalized = [expand_slim_order(o) for o in orders]
     asc = sorted(normalized, key=lambda o: (o.get("orderTime") or 0, order_dedup_key(o)))
     batches: List[Dict[str, Any]] = []
     cur: Optional[Dict[str, Any]] = None
+    ow_net: Dict[str, Decimal] = defaultdict(
+        Decimal, {k: exact(v) for k, v in (initial_oneway_net or {}).items()}
+    )
+    seq = 0
 
     for o in asc:
         sym = o.get("symbol") or ""
@@ -567,60 +942,120 @@ def group_orders_into_batches(orders: Sequence[Dict[str, Any]], gap_ms: int = BA
         ut = int(o.get("orderUpdateTime") or ot)
         q = exact(o.get("executedQty") or 0)
         p = exact(o.get("avgPrice") or 0)
-        # 合并不能把未知收益当零；数量和来源键仍按原始成交字段计算。
-        pnl = _realized_pnl(o.get("totalPnl")) if o.get("pnlKnown") is True else None
-        item = {"time": ut, "orderTime": ot, "qty": float(q), "price": float(p),
-                "pnl": float(pnl) if pnl is not None else None, "pnlKnown": pnl is not None,
-                "sourceKey": order_dedup_key(o)}
         if q <= 0 or p <= 0:
             continue
-        closing = not is_open_leg(side, ps)
+        # 合并不能把未知收益当零；数量和来源键仍按原始成交字段计算。
+        pnl = _realized_pnl(o.get("totalPnl")) if o.get("pnlKnown") is True else None
+        src_key = order_dedup_key(o)
+        ps_upper = str(ps).upper()
+        side_upper = str(side).upper()
 
-        if (
-            cur
-            and cur["symbol"] == sym
-            and cur["positionSide"] == ps
-            and cur["side"] == side
-            and ut - cur["endTime"] <= gap_ms
-        ):
-            cur["endTime"] = max(ut, cur["endTime"])
-            cur["orders"] += 1
-            cur["qty"] += q
-            cur["_pv"] += q * p
-            cur["pnl"] += pnl if pnl is not None else Decimal("0")
-            cur["pnlKnown"] &= pnl is not None
-            cur["items"].append(item)
+        segments: List[Tuple[str, Decimal, Optional[Decimal], bool, bool, Optional[str], str]] = []
+        if ps_upper in ("LONG", "SHORT"):
+            inferred = classifications.get(src_key) if classifications else None
+            closing = (
+                inferred.startswith(("CLOSE_", "REDUCE_"))
+                if inferred
+                else (not is_open_leg(side_upper, ps_upper))
+            )
+            segments.append((ps, q, pnl, pnl is not None, closing, inferred, src_key))
         else:
-            if cur:
-                batches.append(cur)
-            cur = {
-                "key": hashlib.sha1(f"{sym}|{ps}|{side}|{ot}".encode()).hexdigest()[:20],
-                "time": ut,
-                "startTime": ot,
-                "endTime": ut,
-                "symbol": sym,
-                "positionSide": ps,
-                "side": side,
-                "type": o.get("type"),
-                "orders": 1,
-                "qty": q,
-                "_pv": q * p,
-                "pnl": pnl if pnl is not None else Decimal("0"),
-                "pnlKnown": pnl is not None,
-                "isClose": closing,
-                "items": [item],
-            }
+            if side_upper not in ("BUY", "SELL"):
+                continue
+            prev = ow_net[sym]
+            delta = q if side_upper == "BUY" else -q
+            after = prev + delta
+            if (prev > 0 and after < 0) or (prev < 0 and after > 0):
+                close_q = abs(prev)
+                open_q = q - close_q
+                old_ps = "LONG" if prev > 0 else "SHORT"
+                new_ps = "LONG" if after > 0 else "SHORT"
+                segments.append((old_ps, close_q, pnl, pnl is not None, True, f"CLOSE_{old_ps}", f"{src_key}:close"))
+                segments.append((new_ps, open_q, Decimal("0") if pnl is not None else None, pnl is not None, False, f"OPEN_{new_ps}", f"{src_key}:open"))
+                ow_net[sym] = after
+            elif prev == 0:
+                inferred = classifications.get(src_key) if classifications else None
+                if inferred and inferred.startswith(("CLOSE_", "REDUCE_")):
+                    eff_ps = "LONG" if inferred.endswith("_LONG") else "SHORT"
+                    segments.append((eff_ps, q, pnl, pnl is not None, True, inferred, src_key))
+                    ow_net[sym] = Decimal("0")
+                else:
+                    eff_ps = "LONG" if side_upper == "BUY" else "SHORT"
+                    segments.append((eff_ps, q, pnl, pnl is not None, False, f"OPEN_{eff_ps}", src_key))
+                    ow_net[sym] = after
+            elif (prev > 0 and delta > 0) or (prev < 0 and delta < 0):
+                eff_ps = "LONG" if prev > 0 else "SHORT"
+                segments.append((eff_ps, q, pnl, pnl is not None, False, f"ADD_{eff_ps}", src_key))
+                ow_net[sym] = after
+            else:
+                eff_ps = "LONG" if prev > 0 else "SHORT"
+                act_dir = f"CLOSE_{eff_ps}" if after == 0 else f"REDUCE_{eff_ps}"
+                segments.append((eff_ps, q, pnl, pnl is not None, True, act_dir, src_key))
+                ow_net[sym] = after
+
+        for seg_ps, seg_qty, seg_pnl, seg_pnl_known, seg_closing, seg_dir, seg_src_key in segments:
+            item = {"time": ut, "orderTime": ot, "qty": float(seg_qty), "price": float(p),
+                    "pnl": float(seg_pnl) if seg_pnl is not None else None, "pnlKnown": seg_pnl_known,
+                    "sourceKey": seg_src_key}
+            if (
+                cur
+                and cur["symbol"] == sym
+                and cur["positionSide"] == seg_ps
+                and cur["side"] == side
+                and cur["isClose"] == seg_closing
+                and ut - cur["endTime"] <= gap_ms
+            ):
+                cur["endTime"] = max(ut, cur["endTime"])
+                cur["orders"] += 1
+                cur["qty"] += seg_qty
+                cur["_pv"] += seg_qty * p
+                cur["pnl"] += seg_pnl if seg_pnl is not None else Decimal("0")
+                cur["pnlKnown"] &= seg_pnl_known
+                cur["items"].append(item)
+                if seg_dir:
+                    cur["_dirs"].append(seg_dir)
+            else:
+                if cur:
+                    batches.append(cur)
+                seq += 1
+                cur = {
+                    "key": hashlib.sha1(f"{sym}|{seg_ps}|{side}|{ot}".encode()).hexdigest()[:20],
+                    "time": ut,
+                    "startTime": ot,
+                    "endTime": ut,
+                    "symbol": sym,
+                    "positionSide": seg_ps,
+                    "side": side,
+                    "type": o.get("type"),
+                    "orders": 1,
+                    "qty": seg_qty,
+                    "_pv": seg_qty * p,
+                    "pnl": seg_pnl if seg_pnl is not None else Decimal("0"),
+                    "pnlKnown": seg_pnl_known,
+                    "isClose": seg_closing,
+                    "items": [item],
+                    "_dirs": [seg_dir] if seg_dir else [],
+                    "_seq": seq,
+                }
     if cur:
         batches.append(cur)
 
     for b in batches:
         pv = b.pop("_pv")
+        inferred_acts = b.pop("_dirs", [])
         b["avgPriceExact"] = str(pv / b["qty"]) if b["qty"] else None
         b["notionalExact"] = str(pv) if b["qty"] else None
         b["qtyExact"] = str(b["qty"])
         b["avgPrice"] = float(pv / b["qty"]) if b["qty"] else None
         b["notional"] = float(pv) if b["qty"] else None
-        b["dir"] = direction_label(b["side"], b["positionSide"], b["isClose"])
+        if inferred_acts:
+            # Summarize batch action: CLOSE takes precedence at exit, OPEN at entry, else last inferred action.
+            close_act = next((a for a in reversed(inferred_acts) if a.startswith("CLOSE_")), None)
+            open_act = next((a for a in inferred_acts if a.startswith("OPEN_")), None)
+            b["dir"] = close_act or open_act or inferred_acts[-1]
+            b["isClose"] = b["dir"].startswith(("CLOSE_", "REDUCE_"))
+        else:
+            b["dir"] = direction_label(b["side"], b["positionSide"], b["isClose"])
         b["key"] = hashlib.sha1("|".join(item["sourceKey"] for item in b["items"]).encode()).hexdigest()[:20]
         b["orderCount"] = b["orders"]
         b["qty"] = float(b["qty"])
@@ -630,8 +1065,11 @@ def group_orders_into_batches(orders: Sequence[Dict[str, Any]], gap_ms: int = BA
         b["pnl"] = float(pnl) if pnl is not None else None
         b["totalPnl"] = b["pnl"]
 
-    batches.sort(key=lambda x: (x.get("startTime", 0), x.get("endTime", 0), x.get("key", "")))
+    batches.sort(key=lambda x: (x.get("startTime", 0), x.get("endTime", 0), x.pop("_seq", 0), x.get("key", "")))
     return batches
+
+
+build_order_batches = group_orders_into_batches
 
 
 def format_duration(seconds: int) -> str:
@@ -648,97 +1086,168 @@ def format_duration(seconds: int) -> str:
     return f"{days}d {rem_h}h"
 
 
-def reconstruct_trade_cycles(orders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Reconstruct coherent trade cycles/rounds (同轮开平仓与K线复盘归组) per (symbol, positionSide)."""
-    chronological = sorted(orders, key=lambda x: x.get("t") or x.get("time") or 0)
-    groups: Dict[tuple[str, str], List[Dict[str, Any]]] = {}
+def reconstruct_trade_cycles(
+    orders: List[Dict[str, Any]],
+    *,
+    classifications: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, Any]]:
+    """Reconstruct coherent trade cycles/rounds (同轮开平仓与K线复盘归组) per (symbol, inferredSide)."""
+    chronological = sorted(
+        orders,
+        key=lambda x: (
+            x.get("ot") or x.get("orderTime") or x.get("t") or x.get("time") or 0,
+            x.get("t") or x.get("time") or 0,
+            order_dedup_key(expand_slim_order(x)),
+        ),
+    )
+
+    cycle_idx: Dict[tuple[str, str], int] = defaultdict(lambda: 1)
+    active_cycles: Dict[tuple[str, str], Optional[Dict[str, Any]]] = {}
+    net_qtys: Dict[tuple[str, str], Decimal] = defaultdict(Decimal)
+    ow_net: Dict[str, Decimal] = defaultdict(Decimal)
+    cycles: List[Dict[str, Any]] = []
+
+    def _feed_leg(
+        sym: str,
+        ps: str,
+        qty_dec: Decimal,
+        px: float,
+        pnl_val: float,
+        t: int,
+        is_open: bool,
+        explicit_close: bool,
+    ) -> None:
+        qty = float(qty_dec)
+        if qty_dec <= 0:
+            return
+        k = (sym, ps)
+        current_cycle = active_cycles.get(k)
+        if current_cycle is None:
+            if not is_open:
+                return
+            current_cycle = {
+                "cycleId": f"{sym}-{ps} #{cycle_idx[k]}",
+                "symbol": sym,
+                "positionSide": ps,
+                "status": "OPEN",
+                "startTime": t,
+                "endTime": t,
+                "durationSec": 0,
+                "durationFormatted": "0s",
+                "entryCount": 1,
+                "exitCount": 0,
+                "totalEntryQty": qty,
+                "totalExitQty": 0.0,
+                "entryNotional": round(qty * px, 2),
+                "exitNotional": 0.0,
+                "avgEntryPrice": px,
+                "avgExitPrice": 0.0,
+                "realizedPnl": 0.0,
+                "scaleInCount": 0,
+                "orderCount": 1,
+            }
+            active_cycles[k] = current_cycle
+            net_qtys[k] = qty_dec
+            return
+
+        current_cycle["endTime"] = t
+        dur = max(0, int((t - current_cycle["startTime"]) / 1000))
+        current_cycle["durationSec"] = dur
+        current_cycle["durationFormatted"] = format_duration(dur)
+        current_cycle["orderCount"] += 1
+
+        if is_open:
+            current_cycle["entryCount"] += 1
+            current_cycle["scaleInCount"] += 1
+            current_cycle["totalEntryQty"] += qty
+            current_cycle["entryNotional"] = round(current_cycle["entryNotional"] + (qty * px), 2)
+            if current_cycle["totalEntryQty"] > 0:
+                current_cycle["avgEntryPrice"] = round(
+                    current_cycle["entryNotional"] / current_cycle["totalEntryQty"], 6
+                )
+            net_qtys[k] += qty_dec
+        else:
+            current_cycle["exitCount"] += 1
+            current_cycle["totalExitQty"] += qty
+            current_cycle["exitNotional"] = round(current_cycle["exitNotional"] + (qty * px), 2)
+            current_cycle["realizedPnl"] = round(current_cycle["realizedPnl"] + pnl_val, 2)
+            if current_cycle["totalExitQty"] > 0:
+                current_cycle["avgExitPrice"] = round(
+                    current_cycle["exitNotional"] / current_cycle["totalExitQty"], 6
+                )
+            net_qtys[k] -= qty_dec
+
+        if (net_qtys[k] <= Decimal("1e-7") or explicit_close) and current_cycle["totalExitQty"] > 0:
+            current_cycle["status"] = "CLOSED"
+            current_cycle["netRemainingQty"] = 0.0
+            cycles.append(current_cycle)
+            active_cycles[k] = None
+            net_qtys[k] = Decimal("0")
+            cycle_idx[k] += 1
+
     for o in chronological:
         sym = o.get("sym") or o.get("symbol")
-        ps = o.get("ps") or o.get("positionSide")
-        if sym and ps:
-            groups.setdefault((sym, ps), []).append(o)
+        if not sym:
+            continue
+        ps = str(o.get("ps") or o.get("positionSide") or "").upper()
+        side = str(o.get("side") or "").upper()
+        raw_q = o.get("q") if o.get("q") is not None else o.get("executedQty")
+        try:
+            q_dec = exact(raw_q or 0)
+        except Exception:
+            continue
+        if q_dec <= 0:
+            continue
+        px = fnum(o.get("p") if o.get("p") is not None else o.get("avgPrice")) or 0.0
+        pnl = fnum(o.get("pnl") if o.get("pnl") is not None else o.get("totalPnl")) or 0.0
+        t = int(o.get("t") or o.get("time") or o.get("ot") or o.get("orderTime") or 0)
+        norm = expand_slim_order(o)
+        act = classifications.get(order_dedup_key(norm)) if classifications else None
 
-    cycles: List[Dict[str, Any]] = []
-    for (sym, ps), ords in groups.items():
-        cycle_idx = 1
-        current_cycle: Optional[Dict[str, Any]] = None
-        current_net_qty = 0.0
-
-        for o in ords:
-            side = o.get("side") or ""
-            qty = fnum(o.get("q") or o.get("executedQty")) or 0.0
-            px = fnum(o.get("p") or o.get("avgPrice")) or 0.0
-            pnl = fnum(o.get("pnl") or o.get("totalPnl")) or 0.0
-            t = int(o.get("t") or o.get("time") or o.get("orderTime") or 0)
-            is_open = is_open_leg(side, ps)
-
-            if current_cycle is None:
-                if not is_open:
+        if ps in ("LONG", "SHORT"):
+            is_open = act.startswith(("OPEN_", "ADD_")) if act else is_open_leg(side, ps)
+            explicit_close = bool(act and act.startswith("CLOSE_"))
+            _feed_leg(sym, ps, q_dec, px, pnl, t, is_open, explicit_close)
+        elif ps in ("BOTH", ""):
+            if side not in ("BUY", "SELL"):
+                continue
+            prev = ow_net[sym]
+            delta = q_dec if side == "BUY" else -q_dec
+            after = prev + delta
+            if prev == 0:
+                if act and act.startswith(("CLOSE_", "REDUCE_")):
                     continue
-                current_cycle = {
-                    "cycleId": f"{sym}-{ps} #{cycle_idx}",
-                    "symbol": sym,
-                    "positionSide": ps,
-                    "status": "OPEN",
-                    "startTime": t,
-                    "endTime": t,
-                    "durationSec": 0,
-                    "durationFormatted": "0s",
-                    "entryCount": 1,
-                    "exitCount": 0,
-                    "totalEntryQty": qty,
-                    "totalExitQty": 0.0,
-                    "entryNotional": round(qty * px, 2),
-                    "exitNotional": 0.0,
-                    "avgEntryPrice": px,
-                    "avgExitPrice": 0.0,
-                    "realizedPnl": 0.0,
-                    "scaleInCount": 0,
-                    "orderCount": 1,
-                }
-                current_net_qty = qty
+                eff_ps = "LONG" if delta > 0 else "SHORT"
+                _feed_leg(sym, eff_ps, q_dec, px, 0.0, t, True, False)
+                ow_net[sym] = after
+            elif (prev > 0 and delta > 0) or (prev < 0 and delta < 0):
+                eff_ps = "LONG" if prev > 0 else "SHORT"
+                _feed_leg(sym, eff_ps, q_dec, px, 0.0, t, True, False)
+                ow_net[sym] = after
+            elif q_dec <= abs(prev):
+                eff_ps = "LONG" if prev > 0 else "SHORT"
+                _feed_leg(sym, eff_ps, q_dec, px, pnl, t, False, abs(after) <= Decimal("1e-7"))
+                ow_net[sym] = Decimal("0") if abs(after) <= Decimal("1e-7") else after
             else:
-                current_cycle["endTime"] = t
-                dur = max(0, int((t - current_cycle["startTime"]) / 1000))
-                current_cycle["durationSec"] = dur
-                current_cycle["durationFormatted"] = format_duration(dur)
-                current_cycle["orderCount"] += 1
+                # Cross zero: close existing cycle first, then open reversed cycle with remainder
+                old_ps = "LONG" if prev > 0 else "SHORT"
+                new_ps = "LONG" if after > 0 else "SHORT"
+                close_q = abs(prev)
+                open_q = q_dec - close_q
+                _feed_leg(sym, old_ps, close_q, px, pnl, t, False, True)
+                _feed_leg(sym, new_ps, open_q, px, 0.0, t, True, False)
+                ow_net[sym] = after
 
-                if is_open:
-                    current_cycle["entryCount"] += 1
-                    current_cycle["scaleInCount"] += 1
-                    current_cycle["totalEntryQty"] += qty
-                    current_cycle["entryNotional"] = round(current_cycle["entryNotional"] + (qty * px), 2)
-                    if current_cycle["totalEntryQty"] > 0:
-                        current_cycle["avgEntryPrice"] = round(
-                            current_cycle["entryNotional"] / current_cycle["totalEntryQty"], 6
-                        )
-                    current_net_qty += qty
-                else:
-                    current_cycle["exitCount"] += 1
-                    current_cycle["totalExitQty"] += qty
-                    current_cycle["exitNotional"] = round(current_cycle["exitNotional"] + (qty * px), 2)
-                    current_cycle["realizedPnl"] = round(current_cycle["realizedPnl"] + pnl, 2)
-                    if current_cycle["totalExitQty"] > 0:
-                        current_cycle["avgExitPrice"] = round(
-                            current_cycle["exitNotional"] / current_cycle["totalExitQty"], 6
-                        )
-                    current_net_qty -= qty
-
-                if current_net_qty <= 1e-6 and current_cycle["totalExitQty"] > 0:
-                    current_cycle["status"] = "CLOSED"
-                    current_cycle["netRemainingQty"] = 0.0
-                    cycles.append(current_cycle)
-                    current_cycle = None
-                    current_net_qty = 0.0
-                    cycle_idx += 1
-
+    for k, current_cycle in active_cycles.items():
         if current_cycle is not None:
             current_cycle["status"] = "OPEN"
-            current_cycle["netRemainingQty"] = round(current_net_qty, 6)
+            current_cycle["netRemainingQty"] = round(float(net_qtys[k]), 6)
             cycles.append(current_cycle)
 
-    cycles.sort(key=lambda c: c.get("endTime") or c.get("startTime") or 0, reverse=True)
+    cycles.sort(
+        key=lambda c: (c.get("endTime") or c.get("startTime") or 0, 1 if c.get("status") == "OPEN" else 0),
+        reverse=True,
+    )
     return cycles
 
 
@@ -1655,11 +2164,25 @@ class BinanceBapiCollector(BaseLeadCollector):
             for pos, res in zip(open_positions, analyses):
                 pos["analysis"] = res
 
+        positions_confirmed = (
+            (holdings_source == "api" and holdings_error is None)
+            or (holdings_source == "derived-from-order-history" and bool(order_history_complete))
+        )
+        classifications = classify_order_actions(
+            list(orders_store.values()),
+            open_positions=open_positions,
+            closed_rows=closed_rows,
+            positions_confirmed=positions_confirmed,
+        )
         recent_raw = sorted(orders_store.values(), key=lambda x: x.get("t") or 0, reverse=True)[:200]
-        batches = group_orders_into_batches(recent_raw)[-60:]
-        trade_cycles = reconstruct_trade_cycles(list(orders_store.values()))[:40]
-        orders_view = [
-            {
+        batches = group_orders_into_batches(list(orders_store.values()), classifications=classifications)[-60:]
+        trade_cycles = reconstruct_trade_cycles(list(orders_store.values()), classifications=classifications)[:40]
+        orders_view = []
+        for o in recent_raw:
+            exp = expand_slim_order(o)
+            act = classifications.get(order_dedup_key(exp))
+            closing = act.startswith(("CLOSE_", "REDUCE_")) if act else (not is_open_leg(o.get("side"), o.get("ps")))
+            orders_view.append({
                 "time": o.get("t"),
                 "orderTime": o.get("ot"),
                 "symbol": o.get("sym"),
@@ -1670,11 +2193,9 @@ class BinanceBapiCollector(BaseLeadCollector):
                 "avgPrice": fnum(o.get("p")),
                 "pnl": o.get("pnl") if o.get("pnlKnown") is True else None,
                 "pnlKnown": o.get("pnlKnown", False),  # 展示缓存不能把缺失收益变成已知零。
-                "isClose": not is_open_leg(o.get("side"), o.get("ps")),
-                "dir": direction_label(o.get("side"), o.get("ps"), not is_open_leg(o.get("side"), o.get("ps"))),
-            }
-            for o in recent_raw
-        ]
+                "isClose": closing,
+                "dir": act or direction_label(o.get("side"), o.get("ps"), closing),
+            })
 
         tags_raw = detail.get("tagItemVos") or []
         tags = [t.get("tagDesc") or t.get("tagName") for t in tags_raw if (t.get("tagDesc") or t.get("tagName"))]

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
-import { Calculator, Gauge, History, Layers, LineChart, PieChart, Zap } from "lucide-vue-next";
+import { Gauge, History, Layers, LineChart, PieChart, Zap } from "lucide-vue-next";
 import type { LeadSnapshot } from "@/types/api";
 import { useI18n } from "@/i18n";
 import { useAgo } from "@/composables/useAgo";
@@ -8,7 +8,6 @@ import { useNow } from "@/composables/useNow";
 import { formatDateTime, timestampMs } from "@/utils/format";
 import LeadAvatar from "./LeadAvatar.vue";
 import StatTile from "./StatTile.vue";
-import PositionCalculatorCard from "./PositionCalculatorCard.vue";
 import AllocationCard from "./telemetry/AllocationCard.vue";
 import OrderHistory from "./telemetry/OrderHistory.vue";
 import PerformancePanel from "./telemetry/PerformancePanel.vue";
@@ -51,7 +50,6 @@ const lastTradeText = computed(() => timestampMs(profile.value?.lastTradeTime) =
 const SECTIONS = [
   { key: "positions", label: "telemetry.positions", icon: Layers },
   { key: "timeline", label: "board.timeline", icon: Zap },
-  { key: "calculator", label: "telemetry.calculator", icon: Calculator },
   { key: "performance", label: "telemetry.performance", icon: Gauge },
   { key: "returns", label: "telemetry.returns", icon: LineChart },
   { key: "allocation", label: "telemetry.allocation", icon: PieChart },
@@ -117,15 +115,14 @@ function jump(key: string) {
         </template>
       </nav>
     </section>
-    <!-- 持仓分析放最前；外层给了时间线（公开页的今日动态）时并排在右侧，滚动时跟随停留。 -->
+    <!-- 持仓分析与跟单开仓测算合一放最前；外层给了时间线（公开页的今日动态）时并排在右侧，滚动时跟随停留。 -->
     <div v-if="$slots.aside" class="grid min-w-0 items-start gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
-      <PositionAnalysis :snapshot="snapshot" :embedded="embedded" data-section="positions" />
+      <PositionAnalysis :snapshot="snapshot" :embedded="embedded" with-calculator :display-name="displayName" data-section="positions" />
       <section data-section="timeline" class="card xl:sticky xl:top-[var(--sticky-top,1rem)] xl:max-h-[calc(100dvh-var(--sticky-top,1rem)-1rem)] xl:overflow-y-auto">
         <div class="card-body"><slot name="aside" /></div>
       </section>
     </div>
-    <PositionAnalysis v-else :snapshot="snapshot" :embedded="embedded" data-section="positions" />
-    <PositionCalculatorCard :snapshot="snapshot" :display-name="displayName" data-section="calculator" />
+    <PositionAnalysis v-else :snapshot="snapshot" :embedded="embedded" with-calculator :display-name="displayName" data-section="positions" />
     <PerformancePanel :snapshot="snapshot" data-section="performance" />
     <div class="grid min-w-0 gap-4 xl:grid-cols-3">
       <RoiChart :points="snapshot.roiChart365D" data-section="returns" class="xl:col-span-2" />

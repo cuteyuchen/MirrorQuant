@@ -27,20 +27,20 @@ export const mockBoard: DashboardBoard = {
   accounts: [
     { id: 1, name: "Paper Alpha", exchange: "okx", environment: "demo", status: "connected",
       equity: 10426.5, available: 8602.4, unrealizedPnl: 126.5, todayPnl: 226.5, todayPnlPct: 2.22,
-      lastSyncAt: now - 4000, riskLegacyUnverified: false },
+      lastSyncAt: now - 4000, riskLegacyUnverified: false, ownerUserId: 1 },
     { id: 2, name: "Main Futures", exchange: "binance", environment: "live", status: "connected",
       equity: 24782.6, available: 20190.3, unrealizedPnl: -82.7, todayPnl: -217.4, todayPnlPct: -0.87,
-      lastSyncAt: now - 7000, riskLegacyUnverified: true },
+      lastSyncAt: now - 7000, riskLegacyUnverified: true, ownerUserId: 1 },
     { id: 3, name: "Reserve Paper", exchange: "okx", environment: "demo", status: "error",
       equity: 5020, available: null, unrealizedPnl: null, todayPnl: null, todayPnlPct: null,
-      lastSyncAt: now - 180000, riskLegacyUnverified: false },
+      lastSyncAt: now - 180000, riskLegacyUnverified: false, ownerUserId: 2 },
     { id: 4, name: "Awaiting Sync", exchange: "binance", environment: "demo", status: "pending",
       equity: null, available: null, unrealizedPnl: null, todayPnl: null, todayPnlPct: null,
-      lastSyncAt: null, riskLegacyUnverified: null },
+      lastSyncAt: null, riskLegacyUnverified: null, ownerUserId: 2 },
   ],
   leads: [
     { id: 1, name: "Atlas Momentum", avatarUrl: null, status: "healthy", enabled: true,
-      stale: false, snapshotAgeSec: 5, positionShow: true, boundCount: 2, activeBoundCount: 1,
+      stale: false, snapshotAgeSec: 5, positionShow: true, positionsConfirmed: true, boundCount: 2, activeBoundCount: 1,
       todayOpenCount: 3, todayCloseCount: 1,
       todayRealizedPnl: 146.8,
       orphans: [{ ...mine({ bindingId: 12, accountId: 2, accountName: "Main Futures", environment: "live",
@@ -70,11 +70,11 @@ export const mockBoard: DashboardBoard = {
       ] },
     // 可见空仓与下一个未知仓位样例分开，过期快照仍显示独立警示。
     { id: 2, name: "Delta Range", avatarUrl: null, status: "stale", enabled: true, stale: true,
-      snapshotAgeSec: 145, positionShow: true, boundCount: 1, activeBoundCount: 1,
+      snapshotAgeSec: 145, positionShow: true, positionsConfirmed: true, boundCount: 1, activeBoundCount: 1,
       todayOpenCount: 0, todayCloseCount: 2,
       todayRealizedPnl: -34.8, positions: [], orphans: [], todayEvents: [] },
     { id: 3, name: "New Portfolio", avatarUrl: null, status: null, enabled: null, stale: null,
-      snapshotAgeSec: null, positionShow: null, boundCount: 0, activeBoundCount: 0,
+      snapshotAgeSec: null, positionShow: null, positionsConfirmed: false, boundCount: 0, activeBoundCount: 0,
       todayOpenCount: null, todayCloseCount: null,
       todayRealizedPnl: null, positions: null, orphans: null, todayEvents: null },
   ],
@@ -94,6 +94,7 @@ export const mockSettings: SettingsResponse = {
 };
 export const mockAccounts: Account[] = (mockBoard.accounts || []).map(account => ({
   id: account.id!, name: account.name, exchange: account.exchange, environment: account.environment,
+  ownerUserId: account.ownerUserId ?? null,
   proxyId: account.id === 3 ? 2 : account.id === 2 ? 1 : null,
   isEnabled: account.id === 3 ? false : true, status: account.status, totalEquity: account.equity,
   availEquity: account.available, unrealizedPnl: account.unrealizedPnl, lastSyncAt: account.lastSyncAt,
@@ -104,13 +105,13 @@ export const mockAccounts: Account[] = (mockBoard.accounts || []).map(account =>
   lastError: account.id === 3 ? "NETWORK_ERROR" : null,
   positions: account.id === 1 ? [
     { instId: "BTC-USDT-SWAP", posSide: "Long", pos: 0.02, avgPx: 68420.5, curPx: 69500,
-      markPx: 69499, upl: 21.59, uplRatio: 0.0158, lever: 3, notionalUsd: 1390,
+      markPx: 69499, upl: 21.59, uplRatio: 0.0466, lever: 3, notionalUsd: 1390, marginUsd: 463.33,
       cTime: todayTime, uTime: now - 4000, mgnMode: "cross", priceSource: "mark" },
   ] : account.id === 2 ? [
     { instId: "BTCUSDT", posSide: "both", pos: 0.01, avgPx: 68438, curPx: 69500, upl: 10.62,
-      uplRatio: 0.0155, lever: 2, cTime: todayTime, uTime: now - 7000, mgnMode: "cross" },
+      uplRatio: 0.0306, lever: 2, notionalUsd: 695, marginUsd: 347.5, cTime: todayTime, uTime: now - 7000, mgnMode: "cross" },
     { instId: "ADAUSDT", posSide: "LONG", pos: 120, avgPx: 0.452, curPx: 0.382, upl: -8.4,
-      uplRatio: -0.1549, lever: 2, cTime: now - 86400000, uTime: now - 7000, mgnMode: "cross" },
+      uplRatio: -0.3665, lever: 2, notionalUsd: 45.84, marginUsd: 22.92, cTime: now - 86400000, uTime: now - 7000, mgnMode: "cross" },
   ] : account.id === 3 ? [] : null,
 }));
 const riskFields = Object.fromEntries(Object.entries(BINDING_RISK_FIELDS).map(([key, field]) => [field, DEFAULT_RISK[key as keyof typeof DEFAULT_RISK]])) as Pick<Binding, typeof BINDING_RISK_FIELDS[keyof typeof BINDING_RISK_FIELDS]>;

@@ -32,4 +32,28 @@ def with_current_price(position: dict, exchange: str = "") -> dict:
             source = "entry" if current else "unavailable"
     result.update(curPx=current, markPx=current, currentPrice=current, markPrice=current,
                   priceSource=position.get("priceSource") or source)
+    # 盈亏百分比按实际占用保证金（ROE）计算，兼容历史仅按名义价值存储的仓位快照。
+    margin_usd = _number(
+        position.get("marginUsd")
+        or position.get("initialMargin")
+        or position.get("positionInitialMargin")
+        or position.get("margin")
+        or position.get("imr")
+        or position.get("positionIM")
+        or position.get("marginSize")
+    )
+    lever = _number(position.get("lever") or position.get("leverage"))
+    notional = abs(_number(position.get("notionalUsd")))
+    if notional <= 0 and exchange != "okx":
+        notional = abs(_number(position.get("pos"))) * current
+    if margin_usd <= 0 and notional > 0 and lever > 0:
+        margin_usd = notional / lever
+    if margin_usd > 0:
+        result["marginUsd"] = margin_usd
+        if position.get("upl") is not None and (
+            exchange in ("binance", "bybit", "bitget")
+            or position.get("uplRatio") is None
+            or "marginUsd" in position
+        ):
+            result["uplRatio"] = _number(position.get("upl")) / margin_usd
     return result

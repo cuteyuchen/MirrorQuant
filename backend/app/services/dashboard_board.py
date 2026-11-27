@@ -122,6 +122,7 @@ def _account_row(account, today):
         "todayPnlPct": number(pnl / baseline * 100) if pnl is not None and baseline and baseline > 0 else None,
         "lastSyncAt": milliseconds(account.last_sync_at),
         "riskLegacyUnverified": bool(state.get("legacy_unverified")),
+        "ownerUserId": getattr(account, "owner_user_id", None),
     }
 
 
@@ -175,9 +176,42 @@ def _mine(binding, account, source, allocation, physical, blocked_reason, uncert
     asset = _risk(account)["assets"].get(currency) or {}
     equity = number(asset.get("equity"))
     lead_qty = number(source.get("qtyExact", source.get("qty")))  # 持久化精确数量优先，非法精确值不回退。
-    expected = (number(lead_qty * equity / lead_equity * binding.risk_scale)
-                if lead_qty is not None and lead_qty >= 0 and equity is not None and equity >= 0
-                and lead_equity and lead_equity > 0 else None)
+    locked_ok = allocation is not None and not scope_invalid
+    locked_exp = number(allocation.expected_qty_exact) if locked_ok and allocation.expected_qty_exact is not None else None
+    if locked_exp is not None and locked_exp <= 0:
+        locked_exp = None
+    locked_lead = number(allocation.lead_qty_exact) if locked_ok and allocation.lead_qty_exact is not None else None
+    if locked_lead is not None and locked_lead <= 0:
+        locked_lead = None
+    locked_ratio = number(allocation.cycle_ratio_exact) if locked_ok and allocation.cycle_ratio_exact is not None else None
+    if locked_ratio is not None and locked_ratio <= 0:
+        locked_ratio = None
+    legacy_unlocked = False
+    if lead_qty is None or lead_qty < 0:
+        expected = None
+    elif lead_qty == 0:
+        expected = 0.0
+    elif raw_qty == 0:
+        expected = (number(lead_qty * equity / lead_equity * binding.risk_scale)
+                    if equity is not None and equity >= 0 and lead_equity and lead_equity > 0 else None)
+    elif locked_exp is None and locked_ratio is None:
+        expected = None
+        legacy_unlocked = True
+    elif locked_exp is not None and locked_lead is not None:
+        if abs(lead_qty - locked_lead) <= 1e-9:
+            expected = locked_exp
+        elif lead_qty < locked_lead:
+            expected = number(locked_exp * (lead_qty / locked_lead))
+        else:
+            delta_lead = lead_qty - locked_lead
+            inc_rate = (equity / lead_equity * binding.risk_scale
+                        if equity is not None and equity >= 0 and lead_equity and lead_equity > 0
+                        else locked_ratio)
+            expected = number(locked_exp + delta_lead * inc_rate) if inc_rate is not None else None
+    elif locked_exp is not None:
+        expected = locked_exp
+    else:
+        expected = number(lead_qty * locked_ratio)
     state, reason = "unknown", uncertain_reason
     if blocked_reason:
         state, reason = "blocked", blocked_reason
@@ -187,6 +221,8 @@ def _mine(binding, account, source, allocation, physical, blocked_reason, uncert
         elif expected is not None:
             aligned = abs(qty - expected) <= max(abs(expected) * 0.05, 1e-8)
             state, reason = ("aligned", None) if aligned else ("partial", "数量偏离按比例应持仓量超过 5%")
+        elif legacy_unlocked:
+            state, reason = "unknown", "历史仓位缺少锁定比例，等待下一轮建仓"
         else:
             reason = "缺少同币种净值或带单员余额，无法计算应持仓量"
     if not account.last_sync_at and allocation is None:
@@ -302,6 +338,11 @@ def _events(lead, snapshot, deliveries, records, day_start, now):
     remaining = {(p.get("symbol"), p.get("positionSide")): number(p.get("qtyExact", p.get("qty")))
                  for p in observed_positions or [] if isinstance(p, dict)
                  and isinstance(p.get("symbol"), str) and p.get("positionSide") in ("LONG", "SHORT")} if known else {}
+    signed_remaining: dict[str, float | None] = {}
+    if known:
+        for (p_sym, p_side), p_qty in remaining.items():
+            if p_qty is not None:
+                signed_remaining[p_sym] = (signed_remaining.get(p_sym) or 0.0) + (p_qty if p_side == "LONG" else -p_qty)
     closed = [c for c in _json(lead.closed_cache_json, list) if isinstance(c, dict)]
     closed += [c for c in snapshot.get("closed") or [] if isinstance(c, dict)]
     # 同一闭仓周期的刷新只保留最新观察，避免日内次数被重复累计。
@@ -319,40 +360,90 @@ def _events(lead, snapshot, deliveries, records, day_start, now):
                 "details": redact_error_urls(record.details),
             })
     result = []
+    event_actions_by_id: dict[str, str] = {}
     sorted_orders = sorted(orders.items(), key=lambda item: (item[1]["time"] or 0, item[0]), reverse=True)
     for key, event in sorted_orders:
         timestamp, qty, side = event["time"], event["qty"], event["side"]
-        if (timestamp is None or timestamp > now or side not in ("LONG", "SHORT") or not qty or qty < 0
-                or not isinstance(event["symbol"], str)):
+        if (timestamp is None or timestamp > now or not qty or qty < 0
+                or not isinstance(event["symbol"], str) or event["tradeSide"] not in ("BUY", "SELL")):
             continue
-        leg = (event["symbol"], side)
-        is_open = (event["tradeSide"], side) in (("BUY", "LONG"), ("SELL", "SHORT"))
-        if event["tradeSide"] not in ("BUY", "SELL"):
+        if side in ("LONG", "SHORT"):
+            leg = (event["symbol"], side)
+            is_open = (event["tradeSide"], side) in (("BUY", "LONG"), ("SELL", "SHORT"))
+            # 观察时间之后的成交不能用更早的仓位倒推开仓或平仓。
+            after = remaining.get(leg, 0.0 if known else None) if observed_at and timestamp <= observed_at else None
+            action = None
+            out_side = side
+            if after is not None:
+                before = after - qty if is_open else after + qty
+                if before >= -1e-8:
+                    action = ("OPEN" if before <= 1e-8 else "ADD") if is_open else ("CLOSE" if after <= 1e-8 else "REDUCE")
+                    remaining[leg] = max(0.0, before)
+                else:
+                    remaining[leg] = None
+            if action is None:
+                for cycle in cycles.values():
+                    if (cycle.get("symbol"), cycle.get("side")) != leg:
+                        continue
+                    opened, ended = milliseconds(cycle.get("opened")), milliseconds(cycle.get("closed"))
+                    if opened and ended and opened <= timestamp <= ended:
+                        if is_open:
+                            action = "OPEN" if timestamp == opened else "ADD"
+                        else:
+                            action = "CLOSE" if timestamp == ended else "REDUCE"
+                        break
+        elif side in ("BOTH", "", None):
+            sym = event["symbol"]
+            trade_side = event["tradeSide"]
+            after_signed = (
+                signed_remaining[sym]
+                if sym in signed_remaining
+                else (0.0 if known else None)
+            ) if observed_at and timestamp <= observed_at else None
+            action = None
+            out_side = None
+            if after_signed is not None:
+                delta = qty if trade_side == "BUY" else -qty
+                before_signed = after_signed - delta
+                realized_val = event["realizedPnl"]
+                if (
+                    ((before_signed > 1e-8 and after_signed < -1e-8) or (before_signed < -1e-8 and after_signed > 1e-8))
+                    and realized_val == 0
+                ):
+                    action = "OPEN"
+                    out_side = "SHORT" if trade_side == "SELL" else "LONG"
+                    signed_remaining[sym] = None
+                else:
+                    if before_signed > 1e-8 or after_signed > 1e-8:
+                        out_side = "LONG"
+                        action = ("OPEN" if before_signed <= 1e-8 else "ADD") if trade_side == "BUY" else ("CLOSE" if after_signed <= 1e-8 else "REDUCE")
+                    elif before_signed < -1e-8 or after_signed < -1e-8:
+                        out_side = "SHORT"
+                        action = ("OPEN" if before_signed >= -1e-8 else "ADD") if trade_side == "SELL" else ("CLOSE" if after_signed >= -1e-8 else "REDUCE")
+                    if action:
+                        signed_remaining[sym] = before_signed
+            if action is None:
+                for cycle in cycles.values():
+                    if cycle.get("symbol") != sym or cycle.get("side") not in ("LONG", "SHORT"):
+                        continue
+                    opened, ended = milliseconds(cycle.get("opened")), milliseconds(cycle.get("closed"))
+                    if opened and ended and opened <= timestamp <= ended:
+                        c_side = cycle["side"]
+                        c_open = (trade_side, c_side) in (("BUY", "LONG"), ("SELL", "SHORT"))
+                        out_side = c_side
+                        action = ("OPEN" if timestamp == opened else "ADD") if c_open else ("CLOSE" if timestamp == ended else "REDUCE")
+                        break
+        else:
             continue
-        # 观察时间之后的成交不能用更早的仓位倒推开仓或平仓。
-        after = remaining.get(leg, 0.0 if known else None) if observed_at and timestamp <= observed_at else None
-        action = None
-        if after is not None:
-            before = after - qty if is_open else after + qty
-            if before >= -1e-8:
-                action = ("OPEN" if before <= 1e-8 else "ADD") if is_open else ("CLOSE" if after <= 1e-8 else "REDUCE")
-                remaining[leg] = max(0.0, before)
-            else:
-                remaining[leg] = None
-        if action is None:
-            for cycle in cycles.values():
-                if (cycle.get("symbol"), cycle.get("side")) != leg:
-                    continue
-                opened, ended = milliseconds(cycle.get("opened")), milliseconds(cycle.get("closed"))
-                if opened and ended and opened <= timestamp <= ended:
-                    if is_open:
-                        action = "OPEN" if timestamp == opened else "ADD"
-                    else:
-                        action = "CLOSE" if timestamp == ended else "REDUCE"
-                    break
-        if action and timestamp >= day_start:
-            result.append({field: event[field] for field in ("id", "time", "symbol", "side", "qty", "price", "realizedPnl")}
-                          | {"action": action, "mine": execution_by_key[key]})
+
+        if action:
+            event_actions_by_id[event["id"]] = action
+        if action and out_side and timestamp >= day_start:
+            result.append({
+                "id": event["id"], "time": event["time"], "symbol": event["symbol"],
+                "side": out_side, "qty": event["qty"], "price": event["price"], "realizedPnl": event["realizedPnl"],
+                "action": action, "mine": execution_by_key[key],
+            })
     for cycle in cycles.values():
         timestamp = milliseconds(cycle.get("closed"))
         side, symbol = cycle.get("side"), cycle.get("symbol")
@@ -368,7 +459,11 @@ def _events(lead, snapshot, deliveries, records, day_start, now):
                        "qty": None, "price": number(cycle.get("avgClosePrice")), "realizedPnl": _realized_pnl(cycle),
                        "mine": execution_by_key[event_id]})
     day_orders = [o for o in orders.values() if o["time"] and day_start <= o["time"] <= now]
-    exits = [o for o in day_orders if (o["tradeSide"], o["side"]) in (("SELL", "LONG"), ("BUY", "SHORT"))]
+    exits = [
+        o for o in day_orders
+        if (o["tradeSide"], o["side"]) in (("SELL", "LONG"), ("BUY", "SHORT"))
+        or (o["side"] in ("BOTH", "", None) and event_actions_by_id.get(o["id"]) in ("CLOSE", "REDUCE"))
+    ]
     # 只有订单历史覆盖今日且逐笔 PnL 都已知，才给出日内已实现收益。
     covered = any(o["time"] and o["time"] < day_start for o in orders.values())
     realized = number(sum(o["realizedPnl"] for o in exits)) if covered and known and all(
@@ -567,10 +662,16 @@ async def build_board(db, *, now=None, owner_user_id=None):
         counts_known = (classifications_complete and not fresh["stale"] and
                         (snapshot.get("meta") or {}).get("orderHistoryComplete") is True)
         position_show = (snapshot.get("profile") or {}).get("positionShow", lead.position_show)
+        positions_meta = snapshot.get("openPositionsMeta") or {}
+        positions_confirmed = bool(
+            _evidence_confirmed(snapshot, source_valid, observed, now_ms)
+            or (source_valid and positions_meta.get("emptyVerified") is True)
+        )
         lead_rows.append({
             "id": lead.id, "name": lead.name, "avatarUrl": lead.avatar_url, "status": lead.status,
             "enabled": lead.is_enabled, "stale": fresh["stale"], "snapshotAgeSec": fresh["snapshotAgeSec"],
             "positionShow": position_show if isinstance(position_show, bool) else None,
+            "positionsConfirmed": positions_confirmed,
             "boundCount": len(bound), "activeBoundCount": sum(1 for b in bound if b.is_enabled),
             "todayOpenCount": sum(event["action"] == "OPEN" for event in events) if counts_known else None,
             "todayCloseCount": sum(event["action"] == "CLOSE" for event in events) if counts_known else None,

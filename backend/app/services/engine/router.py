@@ -440,6 +440,62 @@ class CopyRouter:
         return exact(allocation.entry_cost_exact if allocation.entry_cost_exact is not None else allocation.entry_cost)
 
     @staticmethod
+    def _clear_locked_expectation(allocation) -> None:
+        allocation.cycle_ratio_exact = None
+        allocation.expected_qty_exact = None
+        allocation.lead_qty_exact = None
+
+    @classmethod
+    def _locked_expectation(cls, allocation) -> tuple[Optional[Decimal], Optional[Decimal], Optional[Decimal]]:
+        """返回 (locked_expected_base, locked_lead_base, locked_ratio)；未持仓或未锁定时返回空。"""
+        if allocation is None or cls._owned_qty(allocation) <= 0:
+            return None, None, None
+        exp_base = None
+        if allocation.expected_qty_exact is not None:
+            parsed = exact(allocation.expected_qty_exact)
+            if parsed > 0:
+                exp_base = parsed
+        lead_base = None
+        if allocation.lead_qty_exact is not None:
+            parsed = exact(allocation.lead_qty_exact)
+            if parsed > 0:
+                lead_base = parsed
+        ratio = None
+        if allocation.cycle_ratio_exact is not None:
+            parsed = exact(allocation.cycle_ratio_exact)
+            if parsed > 0:
+                ratio = parsed
+        return exp_base, lead_base, ratio
+
+    @classmethod
+    def _target_base_for_lead_qty(
+        cls,
+        allocation,
+        target_lead_qty: Decimal,
+        step_ratio: Optional[Decimal],
+    ) -> Optional[Decimal]:
+        """按锁定基准 + 增量算目标基币量，不再用当前权益重算整仓应有量。"""
+        target_lead_qty = exact(target_lead_qty)
+        if target_lead_qty <= 0:
+            return Decimal("0")
+        exp_base, locked_lead, locked_ratio = cls._locked_expectation(allocation)
+        if exp_base is not None or locked_ratio is not None:
+            if exp_base is not None and locked_lead is not None and locked_lead > 0:
+                if target_lead_qty > locked_lead:
+                    rate = step_ratio if step_ratio is not None and step_ratio > 0 else locked_ratio
+                    if rate is None:
+                        return None
+                    return exp_base + (target_lead_qty - locked_lead) * rate
+                return exp_base * target_lead_qty / locked_lead
+            if exp_base is not None:
+                return exp_base
+            if locked_ratio is not None:
+                return target_lead_qty * locked_ratio
+        if step_ratio is not None and step_ratio > 0:
+            return target_lead_qty * step_ratio
+        return None
+
+    @staticmethod
     def _pending_debt(debt):
         return exact(debt.pending_usd_exact if debt.pending_usd_exact is not None else debt.pending_usd)
 
@@ -618,8 +674,13 @@ class CopyRouter:
                 allocation.owned_qty_exact = format_exact(remaining)
                 allocation.owned_qty = float(remaining)
                 if remaining > 0 and owned > 0:
+                    if allocation.expected_qty_exact is not None:
+                        allocation.expected_qty_exact = format_exact(exact(allocation.expected_qty_exact) * remaining / owned)
+                    if allocation.lead_qty_exact is not None:
+                        allocation.lead_qty_exact = format_exact(exact(allocation.lead_qty_exact) * remaining / owned)
                     self._set_debt(debt, self._pending_debt(debt) * remaining / owned)
                 if remaining == 0:
+                    self._clear_locked_expectation(allocation)
                     self._set_debt(debt, 0)
                     await self._clear_guard(db, intent.binding_id, intent.inst_id, intent.pos_side)
                 if delivery is not None:
@@ -629,7 +690,27 @@ class CopyRouter:
                 if owned == 0:
                     allocation.generation += 1
                     allocation.opened_at_ms = source_time_ms or intent.source_time_ms or int(time.time() * 1000)
+                    self._clear_locked_expectation(allocation)
                     await self._clear_guard(db, intent.binding_id, intent.inst_id, intent.pos_side)
+                    if prior == 0 and intent.expected_delta_qty is not None:
+                        exp_delta = exact(intent.expected_delta_qty)
+                        lead_delta = exact(intent.lead_delta_qty or 0)
+                        if exp_delta > 0:
+                            allocation.expected_qty_exact = format_exact(exp_delta)
+                            allocation.lead_qty_exact = format_exact(lead_delta) if lead_delta > 0 else None
+                            allocation.cycle_ratio_exact = (
+                                format_exact(exp_delta / lead_delta) if lead_delta > 0 else intent.cycle_ratio_exact
+                            )
+                elif prior == 0 and allocation.expected_qty_exact is not None and intent.expected_delta_qty is not None:
+                    exp_delta = exact(intent.expected_delta_qty)
+                    lead_delta = exact(intent.lead_delta_qty or 0)
+                    new_exp = exact(allocation.expected_qty_exact) + exp_delta
+                    allocation.expected_qty_exact = format_exact(new_exp)
+                    if allocation.lead_qty_exact is not None and lead_delta >= 0:
+                        new_lead = exact(allocation.lead_qty_exact) + lead_delta
+                        allocation.lead_qty_exact = format_exact(new_lead)
+                        if new_lead > 0:
+                            allocation.cycle_ratio_exact = format_exact(new_exp / new_lead)
                 # Average fill prices are cumulative: subtract previous cost, not delta * average.
                 new_cost = incremental_cost
                 if new_cost <= 0:
@@ -761,7 +842,8 @@ class CopyRouter:
     async def _submit_confirmed(self, db, binding, account, adapter, spec,
                                 source_event_id, target_usd=0, source_time_ms=0, observed_at_ms=0,
                                 retry_terminal=False, source_evidence=None, expires_at_ms=None,
-                                spread_pct=None, sizing_px=None, **order):
+                                spread_pct=None, sizing_px=None, expected_delta_qty=None,
+                                lead_delta_qty=None, cycle_ratio_exact=None, **order):
         material = f"{account.id}:{binding.id}:{source_event_id}"
         db.info.pop("confirmed_execution", None)
         cid = "mq" + hashlib.sha256(material.encode()).hexdigest()[:30]
@@ -814,7 +896,10 @@ class CopyRouter:
                 filled_qty="0", avg_px="0", reduce_only=order["reduce_only"], target_usd=format_exact(target_usd), source_time_ms=source_time_ms,
                 # 只有“滑点超限改挂限价单”带到期时间，到期后由对账流程撤单。
                 expires_at_ms=expires_at_ms, limit_px=order.get("px") if expires_at_ms is not None else None,
-                sizing_px=format_exact(sizing_px) if sizing_px is not None else None)
+                sizing_px=format_exact(sizing_px) if sizing_px is not None else None,
+                expected_delta_qty=format_exact(expected_delta_qty) if expected_delta_qty is not None else None,
+                lead_delta_qty=format_exact(lead_delta_qty) if lead_delta_qty is not None else None,
+                cycle_ratio_exact=format_exact(cycle_ratio_exact) if cycle_ratio_exact is not None else None)
             db.add(intent)
             await db.commit()  # Durable before POST; restart can only query this client ID.
             if source_evidence is not None:
@@ -2027,6 +2112,9 @@ class CopyRouter:
             if entry_px <= 0:
                 entry_px = price
             entry_cost = adoptable * entry_px
+            spec_obj = instruments.get(inst_id)
+            ct_val = spec_obj.ct_val if spec_obj is not None else Decimal("1")
+            adoptable_base = adoptable * ct_val
             allocation = await self._get_allocation(db, binding.id, account.id, inst_id, local_pos_side)
             allocation.generation += 1
             allocation.opened_at_ms = received_at_ms
@@ -2035,6 +2123,9 @@ class CopyRouter:
             allocation.entry_cost = float(allocation.entry_cost_exact)
             allocation.owned_qty_exact = format_exact(adoptable)
             allocation.owned_qty = float(allocation.owned_qty_exact)
+            allocation.expected_qty_exact = format_exact(adoptable_base)
+            allocation.lead_qty_exact = format_exact(lead_qty)
+            allocation.cycle_ratio_exact = format_exact(adoptable_base / lead_qty)
             await self._upsert_guard(db, binding.id, inst_id, local_pos_side,
                                      float(entry_cost / adoptable))
             details = (f"Adopted existing position: my exposure {my_ratio:.2f}x, "
@@ -2141,6 +2232,7 @@ class CopyRouter:
                 allocation.entry_cost = 0.0
                 allocation.entry_cost_exact = "0"
                 allocation.generation += 1
+                self._clear_locked_expectation(allocation)
                 await self._clear_guard(db, binding.id, inst_id, local_pos_side)
                 details = ("持续自动认领：实盘仓位已平（0），账上 "
                            f"{owned} 已清零；带单员正在交易该标的")
@@ -2168,6 +2260,16 @@ class CopyRouter:
             allocation.entry_cost = float(allocation.entry_cost_exact)
             allocation.owned_qty_exact = format_exact(physical_qty)
             allocation.owned_qty = float(allocation.owned_qty_exact)
+            spec_obj = instruments.get(inst_id)
+            ct_val = spec_obj.ct_val if spec_obj is not None else Decimal("1")
+            physical_base = physical_qty * ct_val
+            allocation.expected_qty_exact = format_exact(physical_base)
+            if lead_qty > 0:
+                allocation.lead_qty_exact = format_exact(lead_qty)
+                allocation.cycle_ratio_exact = format_exact(physical_base / lead_qty)
+            else:
+                allocation.lead_qty_exact = None
+                allocation.cycle_ratio_exact = None
             allocation.generation += 1
             await self._upsert_guard(db, binding.id, inst_id, local_pos_side, float(entry_px))
             details = ("持续自动认领：实盘 "
@@ -2272,11 +2374,14 @@ class CopyRouter:
                         positions = await adapter.get_positions()
                     except Exception:
                         return
+                spec = instruments[inst_id]
+                ct_val = spec.ct_val
                 allocation = await self._get_allocation(db, binding.id, account.id, inst_id, side.lower())
                 owned = self._owned_qty(allocation) if allocation is not None else Decimal("0")
-                target = lead_qty * ratio
-                dust = max(Decimal("1e-8"), target * Decimal("0.001"))
-                if abs(owned - target) <= dust:
+                target_base = self._target_base_for_lead_qty(allocation, lead_qty, ratio)
+                pre_target = target_base / ct_val if target_base is not None else lead_qty * ratio / ct_val
+                dust = max(Decimal("1e-8"), pre_target * Decimal("0.001"))
+                if abs(owned - pre_target) <= dust:
                     # 已同步（订单流已处理或无需处理）：基线跟进当前带单量。
                     progress.cumulative_qty = str(lead_qty)
                     await db.commit()
@@ -2336,7 +2441,14 @@ class CopyRouter:
                 # 不动，下轮重试。
                 allocation = await self._get_allocation(db, binding.id, account.id, inst_id, side.lower())
                 owned_after = self._owned_qty(allocation) if allocation is not None else Decimal("0")
-                if abs(owned_after - target) <= dust:
+                if lead_qty < base_qty:
+                    # 带单减仓严格按持仓百分比算目标量，不用当前权益反推。
+                    post_target = (owned * lead_qty / base_qty) if base_qty > 0 else Decimal("0")
+                else:
+                    after_base = self._target_base_for_lead_qty(allocation, lead_qty, ratio)
+                    post_target = after_base / ct_val if after_base is not None else pre_target
+                post_dust = max(Decimal("1e-8"), post_target * Decimal("0.001"))
+                if abs(owned_after - post_target) <= post_dust:
                     progress.cumulative_qty = str(lead_qty)
                     await db.commit()
             except Exception:
@@ -2454,9 +2566,14 @@ class CopyRouter:
             .execution_options(populate_existing=True))).all()
         for binding in bindings:
             baseline = not binding.baseline_seeded
+            ow_net: Dict[str, Decimal] = defaultdict(Decimal)
             for order in expanded_orders:
+                sym = order.get("symbol") or ""
+                ps_upper = str(order.get("positionSide") or "").upper()
+                side_upper = str(order.get("side") or "").upper()
                 key = order_dedup_key(order)
                 cumulative, price = validate_source_fill(order.get("executedQty"), order.get("avgPrice"))
+                signed_cum = cumulative if side_upper == "BUY" else -cumulative
                 notional = cumulative * price
                 progress = await db.get(BindingSourceProgress, (binding.id, key))
                 if progress is None:
@@ -2474,6 +2591,8 @@ class CopyRouter:
                     legacy_key = hashlib.sha1(json.dumps(legacy_payload, sort_keys=True).encode()).hexdigest()[:24]
                     if baseline or key in old_seen or legacy_key in old_seen or any(k in old_seen for k in order.get("_legacy_keys", [])):
                         progress.cumulative_qty, progress.cumulative_notional = str(cumulative), str(notional)
+                        if ps_upper == "BOTH" and side_upper in ("BUY", "SELL"):
+                            ow_net[sym] += signed_cum
                         continue
                 previous = exact(progress.cumulative_qty)
                 if source_fill_kind(order) == "individual":
@@ -2493,6 +2612,7 @@ class CopyRouter:
                     continue
                 delta = cumulative - previous
                 event_id = key + ":" + str(cumulative)
+                prev_before_delta = ow_net[sym] + (previous if side_upper == "BUY" else -previous)
                 if delta == 0 and previous > 0 and not is_open_leg(order.get("side"), order.get("positionSide")):
                     legacy_intent = await db.scalar(select(OrderIntent).where(
                         OrderIntent.binding_id == binding.id, OrderIntent.account_id == binding.account_id,
@@ -2502,15 +2622,22 @@ class CopyRouter:
                             0 < exact(legacy_intent.filled_qty) <= exact(legacy_intent.requested_qty) and
                             await db.get(BindingDelivery, (binding.id, event_id)) is None):
                         start, sequence = self._source_interval(order)
-                        imported = group_orders_into_batches([{**order, "orderTime": start, "orderUpdateTime": sequence}])[0]
+                        imported = group_orders_into_batches(
+                            [{**order, "orderTime": start, "orderUpdateTime": sequence}],
+                            initial_oneway_net={sym: ow_net[sym]} if ps_upper == "BOTH" else None,
+                        )[-1]
                         imported.update(_event_id=event_id, _source_key=key, _source_start_ms=start,
                             _source_time_ms=sequence, _imported_consumed_source=True)
                         db.add(BindingDelivery(binding_id=binding.id, source_event_id=event_id,
                             source_sequence=max(start, sequence), payload_json=json.dumps(imported), state="APPLIED"))
                 if delta <= 0:
+                    if ps_upper == "BOTH" and side_upper in ("BUY", "SELL"):
+                        ow_net[sym] += signed_cum
                     continue
                 delta_notional = notional - exact(progress.cumulative_notional)
                 if delta_notional <= 0:
+                    if ps_upper == "BOTH" and side_upper in ("BUY", "SELL"):
+                        ow_net[sym] += signed_cum
                     continue
                 start, sequence = self._source_interval(order)
                 updated = {**order, "orderTime": start, "orderUpdateTime": sequence,
@@ -2518,18 +2645,36 @@ class CopyRouter:
                 if previous > 0 and source_fill_kind(order) == "cumulative":
                     # 只有数量/名义金额有历史基线，累计收益不能冒充本次增量收益。
                     updated["totalPnl"], updated["pnlKnown"] = None, False
-                batches = sorted(group_orders_into_batches([updated]),
-                    key=lambda b: (b.get("startTime", 0), b.get("endTime", 0), b.get("key", "")))
-                for batch in batches:
+                batches = group_orders_into_batches(
+                    [updated],
+                    initial_oneway_net={sym: prev_before_delta} if ps_upper == "BOTH" else None,
+                )
+                if len(batches) == 1:
+                    batch = batches[0]
                     event_id = key + ":" + str(cumulative)
-                    batch.update(qty=str(delta), qtyExact=str(delta), notional=str(delta_notional), notionalExact=str(delta_notional), avgPrice=str(delta_notional / delta), _event_id=event_id)
+                    batch.update(qty=str(delta), qtyExact=str(delta), notional=str(delta_notional),
+                                 notionalExact=str(delta_notional), avgPrice=str(delta_notional / delta),
+                                 _event_id=event_id)
                     batch["_source_time_ms"] = sequence
                     batch["_source_start_ms"] = start
                     batch["_source_key"] = key
                     db.add(BindingDelivery(binding_id=binding.id, source_event_id=event_id,
                         source_sequence=max(start, sequence), payload_json=json.dumps(batch), state="PENDING"))
                     new_source_events[event_id] = batch
+                else:
+                    for batch in batches:
+                        suffix = ":close" if batch.get("isClose") else ":open"
+                        seg_event_id = f"{key}:{cumulative}{suffix}"
+                        batch["_event_id"] = seg_event_id
+                        batch["_source_time_ms"] = sequence
+                        batch["_source_start_ms"] = start
+                        batch["_source_key"] = key
+                        db.add(BindingDelivery(binding_id=binding.id, source_event_id=seg_event_id,
+                            source_sequence=max(start, sequence), payload_json=json.dumps(batch), state="PENDING"))
+                        new_source_events[seg_event_id] = batch
                 progress.cumulative_qty, progress.cumulative_notional = str(cumulative), str(notional)
+                if ps_upper == "BOTH" and side_upper in ("BUY", "SELL"):
+                    ow_net[sym] += signed_cum
             # Historical closures cannot authorize closing a subsequently reopened cycle.
             if not baseline:
                 for closed in raw_closed:
@@ -2544,25 +2689,47 @@ class CopyRouter:
                         new_source_events[event_id] = payload_closed
             binding.baseline_seeded = True
         if not is_initial_sync:
+            notif_ow_net: Dict[str, Decimal] = defaultdict(Decimal)
             for order in expanded_orders:
+                sym = order.get("symbol") or ""
+                ps_upper = str(order.get("positionSide") or "").upper()
+                side_upper = str(order.get("side") or "").upper()
+                prev_notif = notif_ow_net[sym]
                 key = order_dedup_key(order)
+                try:
+                    cumulative, price = validate_source_fill(order.get("executedQty"), order.get("avgPrice"))
+                except Exception:
+                    continue
+                if ps_upper == "BOTH" and side_upper in ("BUY", "SELL"):
+                    notif_ow_net[sym] += cumulative if side_upper == "BUY" else -cumulative
                 if key not in old_seen:
                     try:
-                        cumulative, price = validate_source_fill(order.get("executedQty"), order.get("avgPrice"))
                         event_id = key + ":" + str(cumulative)
-                        if event_id not in new_source_events:
+                        if event_id not in new_source_events and not (
+                            ps_upper == "BOTH" and f"{event_id}:close" in new_source_events
+                        ):
                             start, sequence = self._source_interval(order)
                             notional = cumulative * price
                             updated = {**order, "orderTime": start, "orderUpdateTime": sequence,
                                        "executedQty": str(cumulative), "avgPrice": str(price)}
-                            batches = sorted(group_orders_into_batches([updated]),
-                                             key=lambda b: (b.get("startTime", 0), b.get("endTime", 0), b.get("key", "")))
-                            for batch in batches:
+                            batches = group_orders_into_batches(
+                                [updated],
+                                initial_oneway_net={sym: prev_notif} if ps_upper == "BOTH" else None,
+                            )
+                            if len(batches) == 1:
+                                batch = batches[0]
                                 batch.update(qty=str(cumulative), qtyExact=str(cumulative),
                                              notional=str(notional), notionalExact=str(notional),
                                              avgPrice=str(price), _event_id=event_id,
                                              _source_time_ms=sequence, _source_start_ms=start, _source_key=key)
                                 new_source_events[event_id] = batch
+                            else:
+                                for batch in batches:
+                                    suffix = ":close" if batch.get("isClose") else ":open"
+                                    seg_event_id = f"{event_id}{suffix}"
+                                    batch.update(_event_id=seg_event_id, _source_time_ms=sequence,
+                                                 _source_start_ms=start, _source_key=key)
+                                    new_source_events[seg_event_id] = batch
                     except Exception:
                         pass
             for closed in raw_closed:
@@ -2756,6 +2923,7 @@ class CopyRouter:
                         positions = await adapter.get_positions()
                         await persist_equity(db, account, bal)
                         account.total_notional = sum(p.notional_usd for p in positions)
+                        account.unrealized_pnl = sum(p.upl for p in positions)
                         account.positions_json = json.dumps([p.to_dict() for p in positions])
                         account.status, account.last_error = "connected", None
                         batch["_freshness_at_ms"] = min(snapshot_times(snapshot).values())
@@ -3026,6 +3194,12 @@ class CopyRouter:
                 details="Exchange inventory is below allocated quantity; reconciliation required", notify_cfg=notify_cfg)
             return
 
+        allocation = next(
+            (a for a in allocations
+             if a.binding_id == binding.id and a.inst_id == inst_id and a.pos_side == local_pos_side),
+            allocation,
+        )
+
         RiskEngine.clear_disabled_loss_breaker(binding)
         if binding.circuit_breaker_tripped:
             await self._record_execution(
@@ -3147,29 +3321,30 @@ class CopyRouter:
             entry_px = float(limit_px_dec)
 
         # 已跟足保护（放在所有风控门之后，只做幂等去重，不绕过任何门）：
-        # 按当前带单持仓与权益比例算出本绑定应有量，已跟足时不再重复买入，
+        # 按锁定应有量 + 增量比例算出本绑定应有量，已跟足时不再重复买入，
         # 只差一部分时后续只补差额。同一加仓可能经订单流与仓位差额快照两
         # 条路到达（2026-11-22 实测公开带单订单流滞后约 2 分钟，快照先行
         # 跟单后订单事件后到），没有这层幂等保护会重复买入。
         # active_lead_positions 为当前快照的带单持仓；未提供或为 0 时不启用。
+        active_qty = active_lead_positions.get(f"{symbol}_{ps}")
+        step_ratio: Optional[Decimal] = None
+        if my_equity and my_equity > 0 and lead_margin_balance and lead_margin_balance > 0:
+            step_ratio = exact(binding.risk_scale or 1) * exact(my_equity) / exact(lead_margin_balance)
         open_residual: Optional[Decimal] = None
         try:
-            active_qty = active_lead_positions.get(f"{symbol}_{ps}")
-            if (active_qty is not None and exact(active_qty) > 0 and my_equity and my_equity > 0
-                    and lead_margin_balance and lead_margin_balance > 0):
-                owned_now = sum((self._owned_qty(a) for a in allocations
-                                 if a.binding_id == binding.id and a.inst_id == inst_id
-                                 and a.pos_side == ps.lower()), Decimal("0"))
-                target_owned = (exact(active_qty) * exact(binding.risk_scale or 1)
-                                * exact(my_equity) / exact(lead_margin_balance))
-                open_residual = target_owned - owned_now
-                if open_residual <= 0:
-                    await self._record_execution(db, binding, lead, account, symbol, inst_id, side, ps, action,
-                        "SKIPPED_ALREADY_FOLLOWED", lead_qty, lead_avg_px, lead_notional,
-                        my_price=ref_px, slippage_pct=slip_res.value,
-                        details=f"Owned {owned_now} already covers target {target_owned} for lead qty {active_qty}",
-                        notify_cfg=notify_cfg)
-                    return
+            if active_qty is not None and exact(active_qty) > 0 and step_ratio is not None:
+                owned_now = self._owned_qty(allocation)
+                target_base = self._target_base_for_lead_qty(allocation, exact(active_qty), step_ratio)
+                if target_base is not None:
+                    target_owned = target_base / spec.ct_val
+                    open_residual = target_owned - owned_now
+                    if open_residual <= 0:
+                        await self._record_execution(db, binding, lead, account, symbol, inst_id, side, ps, action,
+                            "SKIPPED_ALREADY_FOLLOWED", lead_qty, lead_avg_px, lead_notional,
+                            my_price=ref_px, slippage_pct=slip_res.value,
+                            details=f"Owned {owned_now} already covers target {target_owned} for lead qty {active_qty}",
+                            notify_cfg=notify_cfg)
+                        return
         except (ValueError, InvalidOperation, TypeError, AttributeError, ZeroDivisionError):
             open_residual = None
 
@@ -3196,7 +3371,7 @@ class CopyRouter:
         leverage_cap_enabled = getattr(binding, "enable_leverage_cap", False)
         capped_qty, cap_reason = sized.contracts, None
         if open_residual is not None:
-            if open_residual * exact(entry_px) < exact(sized.min_usd):
+            if open_residual * exact(entry_px) * spec.ct_val < exact(sized.min_usd):
                 # 只差灰尘（低于最小名义金额），视为已跟足，不下灰尘单。
                 await self._record_execution(db, binding, lead, account, symbol, inst_id, side, ps, action,
                     "SKIPPED_ALREADY_FOLLOWED", lead_qty, lead_avg_px, lead_notional,
@@ -3287,6 +3462,32 @@ class CopyRouter:
                 spec.validate_order(ord_type, capped_qty, order_px)
             except (ValueError, ArithmeticError) as exc:
                 raise OrderRejected(account.exchange, "LOCAL_VALIDATION", str(exc)) from exc
+            intent_exp_delta: Optional[Decimal] = None
+            intent_lead_delta: Optional[Decimal] = None
+            if step_ratio is not None:
+                raw_lead_after = batch.get("_lead_remaining_qty")
+                event_lead_after = (
+                    exact(raw_lead_after)
+                    if raw_lead_after is not None and exact(raw_lead_after) > 0
+                    else (exact(active_qty) if active_qty is not None and exact(active_qty) > 0 else None)
+                )
+                owned_before = self._owned_qty(allocation)
+                if owned_before == 0:
+                    has_resting = await self._has_resting(db, binding.id, inst_id, local_pos_side)
+                    intent_exp_delta = exact(lead_qty) * step_ratio
+                    if not has_resting and event_lead_after is not None and event_lead_after >= exact(lead_qty):
+                        intent_lead_delta = event_lead_after
+                    else:
+                        intent_lead_delta = exact(lead_qty)
+                else:
+                    exp_base, locked_lead, _ = self._locked_expectation(allocation)
+                    if exp_base is not None:
+                        if event_lead_after is not None and locked_lead is not None and locked_lead > 0:
+                            lead_delta_for_exp = min(exact(lead_qty), max(Decimal("0"), event_lead_after - locked_lead))
+                        else:
+                            lead_delta_for_exp = exact(lead_qty)
+                        intent_exp_delta = lead_delta_for_exp * step_ratio
+                        intent_lead_delta = lead_delta_for_exp
             res = await self._submit_confirmed(db, binding, account, adapter, spec,
                 source_event_id=event_id, target_usd=target_usd,
                 source_time_ms=int(batch.get("startTime") or 0),
@@ -3294,7 +3495,9 @@ class CopyRouter:
                 side=order_side, pos_side=local_pos_side, ord_type=ord_type,
                 sz=format_decimal(capped_qty, spec.lot_sz), px=format_decimal(order_px, spec.tick_sz),
                 reduce_only=False, td_mode=account.margin_mode, expires_at_ms=expires_at_ms,
-                spread_pct=spread_res.value or None, sizing_px=entry_px, retry_terminal=True)
+                spread_pct=spread_res.value or None, sizing_px=entry_px,
+                expected_delta_qty=intent_exp_delta, lead_delta_qty=intent_lead_delta,
+                cycle_ratio_exact=step_ratio, retry_terminal=True)
             fill_sz, fill_px = res.fill_sz, res.avg_px
             if res.state == "resting":
                 # 限价单已挂出但未全部成交：单独记录并通知，成交或失效时再各通知一次。

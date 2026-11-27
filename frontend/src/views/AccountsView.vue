@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onActivated, onMounted, ref } from "vue";
+import { computed, inject, nextTick, onActivated, onDeactivated, onMounted, onUnmounted, ref, watch } from "vue";
+import { routeLocationKey } from "vue-router";
 import { ChevronDown, Pencil, Plus, RefreshCw, Trash2, Wifi } from "lucide-vue-next";
 import { api, ApiError, isCancelled } from "@/api/client";
 import { useDataCacheStore } from "@/stores/dataCache";
@@ -14,7 +15,6 @@ import { pnlClass, sideLabel } from "@/utils/status";
 import { errorMessage, reasonText } from "@/utils/errors";
 import PageHeader from "@/components/PageHeader.vue";
 import DataTable from "@/components/DataTable.vue";
-import MoreMenu from "@/components/MoreMenu.vue";
 import EmptyState from "@/components/EmptyState.vue";
 import AccountFormModal from "@/components/AccountFormModal.vue";
 import EnvBadge from "@/components/EnvBadge.vue";
@@ -24,6 +24,7 @@ import FreshnessStamp from "@/components/FreshnessStamp.vue";
 defineOptions({ name: "AccountsView" });
 const cache = useDataCacheStore();
 const board = useBoardStore();
+const route = inject(routeLocationKey, null);
 const now = useNow();
 const { t } = useI18n();
 const { unit, showQuantity, sizeText } = useDisplayUnit();
@@ -37,6 +38,7 @@ const testResult = ref<Record<number, AccountTestResult>>({});
 const expanded = ref<number | null>(null);
 const loading = ref(false);
 const loadError = ref("");
+const active = ref(false);
 const rows = computed(() => [...accounts.value].sort((a, b) => severity(b) - severity(a) || a.id - b.id));
 const summary = computed(() => cache.accounts ? t("accts.rowSummary", {
   n: accounts.value.length, issues: accounts.value.filter(account => !!issue(account)).length,
@@ -80,17 +82,28 @@ function severity(account: Account) { return issue(account) ? account.lastError 
 function rowTone(account: Account) { return severity(account) === 2 ? "bg-danger/5" : severity(account) === 1 ? "bg-warning/5" : ""; }
 function toggleDetails(account: Account) { expanded.value = expanded.value === account.id ? null : account.id; }
 function positionRows(account: Account) {
-  // 数量和价格保留交易所实际单位；估算/开仓价不冒充实时行情。
+  // 数量和价格保留交易所实际单位；盈亏百分比按实际占用保证金 (ROE%) 计算，而非名义价值百分比。
   return (account.positions || []).map(position => {
     const qty = finiteNumber(position.pos ?? position.qty);
     const price = finiteNumber(position.currentPrice ?? position.curPx ?? position.markPx ?? position.markPrice);
+    const validPrice = position.priceSource === "entry" || position.priceSource === "unavailable" || price == null || price <= 0 ? null : price;
+    const upl = finiteNumber(position.upl ?? position.uPnL);
+    const notional = finiteNumber(position.notionalUsd ?? position.markValue ?? position.notional)
+      ?? (qty != null && validPrice != null ? Math.abs(qty) * validPrice : null);
+    const leverage = finiteNumber(position.lever ?? position.entryLeverage);
+    const rawMargin = finiteNumber(position.marginUsd);
+    const marginUsd = rawMargin != null && rawMargin > 0
+      ? rawMargin
+      : (notional != null && notional > 0 && leverage != null && leverage > 0 ? notional / leverage : null);
+    const fallbackPct = position.uplRatio == null ? finiteNumber(position.uPnLRoePct) : position.uplRatio * 100;
+    const pnlPct = upl != null && marginUsd != null && marginUsd > 0 ? (upl / marginUsd) * 100 : fallbackPct;
     return {
       key: `${position.instId ?? position.symbol}:${position.posSide ?? position.positionSide}:${position.cTime ?? position.openTime}`,
       symbol: position.symbol ?? position.instId, side: sideLabel(position.posSide ?? position.positionSide, qty),
       qty: qty == null ? null : Math.abs(qty), entry: position.avgPx ?? position.avgEntry,
-      price: position.priceSource === "entry" || position.priceSource === "unavailable" || price == null || price <= 0 ? null : price,
-      priceSource: position.priceSource, pnl: position.upl ?? position.uPnL,
-      pnlPct: position.uplRatio == null ? position.uPnLRoePct : position.uplRatio * 100, leverage: position.lever ?? position.entryLeverage,
+      price: validPrice,
+      priceSource: position.priceSource, pnl: upl,
+      pnlPct, leverage,
     };
   });
 }
@@ -140,33 +153,53 @@ function sync(account: Account) { return run(async () => {
   if (response.ok !== true) throw new ApiError(400, response.error || t("accts.testUnknown"));
   await board.refresh(true);
 }); }
-// 直接消费带请求序号保护的缓存，避免视图再保存一份过时列表。
-onMounted(() => { void load(); });
-onActivated(() => { void load(); });
+// 直接消费带请求序号保护的缓存，并跟随全局看板轮询/实时流同步持仓及浮盈。
+watch(() => board.receivedAt, (next, previous) => {
+  if (active.value && next && next !== previous && !loading.value) {
+    void cache.fetchAccounts(true);
+  }
+});
+watch(
+  () => [route?.query?.account, rows.value.length] as const,
+  ([raw]) => {
+    const target = Number(Array.isArray(raw) ? raw[0] : raw);
+    if (!Number.isInteger(target) || target <= 0) return;
+    if (!rows.value.some(account => account.id === target)) return;
+    expanded.value = target;
+    void nextTick(() => {
+      document.getElementById(`account-row-${target}`)?.scrollIntoView?.({ behavior: "smooth", block: "center" });
+    });
+  },
+  { immediate: true },
+);
+onMounted(() => { active.value = true; void load(); });
+onActivated(() => { active.value = true; void load(); });
+onDeactivated(() => { active.value = false; });
+onUnmounted(() => { active.value = false; });
 </script>
 <template>
   <div class="space-y-5">
     <PageHeader :title="t('accts.title')" :summary="summary"><template #actions><button class="icon-button" :disabled="loading || pending" :aria-label="t('common.refresh')" :title="t('common.refresh')" @click="load(true)"><RefreshCw :size="18" :class="{ 'animate-spin': loading }" /></button><button class="button-primary" :disabled="pending" @click="edit(null)"><Plus :size="17" />{{ t("accts.addBtn") }}</button></template></PageHeader>
     <p v-if="error" class="error-banner" role="alert">{{ error }}</p>
     <DataTable :rows="rows" :label="t('accts.title')" :row-key="row => row.id" :row-tone="rowTone" :loading="loading" :error="loadError" :empty="t('accts.emptyTitle')" selectable :expanded="expanded" @select="toggleDetails" @retry="load(true)" :columns="[
-      { key: 'account', label: t('accts.account'), width: '18%', mobileWide: true },
-      { key: 'funds', label: t('accts.funds'), numeric: true, width: '14%' },
-      { key: 'today', label: t('board.todayPnl'), numeric: true, width: '13%' },
-      { key: 'unrealized', label: t('board.unrealized'), numeric: true, width: '11%' },
-      { key: 'drawdown', label: t('accts.drawdown'), numeric: true, width: '9%' },
-      { key: 'sync', label: t('accts.lastSync'), width: '10%' },
-      { key: 'status', label: t('common.status'), mobileWide: true, width: '17%' },
-      { key: 'actions', label: t('common.actions'), width: '8%' },
+      { key: 'account', label: t('accts.account'), width: '15%', mobileWide: true },
+      { key: 'funds', label: t('accts.funds'), numeric: true, width: '13%' },
+      { key: 'today', label: t('board.todayPnl'), numeric: true, width: '12%' },
+      { key: 'unrealized', label: t('board.unrealized'), numeric: true, width: '10%' },
+      { key: 'drawdown', label: t('accts.drawdown'), numeric: true, width: '7%' },
+      { key: 'sync', label: t('accts.lastSync'), width: '9%' },
+      { key: 'status', label: t('common.status'), mobileWide: true, width: '14%' },
+      { key: 'actions', label: t('common.actions'), width: '20%' },
     ]">
       <!-- 无空格长名称也可收缩换行，不挤出固定尺寸的展开按钮。 -->
-      <template #cell-account="{ row }"><p class="flex items-start justify-between gap-2 font-semibold"><span class="min-w-0 flex-1 [overflow-wrap:anywhere]">{{ row.name ?? t("common.unknown") }}</span><ChevronDown :size="16" class="mt-0.5 shrink-0 text-muted" :class="{ 'rotate-180': expanded === row.id }" aria-hidden="true" /></p><div class="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted"><span>{{ row.exchange?.toUpperCase() ?? t("common.unknown") }}</span><EnvBadge :environment="row.environment" /></div></template>
+      <template #cell-account="{ row }"><div :id="`account-row-${row.id}`"><p class="flex items-start justify-between gap-2 font-semibold"><span class="min-w-0 flex-1 [overflow-wrap:anywhere]">{{ row.name ?? t("common.unknown") }}</span><ChevronDown :size="16" class="mt-0.5 shrink-0 text-muted" :class="{ 'rotate-180': expanded === row.id }" aria-hidden="true" /></p><div class="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted"><span>{{ row.exchange?.toUpperCase() ?? t("common.unknown") }}</span><EnvBadge :environment="row.environment" /></div></div></template>
       <template #cell-funds="{ row }"><strong class="text-base">{{ formatUsd(equity(row)) }}</strong><p class="text-xs text-muted">{{ t("accts.available") }} {{ formatUsd(metrics(row).available) }}</p></template>
       <template #cell-today="{ row }"><strong :class="pnlClass(accountBoard(row)?.todayPnl)">{{ signedUsd(accountBoard(row)?.todayPnl) }}</strong><p class="text-xs" :class="pnlClass(accountBoard(row)?.todayPnlPct)">{{ formatPct(accountBoard(row)?.todayPnlPct) }}</p></template>
       <template #cell-unrealized="{ row }"><span :class="pnlClass(metrics(row).unrealized)">{{ signedUsd(metrics(row).unrealized) }}</span></template>
       <template #cell-drawdown="{ row }"><span :class="(drawdown(row) ?? 0) >= 20 ? 'text-danger' : 'text-muted'">{{ formatPct(drawdown(row), 2, false) }}</span></template>
       <template #cell-sync="{ row }"><FreshnessStamp :timestamp="metrics(row).syncedAt" :warn-after="45" :critical-after="90" /><p class="mt-1 text-xs text-muted">{{ formatDateTime(metrics(row).syncedAt, { short: true, withSeconds: false }) }}</p></template>
       <template #cell-status="{ row }"><div class="flex flex-wrap items-center gap-2"><StatusBadge :state="row.isEnabled == null ? 'unknown' : row.isEnabled === false ? 'disabled' : metrics(row).status" /><label class="inline-flex min-h-11 items-center gap-2 text-xs"><input type="checkbox" role="switch" :checked="row.isEnabled === true" :aria-label="t('accts.enabledFor', { name: row.name ?? '—' })" :disabled="pending || row.isEnabled == null" @change="change(row, 'toggle', $event)" /><span>{{ t(row.isEnabled == null ? "state.UNKNOWN" : row.isEnabled ? "common.enabled" : "common.disabled") }}</span></label></div><p v-if="issue(row)" class="mt-1 break-words text-xs" :class="severity(row) === 2 ? 'text-danger' : 'text-warning'">{{ issue(row) }}</p></template>
-      <template #cell-actions="{ row }"><div class="flex items-center justify-end gap-1"><button class="icon-button" :disabled="pending" :aria-label="t('common.edit')" :title="t('common.edit')" @click="edit(row)"><Pencil :size="17" /></button><MoreMenu><button class="menu-item" :disabled="pending" @click="test(row)"><Wifi :size="16" />{{ t("accts.test") }}</button><button class="menu-item" :disabled="pending" @click="sync(row)"><RefreshCw :size="16" />{{ t("accts.sync") }}</button><button class="menu-item text-danger" :disabled="pending" @click="change(row, 'delete')"><Trash2 :size="16" />{{ t("common.delete") }}</button></MoreMenu></div></template>
+      <template #cell-actions="{ row }"><div class="flex flex-wrap items-center justify-end gap-1" @click.stop><button type="button" class="button-secondary min-h-8 px-2 py-1 text-xs" :disabled="pending" :aria-label="t('common.edit')" @click="edit(row)"><Pencil :size="14" />{{ t("common.edit") }}</button><button type="button" class="button-secondary min-h-8 px-2 py-1 text-xs" :disabled="pending" :aria-label="t('accts.test')" @click="test(row)"><Wifi :size="14" />{{ t("accts.testShort") }}</button><button type="button" class="button-secondary min-h-8 px-2 py-1 text-xs" :disabled="pending" :aria-label="t('accts.sync')" @click="sync(row)"><RefreshCw :size="14" />{{ t("accts.syncShort") }}</button><button type="button" class="button-danger min-h-8 px-2 py-1 text-xs" :disabled="pending" :aria-label="t('common.delete')" @click="change(row, 'delete')"><Trash2 :size="14" />{{ t("common.delete") }}</button></div></template>
       <template #mobile-card="{ row }">
         <div class="space-y-3">
           <div class="flex items-start justify-between gap-2">
@@ -184,8 +217,6 @@ onActivated(() => { void load(); });
               <label class="inline-flex min-h-9 items-center">
                 <input type="checkbox" role="switch" :checked="row.isEnabled === true" :aria-label="t('accts.enabledFor', { name: row.name ?? '—' })" :disabled="pending || row.isEnabled == null" @change="change(row, 'toggle', $event)" />
               </label>
-              <button class="icon-button" :disabled="pending" :aria-label="t('common.edit')" :title="t('common.edit')" @click="edit(row)"><Pencil :size="16" /></button>
-              <MoreMenu><button class="menu-item" :disabled="pending" @click="test(row)"><Wifi :size="16" />{{ t("accts.test") }}</button><button class="menu-item" :disabled="pending" @click="sync(row)"><RefreshCw :size="16" />{{ t("accts.sync") }}</button><button class="menu-item text-danger" :disabled="pending" @click="change(row, 'delete')"><Trash2 :size="16" />{{ t("common.delete") }}</button></MoreMenu>
             </div>
           </div>
           <div class="grid grid-cols-2 gap-3 rounded-lg bg-background/40 p-2.5 text-xs">
@@ -212,6 +243,12 @@ onActivated(() => { void load(); });
           <div class="flex items-center justify-between gap-2 text-xs text-muted">
             <FreshnessStamp :timestamp="metrics(row).syncedAt" :warn-after="45" :critical-after="90" />
             <span>{{ t("accts.positions") }} · {{ row.positions?.length ?? 0 }}</span>
+          </div>
+          <div class="flex flex-wrap items-center justify-end gap-1.5 border-t border-border/40 pt-2" @click.stop>
+            <button type="button" class="button-secondary min-h-8 px-2.5 py-1 text-xs" :disabled="pending" :aria-label="t('common.edit')" @click="edit(row)"><Pencil :size="14" />{{ t("common.edit") }}</button>
+            <button type="button" class="button-secondary min-h-8 px-2.5 py-1 text-xs" :disabled="pending" :aria-label="t('accts.test')" @click="test(row)"><Wifi :size="14" />{{ t("accts.testShort") }}</button>
+            <button type="button" class="button-secondary min-h-8 px-2.5 py-1 text-xs" :disabled="pending" :aria-label="t('accts.sync')" @click="sync(row)"><RefreshCw :size="14" />{{ t("accts.syncShort") }}</button>
+            <button type="button" class="button-danger min-h-8 px-2.5 py-1 text-xs" :disabled="pending" :aria-label="t('common.delete')" @click="change(row, 'delete')"><Trash2 :size="14" />{{ t("common.delete") }}</button>
           </div>
         </div>
       </template>

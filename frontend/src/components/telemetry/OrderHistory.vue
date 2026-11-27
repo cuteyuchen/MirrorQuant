@@ -8,6 +8,7 @@ import { useDisplayUnit } from "@/composables/useDisplayUnit";
 import { finiteNumber, formatDateTime, formatPrice, formatQty, formatUsd, signedUsd } from "@/utils/format";
 import { normalizeSide, pnlClass, sideLabel, statusLabel } from "@/utils/status";
 import { telemetryDirectionLabel } from "@/constants/telemetry";
+import { enrichSnapshotHistory } from "@/utils/orderHistory";
 import DataTable from "@/components/DataTable.vue";
 
 const props = defineProps<{ snapshot: LeadSnapshot; ordersOnly?: boolean }>();
@@ -20,12 +21,13 @@ const PAGE = 15;
 const limit = ref(PAGE);
 const expanded = ref<string | null>(null);
 const view = computed<Tab>(() => props.ordersOnly ? "orders" : tab.value);
+const enriched = computed(() => enrichSnapshotHistory(props.snapshot));
 function pick(value: Tab) { tab.value = value; limit.value = PAGE; expanded.value = null; }
 const tabs = computed(() => [
-  { value: "batches" as const, icon: Zap, label: t("feed.tabBatches"), count: props.snapshot.orderBatches?.length ?? null },
-  { value: "cycles" as const, icon: Repeat, label: t("feed.tabCycles"), count: props.snapshot.tradeCycles?.length ?? null },
+  { value: "batches" as const, icon: Zap, label: t("feed.tabBatches"), count: props.snapshot.orderBatches == null ? null : enriched.value.orderBatches.length },
+  { value: "cycles" as const, icon: Repeat, label: t("feed.tabCycles"), count: props.snapshot.tradeCycles == null && !enriched.value.tradeCycles.length ? null : enriched.value.tradeCycles.length },
   { value: "closed" as const, icon: Archive, label: t("feed.tabClosed"), count: props.snapshot.closed?.length ?? null },
-  { value: "orders" as const, icon: ScrollText, label: t("feed.tabOrders"), count: props.snapshot.orders?.length ?? null },
+  { value: "orders" as const, icon: ScrollText, label: t("feed.tabOrders"), count: props.snapshot.orders == null ? null : enriched.value.orders.length },
 ]);
 
 type Row = {
@@ -65,16 +67,17 @@ function leverageText(position: ClosedPosition) {
 }
 // 稳定业务键用于展开状态，翻页或排序不会把另一笔订单展开。
 const unsortedRows = computed<Row[]>(() => {
-  if (view.value === "orders") return (props.snapshot.orders ?? []).map(orderRow);
-  if (view.value === "batches") return (props.snapshot.orderBatches ?? []).map(batch => ({
+  if (view.value === "orders") return enriched.value.orders.map(orderRow);
+  if (view.value === "batches") return enriched.value.orderBatches.map(batch => ({
     ...orderRow(batch), key: `batch:${orderKey(batch)}:${batch.startTime}:${batch.endTime}`,
     time: batch.endTime ?? batch.startTime ?? batch.time, entry: batch.avgPrice ?? null, qty: batch.qty ?? batch.totalQty ?? null,
     notional: batch.notional ?? batch.totalValue ?? null, pnl: batch.pnl ?? batch.totalPnl,
     orderCount: batch.orderCount ?? batch.count ?? (Array.isArray(batch.orders) ? batch.orders.length : batch.orders) ?? null,
     children: batch.items ?? (Array.isArray(batch.orders) ? batch.orders : []),
   }));
-  if (view.value === "cycles") return (props.snapshot.tradeCycles ?? []).map(cycle => ({
-    key: `cycle:${cycle.cycleId ?? `${cycle.symbol}:${cycle.positionSide}:${cycle.avgEntryPrice}`}`, time: cycle.openedAt,
+  if (view.value === "cycles") return enriched.value.tradeCycles.map(cycle => ({
+    key: `cycle:${cycle.cycleId ?? `${cycle.symbol}:${cycle.positionSide}:${cycle.avgEntryPrice}`}`,
+    time: cycle.openedAt ?? cycle.startTime ?? cycle.endTime ?? null,
     symbol: cycle.symbol, badge: sideLabel(cycle.positionSide), badgeClass: sideClass(cycle.positionSide), status: cycle.status ?? null,
     entry: cycle.avgEntryPrice ?? cycle.avgEntry ?? null, exit: cycle.avgExitPrice ?? cycle.avgClose ?? null,
     qty: null, notional: null, pnl: cycle.realizedPnl,
@@ -193,7 +196,10 @@ function childNotional(order: TelemetryOrder) {
         <p class="mb-1 font-sans text-xs font-semibold text-muted">{{ t("feed.childOrders", { n: row.children.length }) }}</p>
         <ul class="divide-y divide-border/40 font-mono text-xs tabular-nums">
           <li v-for="(order, index) in row.children" :key="`${orderKey(order)}:${index}`" class="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 py-1.5">
-            <time class="text-muted">{{ formatDateTime(order.time ?? order.t) }}</time>
+            <div class="flex items-center gap-2">
+              <span v-if="order.dir" :class="directionClass(order.dir)" class="font-sans">{{ telemetryDirectionLabel(order.dir) }}</span>
+              <time class="text-muted">{{ formatDateTime(order.time ?? order.t) }}</time>
+            </div>
             <span><strong class="font-semibold">{{ unit === "both" ? formatQty(order.qty ?? order.q) : sizeText(order.qty ?? order.q, childNotional(order), order.avgPrice ?? order.price ?? order.p) }}</strong> <span class="text-accent">@ {{ formatPrice(order.avgPrice ?? order.price ?? order.p) }}</span></span>
             <span v-if="unit === 'both'" class="text-muted">{{ formatUsd(childNotional(order)) }}</span>
             <span :class="pnlClass(order.pnl)">{{ signedUsd(order.pnl) }}</span>

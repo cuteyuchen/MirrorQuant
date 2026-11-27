@@ -334,6 +334,8 @@ class EngineOrchestrator:
                         asyncio.gather(adapter.get_positions(), adapter.get_instruments()), timeout=20.0
                     )
                     await self._check_account_equity(db, binding, account, adapter)
+                    if isinstance(live_positions, list) and all(hasattr(p, "to_dict") for p in live_positions):
+                        await self._persist_account_positions(db, account, live_positions)
                     await self.router.check_position_guards(
                         db=db, lead=lead, account=account, binding=binding, adapter=adapter,
                         local_positions=live_positions, instruments=instruments,
@@ -402,6 +404,16 @@ class EngineOrchestrator:
         await db.commit()
 
         return True
+
+    @serialized_execution
+    async def _persist_account_positions(self, db: AsyncSession, account: TradingAccount, positions: List[Any]) -> None:
+        """Persist live positions and unrealized PnL alongside periodic equity checks."""
+        await db.refresh(account)
+        account.total_notional = sum(p.notional_usd for p in positions)
+        account.unrealized_pnl = sum(p.upl for p in positions)
+        account.positions_json = json.dumps([p.to_dict() for p in positions])
+        account.last_sync_at = datetime.now(timezone.utc)
+        await db.commit()
 
     async def sync_lead(
         self,

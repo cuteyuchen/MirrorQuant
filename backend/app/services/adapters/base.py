@@ -121,6 +121,7 @@ class ExchangePosition:
     cur_px: float = 0.0
     c_time: int = 0
     u_time: int = 0
+    margin_usd: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -138,6 +139,7 @@ class ExchangePosition:
             "upl": self.upl,
             "uplRatio": self.upl_ratio,
             "notionalUsd": self.notional_usd,
+            "marginUsd": self.margin_usd,
             "lever": self.lever,
             "cTime": self.c_time,
             "uTime": self.u_time,

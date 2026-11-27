@@ -9,6 +9,7 @@
 - The position-diff fast path must baseline on first sight and never backfill
   a pre-existing gap (user: do not auto-fill the missed ETH add).
 """
+from datetime import datetime, timezone
 import json
 from decimal import Decimal
 from types import SimpleNamespace
@@ -24,6 +25,7 @@ from app.models.domain import (
     PositionAllocation, TradingAccount,
 )
 from app.services.adapters.base import BalanceInfo, ExchangePosition, InstrumentSpec, OrderBook, OrderResult
+from app.services.dashboard_board import build_board
 from app.services.engine.router import CopyRouter
 
 
@@ -99,7 +101,7 @@ async def seed_allocations(t, own_qty=1, other_qty=9, physical_qty=None):
 
 
 async def run_batch(t, exchange, side="SELL", qty=1, remaining=0, event="test-event",
-                    position_side="LONG", avg_price="100", positions=None):
+                    position_side="LONG", avg_price="100", positions=None, my_equity=1000):
     batch = {"symbol": "BTCUSDT", "side": side, "positionSide": position_side, "qty": str(qty),
              "avgPrice": avg_price, "notional": str(Decimal(str(qty)) * 100), "_event_id": event,
              "startTime": NOW_MS - 150_000, "endTime": NOW_MS - 150_000}
@@ -114,7 +116,7 @@ async def run_batch(t, exchange, side="SELL", qty=1, remaining=0, event="test-ev
         await t.db.commit()
     await t.router._execute_batch_for_binding(
         t.db, t.binding, t.lead, t.account, exchange, batch,
-        lead_margin_balance=1000, active_lead_positions={f"BTCUSDT_{position_side}": remaining}, my_equity=1000,
+        lead_margin_balance=1000, active_lead_positions={f"BTCUSDT_{position_side}": remaining}, my_equity=my_equity,
         positions=positions if positions is not None else ([] if is_open else [t.pos]),
         instruments={"BTCUSDT": t.spec}, global_kill=False,
         notify_cfg={}, resilience_cfg=None, risk_defaults=None,
@@ -404,3 +406,142 @@ async def test_guard_skip_record_is_not_rewritten_every_cycle(trading):
         ExecutionRecord.binding_id == t.binding.id,
         ExecutionRecord.status == "EXECUTED"))).all()
     assert len(rows) == 2
+
+
+async def test_locked_cycle_ratio_equity_drop_1000_to_800_board_aligned_add_incremental_and_reduce_by_pct(trading):
+    # 回归：权益从 1000 降到 800（其他仓亏损）时：
+    # 1) 带单量不变 -> 已有仓位在看板与路由均判对齐，不误报偏离也不重复补/减；
+    # 2) 带单加仓 +1 -> 只按当时权益 800 对增量下单 0.8 并更新锁定应有量为 1.8；
+    # 3) 带单减仓 50% (2->1) -> 继续严格按持仓百分比减 0.9（留 0.9），不受权益降为 800 干扰；
+    # 4) 带单全平 -> 仓位清零且锁定字段重置为 None。
+    t = trading
+    now_dt = datetime.fromtimestamp(NOW_MS / 1000, tz=timezone.utc)
+    t.binding.enable_circuit_breaker = False
+    t.lead.status = "running"
+    t.lead.last_sync_at = now_dt
+    t.account.status = "connected"
+    t.account.last_sync_at = now_dt
+
+    def sync_account(eq: float, qty: float) -> None:
+        t.account.usdt_equity = eq
+        t.account.avail_equity = eq
+        t.account.risk_equity_json = json.dumps({"assets": {
+            "USDT": {"equity": eq, "available": eq, "hwm": 1000, "day_start": 1000, "date": "1970-01-01"},
+        }})
+        t.pos.pos = t.pos.avail_pos = qty
+        t.pos.notional_usd = qty * 100
+        t.account.positions_json = json.dumps([{
+            "instId": "BTCUSDT", "symbol": "BTCUSDT", "posSide": "long",
+            "pos": qty, "avgPx": 100, "markPrice": 100, "notionalUsd": qty * 100, "upl": 0,
+        }] if qty > 0 else [])
+
+    def full_snapshot(lead_qty: float):
+        snap = public_snapshot(lead_qty) if lead_qty > 0 else _empty_snapshot()
+        snap["meta"]["orderHistoryComplete"] = True
+        snap["profile"]["positionShow"] = True
+        return snap
+
+    sync_account(1000.0, 0.0)
+    exchange = OfflineExchange()
+    exchange.get_positions = AsyncMock(side_effect=lambda: [t.pos] if t.pos.pos > 0 else [])
+    equity_state = {"eq": 1000.0}
+    exchange.get_usdt_balance = AsyncMock(side_effect=lambda: BalanceInfo(
+        eq=equity_state["eq"], avail_eq=equity_state["eq"], cash_bal=equity_state["eq"], upl=0.0, currency="USDT"))
+
+    # 1. 新开仓（权益 1000）：买 1 BTC 并锁定比例与应有量
+    snap1 = full_snapshot(1)
+    await _publish_snapshot_for_exit(t, snap1)
+    await run_batch(t, exchange, side="BUY", qty=1, remaining=1, event="open-1000", positions=[], my_equity=1000)
+    assert len(exchange.orders) == 1
+    assert Decimal(str(exchange.orders[0]["sz"])) == Decimal("1")
+    alloc = await t.db.scalar(select(PositionAllocation).where(
+        PositionAllocation.binding_id == t.binding.id,
+        PositionAllocation.inst_id == "BTCUSDT",
+        PositionAllocation.pos_side == "long"))
+    assert alloc.owned_qty_exact == "1"
+    assert alloc.expected_qty_exact == "1"
+    assert alloc.lead_qty_exact == "1"
+    assert alloc.cycle_ratio_exact == "1"
+
+    sync_account(1000.0, 1.0)
+    await t.db.commit()
+    await run_position_diff(t, exchange, snap1, 1)
+    assert len(exchange.orders) == 1
+
+    # 2. 权益降为 800、带单量仍是 1：看板仍判对齐，重复事件/权益升到 1200 也触发已跟足跳过
+    equity_state["eq"] = 800.0
+    sync_account(800.0, 1.0)
+    await t.db.commit()
+    mine = (await build_board(t.db, now=now_dt))["leads"][0]["positions"][0]["mine"][0]
+    assert mine["state"] == "aligned"
+    assert mine["qty"] == 1
+    assert mine["expectedQty"] == 1
+    assert mine["reason"] is None
+
+    await run_position_diff(t, exchange, snap1, 1)
+    await run_batch(t, exchange, side="BUY", qty=1, remaining=1, event="dup-at-800", positions=[t.pos], my_equity=800)
+    await run_batch(t, exchange, side="BUY", qty=1, remaining=1, event="dup-at-1200", positions=[t.pos], my_equity=1200)
+    assert len(exchange.orders) == 1
+    assert "SKIPPED_ALREADY_FOLLOWED" in await execution_statuses(t)
+
+    # 3. 权益为 800 时带单加仓 1 -> 2：只对增量 1 用当前权益 800 算得 0.8，总应有量更新为 1.8
+    snap2 = full_snapshot(2)
+    await _publish_snapshot_for_exit(t, snap2)
+    await run_position_diff(t, exchange, snap2, 2)
+    assert len(exchange.orders) == 2
+    assert Decimal(str(exchange.orders[1]["sz"])) == Decimal("0.8")
+    await t.db.refresh(alloc)
+    assert alloc.owned_qty_exact == "1.8"
+    assert alloc.expected_qty_exact == "1.8"
+    assert alloc.lead_qty_exact == "2"
+    assert Decimal(alloc.cycle_ratio_exact) == Decimal("0.9")
+    progress = await t.db.get(BindingSourceProgress, (t.binding.id, "posdiff:BTCUSDT:LONG"))
+    assert progress.cumulative_qty == "2"
+
+    sync_account(800.0, 1.8)
+    await t.db.commit()
+    await run_batch(t, exchange, side="BUY", qty=1, remaining=2, event="late-add-stream", positions=[t.pos], my_equity=800)
+    assert len(exchange.orders) == 2
+    mine = (await build_board(t.db, now=now_dt))["leads"][0]["positions"][0]["mine"][0]
+    assert mine["state"] == "aligned"
+    assert mine["qty"] == pytest.approx(1.8)
+    assert mine["expectedQty"] == pytest.approx(1.8)
+
+    # 4. 权益仍为 800 时带单减仓 50% (2 -> 1)：严格按持仓百分比减 0.9，留 0.9 且保持对齐
+    snap_reduce = full_snapshot(1)
+    await _publish_snapshot_for_exit(t, snap_reduce)
+    await run_position_diff(t, exchange, snap_reduce, 1)
+    assert len(exchange.orders) == 3
+    assert exchange.orders[2]["side"].upper() == "SELL"
+    assert Decimal(str(exchange.orders[2]["sz"])) == Decimal("0.9")
+    await t.db.refresh(alloc)
+    assert alloc.owned_qty_exact == "0.9"
+    assert alloc.expected_qty_exact == "0.9"
+    assert alloc.lead_qty_exact == "1"
+    assert Decimal(alloc.cycle_ratio_exact) == Decimal("0.9")
+    await t.db.refresh(progress)
+    assert progress.cumulative_qty == "1"
+
+    sync_account(800.0, 0.9)
+    await t.db.commit()
+    await run_position_diff(t, exchange, snap_reduce, 1)
+    assert len(exchange.orders) == 3
+    mine = (await build_board(t.db, now=now_dt))["leads"][0]["positions"][0]["mine"][0]
+    assert mine["state"] == "aligned"
+    assert mine["qty"] == pytest.approx(0.9)
+    assert mine["expectedQty"] == pytest.approx(0.9)
+
+    # 5. 带单全平（1 -> 0）：清空持仓并重置锁定字段
+    snap_empty = full_snapshot(0)
+    await _publish_snapshot_for_exit(t, snap_empty)
+    await run_position_diff(t, exchange, snap_empty, 0)
+    assert len(exchange.orders) == 4
+    assert exchange.orders[3]["side"].upper() == "SELL"
+    assert Decimal(str(exchange.orders[3]["sz"])) == Decimal("0.9")
+    await t.db.refresh(alloc)
+    assert alloc.owned_qty_exact == "0"
+    assert alloc.expected_qty_exact is None
+    assert alloc.lead_qty_exact is None
+    assert alloc.cycle_ratio_exact is None
+    await t.db.refresh(progress)
+    assert progress.cumulative_qty == "0"
