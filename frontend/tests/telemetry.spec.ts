@@ -167,4 +167,25 @@ describe("操作流倒序展示", () => {
     expect(panel.text()).toContain(t("tel.openAndCalcTitle"));
     panel.unmount();
   });
+
+  it("持仓分析与动态杠杆卡片：单持仓横向分栏、多持仓PC两列展示且r值不重复", async () => {
+    setActivePinia(createPinia());
+    const posA = { symbol: "BTCUSDT", positionSide: "LONG", qty: 0.4, avgEntry: 50000, currentPrice: 51000, notionalLeverage: 2 };
+    const posB = { symbol: "ETHUSDT", positionSide: "SHORT", qty: 5, avgEntry: 2000, currentPrice: 1950, notionalLeverage: 1.5 };
+    const baseSnapshot: LeadSnapshot = {
+      profile: { nickname: "Dual Col", positionShow: true, marginBalance: 10000 },
+      openPositionsSummary: { positionCount: 1, longCount: 1, marginBalance: 10000, totalMarkNotional: 20400, totalNotionalLeverage: 2.04 },
+      openPositions: [posA],
+    };
+    const page = mount(PositionAnalysis, { props: { snapshot: baseSnapshot, embedded: true, withCalculator: true } });
+    expect(page.get('[data-testid="analysis-positions-grid"]').classes()).not.toContain("xl:grid-cols-2");
+    expect(page.find(".cq-single-split").exists()).toBe(true);
+    const strip = page.get('[data-testid="position-sizing-strip"]');
+    expect(strip.text().match(/r=\d+(?:\.\d+)?/g)).toHaveLength(1);
+
+    await page.setProps({ snapshot: { ...baseSnapshot, openPositions: [posA, posB] } });
+    expect(page.get('[data-testid="analysis-positions-grid"]').classes()).toContain("xl:grid-cols-2");
+    expect(page.find(".cq-single-split").exists()).toBe(false);
+    page.unmount();
+  });
 });

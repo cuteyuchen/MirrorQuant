@@ -40,6 +40,17 @@ function positionKey(position: BoardPosition) { return position.key || `${positi
 const isUnbound = computed(() => !props.readOnly && props.lead.boundCount === 0);
 const showMineSection = computed(() => !props.readOnly && !isUnbound.value);
 const showTimeline = computed(() => props.readOnly || (props.lead.todayEvents?.length ?? 0) > 0);
+// 单持仓绝不强制 2 列以免右侧留白；2+ 持仓在 PC 上并排显示两张，已绑定模式在更宽屏拆两列。
+const positionsGridClass = computed(() => {
+  if (positions.value.length <= 1) return "grid-cols-1";
+  return showMineSection.value ? "2xl:grid-cols-2" : "lg:grid-cols-2";
+});
+const outerGridClass = computed(() => {
+  if (!showTimeline.value) return "";
+  return !showMineSection.value && positions.value.length <= 1
+    ? "xl:grid-cols-[minmax(0,1.15fr)_minmax(340px,0.85fr)]"
+    : "xl:grid-cols-[minmax(0,1fr)_340px]";
+});
 const idleSummary = computed(() => {
   if (!boardPositionsConfirmed(props.lead)) return t("board.unknownSummary");
   return t("board.idleSummary", { open: props.lead.todayOpenCount ?? 0, close: props.lead.todayCloseCount ?? 0 });
@@ -76,7 +87,7 @@ const showToday = computed(() => !props.readOnly
 </script>
 <template>
   <section class="card card-accent" :data-testid="`lead-${lead.id}`" :class="readOnly ? 'public-comparison' : ''">
-    <header class="card-header">
+    <header class="card-header" :class="!showDetails ? '!py-2.5' : ''">
       <div class="flex min-w-0 flex-1 items-center gap-3">
         <LeadAvatar :name="lead.name" :url="lead.avatarUrl" :size="42" />
         <div class="min-w-0 flex-1">
@@ -109,7 +120,7 @@ const showToday = computed(() => !props.readOnly
         </button>
       </div>
     </header>
-    <div v-if="!collapsed" class="card-body">
+    <div v-if="!collapsed" class="card-body" :class="!showDetails ? '!p-3 sm:!p-4' : ''">
       <!-- 残留仓是需要立刻处理的风险，放在所有持仓之前。 -->
       <div v-if="!readOnly && lead.orphans?.length" class="mb-4 rounded-xl border border-danger/40 bg-danger/10 p-3 sm:p-4" data-testid="orphans" role="alert">
         <h3 class="flex items-center gap-2 text-sm font-bold text-danger"><AlertTriangle :size="17" aria-hidden="true" />{{ t("board.orphans") }}</h3>
@@ -129,15 +140,15 @@ const showToday = computed(() => !props.readOnly
           <p class="text-xs font-semibold text-danger md:text-right">{{ orphan.reason ? reasonText(orphan.reason) : t("board.orphanWarning") }}</p>
         </div>
       </div>
-      <div class="grid min-w-0 gap-5" :class="showTimeline ? 'xl:grid-cols-[minmax(0,1fr)_300px]' : ''">
+      <div class="grid min-w-0 items-start gap-4" :class="outerGridClass">
         <div class="min-w-0">
           <!-- 隐藏或未知仓位不是已确认空仓，不能显示无持仓。 -->
           <EmptyState v-if="!positions.length" :title="t(boardPositionsConfirmed(lead) ? 'board.noPositions' : 'board.unknownPositions')" data-testid="empty-positions" />
-          <!-- 一个持仓一张卡：未绑定模式双列平铺，已绑定模式左边为带单盈亏与价位、右边为我的对应跟单状态。 -->
-          <div v-else class="grid min-w-0 gap-3" :class="!showMineSection ? 'lg:grid-cols-2' : ''">
+          <!-- 一个持仓一张卡：单持仓不拆半宽，2+ 持仓在 PC 上两列平铺，已绑定模式超宽屏才并排。 -->
+          <div v-else class="grid min-w-0 gap-3" data-testid="positions-grid" :class="positionsGridClass">
             <article v-for="position in positions" :id="`pos-${position.symbol}`" :key="positionKey(position)" :data-position="position.key"
-              class="min-w-0 rounded-xl border p-3 sm:p-4" :class="[cardTone(position), position.openedToday ? 'today-edge' : '']">
-              <div class="grid min-w-0 gap-3 sm:gap-4" :class="showMineSection ? 'lg:grid-cols-[minmax(0,1.15fr)_minmax(0,1fr)]' : ''">
+              class="min-w-0 rounded-xl border p-3 sm:p-3.5" :class="[cardTone(position), position.openedToday ? 'today-edge' : '']">
+              <div class="grid min-w-0 gap-3 sm:gap-4" :class="showMineSection ? (positions.length === 1 ? 'lg:grid-cols-[minmax(0,1.15fr)_minmax(0,1fr)]' : 'lg:grid-cols-[minmax(0,1.15fr)_minmax(0,1fr)] 2xl:grid-cols-1') : ''">
                 <div class="min-w-0">
                   <div class="flex flex-wrap items-center gap-1.5">
                     <h3 class="text-base font-bold tracking-tight">{{ position.symbol ?? t("common.unknown") }}</h3>
@@ -147,7 +158,7 @@ const showToday = computed(() => !props.readOnly
                     <time class="ml-auto font-mono text-xs tabular-nums text-muted" :title="t('board.openedAt')">{{ formatDateTime(position.openedAt, { short: true, withSeconds: false }) }}</time>
                   </div>
                   <!-- 焦点强化：现价与浮动盈亏（ROE% + 金额）一眼可见。 -->
-                  <div class="mt-2.5 flex flex-wrap items-end justify-between gap-x-4 gap-y-1.5 sm:mt-3">
+                  <div class="mt-2 flex flex-wrap items-end justify-between gap-x-4 gap-y-1.5 sm:mt-2.5">
                     <div class="min-w-0">
                       <p class="text-xs text-muted">{{ t("board.mark") }}</p>
                       <p class="mt-0.5 font-mono font-bold leading-none tabular-nums tracking-tight [overflow-wrap:anywhere]" :class="readOnly ? 'text-xl sm:text-2xl' : 'text-lg sm:text-2xl'" data-testid="mark-price">{{ formatPrice(position.markPrice) }}</p>
@@ -165,13 +176,13 @@ const showToday = computed(() => !props.readOnly
                     </button>
                   </div>
                   <div :class="isDetailsExpanded(positionKey(position)) ? '' : 'hidden sm:block'">
-                    <dl class="mt-2.5 grid gap-2 text-xs sm:mt-3" :class="showQuantity && showNotional ? 'grid-cols-3' : 'grid-cols-2'">
+                    <dl class="mt-2.5 grid gap-2 rounded-lg bg-surface2/50 px-2.5 py-1.5 text-xs sm:mt-3" :class="showQuantity && showNotional ? 'grid-cols-3' : 'grid-cols-2'">
                       <div class="min-w-0"><dt class="text-muted">{{ t("board.entry") }}</dt><dd class="mt-0.5 font-mono font-semibold tabular-nums">{{ formatPrice(position.entryPrice) }}</dd></div>
                       <div v-if="showQuantity" class="min-w-0"><dt class="text-muted">{{ t("common.quantity") }}</dt><dd class="mt-0.5 font-mono font-semibold tabular-nums">{{ formatQty(position.qty) }}</dd></div>
                       <div v-if="showNotional" class="min-w-0 text-right"><dt class="text-muted">{{ t("board.notional") }}</dt><dd class="mt-0.5 font-mono font-semibold tabular-nums">{{ formatUsd(position.notional, 0) }}</dd></div>
                     </dl>
                     <!-- 止损在左、止盈在右，中间的位置条标出现价落在两者之间的哪里；仅在有已知止损或止盈时渲染。 -->
-                    <div v-if="showLevels(position)" class="mt-3 rounded-lg border border-border/40 bg-surface/70 p-2.5">
+                    <div v-if="showLevels(position)" class="mt-2.5 rounded-lg border border-border/40 bg-surface/70 p-2.5">
                       <div class="flex items-start justify-between gap-3 text-xs">
                         <div class="min-w-0">
                           <p class="font-semibold text-danger">{{ t("board.stopLoss") }}</p>
@@ -184,11 +195,12 @@ const showToday = computed(() => !props.readOnly
                           <p class="font-mono tabular-nums text-muted">{{ t("board.fromMark") }} {{ formatPct(distancePct(position.takeProfitPrice, position.markPrice)) }}</p>
                         </div>
                       </div>
-                      <LevelTrack class="mt-2.5" :mark="position.markPrice" :entry="position.entryPrice" :take-profit="position.takeProfitPrice" :stop-loss="position.stopLossPrice" />
+                      <LevelTrack class="mt-2" :mark="position.markPrice" :entry="position.entryPrice" :take-profit="position.takeProfitPrice" :stop-loss="position.stopLossPrice" />
                     </div>
                   </div>
                 </div>
-                <div v-if="showMineSection" class="min-w-0 border-t border-border/50 pt-2.5 sm:pt-3 lg:border-l lg:border-t-0 lg:pl-4 lg:pt-0">
+                <div v-if="showMineSection" class="min-w-0 border-t border-border/50 pt-2.5 sm:pt-3 lg:border-l lg:border-t-0 lg:pl-4 lg:pt-0"
+                  :class="positions.length > 1 ? '2xl:border-l-0 2xl:border-t 2xl:pl-0 2xl:pt-2.5' : ''">
                   <p class="eyebrow mb-2">{{ t("board.mine") }}</p>
                   <div class="space-y-2">
                     <MineCard v-for="mine in mineRows(position)" :key="mine?.bindingId || mine?.accountName || 'unbound'" :mine="mine" :class="mine?.bindingEnabled === false ? 'opacity-65' : ''" />
@@ -198,7 +210,7 @@ const showToday = computed(() => !props.readOnly
             </article>
           </div>
         </div>
-        <LeadTimeline v-if="showTimeline" class="border-t border-border/50 pt-4 xl:border-l xl:border-t-0 xl:pl-5 xl:pt-0" :events="lead.todayEvents" :positions="lead.positions" :accounts="readOnly ? null : accounts" :read-only="readOnly" />
+        <LeadTimeline v-if="showTimeline" class="border-t border-border/50 pt-3.5 xl:border-l xl:border-t-0 xl:pl-4 xl:pt-0" :events="lead.todayEvents" :positions="lead.positions" :accounts="readOnly ? null : accounts" :read-only="readOnly" :unbound="isUnbound" />
       </div>
       <LeadCalculator v-if="calcOpen && !readOnly && lead.id != null" class="mt-5" :lead-id="lead.id" :name="lead.name" />
     </div>

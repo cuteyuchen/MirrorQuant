@@ -151,6 +151,21 @@ describe("跟单看板", () => {
     expect(wrapper.findAll("[data-position]").length).toBeGreaterThan(0);
   });
 
+  it("单持仓不拆半宽留白，多持仓在PC按两列平铺", async () => {
+    const wrapper = comparison();
+    // 已绑定多持仓在 2xl 双列展示
+    expect(wrapper.get('[data-testid="positions-grid"]').classes()).toContain("2xl:grid-cols-2");
+    // 未绑定多持仓在 lg 双列展示
+    await wrapper.setProps({ lead: { ...mockBoard.leads![0], boundCount: 0, activeBoundCount: 0 } });
+    expect(wrapper.get('[data-testid="positions-grid"]').classes()).toContain("lg:grid-cols-2");
+    // 未绑定仅单个持仓时不启用双列，占满容器宽度避免右侧大片空白
+    await wrapper.setProps({ lead: { ...mockBoard.leads![0], boundCount: 0, activeBoundCount: 0, positions: [mockBoard.leads![0].positions![0]] } });
+    const singleClasses = wrapper.get('[data-testid="positions-grid"]').classes();
+    expect(singleClasses).toContain("grid-cols-1");
+    expect(singleClasses).not.toContain("lg:grid-cols-2");
+    expect(singleClasses).not.toContain("2xl:grid-cols-2");
+  });
+
   it("空闲带单员默认折叠为一行摘要，展开后恢复持仓明细", async () => {
     const wrapper = comparison();
     await wrapper.setProps({ lead: mockBoard.leads![1], defaultCollapsed: true });
@@ -233,5 +248,15 @@ describe("今日动态", () => {
     const scroller = wrapper.find("ol").element.parentElement;
     expect(scroller?.className).toContain("overflow-y-auto");
     expect(scroller?.className).toContain("max-h-");
+  });
+  it("未绑定监控模式下不每条刷屏提示尚无对应执行结果，已绑定模式照常提示", () => {
+    const events: BoardEvent[] = [
+      { id: 1, time: Date.now(), symbol: "ETHUSDT", side: "SHORT", action: "OPEN", qty: 10, price: 1730, realizedPnl: null, mine: [] },
+    ];
+    const bound = timeline(events);
+    expect(bound.text()).toContain("尚无对应执行结果");
+    const unboundWrapper = mount(LeadTimeline, { props: { events, positions: [], accounts: [], unbound: true } });
+    wrappers.push(unboundWrapper);
+    expect(unboundWrapper.text()).not.toContain("尚无对应执行结果");
   });
 });

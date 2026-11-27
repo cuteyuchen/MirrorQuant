@@ -64,6 +64,15 @@ function shareText(value: number | null) {
   return pct == null ? "" : t("calc.capitalShare", { pct: formatPct(pct, 1, false) });
 }
 function ratioText(row: SizingRow) { return row.ratio == null ? "" : `r=${row.ratio.toFixed(4)}`; }
+function leadLevText(position: LegacyPosition) {
+  const lev = finiteNumber(position.notionalLeverage ?? position.entryLeverage);
+  return lev == null ? "" : `${t("board.lead")} ${formatLeverage(lev)}`;
+}
+const positionsGridClass = computed(() =>
+  positions.value.length > 1
+    ? "cq-pos-grid cq-pos-grid-2 grid-cols-1 xl:grid-cols-2"
+    : "grid min-w-0 grid-cols-1 gap-3",
+);
 function liqText(row: SizingRow) {
   if (row.liquidation == null || row.mark == null) return "";
   return `${t("board.fromMark")} ${formatPct((row.liquidation - row.mark) / row.mark * 100)}`;
@@ -220,7 +229,7 @@ function orderNotional(order: TelemetryOrder) {
 </script>
 <template>
   <section class="card">
-    <header class="card-header">
+    <header class="card-header !py-2.5">
       <div class="flex min-w-0 flex-1 flex-wrap items-center gap-x-2.5 gap-y-2">
         <span class="section-icon" aria-hidden="true"><component :is="withCalculator ? Calculator : Layers" :size="18" /></span>
         <h3 class="section-title min-w-0">{{ t(withCalculator ? "tel.openAndCalcTitle" : "tel.openSectionTitle") }}</h3>
@@ -232,121 +241,96 @@ function orderNotional(order: TelemetryOrder) {
         <FreshnessStamp :timestamp="snapshot.meta?.priceUpdatedAt ?? summary?.priceAsOf" :stale="snapshot.meta?.stale" />
       </div>
     </header>
-    <div class="card-body cq space-y-4">
+    <div class="card-body cq space-y-3 !p-3 sm:!p-4">
       <dl class="cq-tiles-6">
-        <StatTile v-for="tile in tiles" :key="tile.key" :label="tile.label" :value="tile.value" :sub="tile.sub" :value-class="tile.valueClass" :sub-class="tile.subClass" />
+        <StatTile v-for="tile in tiles" :key="tile.key" class="!rounded-lg !p-2" :label="tile.label" :value="tile.value" :sub="tile.sub" :value-class="tile.valueClass" :sub-class="tile.subClass" />
       </dl>
-      <!-- 合并测算控制栏：共享带单本金与持仓列表，避免与独立的仓位测算卡重复信息。 -->
+      <!-- 合并测算控制栏 + 组合汇总：控制项横排紧凑展示，核心组合汇总紧贴其下。 -->
       <div v-if="withCalculator && confirmed && !flat" data-testid="merged-calculator-controls" data-section="calculator"
-        class="grid min-w-0 gap-4 rounded-xl border border-accent/25 bg-accent/[0.04] p-3 sm:p-4 lg:grid-cols-2">
-        <div class="min-w-0">
-          <label :for="capitalId" class="field-label mb-1">{{ t("calc.capitalLabel") }}</label>
-          <input :id="capitalId" v-model="capitalInput" type="number" inputmode="decimal" min="0" step="100" class="form-input font-mono tabular-nums"
-            :placeholder="t('calc.capitalPlaceholder')" :aria-invalid="capital == null" :aria-describedby="capital == null ? `${capitalId}-error` : undefined" />
-          <p v-if="capital == null" :id="`${capitalId}-error`" class="field-error" role="alert">{{ t("calc.capitalInvalid") }}</p>
-          <div class="mt-2 flex flex-wrap items-center gap-1.5" role="group" :aria-label="t('calc.quickPreset')">
-            <span class="text-xs text-muted">{{ t("calc.quickPreset") }}</span>
-            <button v-for="preset in PRESETS" :key="preset" type="button" class="chip-button" :aria-pressed="capital === preset" @click="capitalInput = preset">{{ preset.toLocaleString("en-US") }}</button>
+        class="space-y-2.5 rounded-xl border border-accent/25 bg-accent/[0.04] p-2.5 sm:p-3">
+        <div class="flex flex-wrap items-end justify-between gap-3">
+          <div class="min-w-0 flex-1 basis-72">
+            <div class="flex flex-wrap items-center gap-2">
+              <label :for="capitalId" class="field-label shrink-0">{{ t("calc.capitalLabel") }}</label>
+              <input :id="capitalId" v-model="capitalInput" type="number" inputmode="decimal" min="0" step="100" class="form-input !min-h-9 w-36 !py-1 font-mono tabular-nums sm:w-40"
+                :placeholder="t('calc.capitalPlaceholder')" :aria-invalid="capital == null" :aria-describedby="capital == null ? `${capitalId}-error` : undefined" />
+              <div class="flex flex-wrap items-center gap-1" role="group" :aria-label="t('calc.quickPreset')">
+                <button v-for="preset in PRESETS" :key="preset" type="button" class="chip-button !min-h-7 !px-2 !py-0.5" :aria-pressed="capital === preset" @click="capitalInput = preset">{{ preset.toLocaleString("en-US") }}</button>
+              </div>
+            </div>
+            <p v-if="capital == null" :id="`${capitalId}-error`" class="field-error" role="alert">{{ t("calc.capitalInvalid") }}</p>
+          </div>
+          <fieldset class="min-w-0 shrink-0">
+            <legend class="sr-only">{{ t("calc.multiplierLabel") }}</legend>
+            <div class="tab-list" role="group">
+              <button v-for="mode in MODES" :key="mode.value" type="button" class="tab-button !min-h-8 !px-2.5 !py-1 text-xs" :aria-pressed="multiplier === mode.value" @click="multiplier = mode.value">{{ t(mode.label) }}</button>
+            </div>
+          </fieldset>
+        </div>
+        <div v-if="sizing && sizing.rows.length" class="border-t border-accent/15 pt-2.5">
+          <dl class="grid grid-cols-2 gap-2 lg:grid-cols-4">
+            <StatTile class="!rounded-lg !p-2" :label="t('calc.totalNotional')" :value="formatUsd(sizing.totalNotional)" :sub="t('calc.positionCount', { n: sizing.rows.length })" />
+            <StatTile class="!rounded-lg !p-2" :label="t('calc.portfolioLev')" :value="formatLeverage(sizing.portfolioLeverage)" value-class="text-accent"
+              :sub="`${t('calc.leadLeverage')} ${formatLeverage(summary?.totalNotionalLeverage)}`" />
+            <StatTile class="!rounded-lg !p-2" :label="t('calc.marginOccupied')" :value="formatUsd(sizing.totalMargin)" :sub="shareText(sizing.totalMargin)" />
+            <StatTile class="!rounded-lg !p-2" :label="t('calc.freeCashCushion')" :value="formatUsd(sizing.freeCash)" :value-class="sizing.freeCash == null ? '' : overCommitted ? 'text-danger' : 'text-success'"
+              :sub="sizing.buffer == null ? '' : `${t('calc.buffer')} ±${formatPct(sizing.buffer, 2, false)}`" />
+          </dl>
+          <div v-if="marginPct != null" class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1">
+            <div class="meter-track min-w-[120px] flex-1" aria-hidden="true"><span class="h-full rounded-full" :class="overCommitted ? 'bg-danger' : 'bg-accent'" :style="{ width: `${Math.min(100, Math.max(0, marginPct))}%` }" /></div>
+            <div class="flex flex-wrap items-center gap-x-3 text-xs">
+              <span :class="overCommitted ? 'font-semibold text-danger' : 'text-muted'">{{ overCommitted ? t("calc.overCommitted") : t("calc.barMargin", { pct: formatPct(marginPct, 1, false) }) }}</span>
+              <span class="text-muted">{{ t("calc.barFree", { pct: formatPct(Math.max(0, 100 - marginPct), 1, false) }) }}</span>
+            </div>
           </div>
         </div>
-        <fieldset class="min-w-0">
-          <legend class="field-label mb-1">{{ t("calc.multiplierLabel") }}</legend>
-          <div class="tab-list" role="group">
-            <button v-for="mode in MODES" :key="mode.value" type="button" class="tab-button" :aria-pressed="multiplier === mode.value" @click="multiplier = mode.value">{{ t(mode.label) }}</button>
-          </div>
-          <p class="mt-2 text-xs text-faint">{{ t("calc.ratioFormula") }} · {{ t("calc.dynLevFormula") }}</p>
-        </fieldset>
       </div>
       <EmptyState v-if="!confirmed" :title="t('board.unknownPositions')" />
       <EmptyState v-else-if="flat" :title="t('tel.noOpenPositions')" />
       <div v-else class="space-y-3">
         <p v-if="withCalculator && sizing && !sizing.complete" class="warning-banner" role="alert">{{ t("calc.incomplete") }}</p>
-        <!-- 嵌入模式（详情页）：持仓已在顶部 LeadComparison 中权威展示，这里仅保留 SMC/PA 结构分析、建仓订单与合并跟单测算 -->
-        <template v-if="embedded">
-          <article v-for="(position, idx) in positions" :key="positionKey(position)" class="cq min-w-0 rounded-xl border border-border/50 bg-background/40 p-3 sm:p-4" :class="openedToday(position) ? 'today-edge' : ''">
-            <div class="flex flex-wrap items-center justify-between gap-2 border-b border-border/40 pb-2.5">
-              <div class="flex flex-wrap items-center gap-1.5">
-                <h4 class="text-base font-bold tracking-tight">{{ position.symbol ?? position.instId ?? t("common.unknown") }}</h4>
-                <span :class="sideClass(position)">{{ sideLabel(position.positionSide ?? position.posSide, position.qty ?? position.pos) }}</span>
-                <span v-if="openedToday(position)" class="pill tone-accent font-semibold">{{ t("board.today") }}</span>
-                <span v-if="position.fundingRate != null" class="pill font-mono tabular-nums">{{ t("pos.fundingRate", { rate: fundingText(position.fundingRate) }) }}</span>
-              </div>
-              <div class="flex items-center gap-3">
-                <span class="text-right font-mono text-sm font-bold tabular-nums" :class="pnlClass(position.uPnL)">
-                  {{ signedUsd(position.uPnL) }}<span class="ml-1.5 text-xs font-semibold" :class="pnlClass(position.uPnLRoePct)">{{ formatPct(position.uPnLRoePct) }}</span>
-                </span>
-                <a :href="`#pos-${position.symbol ?? position.instId}`" class="inline-flex min-h-8 items-center gap-1 text-xs font-semibold text-accent transition hover:underline">
-                  {{ t("common.details") }} ↑
-                </a>
-              </div>
-            </div>
-            <div class="mt-3 space-y-3">
-              <div v-if="withCalculator && sizingRow(idx)" data-testid="position-sizing-strip" class="rounded-lg border border-accent/25 bg-accent/[0.04] p-2.5">
-                <p v-if="rowIssue(sizingRow(idx)!)" class="mb-2 text-xs font-medium text-warning">{{ rowIssue(sizingRow(idx)!) }}</p>
-                <dl class="grid grid-cols-2 gap-2.5 sm:grid-cols-5">
-                  <StatTile v-if="showQuantity" :boxed="false" :label="t('calc.colTargetQty')" :value="formatQty(sizingRow(idx)!.targetQty)" :sub="baseAsset(position.symbol)" value-class="text-accent" />
-                  <StatTile v-if="showNotional" :boxed="false" :label="t('calc.colTargetNotional')" :value="formatUsd(sizingRow(idx)!.targetNotional)" :sub="ratioText(sizingRow(idx)!)" />
-                  <StatTile :boxed="false" :label="t('calc.colOptLev')" :value="sizingRow(idx)!.leverage != null ? t('unit.leverage', { n: formatQty(sizingRow(idx)!.leverage) }) : t('common.unknown')" value-class="text-accent" :sub="ratioText(sizingRow(idx)!)" />
-                  <StatTile :boxed="false" :label="t('calc.colMarginReq')" :value="formatUsd(sizingRow(idx)!.initialMargin)" :sub="shareText(sizingRow(idx)!.initialMargin)" />
-                  <StatTile :boxed="false" :label="t('calc.colEstLiq')" :value="formatPrice(sizingRow(idx)!.liquidation)" :sub="liqText(sizingRow(idx)!)" value-class="text-warning" />
-                </dl>
-              </div>
-              <PriceActionPanel v-if="position.analysis?.ok" :analysis="position.analysis" />
-              <p v-else class="tile self-start text-xs text-muted">{{ t("pa.pending") }}</p>
-              <details v-if="position.entryOrders?.length" class="rounded-lg border border-border/40 bg-surface/60">
-                <summary class="cursor-pointer rounded-lg px-3 py-2 text-xs font-semibold text-accent">{{ t("pos.entryFills") }} · {{ t("pos.entryOrdersCount", { n: position.entryOrders.length }) }}</summary>
-                <ul class="divide-y divide-border/40 px-3 pb-1.5 font-mono text-xs tabular-nums">
-                  <li v-for="order in position.entryOrders" :key="orderKey(order)" class="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 py-1.5">
-                    <time class="text-muted">{{ formatDateTime(order.t ?? order.time, { short: true }) }}</time>
-                    <span class="font-sans">{{ entryDirection(order, position) }}</span>
-                    <span><strong class="font-semibold">{{ unit === "both" ? formatQty(order.q ?? order.qty) : sizeText(order.q ?? order.qty, orderNotional(order), order.p ?? order.price ?? order.avgPrice) }}</strong> <span class="text-accent">@ {{ formatPrice(order.p ?? order.price ?? order.avgPrice) }}</span></span>
-                    <span v-if="unit === 'both'" class="text-muted">{{ formatUsd(orderNotional(order)) }}</span>
-                  </li>
-                </ul>
-              </details>
-            </div>
-          </article>
-        </template>
-        <!-- 独立模式（公开看板等）：外层无权威持仓卡，渲染完整的持仓分析大卡 -->
-        <template v-else>
-          <article v-for="(position, idx) in positions" :key="positionKey(position)" class="cq min-w-0 rounded-xl border border-border/50 bg-background/40 p-3 sm:p-4" :class="openedToday(position) ? 'today-edge' : ''">
-            <div class="cq-split">
-              <div class="cq min-w-0">
+        <div :class="positionsGridClass" data-testid="analysis-positions-grid">
+          <!-- 嵌入模式（详情页）：PC 有 2+ 持仓时双列平铺；单持仓时左测算/订单、右 PA/SMC 分析。 -->
+          <template v-if="embedded">
+            <article v-for="(position, idx) in positions" :key="positionKey(position)" class="cq min-w-0 rounded-xl border border-border/50 bg-background/40 p-3" :class="openedToday(position) ? 'today-edge' : ''">
+              <div class="flex flex-wrap items-center justify-between gap-2 border-b border-border/40 pb-2">
                 <div class="flex flex-wrap items-center gap-1.5">
                   <h4 class="text-base font-bold tracking-tight">{{ position.symbol ?? position.instId ?? t("common.unknown") }}</h4>
                   <span :class="sideClass(position)">{{ sideLabel(position.positionSide ?? position.posSide, position.qty ?? position.pos) }}</span>
                   <span v-if="openedToday(position)" class="pill tone-accent font-semibold">{{ t("board.today") }}</span>
                   <span v-if="position.fundingRate != null" class="pill font-mono tabular-nums">{{ t("pos.fundingRate", { rate: fundingText(position.fundingRate) }) }}</span>
+                  <span v-if="position.avgEntry != null || position.currentPrice != null || position.markPrice != null" class="font-mono text-xs tabular-nums text-muted">
+                    {{ formatPrice(position.avgEntry) }} → <strong class="font-semibold text-foreground">{{ formatPrice(position.currentPrice ?? position.markPrice) }}</strong>
+                  </span>
                 </div>
-                <div class="mt-3 flex flex-wrap items-end justify-between gap-x-4 gap-y-2">
-                  <div class="min-w-0">
-                    <p class="flex items-center gap-1.5 text-xs text-muted"><span v-if="snapshot.meta?.stale === false" class="live-dot text-success" aria-hidden="true" />{{ t("pos.curPrice") }}</p>
-                    <p class="mt-1 font-mono text-2xl font-bold leading-none tabular-nums tracking-tight sm:text-3xl [overflow-wrap:anywhere]">{{ formatPrice(position.currentPrice ?? position.markPrice) }}</p>
-                    <p class="mt-1.5 font-mono text-xs font-semibold tabular-nums" :class="pnlClass(position.priceEdgePct)">{{ t("pos.vsAvg") }} {{ formatPct(position.priceDiffPct) }}</p>
-                  </div>
-                  <div class="min-w-0 text-right">
-                    <p class="text-xs text-muted">{{ t("pos.floatPnl") }}</p>
-                    <p class="mt-1 font-mono text-xl font-bold leading-none tabular-nums sm:text-2xl [overflow-wrap:anywhere]" :class="pnlClass(position.uPnL)">{{ signedUsd(position.uPnL) }}</p>
-                    <p class="mt-1.5 font-mono text-xs font-semibold tabular-nums" :class="pnlClass(position.uPnLRoePct)">ROE {{ formatPct(position.uPnLRoePct) }}</p>
-                  </div>
+                <div class="flex items-center gap-2.5">
+                  <span class="text-right font-mono text-sm font-bold tabular-nums" :class="pnlClass(position.uPnL)">
+                    {{ signedUsd(position.uPnL) }}<span class="ml-1.5 text-xs font-semibold" :class="pnlClass(position.uPnLRoePct)">{{ formatPct(position.uPnLRoePct) }}</span>
+                  </span>
+                  <a :href="`#pos-${position.symbol ?? position.instId}`" class="inline-flex min-h-7 items-center gap-1 text-xs font-semibold text-accent transition hover:underline">
+                    {{ t("common.details") }} ↑
+                  </a>
                 </div>
-                <dl class="cq-tiles mt-3.5">
-                  <StatTile v-for="tile in positionTiles(position)" :key="tile.key" :label="tile.label" :value="tile.value" :sub="tile.sub" :value-class="tile.valueClass" />
-                </dl>
-                <div v-if="withCalculator && sizingRow(idx)" data-testid="position-sizing-strip" class="mt-3 rounded-lg border border-accent/25 bg-accent/[0.04] p-2.5">
+              </div>
+              <div class="mt-2.5 grid min-w-0 gap-2.5" :class="positions.length === 1 ? 'cq-single-split xl:grid-cols-[minmax(0,1.05fr)_minmax(0,1fr)] xl:items-start' : ''">
+                <div v-if="withCalculator && sizingRow(idx)" data-testid="position-sizing-strip" class="min-w-0 rounded-lg border border-accent/25 bg-accent/[0.04] p-2.5">
                   <p v-if="rowIssue(sizingRow(idx)!)" class="mb-2 text-xs font-medium text-warning">{{ rowIssue(sizingRow(idx)!) }}</p>
-                  <dl class="grid grid-cols-2 gap-2.5 sm:grid-cols-5">
-                    <StatTile v-if="showQuantity" :boxed="false" :label="t('calc.colTargetQty')" :value="formatQty(sizingRow(idx)!.targetQty)" :sub="baseAsset(position.symbol)" value-class="text-accent" />
-                    <StatTile v-if="showNotional" :boxed="false" :label="t('calc.colTargetNotional')" :value="formatUsd(sizingRow(idx)!.targetNotional)" :sub="ratioText(sizingRow(idx)!)" />
-                    <StatTile :boxed="false" :label="t('calc.colOptLev')" :value="sizingRow(idx)!.leverage != null ? t('unit.leverage', { n: formatQty(sizingRow(idx)!.leverage) }) : t('common.unknown')" value-class="text-accent" :sub="ratioText(sizingRow(idx)!)" />
+                  <dl class="cq-sizing-grid gap-y-2">
+                    <StatTile v-if="showQuantity" :boxed="false" :label="t('calc.colTargetQty')" :value="formatQty(sizingRow(idx)!.targetQty)" :sub="baseAsset(position.symbol)" value-class="text-base font-bold text-accent" />
+                    <StatTile v-if="showNotional" :boxed="false" :label="t('calc.colTargetNotional')" :value="formatUsd(sizingRow(idx)!.targetNotional)" :sub="ratioText(sizingRow(idx)!)" value-class="text-base font-bold" />
+                    <StatTile :boxed="false" :label="t('calc.colOptLev')" :value="sizingRow(idx)!.leverage != null ? t('unit.leverage', { n: formatQty(sizingRow(idx)!.leverage) }) : t('common.unknown')" value-class="text-base font-bold text-accent" :sub="showNotional ? leadLevText(position) : ratioText(sizingRow(idx)!)" />
                     <StatTile :boxed="false" :label="t('calc.colMarginReq')" :value="formatUsd(sizingRow(idx)!.initialMargin)" :sub="shareText(sizingRow(idx)!.initialMargin)" />
                     <StatTile :boxed="false" :label="t('calc.colEstLiq')" :value="formatPrice(sizingRow(idx)!.liquidation)" :sub="liqText(sizingRow(idx)!)" value-class="text-warning" />
                   </dl>
                 </div>
-                <details v-if="position.entryOrders?.length" class="mt-3 rounded-lg border border-border/40 bg-surface/60">
-                  <summary class="cursor-pointer rounded-lg px-3 py-2 text-xs font-semibold text-accent">{{ t("pos.entryFills") }} · {{ t("pos.entryOrdersCount", { n: position.entryOrders.length }) }}</summary>
+                <div :class="positions.length === 1 ? 'cq-single-aside min-w-0 xl:col-start-2 xl:row-start-1 xl:row-span-2' : 'min-w-0'">
+                  <PriceActionPanel v-if="position.analysis?.ok" :analysis="position.analysis" />
+                  <p v-else class="tile self-start text-xs text-muted">{{ t("pa.pending") }}</p>
+                </div>
+                <details v-if="position.entryOrders?.length" class="min-w-0 rounded-lg border border-border/40 bg-surface/60" :class="positions.length === 1 ? 'xl:col-start-1' : ''">
+                  <summary class="cursor-pointer rounded-lg px-3 py-1.5 text-xs font-semibold text-accent">{{ t("pos.entryFills") }} · {{ t("pos.entryOrdersCount", { n: position.entryOrders.length }) }}</summary>
                   <ul class="divide-y divide-border/40 px-3 pb-1.5 font-mono text-xs tabular-nums">
-                    <li v-for="order in position.entryOrders" :key="orderKey(order)" class="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 py-1.5">
+                    <li v-for="order in position.entryOrders" :key="orderKey(order)" class="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 py-1">
                       <time class="text-muted">{{ formatDateTime(order.t ?? order.time, { short: true }) }}</time>
                       <span class="font-sans">{{ entryDirection(order, position) }}</span>
                       <span><strong class="font-semibold">{{ unit === "both" ? formatQty(order.q ?? order.qty) : sizeText(order.q ?? order.qty, orderNotional(order), order.p ?? order.price ?? order.avgPrice) }}</strong> <span class="text-accent">@ {{ formatPrice(order.p ?? order.price ?? order.avgPrice) }}</span></span>
@@ -355,32 +339,71 @@ function orderNotional(order: TelemetryOrder) {
                   </ul>
                 </details>
               </div>
-              <PriceActionPanel v-if="position.analysis?.ok" :analysis="position.analysis" />
-              <p v-else class="tile self-start text-xs text-muted">{{ t("pa.pending") }}</p>
-            </div>
-          </article>
-        </template>
-        <div v-if="withCalculator && sizing && sizing.rows.length" class="rounded-xl border border-border/50 bg-background/40 p-3 sm:p-4">
-          <h4 class="eyebrow mb-3">{{ t("calc.summaryTitle") }}</h4>
-          <dl class="grid grid-cols-2 gap-3 lg:grid-cols-4">
-            <StatTile :label="t('calc.totalNotional')" :value="formatUsd(sizing.totalNotional)" :sub="t('calc.positionCount', { n: sizing.rows.length })" />
-            <StatTile :label="t('calc.portfolioLev')" :value="formatLeverage(sizing.portfolioLeverage)" value-class="text-accent"
-              :sub="`${t('calc.leadLeverage')} ${formatLeverage(summary?.totalNotionalLeverage)}`" />
-            <StatTile :label="t('calc.marginOccupied')" :value="formatUsd(sizing.totalMargin)" :sub="shareText(sizing.totalMargin)" />
-            <StatTile :label="t('calc.freeCashCushion')" :value="formatUsd(sizing.freeCash)" :value-class="sizing.freeCash == null ? '' : overCommitted ? 'text-danger' : 'text-success'"
-              :sub="sizing.buffer == null ? '' : `${t('calc.buffer')} ±${formatPct(sizing.buffer, 2, false)}`" />
-          </dl>
-          <div v-if="marginPct != null" class="mt-3">
-            <div class="meter-track" aria-hidden="true"><span class="h-full rounded-full" :class="overCommitted ? 'bg-danger' : 'bg-accent'" :style="{ width: `${Math.min(100, Math.max(0, marginPct))}%` }" /></div>
-            <div class="mt-1.5 flex flex-wrap justify-between gap-2 text-xs">
-              <span :class="overCommitted ? 'font-semibold text-danger' : 'text-muted'">{{ overCommitted ? t("calc.overCommitted") : t("calc.barMargin", { pct: formatPct(marginPct, 1, false) }) }}</span>
-              <span class="text-muted">{{ t("calc.barFree", { pct: formatPct(Math.max(0, 100 - marginPct), 1, false) }) }}</span>
-            </div>
-          </div>
-          <p class="mt-3 text-xs text-muted">{{ t("calc.crossMarginNotice") }}</p>
-          <p class="mt-1 text-xs text-muted">{{ t("calc.estimateNotice") }}</p>
+            </article>
+          </template>
+          <!-- 独立模式（公开看板等）：外层无权威持仓卡，渲染完整的持仓分析卡片（PC 多持仓两列、单持仓左右拆分）。 -->
+          <template v-else>
+            <article v-for="(position, idx) in positions" :key="positionKey(position)" class="cq min-w-0 rounded-xl border border-border/50 bg-background/40 p-3" :class="openedToday(position) ? 'today-edge' : ''">
+              <div :class="positions.length === 1 ? 'cq-single-split xl:grid xl:grid-cols-[minmax(0,1.05fr)_minmax(0,1fr)] xl:items-start xl:gap-3.5' : 'space-y-2.5'">
+                <div class="cq min-w-0">
+                  <div class="flex flex-wrap items-center gap-1.5">
+                    <h4 class="text-base font-bold tracking-tight">{{ position.symbol ?? position.instId ?? t("common.unknown") }}</h4>
+                    <span :class="sideClass(position)">{{ sideLabel(position.positionSide ?? position.posSide, position.qty ?? position.pos) }}</span>
+                    <span v-if="openedToday(position)" class="pill tone-accent font-semibold">{{ t("board.today") }}</span>
+                    <span v-if="position.fundingRate != null" class="pill font-mono tabular-nums">{{ t("pos.fundingRate", { rate: fundingText(position.fundingRate) }) }}</span>
+                  </div>
+                  <div class="mt-2.5 flex flex-wrap items-end justify-between gap-x-4 gap-y-1.5">
+                    <div class="min-w-0">
+                      <p class="flex items-center gap-1.5 text-xs text-muted"><span v-if="snapshot.meta?.stale === false" class="live-dot text-success" aria-hidden="true" />{{ t("pos.curPrice") }}</p>
+                      <p class="mt-0.5 font-mono text-xl font-bold leading-none tabular-nums tracking-tight sm:text-2xl [overflow-wrap:anywhere]">{{ formatPrice(position.currentPrice ?? position.markPrice) }}</p>
+                      <p class="mt-1 font-mono text-xs font-semibold tabular-nums" :class="pnlClass(position.priceEdgePct)">{{ t("pos.vsAvg") }} {{ formatPct(position.priceDiffPct) }}</p>
+                    </div>
+                    <div class="min-w-0 text-right">
+                      <p class="text-xs text-muted">{{ t("pos.floatPnl") }}</p>
+                      <p class="mt-0.5 font-mono text-lg font-bold leading-none tabular-nums sm:text-xl [overflow-wrap:anywhere]" :class="pnlClass(position.uPnL)">{{ signedUsd(position.uPnL) }}</p>
+                      <p class="mt-1 font-mono text-xs font-semibold tabular-nums" :class="pnlClass(position.uPnLRoePct)">ROE {{ formatPct(position.uPnLRoePct) }}</p>
+                    </div>
+                  </div>
+                  <dl class="cq-tiles mt-2.5">
+                    <StatTile v-for="tile in positionTiles(position)" :key="tile.key" class="!rounded-lg !p-2" :label="tile.label" :value="tile.value" :sub="tile.sub" :value-class="tile.valueClass" />
+                  </dl>
+                  <div v-if="withCalculator && sizingRow(idx)" data-testid="position-sizing-strip" class="mt-2.5 rounded-lg border border-accent/25 bg-accent/[0.04] p-2.5">
+                    <p v-if="rowIssue(sizingRow(idx)!)" class="mb-2 text-xs font-medium text-warning">{{ rowIssue(sizingRow(idx)!) }}</p>
+                    <dl class="cq-sizing-grid gap-y-2">
+                      <StatTile v-if="showQuantity" :boxed="false" :label="t('calc.colTargetQty')" :value="formatQty(sizingRow(idx)!.targetQty)" :sub="baseAsset(position.symbol)" value-class="text-base font-bold text-accent" />
+                      <StatTile v-if="showNotional" :boxed="false" :label="t('calc.colTargetNotional')" :value="formatUsd(sizingRow(idx)!.targetNotional)" :sub="ratioText(sizingRow(idx)!)" value-class="text-base font-bold" />
+                      <StatTile :boxed="false" :label="t('calc.colOptLev')" :value="sizingRow(idx)!.leverage != null ? t('unit.leverage', { n: formatQty(sizingRow(idx)!.leverage) }) : t('common.unknown')" value-class="text-base font-bold text-accent" :sub="showNotional ? leadLevText(position) : ratioText(sizingRow(idx)!)" />
+                      <StatTile :boxed="false" :label="t('calc.colMarginReq')" :value="formatUsd(sizingRow(idx)!.initialMargin)" :sub="shareText(sizingRow(idx)!.initialMargin)" />
+                      <StatTile :boxed="false" :label="t('calc.colEstLiq')" :value="formatPrice(sizingRow(idx)!.liquidation)" :sub="liqText(sizingRow(idx)!)" value-class="text-warning" />
+                    </dl>
+                  </div>
+                  <details v-if="position.entryOrders?.length" class="mt-2.5 rounded-lg border border-border/40 bg-surface/60">
+                    <summary class="cursor-pointer rounded-lg px-3 py-1.5 text-xs font-semibold text-accent">{{ t("pos.entryFills") }} · {{ t("pos.entryOrdersCount", { n: position.entryOrders.length }) }}</summary>
+                    <ul class="divide-y divide-border/40 px-3 pb-1.5 font-mono text-xs tabular-nums">
+                      <li v-for="order in position.entryOrders" :key="orderKey(order)" class="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 py-1">
+                        <time class="text-muted">{{ formatDateTime(order.t ?? order.time, { short: true }) }}</time>
+                        <span class="font-sans">{{ entryDirection(order, position) }}</span>
+                        <span><strong class="font-semibold">{{ unit === "both" ? formatQty(order.q ?? order.qty) : sizeText(order.q ?? order.qty, orderNotional(order), order.p ?? order.price ?? order.avgPrice) }}</strong> <span class="text-accent">@ {{ formatPrice(order.p ?? order.price ?? order.avgPrice) }}</span></span>
+                        <span v-if="unit === 'both'" class="text-muted">{{ formatUsd(orderNotional(order)) }}</span>
+                      </li>
+                    </ul>
+                  </details>
+                </div>
+                <PriceActionPanel v-if="position.analysis?.ok" :analysis="position.analysis" />
+                <p v-else class="tile self-start text-xs text-muted">{{ t("pa.pending") }}</p>
+              </div>
+            </article>
+          </template>
         </div>
-        <p class="text-xs leading-relaxed text-faint">{{ t("tel.formulaNote", { mb: formatUsd(marginBalance), src: mmrSource }) }}</p>
+        <details class="rounded-lg border border-border/40 bg-background/40 px-3 py-1.5 text-xs text-muted">
+          <summary class="cursor-pointer select-none font-medium text-muted hover:text-foreground">{{ t("calc.formulaToggle") }}</summary>
+          <div class="mt-1.5 space-y-1 leading-relaxed text-faint">
+            <p v-if="withCalculator && sizing && sizing.rows.length">{{ t("calc.crossMarginNotice") }}</p>
+            <p v-if="withCalculator">{{ t("calc.estimateNotice") }}</p>
+            <p>{{ t("tel.formulaNote", { mb: formatUsd(marginBalance), src: mmrSource }) }}</p>
+            <p v-if="withCalculator">{{ t("calc.ratioFormula") }} · {{ t("calc.dynLevFormula") }}</p>
+          </div>
+        </details>
       </div>
     </div>
   </section>

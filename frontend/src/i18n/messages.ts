@@ -668,6 +668,8 @@ export const additions: Record<string, readonly [string, string]> = {
   "board.viewPositions": ["查看账户 {name} 持仓", "View positions for {name}"],
   "leadDetail.quickSwitch": ["切换带单员", "Switch lead trader"],
   "tel.openAndCalcTitle": ["当前持仓 · 跟单开仓测算与动态最优杠杆", "Open Positions · Sizing & Dynamic Leverage"],
+  "pa.notesToggle": ["结构解读", "Structure notes"],
+  "calc.formulaToggle": ["公式与测算说明", "Formula & notes"],
   "accts.testShort": ["测连", "Test"],
   "accts.syncShort": ["同步", "Sync"],
   "proxy.testShort": ["测速", "Ping"],

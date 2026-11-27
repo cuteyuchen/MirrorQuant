@@ -109,6 +109,7 @@
   .card-header { @apply flex flex-wrap items-center justify-between gap-3 border-b border-border/50 px-4 py-3 sm:px-5; }
   .card-body { @apply p-4 sm:p-5; }
   .tile { @apply min-w-0 rounded-xl border border-border/50 bg-background/60 p-3; }
+  .tile-compact { @apply min-w-0 rounded-lg border border-border/45 bg-background/55 px-2.5 py-1.5; }
   /* 顶部一道强调色光带，用于需要被一眼看到的卡片。 */
   .card-accent { @apply relative overflow-hidden; }
   .card-accent::before {
@@ -248,9 +249,20 @@
  */
 .cq { container-type: inline-size; }
 .cq-tiles, .cq-tiles-6 { display: grid; gap: 0.5rem; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.cq-subtiles, .cq-sizing-grid { display: grid; gap: 0.35rem 0.75rem; grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .cq-split { display: grid; gap: 1rem; min-width: 0; }
+.cq-pos-grid { display: grid; gap: 0.75rem; min-width: 0; }
 @container (min-width: 520px) { .cq-tiles { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
-@container (min-width: 620px) { .cq-tiles-6 { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@container (min-width: 620px) {
+  .cq-tiles-6 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .cq-subtiles { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .cq-sizing-grid { grid-template-columns: repeat(auto-fit, minmax(112px, 1fr)); }
+}
+@container (min-width: 880px) {
+  .cq-pos-grid.cq-pos-grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .cq-single-split { display: grid; gap: 0.875rem; grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr); align-items: start; }
+  .cq-single-split > .cq-single-aside { grid-column: 2; grid-row: 1 / span 2; }
+}
 @container (min-width: 1120px) { .cq-tiles-6 { grid-template-columns: repeat(6, minmax(0, 1fr)); } }
 /* 持仓卡足够宽时，基础数据与 PA / SMC 分析左右并排。 */
 @container (min-width: 1200px) { .cq-split { grid-template-columns: minmax(0, 1fr) minmax(0, 1.05fr); } }

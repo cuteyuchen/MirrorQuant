@@ -10,12 +10,12 @@ import { reasonText } from "@/utils/errors";
 import StatusBadge from "@/components/StatusBadge.vue";
 import EnvBadge from "@/components/EnvBadge.vue";
 const props = withDefaults(defineProps<{
-  events: BoardEvent[] | null; positions: BoardPosition[] | null; accounts: BoardAccount[] | null; readOnly?: boolean;
-}>(), { readOnly: false });
+  events: BoardEvent[] | null; positions: BoardPosition[] | null; accounts: BoardAccount[] | null; readOnly?: boolean; unbound?: boolean;
+}>(), { readOnly: false, unbound: false });
 const { t } = useI18n();
 const { sizeText } = useDisplayUnit();
 // 默认只展开最近几条，卡片高度不被一整天的动态撑开；其余一键展开。
-const PREVIEW = 6;
+const PREVIEW = 5;
 const expanded = ref(false);
 const sorted = computed(() => [...(props.events || [])].sort((a, b) => (b.time ?? -Infinity) - (a.time ?? -Infinity)));
 const visible = computed(() => expanded.value ? sorted.value : sorted.value.slice(0, PREVIEW));
@@ -50,8 +50,8 @@ function executionDetail(execution: BoardExecution): string | null {
     <p v-if="readOnly" class="mb-3 text-xs text-muted">{{ t("pub.knownEvents") }}</p>
     <p v-if="!sorted.length" class="rounded-xl border border-dashed border-border/60 px-3 py-6 text-center text-xs text-muted">{{ events == null ? t("common.unknown") : t("board.noEvents") }}</p>
     <!-- 桌面端动态列表高度封顶内部滚动，移动端取消内部滚动容器由整页统一滚动，杜绝嵌套滚动陷阱。 -->
-    <div v-else class="pr-1 xl:max-h-[calc(100vh-8rem)] xl:overflow-y-auto xl:overscroll-contain">
-    <ol class="relative space-y-4 before:absolute before:bottom-2 before:left-[5px] before:top-2 before:w-px before:bg-border/70">
+    <div v-else class="pr-1 xl:max-h-72 xl:overflow-y-auto xl:overscroll-contain">
+    <ol class="relative space-y-2.5 before:absolute before:bottom-2 before:left-[5px] before:top-2 before:w-px before:bg-border/70">
       <li v-for="event in visible" :key="event.id || `${event.time}:${event.symbol}:${event.action}`" class="relative min-w-0 pl-6">
         <span class="absolute left-0 top-1.5 h-[11px] w-[11px] rounded-full border-2 border-surface bg-accent" aria-hidden="true" />
         <div class="flex flex-wrap items-center justify-between gap-x-2 gap-y-1">
@@ -62,11 +62,11 @@ function executionDetail(execution: BoardExecution): string | null {
           </span>
           <time class="font-mono text-xs tabular-nums text-muted" :title="formatDateTime(event.time)">{{ formatClock(event.time) }}</time>
         </div>
-        <p class="mt-1 font-mono text-xs tabular-nums text-muted">
-          {{ sizeText(event.qty, null, event.price) }} @ {{ formatPrice(event.price) }}
-          <span v-if="event.realizedPnl != null" class="ml-1 font-semibold" :class="pnlClass(event.realizedPnl)">{{ signedUsd(event.realizedPnl) }}</span>
+        <p class="mt-0.5 flex flex-wrap items-baseline justify-between gap-x-2 font-mono text-xs tabular-nums text-muted">
+          <span>{{ sizeText(event.qty, null, event.price) }} @ {{ formatPrice(event.price) }}</span>
+          <span v-if="event.realizedPnl != null" class="font-semibold" :class="pnlClass(event.realizedPnl)">{{ signedUsd(event.realizedPnl) }}</span>
         </p>
-        <p v-if="!readOnly && !event.mine?.length" class="mt-1.5 text-xs font-medium text-warning">{{ t("board.noExecution") }}</p>
+        <p v-if="!readOnly && !unbound && !event.mine?.length" class="mt-1 text-xs font-medium text-warning">{{ t("board.noExecution") }}</p>
         <!-- 我的执行结果只在私有看板出现，精简展示执行状态与异常/拦截原因，不重复长篇持仓信息。 -->
         <template v-if="!readOnly">
           <div v-for="execution in event.mine || []" :key="execution.bindingId || execution.accountName || 'execution'" class="mt-1.5 min-w-0 rounded-lg border border-border/50 bg-background/50 p-2 text-xs">

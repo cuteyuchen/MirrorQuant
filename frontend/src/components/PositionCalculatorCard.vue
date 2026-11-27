@@ -102,25 +102,28 @@ async function copyPlan() {
         </button>
       </div>
     </header>
-    <div v-show="!collapsed" :id="bodyId" class="card-body space-y-4">
+    <div v-show="!collapsed" :id="bodyId" class="card-body space-y-3" :class="compact ? '!p-3 sm:!p-4' : ''">
       <!-- 输入区：本金与快捷金额在左，测算系数与带单员本金在右。 -->
-      <div class="grid min-w-0 gap-4 lg:grid-cols-2">
-        <div class="min-w-0">
-          <label :for="capitalId" class="field-label mb-1">{{ t("calc.capitalLabel") }}</label>
-          <input :id="capitalId" v-model="capitalInput" type="number" inputmode="decimal" min="0" step="100" class="form-input font-mono tabular-nums"
-            :placeholder="t('calc.capitalPlaceholder')" :aria-invalid="capital == null" :aria-describedby="capital == null ? `${capitalId}-error` : undefined" />
-          <p v-if="capital == null" :id="`${capitalId}-error`" class="field-error" role="alert">{{ t("calc.capitalInvalid") }}</p>
-          <div class="mt-2 flex flex-wrap items-center gap-1.5" role="group" :aria-label="t('calc.quickPreset')">
-            <span class="text-xs text-muted">{{ t("calc.quickPreset") }}</span>
-            <button v-for="preset in PRESETS" :key="preset" type="button" class="chip-button" :aria-pressed="capital === preset" @click="capitalInput = preset">{{ preset.toLocaleString("en-US") }}</button>
+      <div class="flex flex-wrap items-end justify-between gap-3">
+        <div class="min-w-0 flex-1 basis-72">
+          <div class="flex flex-wrap items-center gap-2">
+            <label :for="capitalId" class="field-label shrink-0">{{ t("calc.capitalLabel") }}</label>
+            <input :id="capitalId" v-model="capitalInput" type="number" inputmode="decimal" min="0" step="100" class="form-input !min-h-9 w-36 !py-1 font-mono tabular-nums sm:w-40"
+              :placeholder="t('calc.capitalPlaceholder')" :aria-invalid="capital == null" :aria-describedby="capital == null ? `${capitalId}-error` : undefined" />
+            <div class="flex flex-wrap items-center gap-1" role="group" :aria-label="t('calc.quickPreset')">
+              <button v-for="preset in PRESETS" :key="preset" type="button" class="chip-button !min-h-7 !px-2 !py-0.5" :aria-pressed="capital === preset" @click="capitalInput = preset">{{ preset.toLocaleString("en-US") }}</button>
+            </div>
           </div>
+          <p v-if="capital == null" :id="`${capitalId}-error`" class="field-error" role="alert">{{ t("calc.capitalInvalid") }}</p>
         </div>
         <fieldset class="min-w-0">
-          <legend class="field-label mb-1">{{ t("calc.multiplierLabel") }}</legend>
-          <div class="tab-list" role="group">
-            <button v-for="mode in MODES" :key="mode.value" type="button" class="tab-button" :aria-pressed="multiplier === mode.value" @click="multiplier = mode.value">{{ t(mode.label) }}</button>
+          <legend class="sr-only">{{ t("calc.multiplierLabel") }}</legend>
+          <div class="flex flex-wrap items-center gap-2.5">
+            <div class="tab-list" role="group">
+              <button v-for="mode in MODES" :key="mode.value" type="button" class="tab-button !min-h-8 !px-2.5 !py-1 text-xs" :aria-pressed="multiplier === mode.value" @click="multiplier = mode.value">{{ t(mode.label) }}</button>
+            </div>
+            <p class="text-xs text-muted">{{ t("calc.leadMarginBal") }} <strong class="font-mono tabular-nums text-foreground">{{ formatUsd(leadMargin) }}</strong></p>
           </div>
-          <p class="mt-2 text-xs text-muted">{{ t("calc.leadMarginBal") }} <strong class="font-mono tabular-nums text-foreground">{{ formatUsd(leadMargin) }}</strong></p>
           <p v-if="!compact" class="mt-1 text-xs text-faint">{{ t("calc.ratioFormula") }} · {{ t("calc.dynLevFormula") }}</p>
         </fieldset>
       </div>
