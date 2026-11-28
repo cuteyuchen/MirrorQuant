@@ -1,7 +1,14 @@
+import json
 from decimal import Decimal
 from types import SimpleNamespace
 
-from app.services.engine.auto_blacklist import compute_auto_blacklist_changes
+import pytest
+
+from app.services.engine.auto_blacklist import (
+    AutoBlacklistDecision,
+    apply_auto_blacklist_changes,
+    compute_auto_blacklist_changes,
+)
 
 
 def _alloc(inst_id, qty):
@@ -71,3 +78,43 @@ def test_disabled_switch_no_changes():
         positions=[_pos("EVAAUSDT", "10")], open_orders=[], allocations=[],
     )
     assert d.add == () and d.remove == ()
+
+
+class _ScalarResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def all(self):
+        return list(self._rows)
+
+
+class _FakeDb:
+    def __init__(self):
+        self.added = []
+        self.deleted = []
+
+    async def scalars(self, _stmt):
+        return _ScalarResult([])
+
+    def add(self, row):
+        self.added.append(row)
+
+    async def delete(self, row):
+        self.deleted.append(row)
+
+
+@pytest.mark.asyncio
+async def test_apply_auto_blacklist_changes_is_silent():
+    db = _FakeDb()
+    binding = SimpleNamespace(
+        id=6, symbol_blacklist_json="[]", name="test", lead_id=1, owner_user_id=1,
+    )
+
+    result = await apply_auto_blacklist_changes(
+        db, binding, decisions=AutoBlacklistDecision(add=("TRUMPUSDT",), remove=()),
+    )
+
+    assert result.add == ("TRUMPUSDT",)
+    assert json.loads(binding.symbol_blacklist_json) == ["TRUMPUSDT"]
+    assert [type(row).__name__ for row in db.added] == ["AutoBlacklistEntry"]
+    assert db.deleted == []

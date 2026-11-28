@@ -167,13 +167,13 @@ async def apply_auto_blacklist_changes(
     binding: CopyBinding,
     *,
     decisions: AutoBlacklistDecision,
-    notify_cfg: Optional[dict[str, Any]] = None,
 ) -> AutoBlacklistDecision:
     """Persist decisions, keeping the JSON blacklist and marker table in sync.
 
     The marker row is the sole authority for automatic removal: a manually
-    added symbol has no marker and is therefore never auto-removed. The
-    notification joins the caller's transaction via the durable outbox.
+    added symbol has no marker and is therefore never auto-removed. Automatic
+    blacklist maintenance is deliberately silent: it updates state and logs
+    only, and never becomes a user notification.
     """
     if not decisions.add and not decisions.remove:
         return decisions
@@ -228,26 +228,6 @@ async def apply_auto_blacklist_changes(
             symbol, binding.id,
         )
 
-    if notify_cfg is not None:
-        from app.services.notifier.outbox import enqueue_notification
-
-        parts = []
-        if applied_add:
-            parts.append("自动加入黑名单 / auto-blacklisted: " + ", ".join(applied_add))
-        if applied_remove:
-            parts.append("自动移除黑名单 / auto-removed: " + ", ".join(applied_remove))
-        enqueue_notification(
-            db,
-            notify_cfg,
-            "MirrorQuant",
-            f"绑定「{binding.name}」品种黑名单已更新 / Binding blacklist updated\n" + "\n".join(parts),
-            event_type="AUTO_BLACKLIST",
-            event_key=f"auto-blacklist:{binding.id}:{','.join(applied_add)}:{','.join(applied_remove)}",
-            lead_id=binding.lead_id,
-            owner_user_id=binding.owner_user_id,
-            destination_type="system",
-        )
-
     return AutoBlacklistDecision(add=tuple(applied_add), remove=tuple(applied_remove))
 
 
@@ -258,7 +238,6 @@ async def reconcile_auto_blacklist(
     *,
     positions: Sequence[Any],
     open_orders: Sequence[Any],
-    notify_cfg: Optional[dict[str, Any]] = None,
 ) -> AutoBlacklistDecision:
     """Load account-wide ownership and apply the pure decision for one binding."""
     if not bool(getattr(binding, "auto_blacklist_manual", True)):
@@ -279,4 +258,4 @@ async def reconcile_auto_blacklist(
         open_orders=open_orders,
         allocations=allocations,
     )
-    return await apply_auto_blacklist_changes(db, binding, decisions=decisions, notify_cfg=notify_cfg)
+    return await apply_auto_blacklist_changes(db, binding, decisions=decisions)

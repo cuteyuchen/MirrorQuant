@@ -532,13 +532,10 @@ class EngineOrchestrator:
             if positions is None:
                 positions = await asyncio.wait_for(adapter.get_positions(), timeout=15.0)
             open_orders = await asyncio.wait_for(adapter.get_open_orders_normalized(), timeout=15.0)
-            notify_cfg = await self.router._get_config(
-                db, "notifications", DEFAULT_SYSTEM_CONFIG["notifications"]
-            )
             async with db.begin_nested():
                 await reconcile_auto_blacklist(
                     db, binding, account,
-                    positions=positions, open_orders=open_orders, notify_cfg=notify_cfg,
+                    positions=positions, open_orders=open_orders,
                 )
             await db.commit()
         except Exception as exc:
