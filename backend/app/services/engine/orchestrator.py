@@ -486,7 +486,9 @@ class EngineOrchestrator:
                         await self.router.reconcile_pending_orders(db, account, adapter, instruments)
                     now = time.time()
                     interval = max(15, int(resilience_cfg.get("reconcile_interval_sec", 60)))
-                    if (getattr(binding, "is_enabled", True) and getattr(account, "is_enabled", True)
+                    # Auto-blacklist also runs while the binding is disabled: isolating
+                    # manual symbols is what makes a later re-enable safe.
+                    if (getattr(account, "is_enabled", True)
                             and hasattr(adapter, "get_open_orders_normalized")
                             and now - self._last_auto_blacklist.get(binding.id, 0.0) >= interval):
                         self._last_auto_blacklist[binding.id] = now
