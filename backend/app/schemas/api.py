@@ -294,6 +294,7 @@ class BindingCreate(CamelModel):
     hard_stop_loss_pct: float = Field(default=15.0, gt=0.0, le=95.0)
     symbol_whitelist: List[str] = Field(default_factory=list)
     symbol_blacklist: List[str] = Field(default_factory=list)
+    auto_blacklist_manual: bool = True
     symbol_map: Dict[str, str] = Field(default_factory=dict)
 
 
@@ -312,6 +313,7 @@ class BindingUpdate(UpdateModel):
     max_drawdown_pct: Optional[float] = Field(default=None, ge=0.0, le=100.0)
     daily_max_loss_pct: Optional[float] = Field(default=None, ge=0.0, le=100.0)
     max_slippage_pct: Optional[float] = Field(default=None, gt=0.0, le=50.0)
+    auto_blacklist_manual: Optional[bool] = None
     max_spread_pct: Optional[float] = Field(default=None, ge=0.0, le=20.0)
     ioc_offset_pct: Optional[float] = Field(default=None, ge=0.0, le=10.0)
     order_mode: Optional[str] = Field(default=None, pattern="^(ioc_then_market|ioc_only|market_only)$")

@@ -61,7 +61,7 @@ const showModal = ref(false);
 const initialRisk = ref<RiskSettings | null>(null);
 const formElement = ref<HTMLFormElement | null>(null);
 const form = ref({ name: "", leadId: null as number | null, accountId: null as number | null, riskScale: 1 as number | null,
-  risk: { ...DEFAULT_RISK }, whitelist: "", blacklist: "", symbolMap: "" });
+  risk: { ...DEFAULT_RISK }, whitelist: "", blacklist: "", autoBlacklistManual: true, symbolMap: "" });
 const errors = ref<Record<string, string>>({});
 const environment = computed(() => editing.value?.accountEnvironment ?? accounts.value.find(account => account.id === form.value.accountId)?.environment ?? null);
 const protectionLocked = computed(() => !!editing.value && (status(editing.value)?.positionCount == null ||
@@ -127,6 +127,7 @@ function open(binding: Binding | null) {
   form.value = { name: binding?.name || "", leadId: binding?.leadId ?? null, accountId: binding?.accountId ?? null,
     riskScale: binding ? binding.riskScale : 1, risk: { ...initialRisk.value },
     whitelist: binding?.symbolWhitelist?.join(", ") || "", blacklist: binding?.symbolBlacklist?.join(", ") || "",
+    autoBlacklistManual: binding?.autoBlacklistManual ?? true,
     symbolMap: Object.entries(binding?.symbolMap || {}).map(([source, target]) => `${source}=${target}`).join("\n") };
   showModal.value = true;
 }
@@ -170,7 +171,8 @@ async function saveBinding() {
   if (Object.keys(errors.value).length) { await focusError(); return; }
   const reduced = riskReductions(initialRisk.value, form.value.risk);
   const payload = { name: form.value.name.trim(), risk_scale: form.value.riskScale, ...form.value.risk,
-    symbol_whitelist: whitelist, symbol_blacklist: blacklist, symbol_map: symbolMap };
+    symbol_whitelist: whitelist, symbol_blacklist: blacklist, auto_blacklist_manual: form.value.autoBlacklistManual,
+    symbol_map: symbolMap };
   // 新建实盘绑定默认停用，启用必须再走独立的强确认。
   const result = await run(() => editing.value ? api.put(`/api/bindings/${editing.value.id}`, payload) :
     api.post("/api/bindings", { ...payload, leadId: form.value.leadId, accountId: form.value.accountId, isEnabled: environment.value === "demo" }), {
@@ -297,6 +299,10 @@ onUnmounted(stop);
         <details :open="sectionHasError('protection')" class="rounded-xl border border-border/50 bg-background/40 px-3.5 py-2.5"><summary class="flex min-h-10 cursor-pointer items-center justify-between gap-2 text-sm font-semibold">{{ t("bind.protectionSection") }}<ChevronDown :size="17" /></summary><div class="mt-3 space-y-3"><p v-if="protectionLocked" class="text-xs text-warning">{{ lockMessage }}</p><RiskPolicyFields v-model="form.risk" section="protection" :errors="errors" :defaults="defaults" :disabled-fields="disabledRiskFields" /></div></details>
         <details :open="!!(errors.whitelist || errors.symbol_whitelist || errors.symbol_blacklist || errors.symbolMap || errors.symbol_map)" class="rounded-xl border border-border/50 bg-background/40 px-3.5 py-2.5"><summary class="flex min-h-10 cursor-pointer items-center justify-between gap-2 text-sm font-semibold">{{ t("bind.filterSection") }}<ChevronDown :size="17" /></summary>
           <div class="mt-3 grid gap-4 sm:grid-cols-2">
+            <label class="sm:col-span-2 flex items-start gap-2.5 rounded-lg border border-border/40 bg-surface/50 px-3 py-2.5 text-sm font-medium">
+              <input v-model="form.autoBlacklistManual" type="checkbox" role="switch" name="autoBlacklistManual" class="mt-0.5" />
+              <span>{{ t("bind.autoBlacklistManual") }}<span class="mt-1 block text-xs font-normal leading-relaxed text-muted">{{ t("bind.autoBlacklistManualHelp") }}</span></span>
+            </label>
             <label class="field-label">{{ t("bind.symbolWhitelist") }}<textarea v-model="form.whitelist" :placeholder="t('bind.symbolPlaceholder')" :aria-invalid="!!(errors.whitelist || errors.symbol_whitelist)" class="form-input mt-1" rows="2" /><span class="mt-1 block text-xs text-muted">{{ t("bind.whitelistHelp") }}</span><span v-if="errors.whitelist || errors.symbol_whitelist" class="field-error" role="alert">{{ errors.whitelist || errors.symbol_whitelist }}</span></label>
             <label class="field-label">{{ t("bind.symbolBlacklist") }}<textarea v-model="form.blacklist" :placeholder="t('bind.symbolPlaceholder')" :aria-invalid="!!errors.symbol_blacklist" class="form-input mt-1" rows="2" /><span class="mt-1 block text-xs text-muted">{{ t("bind.blacklistHelp") }}</span><span v-if="errors.symbol_blacklist" class="field-error" role="alert">{{ errors.symbol_blacklist }}</span></label>
             <label class="field-label sm:col-span-2">{{ t("bind.symbolMap") }}<textarea v-model="form.symbolMap" :placeholder="t('bind.symbolMapPlaceholder')" :disabled="protectionLocked" :aria-invalid="!!(errors.symbolMap || errors.symbol_map)" class="form-input mt-1 font-mono" rows="3" /><span class="mt-1 block text-xs" :class="protectionLocked ? 'text-warning' : 'text-muted'">{{ protectionLocked ? lockMessage : t("bind.mappingHelp") }}</span><span v-if="errors.symbolMap || errors.symbol_map" class="field-error" role="alert">{{ errors.symbolMap || errors.symbol_map }}</span></label>

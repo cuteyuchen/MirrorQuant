@@ -39,6 +39,8 @@ export const bindingsAdditions: Record<string, readonly [string, string]> = {
   "bind.riskSection": ["风控保护", "Risk protections"],
   "bind.protectionSection": ["止盈止损", "Take profit and stop loss"],
   "bind.filterSection": ["品种过滤与映射", "Symbol filters and mapping"],
+  "bind.autoBlacklistManual": ["自动黑名单手动标的", "Auto-blacklist manual symbols"],
+  "bind.autoBlacklistManualHelp": ["账户对账时，若出现无跟单归属的非零持仓或未成交挂单，系统会自动加入该绑定黑名单；持仓归零且无挂单后自动移除。手动加入的黑名单条目永不移除。", "During account reconciliation, symbols with unowned non-zero positions or resting orders are auto-blacklisted for this binding and removed once flat with no orders. Manually added entries are never auto-removed."],
   "bind.lockedProtection": ["此绑定有持仓或待处理订单。平仓并核对订单前，不可修改品种映射和止盈止损参数。", "This binding has positions or pending orders. Reconcile and close them before changing symbol mapping or protection parameters."],
   "bind.unverifiedProtection": ["持仓或待处理订单状态未确认，暂不可修改品种映射和止盈止损参数。", "Positions or pending orders are unverified. Symbol mapping and protection parameters are temporarily locked."],
   "bind.whitelistHelp": ["留空跟随全部品种；填写后只跟随列表中的品种。", "Leave empty to copy all symbols; otherwise only listed symbols are copied."],

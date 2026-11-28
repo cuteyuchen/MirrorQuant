@@ -245,6 +245,7 @@ SQLITE_MIGRATIONS: Dict[str, List[Tuple[str, str]]] = {
         ("adopt_existing_positions", "BOOLEAN NOT NULL DEFAULT 1"),
         ("adopt_tolerance_pct", "FLOAT NOT NULL DEFAULT 10.0"),
         ("adoption_completed", "BOOLEAN NOT NULL DEFAULT 0"),
+        ("auto_blacklist_manual", "BOOLEAN NOT NULL DEFAULT 1"),
         ("owner_user_id", "INTEGER"),
         ("deleted_at", "DATETIME"),
     ],

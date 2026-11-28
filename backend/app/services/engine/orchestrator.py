@@ -27,6 +27,7 @@ from app.services.analysis.pa_analyzer import PAAnalyzer
 from app.services.engine.cashflow import cash_flow_is_fresh, fetch_today_net_flow
 from app.core.time_util import BEIJING_TZ
 from app.services.engine.router import CopyRouter
+from app.services.engine.auto_blacklist import reconcile_auto_blacklist
 from app.services.engine.risk import RiskEngine
 from app.services.engine.equity import display_equity, equity_baseline, persist_equity, risk_state
 from app.services.engine.serialization import serialized_execution
@@ -165,6 +166,7 @@ class EngineOrchestrator:
         self._last_account_poll: Dict[int, float] = {}
         self._last_clock_sync: Dict[int, float] = {}
         self._last_reconcile: Dict[int, float] = {}
+        self._last_auto_blacklist: Dict[int, float] = {}
         self._last_unverified_logged: Dict[int, str] = {}
         self._sync_failure_log_at: Dict[int, float] = {}
         self._sync_failure_warn_at: Dict[int, float] = {}
@@ -484,6 +486,13 @@ class EngineOrchestrator:
                         await self.router.reconcile_pending_orders(db, account, adapter, instruments)
                     now = time.time()
                     interval = max(15, int(resilience_cfg.get("reconcile_interval_sec", 60)))
+                    if (getattr(binding, "is_enabled", True) and getattr(account, "is_enabled", True)
+                            and hasattr(adapter, "get_open_orders_normalized")
+                            and now - self._last_auto_blacklist.get(binding.id, 0.0) >= interval):
+                        self._last_auto_blacklist[binding.id] = now
+                        await self._reconcile_auto_blacklist(
+                            db, binding, account, adapter, positions=live_positions
+                        )
                     snapshot = json.loads(lead.snapshot_json or "{}")
                     if lead.status == "running" and now - self._last_reconcile.get(binding.id, 0.0) >= interval and is_authoritative_snapshot(snapshot):
                         self._last_reconcile[binding.id] = now
@@ -500,6 +509,44 @@ class EngineOrchestrator:
                     logger.exception("Risk monitor failed for binding %s", binding_id)
 
         await asyncio.gather(*(check_binding(binding_id) for binding_id in binding_ids))
+
+    async def _reconcile_auto_blacklist(
+        self, db: AsyncSession, binding: CopyBinding, account: TradingAccount, adapter: Any,
+        *, positions: Optional[List[Any]] = None,
+    ) -> None:
+        """Auto-blacklist symbols with unowned exposure; failures never block protection.
+
+        Positions already fetched by the risk tick are not reused: the tick may
+        run after guard orders changed physical exposure, so a fresh inventory
+        is required before removing an auto entry. Pending orders come from the
+        complete normalized snapshot; if the exchange cannot provide a complete
+        view, the check is skipped instead of guessing that nothing is resting.
+        """
+        if not bool(getattr(binding, "auto_blacklist_manual", True)):
+            return
+        if not asyncio.iscoroutinefunction(getattr(adapter, "get_open_orders_normalized", None)):
+            return
+        try:
+            if positions is None:
+                positions = await asyncio.wait_for(adapter.get_positions(), timeout=15.0)
+            open_orders = await asyncio.wait_for(adapter.get_open_orders_normalized(), timeout=15.0)
+            notify_cfg = await self.router._get_config(
+                db, "notifications", DEFAULT_SYSTEM_CONFIG["notifications"]
+            )
+            async with db.begin_nested():
+                await reconcile_auto_blacklist(
+                    db, binding, account,
+                    positions=positions, open_orders=open_orders, notify_cfg=notify_cfg,
+                )
+            await db.commit()
+        except Exception as exc:
+            # The savepoint already rolled back only this feature's writes;
+            # never roll back the caller's transaction from here.
+            pass
+            logger.warning(
+                "Auto-blacklist reconciliation failed for binding %s: %s",
+                binding.id, redact_proxy_userinfo(str(exc))[:300],
+            )
 
     @serialized_execution
     async def _check_account_equity(self, db: AsyncSession, binding: CopyBinding, account: TradingAccount, adapter: Any) -> bool:

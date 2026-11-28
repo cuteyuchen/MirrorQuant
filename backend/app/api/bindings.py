@@ -15,6 +15,7 @@ from app.core.secret_mask import redact_error_urls, redact_proxy_userinfo
 from app.core.security import CredentialVault
 from app.core.time_util import BEIJING_TZ
 from app.models.domain import (
+    AutoBlacklistEntry,
     BindingDebt,
     CopyBinding,
     ExecutionRecord,
@@ -82,6 +83,7 @@ def _serialize_binding(
         "hardStopLossPct": getattr(b, "hard_stop_loss_pct", 15.0),
         "symbolWhitelist": json.loads(b.symbol_whitelist_json or "[]"),
         "symbolBlacklist": json.loads(b.symbol_blacklist_json or "[]"),
+        "autoBlacklistManual": bool(getattr(b, "auto_blacklist_manual", True)),
         "symbolMap": json.loads(b.symbol_map_json or "{}"),
         "circuitBreakerTripped": b.circuit_breaker_tripped,
         "circuitBreakerReason": redact_error_urls(b.circuit_breaker_reason) if b.circuit_breaker_reason else None,
@@ -232,6 +234,7 @@ async def create_binding(
         hard_stop_loss_pct=payload.hard_stop_loss_pct,
         symbol_whitelist_json=json.dumps([s.upper() for s in payload.symbol_whitelist]),
         symbol_blacklist_json=json.dumps([s.upper() for s in payload.symbol_blacklist]),
+        auto_blacklist_manual=payload.auto_blacklist_manual,
         symbol_map_json=json.dumps(payload.symbol_map),
     )
     db.add(binding)
@@ -267,7 +270,19 @@ async def update_binding(
     if "symbol_whitelist" in data:
         binding.symbol_whitelist_json = json.dumps([s.upper() for s in (data.pop("symbol_whitelist") or [])])
     if "symbol_blacklist" in data:
-        binding.symbol_blacklist_json = json.dumps([s.upper() for s in (data.pop("symbol_blacklist") or [])])
+        requested = {s.upper() for s in (data.pop("symbol_blacklist") or [])}
+        existing = set(json.loads(binding.symbol_blacklist_json or "[]"))
+        # 手动删除的自动条目同时删掉标记，否则下一轮对账会把它当作自动条目移除；
+        # 手动新增的条目没有标记，对账永远不会自动移除。
+        removed = {s for s in existing - requested}
+        if removed:
+            auto_rows = list((await db.scalars(select(AutoBlacklistEntry).where(
+                AutoBlacklistEntry.binding_id == binding.id
+            ))).all())
+            for row in auto_rows:
+                if row.symbol.upper() in removed:
+                    await db.delete(row)
+        binding.symbol_blacklist_json = json.dumps(sorted(requested))
     if "symbol_map" in data:
         binding.symbol_map_json = json.dumps(data.pop("symbol_map") or {})
     for k, v in data.items():

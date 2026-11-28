@@ -139,6 +139,7 @@ export interface Binding {
   enableTakeProfit: boolean | null; takeProfitPct: number | null;
   enableTrailingStop: boolean | null; trailingCallbackPct: number | null; hardStopLossPct: number | null;
   symbolWhitelist: string[] | null; symbolBlacklist: string[] | null; symbolMap: Record<string, string> | null;
+  autoBlacklistManual?: boolean | null;
   circuitBreakerTripped: boolean | null; circuitBreakerReason: string | null;
   consecutiveFailures: number | null; baselineSeeded: boolean | null; pendingDebtUsd: number | null;
   todaySuccessCount?: number | null; todayFailedCount?: number | null;

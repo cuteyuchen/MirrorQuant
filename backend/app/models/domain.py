@@ -337,6 +337,8 @@ class CopyBinding(Base):
 
     symbol_whitelist_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
     symbol_blacklist_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    # 账户对账时自动把无跟单归属的品种加入黑名单；手动条目永不自动移除。
+    auto_blacklist_manual: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     symbol_map_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
 
     circuit_breaker_tripped: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
@@ -389,6 +391,22 @@ class PositionAllocation(Base):
     opened_at_ms: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
     binding: Mapped["CopyBinding"] = relationship(back_populates="allocations")
+
+
+class AutoBlacklistEntry(Base):
+    """Durable marker for symbols this binding added to its blacklist automatically."""
+
+    __tablename__ = "auto_blacklist_entries"
+    __table_args__ = (
+        UniqueConstraint("binding_id", "symbol", name="uq_auto_blacklist_binding_symbol"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    binding_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("copy_bindings.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 
 class BindingSourceProgress(Base):

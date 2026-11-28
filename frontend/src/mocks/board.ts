@@ -144,7 +144,8 @@ export const mockBindings = [1, 2, 3].map((accountId): Binding => ({
   ...riskFields, id: accountId + 10, name: accountId === 1 ? "Atlas / Paper" : "Atlas / Live",
   leadId: 1, leadName: "Atlas Momentum", accountId, accountName: mockAccounts[accountId - 1].name,
   accountExchange: mockAccounts[accountId - 1].exchange, accountEnvironment: mockAccounts[accountId - 1].environment,
-  isEnabled: accountId === 1, riskScale: 1, symbolWhitelist: [], symbolBlacklist: ["SOLUSDT"], symbolMap: {},
+  isEnabled: accountId === 1, riskScale: 1, symbolWhitelist: [], symbolBlacklist: ["SOLUSDT"],
+  autoBlacklistManual: true, symbolMap: {},
   circuitBreakerTripped: accountId === 1, circuitBreakerReason: accountId === 1 ? "CIRCUIT_BREAKER" : null,
   consecutiveFailures: 1, baselineSeeded: true, adoptionCompleted: false, pendingDebtUsd: 12.4,
 }));
